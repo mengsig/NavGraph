@@ -1,71 +1,49 @@
-const std = @import("std");
-const Io = std.Io;
+//! NavGraph CLI entry point: parse args, build the index, dispatch the query.
 
-const NavGraph = @import("NavGraph");
+const std = @import("std");
+const cli = @import("cli.zig");
+const index_mod = @import("index.zig");
+const query = @import("query.zig");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const gpa = init.gpa;
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+    var stdout_buffer: [64 * 1024]u8 = undefined;
+    var stdout_file: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const out = &stdout_file.interface;
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    const argv = try init.minimal.args.toSlice(arena);
+    const parsed = cli.parse(argv[1..]) catch {
+        try cli.usage(out);
+        try out.flush();
+        return;
+    };
+    if (parsed.command == .help) {
+        try cli.usage(out);
+        try out.flush();
+        return;
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try NavGraph.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+    var idx = index_mod.build(gpa, io, parsed.root) catch |err| {
+        try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
+        try out.flush();
+        return err;
     };
+    defer idx.deinit();
+
+    try dispatch(out, &idx, parsed);
+    try out.flush();
+}
+
+fn dispatch(out: *std.Io.Writer, idx: *index_mod.Index, parsed: cli.Parsed) !void {
+    switch (parsed.command) {
+        .outline => try query.outline(out, idx, parsed.arg, parsed.options),
+        .def => try query.showDef(out, idx, parsed.arg, parsed.options),
+        .calls => try query.walk(out, idx, parsed.arg, false, parsed.options),
+        .callers => try query.walk(out, idx, parsed.arg, true, parsed.options),
+        .search => try query.search(out, idx, parsed.arg, parsed.options),
+        .help => unreachable,
+    }
 }

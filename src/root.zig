@@ -1,18 +1,15 @@
-//! By convention, root.zig is the root source file when making a package.
-const std = @import("std");
-const Io = std.Io;
+//! NavGraph library root: re-exports the modules so `zig build test` covers
+//! them and downstream consumers can embed the graph engine.
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+pub const language = @import("language.zig");
+pub const lexer = @import("lexer.zig");
+pub const model = @import("model.zig");
+pub const parser = @import("parser.zig");
+pub const index = @import("index.zig");
+pub const query = @import("query.zig");
+pub const render = @import("render.zig");
+pub const cli = @import("cli.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test {
+    @import("std").testing.refAllDecls(@This());
 }

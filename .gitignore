@@ -1,3 +1,4 @@
 .nvime/
 .advantage/
-
+.zig-cache/
+zig-out/
