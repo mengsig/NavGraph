@@ -18,6 +18,8 @@ pub const Options = struct {
     verbosity: render.Verbosity = .sig,
     depth: u32 = 1,
     limit: u32 = 300,
+    /// Follow only high-confidence (type/self-bound or unambiguous) edges.
+    strict: bool = false,
 };
 
 /// Print an outline of the file(s) under `path_filter` (a path prefix, or ""
@@ -137,7 +139,8 @@ fn walkCallees(
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
         if (ref.kind != .call) continue;
-        if (ref.target != invalid) {
+        const followed = ref.target != invalid and (!opts.strict or ref.exact);
+        if (followed) {
             try walkNode(w, idx, ref.target, false, opts, indent + 1, visited);
         } else {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
@@ -160,8 +163,17 @@ fn walkCallers(
     visited: *std.AutoHashMap(SymbolId, void),
 ) !void {
     for (idx.callersOf(id)) |cid| {
+        if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
         try walkNode(w, idx, cid, true, opts, indent + 1, visited);
     }
+}
+
+/// True when `from` references `to` via a high-confidence (exact) edge.
+fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
+    for (idx.graph.symbols[from].refs) |ref| {
+        if (ref.target == to and ref.exact) return true;
+    }
+    return false;
 }
 
 /// Substring search over symbol names; prints matches like `def`.

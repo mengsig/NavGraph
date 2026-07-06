@@ -36,6 +36,7 @@ const usage_text =
     \\  -d, --depth <N>                        Graph depth for calls/callers (default: 1)
     \\  -C, --root <path>                      Project root to index (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
+    \\  -s, --strict                           Follow only high-confidence edges
     \\
     \\EXAMPLES:
     \\  navgraph outline src/parser.zig
@@ -104,6 +105,10 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     if (eqAny(flag, &.{ "-C", "--root" })) {
         out.root = try value(args, i);
         return i + 1;
+    }
+    if (eqAny(flag, &.{ "-s", "--strict" })) {
+        out.options.strict = true;
+        return i;
     }
     return error.UnknownFlag;
 }

@@ -16,6 +16,7 @@ const AllocError = std.mem.Allocator.Error;
 const SymbolKind = model.SymbolKind;
 const Reference = model.Reference;
 const RefKind = model.RefKind;
+const Binding = model.Binding;
 
 /// A symbol as discovered within a single file, before global ids are assigned.
 pub const ParsedSymbol = struct {
@@ -30,6 +31,13 @@ pub const ParsedSymbol = struct {
     /// Index (into the per-file parse output) of the enclosing symbol, if any.
     parent_local: ?u32,
     refs: []Reference,
+    bindings: []const Binding = &.{},
+};
+
+/// References plus local bindings collected from one symbol body.
+const BodyInfo = struct {
+    refs: []Reference,
+    bindings: []const Binding,
 };
 
 const sentinel: u32 = std.math.maxInt(u32);
@@ -169,11 +177,15 @@ fn lineStartOffset(ctx: *const Ctx, i: u32) u32 {
 const KeywordSet = std.StaticStringMap(void);
 
 /// Collect deduplicated references from the token range [lo, hi).
-fn collectRefs(ctx: *Ctx, lo: u32, hi: u32, self_name: []const u8, kw: KeywordSet) ![]Reference {
+fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const u8, kw: KeywordSet) !BodyInfo {
     std.debug.assert(lo <= hi);
     std.debug.assert(hi <= ctx.toks.len);
     var seen: std.StringHashMap(u32) = .init(ctx.gpa);
-    defer seen.deinit();
+    defer {
+        var kit = seen.keyIterator();
+        while (kit.next()) |k| ctx.gpa.free(k.*);
+        seen.deinit();
+    }
     var refs: std.ArrayList(Reference) = .empty;
     defer refs.deinit(ctx.gpa);
 
@@ -185,9 +197,21 @@ fn collectRefs(ctx: *Ctx, lo: u32, hi: u32, self_name: []const u8, kw: KeywordSe
         if (name.len < 2 or kw.has(name)) continue;
         if (std.mem.eql(u8, name, self_name)) continue;
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
-        try recordRef(ctx, &refs, &seen, name, t.line, is_call);
+        try recordRef(ctx, &refs, &seen, name, memberQualifier(ctx, i, lo), t.line, is_call);
     }
-    return ctx.arena.dupe(Reference, refs.items);
+    return .{
+        .refs = try ctx.arena.dupe(Reference, refs.items),
+        .bindings = try collectBindings(ctx, params_open, lo, hi),
+    };
+}
+
+/// If token `i` is the trailing member of `recv.name`, return `recv`'s text
+/// (the receiver identifier); otherwise "". `lo` bounds the body start.
+fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+    if (i < lo + 2) return "";
+    if (!ctx.isPunct(i - 1, '.')) return "";
+    if (ctx.toks[i - 2].kind != .identifier) return "";
+    return ctx.textOf(i - 2);
 }
 
 fn recordRef(
@@ -195,22 +219,139 @@ fn recordRef(
     refs: *std.ArrayList(Reference),
     seen: *std.StringHashMap(u32),
     name: []const u8,
+    qualifier: []const u8,
     line: u32,
     is_call: bool,
 ) !void {
-    if (seen.get(name)) |idx| {
+    // Dedup on (qualifier, name) so `a.foo()` and `b.foo()` stay distinct.
+    var key_buf: [128]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ qualifier, name }) catch name;
+    if (seen.get(key)) |idx| {
         var r = &refs.items[idx];
         r.count += 1;
         if (is_call) r.kind = .call;
         return;
     }
-    try seen.put(name, @intCast(refs.items.len));
+    try seen.put(try ctx.gpa.dupe(u8, key), @intCast(refs.items.len));
     try refs.append(ctx.gpa, .{
         .name = name,
+        .qualifier = qualifier,
         .line = line,
         .kind = if (is_call) .call else .read,
         .count = 1,
     });
+}
+
+/// Factory-method names whose receiver is the constructed type: `T.init(...)`.
+const factory_names = std.StaticStringMap(void).initComptime(.{
+    .{"init"}, .{"create"}, .{"new"}, .{"from"}, .{"default"}, .{"make"},
+});
+
+/// Scan a body for `const/var/let NAME [: T] = ...` and `NAME = T(...)` and
+/// record inferred `NAME -> T` bindings used for receiver resolution.
+fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]const Binding {
+    var list: std.ArrayList(Binding) = .empty;
+    defer list.deinit(ctx.gpa);
+    if (params_open != sentinel) try collectParamBindings(ctx, params_open, &list);
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        const b = detectBinding(ctx, i, hi, lo) orelse continue;
+        try list.append(ctx.gpa, b);
+    }
+    return ctx.arena.dupe(Binding, list.items);
+}
+
+/// Record `name -> Type` for each typed parameter `name: Type` in `(...)`.
+fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !void {
+    const close = ctx.close[open];
+    if (close == sentinel) return;
+    var expect_name = true;
+    var i = open + 1;
+    while (i < close) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '{')) {
+            const c = ctx.close[i];
+            i = if (c == sentinel or c >= close) i + 1 else c + 1;
+            expect_name = false;
+            continue;
+        }
+        if (ctx.isPunct(i, ',')) {
+            expect_name = true;
+            i += 1;
+            continue;
+        }
+        if (expect_name and ctx.toks[i].kind == .identifier and ctx.isPunct(i + 1, ':')) {
+            if (typeFromChain(ctx, i + 2, close)) |ty| {
+                try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
+            }
+        }
+        expect_name = false;
+        i += 1;
+    }
+}
+
+fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
+    const t = ctx.toks[i];
+    if (t.kind != .identifier) return null;
+    const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
+    if (is_decl) {
+        if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
+        const ty = inferDeclType(ctx, i + 1, hi) orelse return null;
+        return .{ .name = ctx.textOf(i + 1), .type_name = ty };
+    }
+    // Bare assignment at line start: `name = Type(...)` (python/js).
+    const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
+    if (!first_on_line or !ctx.isPunct(i + 1, '=') or ctx.isPunct(i + 2, '=')) return null;
+    const ty = typeFromRhs(ctx, i + 2, hi) orelse return null;
+    return .{ .name = ctx.textOf(i), .type_name = ty };
+}
+
+/// Type for `NAME : T = ...` (annotation) or `NAME = T(...)` (initializer).
+fn inferDeclType(ctx: *const Ctx, name_i: u32, hi: u32) ?[]const u8 {
+    const j = name_i + 1;
+    if (ctx.isPunct(j, ':')) return typeFromChain(ctx, j + 1, hi);
+    if (ctx.isPunct(j, '=')) return typeFromRhs(ctx, j + 1, hi);
+    return null;
+}
+
+/// Last identifier of a leading dotted chain `A(.B)*`, skipping `*?[]&` prefixes.
+fn typeFromChain(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
+    var i = start;
+    while (i < hi and ctx.toks[i].kind != .identifier) : (i += 1) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '=') or ctx.isPunct(i, ';')) return null;
+    }
+    var last: ?u32 = null;
+    while (i < hi and ctx.toks[i].kind == .identifier) {
+        last = i;
+        if (!ctx.isPunct(i + 1, '.')) break;
+        i += 2;
+    }
+    return if (last) |l| ctx.textOf(l) else null;
+}
+
+/// Type produced by an initializer expression: the constructed type in
+/// `T(...)`, `T{...}`, `new T(...)`, or `T.init(...)` (factory).
+fn typeFromRhs(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
+    var i = start;
+    while (i < hi and isRhsSkip(ctx, i)) : (i += 1) {}
+    var segs: [8]u32 = undefined;
+    var n: usize = 0;
+    while (i < hi and ctx.toks[i].kind == .identifier and n < segs.len) {
+        segs[n] = i;
+        n += 1;
+        if (!ctx.isPunct(i + 1, '.')) break;
+        i += 2;
+    }
+    if (n == 0) return null;
+    const after = segs[n - 1] + 1;
+    if (ctx.isPunct(after, '{')) return ctx.textOf(segs[n - 1]);
+    if (!ctx.isPunct(after, '(')) return null;
+    if (n >= 2 and factory_names.has(ctx.textOf(segs[n - 1]))) return ctx.textOf(segs[n - 2]);
+    return ctx.textOf(segs[n - 1]);
+}
+
+fn isRhsSkip(ctx: *const Ctx, i: u32) bool {
+    return ctx.identEql(i, "new") or ctx.identEql(i, "try") or
+        ctx.identEql(i, "await") or ctx.identEql(i, "comptime");
 }
 
 fn emit(ctx: *Ctx, sym: ParsedSymbol) !u32 {
@@ -314,7 +455,7 @@ fn parseZigFn(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exporte
         sig_end = ctx.toks[end_i].end;
         span_end = sig_end;
     }
-    const refs = try collectRefs(ctx, body_lo, body_hi, ctx.textOf(name_i), zig_keywords);
+    const body = try collectRefs(ctx, fn_i + 2, body_lo, body_hi, ctx.textOf(name_i), zig_keywords);
     _ = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = kind,
@@ -325,7 +466,8 @@ fn parseZigFn(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exporte
         .doc = collectDoc(ctx, start_i),
         .exported = exported,
         .parent_local = parent,
-        .refs = refs,
+        .refs = body.refs,
+        .bindings = body.bindings,
     });
     return if (span_end > ctx.toks[start_i].start) tokenAfterOffset(ctx, span_end, hi) else start_i + 1;
 }
@@ -570,7 +712,7 @@ fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) 
     const body_open = params_close + 1;
     const body_close = ctx.close[body_open];
     if (body_close == sentinel) return name_i;
-    const refs = try collectRefs(ctx, body_open + 1, body_close, ctx.textOf(name_i), c_keywords);
+    const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), c_keywords);
     _ = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = if (parent != null) .method else .function,
@@ -581,7 +723,8 @@ fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) 
         .doc = collectDoc(ctx, stmt_start),
         .exported = true,
         .parent_local = parent,
-        .refs = refs,
+        .refs = body.refs,
+        .bindings = body.bindings,
     });
     return body_close + 1;
 }
@@ -687,16 +830,54 @@ fn parseJsDecl(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !u32 {
     return i;
 }
 
+/// Skip a `<...>` generic list, returning the index after `>` (or `i` unchanged
+/// if `i` is not `<` or the list looks unbalanced).
+fn jsSkipGenerics(ctx: *const Ctx, i: u32, hi: u32) u32 {
+    if (!ctx.isPunct(i, '<')) return i;
+    var depth: i32 = 0;
+    var j = i;
+    while (j < hi) : (j += 1) {
+        if (ctx.isPunct(j, '{') or ctx.isPunct(j, ';')) return i;
+        if (ctx.isPunct(j, '<')) depth += 1;
+        if (ctx.isPunct(j, '>')) {
+            depth -= 1;
+            if (depth <= 0) return j + 1;
+        }
+    }
+    return i;
+}
+
+/// Body `{` of a JS/TS callable whose params close at `pclose`, skipping an
+/// optional TS return-type annotation `): T {`. Sentinel for a bodyless
+/// declaration (`): T;`) or when no body follows.
+fn jsBodyOpen(ctx: *const Ctx, pclose: u32, hi: u32) u32 {
+    var b = pclose + 1;
+    if (b < hi and ctx.isPunct(b, ':')) {
+        b += 1;
+        while (b < hi) : (b += 1) {
+            if (ctx.isPunct(b, '{')) break;
+            if (ctx.isPunct(b, ';')) return sentinel;
+            if (ctx.isPunct(b, '(') or ctx.isPunct(b, '[')) {
+                const c = ctx.close[b];
+                if (c != sentinel) b = c;
+            }
+        }
+    }
+    if (b < hi and ctx.isPunct(b, '{')) return b;
+    return sentinel;
+}
+
 fn parseJsFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
     if (fn_i + 1 >= hi or ctx.toks[fn_i + 1].kind != .identifier) return start_i;
     const name_i = fn_i + 1;
-    if (!ctx.isPunct(name_i + 1, '(')) return start_i;
-    const pclose = ctx.close[name_i + 1];
+    const popen = jsSkipGenerics(ctx, name_i + 1, hi);
+    if (!ctx.isPunct(popen, '(')) return start_i;
+    const pclose = ctx.close[popen];
     if (pclose == sentinel) return start_i;
-    const body_open = findNext(ctx, pclose + 1, hi, '{');
+    const body_open = jsBodyOpen(ctx, pclose, hi);
     if (body_open == sentinel or ctx.close[body_open] == sentinel) return start_i;
     const body_close = ctx.close[body_open];
-    const refs = try collectRefs(ctx, body_open + 1, body_close, ctx.textOf(name_i), js_keywords);
+    const body = try collectRefs(ctx, popen, body_open + 1, body_close, ctx.textOf(name_i), js_keywords);
     _ = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = if (parent != null) .method else .function,
@@ -707,7 +888,8 @@ fn parseJsFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, ex
         .doc = collectDoc(ctx, start_i),
         .exported = exported,
         .parent_local = parent,
-        .refs = refs,
+        .refs = body.refs,
+        .bindings = body.bindings,
     });
     return body_close + 1;
 }
@@ -791,7 +973,10 @@ fn detectJsArrow(ctx: *const Ctx, eq_i: u32, hi: u32, semi_i: u32) JsArrow {
 fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u32, exported: bool, hi: u32) !u32 {
     const close = ctx.close[arrow.open];
     if (close == sentinel) return start_i + 1;
-    const refs = try collectRefs(ctx, arrow.open + 1, close, ctx.textOf(name_i), js_keywords);
+    const popen = findNext(ctx, name_i + 1, arrow.open, '(');
+    const params_open = if (popen != sentinel and ctx.close[popen] != sentinel and
+        ctx.close[popen] < arrow.open) popen else sentinel;
+    const body = try collectRefs(ctx, params_open, arrow.open + 1, close, ctx.textOf(name_i), js_keywords);
     _ = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = if (parent != null) .method else .function,
@@ -802,7 +987,8 @@ fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u3
         .doc = collectDoc(ctx, start_i),
         .exported = exported,
         .parent_local = parent,
-        .refs = refs,
+        .refs = body.refs,
+        .bindings = body.bindings,
     });
     _ = hi;
     return close + 1;
@@ -811,17 +997,21 @@ fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u3
 /// Class members: methods `name(...) { }` and accessors.
 fn parseJsMember(ctx: *Ctx, start_i: u32, k: u32, hi: u32, parent: u32) !u32 {
     var m = k;
-    while (m < hi and (ctx.identEql(m, "static") or ctx.identEql(m, "async") or
-        ctx.identEql(m, "get") or ctx.identEql(m, "set") or ctx.identEql(m, "readonly"))) m += 1;
+    // Skip method modifiers, but only when they prefix a name — `get x()` is an
+    // accessor, whereas `get()`/`get<T>()` is a method literally named `get`.
+    while (m + 1 < hi and ctx.toks[m + 1].kind == .identifier and
+        (ctx.identEql(m, "static") or ctx.identEql(m, "async") or
+            ctx.identEql(m, "get") or ctx.identEql(m, "set") or ctx.identEql(m, "readonly"))) m += 1;
     if (m >= hi or ctx.toks[m].kind != .identifier) return start_i;
-    if (!ctx.isPunct(m + 1, '(')) return start_i;
-    const pclose = ctx.close[m + 1];
+    const popen = jsSkipGenerics(ctx, m + 1, hi);
+    if (!ctx.isPunct(popen, '(')) return start_i;
+    const pclose = ctx.close[popen];
     if (pclose == sentinel) return start_i;
-    if (!ctx.isPunct(pclose + 1, '{')) return start_i;
-    const body_open = pclose + 1;
+    const body_open = jsBodyOpen(ctx, pclose, hi);
+    if (body_open == sentinel) return start_i;
     const body_close = ctx.close[body_open];
     if (body_close == sentinel) return start_i;
-    const refs = try collectRefs(ctx, body_open + 1, body_close, ctx.textOf(m), js_keywords);
+    const body = try collectRefs(ctx, popen, body_open + 1, body_close, ctx.textOf(m), js_keywords);
     _ = try emit(ctx, .{
         .name = ctx.textOf(m),
         .kind = .method,
@@ -832,7 +1022,8 @@ fn parseJsMember(ctx: *Ctx, start_i: u32, k: u32, hi: u32, parent: u32) !u32 {
         .doc = collectDoc(ctx, start_i),
         .exported = false,
         .parent_local = parent,
-        .refs = refs,
+        .refs = body.refs,
+        .bindings = body.bindings,
     });
     return body_close + 1;
 }
@@ -922,7 +1113,7 @@ fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_met
     const colon = findNext(ctx, name_i + 1, hi, ':');
     const sig_end = if (colon != sentinel) ctx.toks[colon].end else ctx.toks[name_i].end;
     const body_lo = if (colon != sentinel) colon + 1 else name_i + 1;
-    const refs = try collectRefs(ctx, body_lo, term, ctx.textOf(name_i), py_keywords);
+    const body = try collectRefs(ctx, name_i + 1, body_lo, term, ctx.textOf(name_i), py_keywords);
     return emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = if (is_method) .method else .function,
@@ -933,7 +1124,8 @@ fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_met
         .doc = collectDoc(ctx, start_i),
         .exported = ctx.source[ctx.toks[name_i].start] != '_',
         .parent_local = parent,
-        .refs = refs,
+        .refs = body.refs,
+        .bindings = body.bindings,
     });
 }
 
@@ -1119,9 +1311,73 @@ test "c: function and macro" {
     try testing.expect(found);
 }
 
+test "zig: captures member qualifiers and local/param bindings" {
+    const src =
+        \\pub fn run(ctx: *Ctx) void {
+        \\    var list = std.ArrayList(u8).init(ctx);
+        \\    ctx.begin();
+        \\    list.append(1);
+        \\}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const run = findSym(out.items, "run").?;
+
+    var saw_ctx_begin = false;
+    for (run.refs) |r| {
+        if (std.mem.eql(u8, r.name, "begin")) {
+            try testing.expectEqualStrings("ctx", r.qualifier);
+            saw_ctx_begin = true;
+        }
+    }
+    try testing.expect(saw_ctx_begin);
+
+    // Param `ctx: *Ctx` and local `list = std.ArrayList(...)` are typed.
+    try testing.expectEqualStrings("Ctx", bindingType(run.bindings, "ctx").?);
+    try testing.expectEqualStrings("ArrayList", bindingType(run.bindings, "list").?);
+}
+
+test "ts: methods with return types and generics are parsed and typed" {
+    const src =
+        \\class Cache {
+        \\  clear(): void {}
+        \\  get<T>(k: string): T { return this.clear(); }
+        \\}
+        \\function handler(c: Cache): void {
+        \\  c.clear();
+        \\}
+    ;
+    var out = try parseForTest(src, .typescript);
+    defer freeRefs(&out);
+
+    // Return-type-annotated and generic methods must still be indexed.
+    const clear = findSym(out.items, "clear").?;
+    try testing.expectEqual(SymbolKind.method, clear.kind);
+    try testing.expect(findSym(out.items, "get") != null);
+
+    // The typed param `c: Cache` yields a receiver binding; `c.clear()` is a
+    // qualified ref that later resolves to Cache.clear.
+    const handler = findSym(out.items, "handler").?;
+    try testing.expectEqualStrings("Cache", bindingType(handler.bindings, "c").?);
+    var saw = false;
+    for (handler.refs) |r| {
+        if (std.mem.eql(u8, r.name, "clear")) {
+            try testing.expectEqualStrings("c", r.qualifier);
+            saw = true;
+        }
+    }
+    try testing.expect(saw);
+}
+
+fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {
+    for (bindings) |b| if (std.mem.eql(u8, b.name, name)) return b.type_name;
+    return null;
+}
+
 fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     for (out.items) |s| {
         if (s.refs.len != 0) testing.allocator.free(s.refs);
+        if (s.bindings.len != 0) testing.allocator.free(s.bindings);
     }
     out.deinit(testing.allocator);
 }

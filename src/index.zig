@@ -174,6 +174,7 @@ fn parseFileInto(b: *Builder, text: []const u8, lang: language.Language, file_id
             .parent = parent,
             .exported = p.exported,
             .refs = p.refs,
+            .bindings = p.bindings,
         });
     }
 }
@@ -201,21 +202,69 @@ fn buildNameIndex(idx: *Index) !void {
 fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
-            const candidates = idx.by_name.get(ref.name) orelse continue;
-            ref.target = chooseTarget(idx, sym.*, candidates);
+            resolveOne(idx, sym.*, ref);
         }
     }
 }
 
-/// Pick the best definition for a reference: prefer same file, then same
-/// language family, then a callable over a value, else the first candidate.
-fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const SymbolId) SymbolId {
+/// Resolve a single reference to a target definition and set its confidence.
+///
+/// A member access `recv.name` is *type-scoped*: it resolves only to a member
+/// of `recv`'s known type (self/this, or a local binding). If that type is
+/// unknown we leave the ref external rather than guess — this is what stops
+/// same-name false edges like a stdlib `x.deinit()` pointing at `Index.deinit`.
+/// A bare `name(...)` falls back to a heuristic global name match.
+fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    if (ref.qualifier.len != 0) {
+        const type_name = receiverType(idx, from, ref.qualifier) orelse return;
+        ref.target = memberOf(idx, type_name, ref.name);
+        ref.exact = ref.target != invalid;
+        return;
+    }
+    const candidates = idx.by_name.get(ref.name) orelse return;
+    const choice = chooseTarget(idx, from, candidates);
+    ref.target = choice.id;
+    ref.exact = choice.confident;
+}
+
+/// The type name a receiver identifier refers to inside `from`'s body: the
+/// enclosing type for self/this, otherwise a local `var -> type` binding.
+fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, qualifier, "self") or std.mem.eql(u8, qualifier, "this")) {
+        if (from.parent == invalid) return null;
+        return idx.graph.symbols[from.parent].name;
+    }
+    for (from.bindings) |b| {
+        if (std.mem.eql(u8, b.name, qualifier)) return b.type_name;
+    }
+    return null;
+}
+
+/// A member (method/field/const) named `name` whose parent type is `type_name`.
+fn memberOf(idx: *const Index, type_name: []const u8, name: []const u8) SymbolId {
+    const candidates = idx.by_name.get(name) orelse return invalid;
+    for (candidates) |cid| {
+        const cand = idx.graph.symbols[cid];
+        if (cand.parent == invalid) continue;
+        if (std.mem.eql(u8, idx.graph.symbols[cand.parent].name, type_name)) return cid;
+    }
+    return invalid;
+}
+
+const Choice = struct { id: SymbolId, confident: bool };
+
+/// Pick the best definition for a bare reference: prefer same file, then same
+/// language family, then a callable over a value. `confident` is set when the
+/// pick is unambiguous (same file, or the only candidate).
+fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const SymbolId) Choice {
     std.debug.assert(candidates.len > 0);
     const from_lang = idx.graph.files[from.file].language.family();
     var best: SymbolId = invalid;
     var best_score: i32 = -1;
+    var eligible: u32 = 0;
     for (candidates) |cid| {
         if (cid == from.id) continue;
+        eligible += 1;
         const cand = idx.graph.symbols[cid];
         var score: i32 = 0;
         if (cand.file == from.file) score += 4;
@@ -226,7 +275,8 @@ fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const Symbo
             best = cid;
         }
     }
-    return best;
+    const confident = best != invalid and (eligible == 1 or best_score >= 4);
+    return .{ .id = best, .confident = confident };
 }
 
 fn buildCallers(idx: *Index) !void {
@@ -251,6 +301,59 @@ fn buildCallers(idx: *Index) !void {
         }
     }
     idx.callers = try idx.gpa.dupe([]SymbolId, lists);
+}
+
+test "member calls resolve by receiver type, not global name" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data = 
+        \\pub const Foo = struct {
+        \\    pub fn stop(self: *Foo) void {}
+        \\};
+        \\pub const Bar = struct {
+        \\    pub fn stop(self: *Bar) void {}
+        \\};
+        \\pub fn run(f: *Foo) void {
+        \\    f.stop();
+        \\    g.stop();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root);
+    defer idx.deinit();
+
+    // The typed `f.stop()` must resolve to Foo.stop (exact), never Bar.stop.
+    const foo_stop = qualifiedId(&idx, "Foo", "stop").?;
+    const bar_stop = qualifiedId(&idx, "Bar", "stop").?;
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    var checked = false;
+    for (run.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "stop")) continue;
+        if (std.mem.eql(u8, ref.qualifier, "f")) {
+            try testing.expectEqual(foo_stop, ref.target);
+            try testing.expect(ref.target != bar_stop);
+            try testing.expect(ref.exact);
+            checked = true;
+        } else if (std.mem.eql(u8, ref.qualifier, "g")) {
+            // Unknown receiver type: left external, not guessed globally.
+            try testing.expectEqual(invalid, ref.target);
+        }
+    }
+    try testing.expect(checked);
+}
+
+fn qualifiedId(idx: *const Index, parent: []const u8, child: []const u8) ?SymbolId {
+    for (idx.lookup(child)) |id| {
+        const sym = idx.graph.symbols[id];
+        if (sym.parent == invalid) continue;
+        if (std.mem.eql(u8, idx.graph.symbols[sym.parent].name, parent)) return id;
+    }
+    return null;
 }
 
 test "build index over a temp project resolves cross-file calls" {

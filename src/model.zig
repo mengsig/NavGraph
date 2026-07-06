@@ -70,12 +70,25 @@ pub const RefKind = enum {
 /// resolution (`invalid_symbol` when unresolved / external).
 pub const Reference = struct {
     name: []const u8,
+    /// Receiver identifier for a member access `recv.name`, else "" for a bare
+    /// reference. Used to type-scope resolution (kills same-name false edges).
+    qualifier: []const u8 = "",
     /// First line (1-based) where this name is referenced in the body.
     line: u32,
     kind: RefKind,
     /// Number of times this name is referenced within the owning symbol's body.
     count: u32 = 1,
     target: SymbolId = invalid_symbol,
+    /// True when resolution bound `target` via a known receiver type or self,
+    /// rather than a heuristic global name match. `--strict` follows only these.
+    exact: bool = false,
+};
+
+/// A local variable binding discovered inside a symbol body: `name` was declared
+/// with (inferred) type `type_name`. Used to resolve `name.method()` receivers.
+pub const Binding = struct {
+    name: []const u8,
+    type_name: []const u8,
 };
 
 /// A definition discovered in a source file.
@@ -99,6 +112,8 @@ pub const Symbol = struct {
     exported: bool,
     /// Outgoing references collected from the body.
     refs: []Reference,
+    /// Local variable -> type-name bindings discovered in the body.
+    bindings: []const Binding = &.{},
 
     /// The single-line signature slice (declaration up to sig_end), trimmed.
     pub fn signature(self: Symbol, source: []const u8) []const u8 {
