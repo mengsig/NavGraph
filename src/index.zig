@@ -11,6 +11,7 @@ const model = @import("model.zig");
 const language = @import("language.zig");
 const parser = @import("parser.zig");
 const api = @import("api.zig");
+const cache = @import("cache.zig");
 
 const SymbolId = model.SymbolId;
 const FileId = model.FileId;
@@ -53,10 +54,16 @@ const Builder = struct {
     root_dir: std.Io.Dir,
     files: std.ArrayList(model.SourceFile),
     symbols: std.ArrayList(model.Symbol),
+    /// Per-file (mtime, size) aligned 1:1 with `files`, used to write the cache.
+    stats: std.ArrayList(cache.FileStat),
+    /// Loaded on-disk cache of previously parsed files (null when disabled).
+    store: ?cache.Store,
 };
 
-/// Build an index rooted at `root_path` (relative to cwd or absolute).
-pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8) !Index {
+/// Build an index rooted at `root_path` (relative to cwd or absolute). When
+/// `use_cache` is set, unchanged files are restored from `.navgraph/cache` and
+/// the refreshed cache is written back.
+pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cache: bool) !Index {
     std.debug.assert(root_path.len > 0);
     const arena_box = try gpa.create(std.heap.ArenaAllocator);
     arena_box.* = std.heap.ArenaAllocator.init(gpa);
@@ -76,9 +83,13 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8) !Index {
         .root_dir = root_dir,
         .files = .empty,
         .symbols = .empty,
+        .stats = .empty,
+        .store = if (use_cache) cache.load(gpa, io, root_dir) else null,
     };
     defer b.files.deinit(gpa);
     defer b.symbols.deinit(gpa);
+    defer b.stats.deinit(gpa);
+    defer if (b.store) |*s| s.deinit();
 
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
@@ -100,7 +111,18 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8) !Index {
     resolveReferences(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
+    if (use_cache) persistCache(&b, &idx);
     return idx;
+}
+
+/// Best-effort cache write. A failure here (e.g. a read-only tree) must never
+/// fail the query, so it is reported on stderr and swallowed — the cache is a
+/// pure optimization, not required for correctness.
+fn persistCache(b: *const Builder, idx: *const Index) void {
+    std.debug.assert(idx.graph.files.len == b.stats.items.len);
+    cache.write(b.gpa, b.io, b.root_dir, idx.graph.files, b.stats.items, idx.graph.symbols) catch |err| {
+        std.debug.print("navgraph: cache write skipped: {s}\n", .{@errorName(err)});
+    };
 }
 
 const ignored_dirs = std.StaticStringMap(void).initComptime(.{
@@ -109,6 +131,7 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
     .{"dist"},        .{"build"},        .{".next"},     .{"target"},
     .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},   .{".advantage"},
     .{".nvime"},      .{".idea"},        .{".vscode"},   .{"coverage"},
+    .{".navgraph"},
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
@@ -138,33 +161,52 @@ fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.Ar
 fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     const lang = language.detect(rel_path);
     if (lang == .unknown) return;
+    const stat = statOf(b, rel_path) orelse return;
+
+    if (b.store) |*s| {
+        if (s.restore(b.arena, rel_path, stat)) |hit| {
+            std.debug.assert(hit.text.len == stat.size);
+            try appendFile(b, rel_path, lang, hit.text, hit.symbols, stat);
+            return;
+        }
+    }
     const text = b.root_dir.readFileAlloc(b.io, rel_path, b.arena, .limited(max_file_bytes)) catch return;
     std.debug.assert(text.len <= std.math.maxInt(u32));
-
-    const sym_start: u32 = @intCast(b.symbols.items.len);
-    const file_id: FileId = @intCast(b.files.items.len);
-    try parseFileInto(b, text, lang, file_id, sym_start);
-    const sym_end: u32 = @intCast(b.symbols.items.len);
-    try b.files.append(b.gpa, .{
-        .id = file_id,
-        .path = try b.arena.dupe(u8, rel_path),
-        .language = lang,
-        .text = text,
-        .sym_start = sym_start,
-        .sym_end = sym_end,
-    });
+    const parsed = try parseFile(b, text, lang);
+    try appendFile(b, rel_path, lang, text, parsed, stat);
 }
 
-fn parseFileInto(b: *Builder, text: []const u8, lang: language.Language, file_id: FileId, base: u32) !void {
+/// (mtime, size) of `rel_path`, or null when the file cannot be stat'd (e.g. it
+/// vanished between directory iteration and here).
+fn statOf(b: *Builder, rel_path: []const u8) ?cache.FileStat {
+    const st = b.root_dir.statFile(b.io, rel_path, .{}) catch return null;
+    return .{ .mtime_ns = st.mtime.nanoseconds, .size = st.size };
+}
+
+fn parseFile(b: *Builder, text: []const u8, lang: language.Language) ![]parser.ParsedSymbol {
     var parsed: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer parsed.deinit(b.gpa);
-    parser.parse(b.gpa, b.arena, text, lang, &parsed) catch return;
+    try parser.parse(b.gpa, b.arena, text, lang, &parsed);
+    return b.arena.dupe(parser.ParsedSymbol, parsed.items);
+}
 
-    for (parsed.items, 0..) |p, local| {
-        const id: SymbolId = base + @as(u32, @intCast(local));
+/// Assign global ids to `parsed`, append its symbols and the owning `SourceFile`
+/// (plus its cache stat). Shared by the fresh-parse and cache-restore paths.
+fn appendFile(
+    b: *Builder,
+    rel_path: []const u8,
+    lang: language.Language,
+    text: []const u8,
+    parsed: []const parser.ParsedSymbol,
+    stat: cache.FileStat,
+) !void {
+    std.debug.assert(text.len <= std.math.maxInt(u32));
+    const base: u32 = @intCast(b.symbols.items.len);
+    const file_id: FileId = @intCast(b.files.items.len);
+    for (parsed, 0..) |p, local| {
         const parent: SymbolId = if (p.parent_local) |pl| base + pl else invalid;
         try b.symbols.append(b.gpa, .{
-            .id = id,
+            .id = base + @as(u32, @intCast(local)),
             .file = file_id,
             .name = p.name,
             .kind = p.kind,
@@ -179,6 +221,15 @@ fn parseFileInto(b: *Builder, text: []const u8, lang: language.Language, file_id
             .bindings = p.bindings,
         });
     }
+    try b.files.append(b.gpa, .{
+        .id = file_id,
+        .path = try b.arena.dupe(u8, rel_path),
+        .language = lang,
+        .text = text,
+        .sym_start = base,
+        .sym_end = @intCast(b.symbols.items.len),
+    });
+    try b.stats.append(b.gpa, stat);
 }
 
 fn buildNameIndex(idx: *Index) !void {
@@ -329,6 +380,56 @@ fn buildCallers(idx: *Index) !void {
     idx.callers = try idx.gpa.dupe([]SymbolId, lists);
 }
 
+test "incremental cache: second build restores identical symbols from disk" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = 
+        \\pub fn alpha(x: i32) i32 {
+        \\    return beta(x);
+        \\}
+        \\pub fn beta(x: i32) i32 {
+        \\    return x;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // First build parses and writes `.navgraph/cache`.
+    var cold = try build(testing.allocator, io, root, true);
+    const cold_names = try dupeNames(testing.allocator, &cold);
+    defer freeNames(testing.allocator, cold_names);
+    const cold_alpha = cold.lookup("alpha")[0];
+    const cold_beta_callers = cold.callersOf(cold.lookup("beta")[0]).len;
+    cold.deinit();
+
+    // Second build restores from the cache; the resulting graph must match.
+    var warm = try build(testing.allocator, io, root, true);
+    defer warm.deinit();
+    try testing.expectEqual(cold_names.len, warm.graph.symbols.len);
+    for (cold_names, warm.graph.symbols) |name, sym| try testing.expectEqualStrings(name, sym.name);
+    // Resolution re-runs on the restored symbols: the alpha→beta edge survives.
+    try testing.expectEqual(cold_alpha, warm.lookup("alpha")[0]);
+    try testing.expectEqual(cold_beta_callers, warm.callersOf(warm.lookup("beta")[0]).len);
+    try testing.expect(cold_beta_callers == 1);
+}
+
+/// Copy every symbol name (bytes and all) so the comparison outlives the index
+/// whose arena owns the originals.
+fn dupeNames(gpa: std.mem.Allocator, idx: *const Index) ![][]const u8 {
+    const names = try gpa.alloc([]const u8, idx.graph.symbols.len);
+    for (idx.graph.symbols, names) |sym, *slot| slot.* = try gpa.dupe(u8, sym.name);
+    return names;
+}
+
+fn freeNames(gpa: std.mem.Allocator, names: [][]const u8) void {
+    for (names) |n| gpa.free(n);
+    gpa.free(names);
+}
+
 test "links a frontend HTTP client call to a backend route across languages" {
     const testing = std.testing;
     const io = testing.io;
@@ -349,7 +450,7 @@ test "links a frontend HTTP client call to a backend route across languages" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root);
+    var idx = try build(testing.allocator, io, root, false);
     defer idx.deinit();
 
     // The route symbol exists and links to its handler.
@@ -397,7 +498,7 @@ test "member calls resolve by receiver type, not global name" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root);
+    var idx = try build(testing.allocator, io, root, false);
     defer idx.deinit();
 
     // The typed `f.stop()` must resolve to Foo.stop (exact), never Bar.stop.
@@ -450,7 +551,7 @@ test "build index over a temp project resolves cross-file calls" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var idx = try build(testing.allocator, io, root);
+    var idx = try build(testing.allocator, io, root, false);
     defer idx.deinit();
 
     try testing.expect(idx.graph.files.len == 2);

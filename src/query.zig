@@ -8,11 +8,15 @@ const std = @import("std");
 const model = @import("model.zig");
 const index_mod = @import("index.zig");
 const render = @import("render.zig");
+const json_out = @import("json_out.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
 const SymbolId = model.SymbolId;
 const invalid = model.invalid_symbol;
+
+/// Output encoding: compact text for agents, or JSON for tooling/MCP.
+pub const OutputFormat = enum { text, json };
 
 pub const Options = struct {
     verbosity: render.Verbosity = .sig,
@@ -20,11 +24,13 @@ pub const Options = struct {
     limit: u32 = 300,
     /// Follow only high-confidence (type/self-bound or unambiguous) edges.
     strict: bool = false,
+    format: OutputFormat = .text,
 };
 
 /// Print an outline of the file(s) under `path_filter` (a path prefix, or ""
 /// for the whole project). Symbols are grouped by file and indented by nesting.
 pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.outline(w, idx, path_filter, opts);
     var shown: u32 = 0;
     var any = false;
     for (idx.graph.files) |file| {
@@ -69,15 +75,16 @@ fn parentDepth(idx: *const Index, sym: model.Symbol) usize {
     return depth;
 }
 
-fn matchesFilter(path: []const u8, filter: []const u8) bool {
+pub fn matchesFilter(path: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;
     return std.mem.startsWith(u8, path, filter) or std.mem.indexOf(u8, path, filter) != null;
 }
 
 /// Show the definition(s) of `name` (supports `Parent.name`).
 pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.showDef(w, idx, name, opts);
     var buf: [64]SymbolId = undefined;
-    const ids = resolve(idx, name, &buf);
+    const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no definition named '{s}')\n", .{name});
         return;
@@ -89,8 +96,9 @@ pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !
 
 /// Walk the call graph from `name`. `incoming` selects callers vs callees.
 pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !void {
+    if (opts.format == .json) return json_out.walk(w, idx, name, incoming, opts);
     var buf: [64]SymbolId = undefined;
-    const ids = resolve(idx, name, &buf);
+    const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no symbol named '{s}')\n", .{name});
         return;
@@ -169,7 +177,7 @@ fn walkCallers(
 }
 
 /// True when `from` references `to` via a high-confidence (exact) edge.
-fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
+pub fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
     for (idx.graph.symbols[from].refs) |ref| {
         if (ref.target == to and ref.exact) return true;
     }
@@ -179,6 +187,7 @@ fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
 /// Substring search over symbol names; prints matches like `def`.
 pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
     std.debug.assert(pattern.len > 0);
+    if (opts.format == .json) return json_out.search(w, idx, pattern, opts);
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
@@ -193,6 +202,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 /// List HTTP route definitions and, under each, its handler (callee) and the
 /// client call sites that hit it (callers) — the API surface across languages.
 pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.listRoutes(w, idx, filter, opts);
     var any = false;
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
@@ -231,7 +241,7 @@ fn indentLine(w: *Writer, indent: usize, text: []const u8) !void {
 
 /// Resolve a query name to symbol ids. Supports a `Parent.child` qualifier.
 /// Results are written into `buf` and a sub-slice is returned.
-fn resolve(idx: *const Index, name: []const u8, buf: []SymbolId) []const SymbolId {
+pub fn resolveIds(idx: *const Index, name: []const u8, buf: []SymbolId) []const SymbolId {
     std.debug.assert(buf.len > 0);
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
         const parent = name[0..dot];

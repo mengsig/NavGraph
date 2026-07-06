@@ -48,15 +48,29 @@ not fully captured as edges.
 
 ## Tier 3 — Speed & integration
 
-5. **Incremental on-disk cache** keyed by mtime + size (`.navgraph/cache`).
-   Re-parse only changed files; turns repeated agent calls from ~200ms to ~ms.
+5. **Incremental on-disk cache.** ✅ *Done.* `src/cache.zig` persists each
+   file's parsed symbols to `.navgraph/cache`, keyed by path + mtime + size.
+   Unchanged files are restored from a single binary blob instead of re-lexed
+   and re-parsed; only reference resolution re-runs (global ids change per
+   build, so ref *targets* are never cached). Measured ~4.8× faster on a
+   40k-line tree (1.26s → 0.26s). Editing one file re-parses only that file.
+   `--no-cache` forces a clean rebuild. A version-tagged magic (`NGCACHE2`)
+   invalidates the whole cache on any format change or corruption (safe
+   rebuild, never a crash).
 
 6. **Daemon / LSP / MCP mode.** Long-running server with `inotify` file-watching
    to keep the graph warm; agents query over a socket for near-instant
    responses. Optionally expose as an MCP server or editor LSP.
+   - *Note:* the on-disk cache (5) already captures most of the per-call speed
+     win without the complexity of a resident process + cross-platform watcher.
 
-7. **`--json` / `--jsonl` output** for stable programmatic consumption by agents
-   and tooling.
+7. **`--json` output.** ✅ *Done.* `src/json_out.zig` mirrors every verb
+   (`outline`/`def`/`calls`/`callers`/`search`/`routes`) behind `-j`/`--json`.
+   List verbs emit a JSON array; `calls`/`callers` emit an array of call-tree
+   roots (`callees`/`callers` children, `ext` for unresolved names, `recursion`
+   markers). Strings are escaped; fields grow with verbosity (`sig`→`doc`→
+   `body`). For stable programmatic/MCP/editor consumption.
+   - *Still open:* `--jsonl` streaming variant for very large result sets.
 
 ## Tier 4 — Smarter views
 
@@ -81,7 +95,8 @@ not fully captured as edges.
 
 ## Suggested next step
 
-Tier 1 receiver-type resolution is done. Next highest-value: **import-aware
-module resolution** (Tier 1.1) to recover edges through imported module
-qualifiers, then the **incremental on-disk cache** (Tier 3.5) for speed on
-repeated agent calls.
+Tier 1 receiver-type resolution, Tier 2 API linking, and Tier 3 speed/JSON are
+done. Next highest-value: **import-aware module resolution** (Tier 1.1) to
+recover edges through imported module qualifiers, then **new query verbs**
+(Tier 4.8: `path`, `neighbors`, `unused`, `imports`/`importers`) which compose
+directly on the existing graph.

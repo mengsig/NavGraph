@@ -2,3 +2,4 @@
 .advantage/
 .zig-cache/
 zig-out/
+.navgraph/

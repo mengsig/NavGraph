@@ -30,6 +30,19 @@ Languages: Zig, C/C++, Python, JavaScript, TypeScript, TSX.
 - `-l N` — cap results (default `300`).
 - `-s/--strict` — for `calls`/`callers`, follow only high-confidence edges
   (type/receiver-bound or unambiguous). Use it when you want zero false edges.
+- `-j/--json` — emit JSON instead of the compact text (stable schema for
+  tooling/MCP; list verbs → arrays, `calls`/`callers` → call-tree roots).
+- `--no-cache` — ignore `.navgraph/cache` and rebuild from scratch.
+
+Flags come **after** the command (e.g. `navgraph outline src -v full`, not
+`navgraph -v full outline`).
+
+## Speed
+
+NavGraph writes an incremental cache to `.navgraph/cache` (keyed by file
+mtime + size). Repeat calls only re-parse files that changed — typically several
+times faster on a warm cache. The cache is safe to delete and is regenerated on
+the next run; add `.navgraph/` to `.gitignore`.
 
 ## Argument meaning per command
 

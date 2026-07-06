@@ -14,6 +14,9 @@ pub const Parsed = struct {
     arg: []const u8 = "",
     root: []const u8 = ".",
     options: query.Options = .{},
+    /// Use the incremental on-disk cache (`.navgraph/cache`). Disabled by
+    /// `--no-cache` for a guaranteed-clean rebuild.
+    use_cache: bool = true,
 };
 
 pub const ParseError = error{ Usage, UnknownFlag, MissingValue, BadValue };
@@ -38,6 +41,8 @@ const usage_text =
     \\  -C, --root <path>                      Project root to index (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  -s, --strict                           Follow only high-confidence edges
+    \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
+    \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\
     \\EXAMPLES:
     \\  navgraph outline src/parser.zig
@@ -111,6 +116,14 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (eqAny(flag, &.{ "-s", "--strict" })) {
         out.options.strict = true;
+        return i;
+    }
+    if (eqAny(flag, &.{ "-j", "--json" })) {
+        out.options.format = .json;
+        return i;
+    }
+    if (eqAny(flag, &.{"--no-cache"})) {
+        out.use_cache = false;
         return i;
     }
     return error.UnknownFlag;

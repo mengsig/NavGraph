@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var idx = index_mod.build(gpa, io, parsed.root) catch |err| {
+    var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
         return err;
