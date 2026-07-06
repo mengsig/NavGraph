@@ -10,6 +10,7 @@ const std = @import("std");
 const language = @import("language.zig");
 const lexer = @import("lexer.zig");
 const model = @import("model.zig");
+const api = @import("api.zig");
 
 const Token = lexer.Token;
 const AllocError = std.mem.Allocator.Error;
@@ -108,6 +109,139 @@ pub fn parse(
         .python => try parsePython(&ctx),
         .other => {},
     }
+    try detectApi(&ctx, n);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-language API linking (see api.zig)
+// ---------------------------------------------------------------------------
+
+/// Post-pass: emit a `route` symbol for each HTTP route definition and attach a
+/// `route_call` reference to every enclosing symbol that makes an HTTP client
+/// call. `index.zig` later resolves those references to matching routes.
+fn detectApi(ctx: *Ctx, n: u32) !void {
+    const route_start: u32 = @intCast(ctx.out.items.len);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (api.matchRouteDef(ctx.toks, ctx.source, i)) |rd| try emitRoute(ctx, rd, n);
+    }
+    try attachClientCalls(ctx, route_start, n);
+}
+
+fn apiKey(ctx: *Ctx, ep: api.Endpoint) ![]const u8 {
+    return std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ ep.method, ep.path });
+}
+
+fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32) !void {
+    const close = ctx.close[rd.open_i];
+    const span_start = lineStartOffset(ctx, rd.recv_i);
+    const span_end = if (close != sentinel) ctx.toks[close].end else ctx.toks[rd.open_i].end;
+    std.debug.assert(span_start <= span_end);
+    var refs: []Reference = &.{};
+    if (routeHandler(ctx, rd, n)) |name| {
+        const r = try ctx.arena.alloc(Reference, 1);
+        r[0] = .{ .name = name, .line = ctx.toks[rd.recv_i].line, .kind = .call };
+        refs = r;
+    }
+    _ = try emit(ctx, .{
+        .name = try apiKey(ctx, rd.endpoint),
+        .kind = .route,
+        .line = ctx.toks[rd.recv_i].line,
+        .span_start = span_start,
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = true,
+        .parent_local = null,
+        .refs = refs,
+    });
+}
+
+/// The handler name a route dispatches to: an Express identifier argument after
+/// the path, or the `def`/`function` that follows a decorator.
+fn routeHandler(ctx: *const Ctx, rd: api.RouteDef, n: u32) ?[]const u8 {
+    const path_i = rd.open_i + 1;
+    if (ctx.isPunct(path_i + 1, ',') and ctx.toks[path_i + 2].kind == .identifier) {
+        const name = ctx.textOf(path_i + 2);
+        if (!isDefKeyword(name)) return name;
+    }
+    var j = rd.open_i;
+    var scanned: u32 = 0;
+    while (j < n and scanned < 60) : ({
+        j += 1;
+        scanned += 1;
+    }) {
+        if ((ctx.identEql(j, "def") or ctx.identEql(j, "function")) and
+            j + 1 < n and ctx.toks[j + 1].kind == .identifier) return ctx.textOf(j + 1);
+    }
+    return null;
+}
+
+fn isDefKeyword(name: []const u8) bool {
+    return std.mem.eql(u8, name, "async") or std.mem.eql(u8, name, "function") or
+        std.mem.eql(u8, name, "def");
+}
+
+fn attachClientCalls(ctx: *Ctx, sym_hi: u32, n: u32) !void {
+    var extra = std.AutoHashMap(u32, std.ArrayList(Reference)).init(ctx.gpa);
+    defer {
+        var vit = extra.valueIterator();
+        while (vit.next()) |v| v.deinit(ctx.gpa);
+        extra.deinit();
+    }
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const ep = api.matchClientCall(ctx.toks, ctx.source, i) orelse continue;
+        const owner = enclosingSymbol(ctx, ctx.toks[i].start, sym_hi) orelse continue;
+        try addClientRef(ctx, &extra, owner, ep, ctx.toks[i].line);
+    }
+    try mergeExtraRefs(ctx, &extra);
+}
+
+fn addClientRef(
+    ctx: *Ctx,
+    extra: *std.AutoHashMap(u32, std.ArrayList(Reference)),
+    owner: u32,
+    ep: api.Endpoint,
+    line: u32,
+) !void {
+    const gop = try extra.getOrPut(owner);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    const key = try apiKey(ctx, ep);
+    for (gop.value_ptr.items) |r| if (std.mem.eql(u8, r.name, key)) return; // dedup
+    try gop.value_ptr.append(ctx.gpa, .{ .name = key, .line = line, .kind = .route_call });
+}
+
+/// Rebuild each owner's ref slice as `old ++ client refs` (arena-owned).
+fn mergeExtraRefs(ctx: *Ctx, extra: *std.AutoHashMap(u32, std.ArrayList(Reference))) !void {
+    var it = extra.iterator();
+    while (it.next()) |e| {
+        const owner = e.key_ptr.*;
+        const add = e.value_ptr.items;
+        std.debug.assert(owner < ctx.out.items.len);
+        const old = ctx.out.items[owner].refs;
+        const merged = try ctx.arena.alloc(Reference, old.len + add.len);
+        @memcpy(merged[0..old.len], old);
+        @memcpy(merged[old.len..], add);
+        ctx.out.items[owner].refs = merged;
+    }
+}
+
+/// Innermost already-parsed symbol whose byte span contains `off` (indices
+/// `[0, hi)` so freshly-appended route symbols are excluded).
+fn enclosingSymbol(ctx: *const Ctx, off: u32, hi: u32) ?u32 {
+    var best: ?u32 = null;
+    var best_start: u32 = 0;
+    var idx: u32 = 0;
+    while (idx < hi) : (idx += 1) {
+        const s = ctx.out.items[idx];
+        if (off < s.span_start or off >= s.span_end) continue;
+        if (best == null or s.span_start >= best_start) {
+            best = idx;
+            best_start = s.span_start;
+        }
+    }
+    return best;
 }
 
 /// Build the bracket-matching table for `()`, `{}`, `[]`.

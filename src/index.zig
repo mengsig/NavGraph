@@ -10,6 +10,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const language = @import("language.zig");
 const parser = @import("parser.zig");
+const api = @import("api.zig");
 
 const SymbolId = model.SymbolId;
 const FileId = model.FileId;
@@ -97,6 +98,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8) !Index {
     };
     try buildNameIndex(&idx);
     resolveReferences(&idx);
+    linkRoutes(&idx);
     try buildCallers(&idx);
     return idx;
 }
@@ -215,6 +217,7 @@ fn resolveReferences(idx: *Index) void {
 /// same-name false edges like a stdlib `x.deinit()` pointing at `Index.deinit`.
 /// A bare `name(...)` falls back to a heuristic global name match.
 fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    if (ref.kind == .route_call) return; // resolved later by linkRoutes
     if (ref.qualifier.len != 0) {
         const type_name = receiverType(idx, from, ref.qualifier) orelse return;
         ref.target = memberOf(idx, type_name, ref.name);
@@ -225,6 +228,29 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     const choice = chooseTarget(idx, from, candidates);
     ref.target = choice.id;
     ref.exact = choice.confident;
+}
+
+/// Resolve `route_call` references (HTTP client calls) to the `route` symbol
+/// whose method and path pattern they match — the cross-language edge that links
+/// a frontend fetch/axios/requests call to the backend endpoint that serves it.
+fn linkRoutes(idx: *Index) void {
+    for (idx.graph.symbols) |*sym| {
+        for (sym.refs) |*ref| {
+            if (ref.kind != .route_call) continue;
+            ref.target = matchRoute(idx, ref.name);
+            ref.exact = ref.target != invalid;
+        }
+    }
+}
+
+fn matchRoute(idx: *const Index, client_key: []const u8) SymbolId {
+    const c = api.splitKey(client_key) orelse return invalid;
+    for (idx.graph.symbols) |rsym| {
+        if (rsym.kind != .route) continue;
+        const r = api.splitKey(rsym.name) orelse continue;
+        if (api.methodsMatch(r.method, c.method) and api.pathsMatch(r.path, c.path)) return rsym.id;
+    }
+    return invalid;
 }
 
 /// The type name a receiver identifier refers to inside `from`'s body: the
@@ -301,6 +327,53 @@ fn buildCallers(idx: *Index) !void {
         }
     }
     idx.callers = try idx.gpa.dupe([]SymbolId, lists);
+}
+
+test "links a frontend HTTP client call to a backend route across languages" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data = 
+        \\app = FastAPI()
+        \\@app.get("/users/{id}")
+        \\def get_user(id):
+        \\    return id
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data = 
+        \\function loadUser(id) {
+        \\  return fetch(`/users/${id}`);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root);
+    defer idx.deinit();
+
+    // The route symbol exists and links to its handler.
+    const route_id = routeId(&idx).?;
+    const route = idx.graph.symbols[route_id];
+    try testing.expectEqualStrings("GET /users/{id}", route.name);
+
+    // The frontend fetch resolves (exact) to that route across languages.
+    const loader = idx.graph.symbols[idx.lookup("loadUser")[0]];
+    var linked = false;
+    for (loader.refs) |ref| {
+        if (ref.kind != .route_call) continue;
+        try testing.expectEqual(route_id, ref.target);
+        try testing.expect(ref.exact);
+        linked = true;
+    }
+    try testing.expect(linked);
+    // And the route's callers include the frontend loader.
+    try testing.expectEqual(loader.id, idx.callersOf(route_id)[0]);
+}
+
+fn routeId(idx: *const Index) ?SymbolId {
+    for (idx.graph.symbols) |s| if (s.kind == .route) return s.id;
+    return null;
 }
 
 test "member calls resolve by receiver type, not global name" {

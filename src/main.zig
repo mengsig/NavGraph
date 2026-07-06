@@ -44,6 +44,7 @@ fn dispatch(out: *std.Io.Writer, idx: *index_mod.Index, parsed: cli.Parsed) !voi
         .calls => try query.walk(out, idx, parsed.arg, false, parsed.options),
         .callers => try query.walk(out, idx, parsed.arg, true, parsed.options),
         .search => try query.search(out, idx, parsed.arg, parsed.options),
+        .routes => try query.listRoutes(out, idx, parsed.arg, parsed.options),
         .help => unreachable,
     }
 }

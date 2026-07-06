@@ -5,7 +5,7 @@ const std = @import("std");
 const query = @import("query.zig");
 const render = @import("render.zig");
 
-pub const Command = enum { outline, def, calls, callers, search, help };
+pub const Command = enum { outline, def, calls, callers, search, routes, help };
 
 pub const Parsed = struct {
     command: Command,
@@ -29,6 +29,7 @@ const usage_text =
     \\  calls <name>       Symbols that <name> calls/uses (callees), as a tree
     \\  callers <name>     Symbols that call/use <name> (callers), as a tree
     \\  search <pattern>   Find symbols whose name contains <pattern>
+    \\  routes [filter]    List HTTP routes and the client calls that hit them
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -68,7 +69,8 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
             return error.Usage; // extra positional
         }
     }
-    if (command != .outline and result.arg.len == 0) return error.Usage;
+    const arg_optional = command == .outline or command == .routes;
+    if (!arg_optional and result.arg.len == 0) return error.Usage;
     return result;
 }
 
@@ -79,6 +81,7 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "calls", Command.calls },     .{ "callees", Command.calls },
         .{ "callers", Command.callers }, .{ "uses", Command.callers },
         .{ "search", Command.search },   .{ "grep", Command.search },
+        .{ "routes", Command.routes },   .{ "api", Command.routes },
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },
     };

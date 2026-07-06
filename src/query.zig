@@ -138,7 +138,7 @@ fn walkCallees(
     var externals: std.ArrayList(u8) = .empty;
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
-        if (ref.kind != .call) continue;
+        if (ref.kind != .call and ref.kind != .route_call) continue;
         const followed = ref.target != invalid and (!opts.strict or ref.exact);
         if (followed) {
             try walkNode(w, idx, ref.target, false, opts, indent + 1, visited);
@@ -188,6 +188,34 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         if (shown >= opts.limit) break;
     }
     if (shown == 0) try w.print("(no symbol matching '{s}')\n", .{pattern});
+}
+
+/// List HTTP route definitions and, under each, its handler (callee) and the
+/// client call sites that hit it (callers) — the API surface across languages.
+pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    var any = false;
+    var shown: u32 = 0;
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind != .route) continue;
+        if (filter.len != 0 and std.mem.indexOf(u8, sym.name, filter) == null) continue;
+        any = true;
+        try render.symbol(w, idx, sym, opts.verbosity, 0, true);
+        try routeRelations(w, idx, sym);
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    if (!any) try w.print("(no routes under '{s}')\n", .{filter});
+}
+
+fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
+    for (route.refs) |ref| {
+        if (ref.kind == .call and ref.target != invalid) {
+            try render.symbol(w, idx, idx.graph.symbols[ref.target], .sig, 1, true);
+        }
+    }
+    for (idx.callersOf(route.id)) |cid| {
+        try render.symbol(w, idx, idx.graph.symbols[cid], .sig, 1, true);
+    }
 }
 
 fn headerVerbosity(v: render.Verbosity) render.Verbosity {

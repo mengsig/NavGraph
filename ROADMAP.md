@@ -36,9 +36,14 @@ not fully captured as edges.
    for exact parsing and more languages (Go, Rust, Java, Ruby), keeping the
    zero-dependency heuristic path as a fallback.
 
-4. **Cross-language API linking.** Detect route definitions (FastAPI/Flask
-   decorators, Express `app.get`, etc.) and client calls (`fetch('/route')`,
-   axios, RPC) and link them across languages. Likewise DB models, GraphQL,
+4. **Cross-language API linking.** ✅ *Done (HTTP).* `src/api.zig` recognizes
+   route definitions (FastAPI/Flask `@app.get`, Express `app.get(...)`) and HTTP
+   client calls (`fetch`, `axios`, `requests`/known clients), emits a `route`
+   symbol per endpoint, and links each client call to the matching route by
+   method + path pattern (`{id}`/`:id`/`<int:id>`/template/numeric segments act
+   as wildcards). Surfaced via `navgraph routes` and traversable with
+   `calls`/`callers` across languages. *Still open:* fetch `method:` option
+   detection (POST client calls currently default to GET), DB models, GraphQL,
    protobuf/OpenAPI schemas.
 
 ## Tier 3 — Speed & integration
