@@ -53,6 +53,103 @@ addressing next — ranked by impact on an agent.
 
 ---
 
+## Cross-repo dogfooding fixes (src-layout monorepo)
+
+Surfaced auditing a Python+TS `src/`-layout monorepo where installed package
+names (`ccso_core`) differ from on-disk directories
+(`packages/ccso_core/src/ccso_core/...`). All fixed:
+
+1. **Src-layout imports now resolve.** `imports`/`importers`/`path` used to
+   report "no local imports" because `from ccso_core.classes.Ship import Ship`
+   maps to the candidate `ccso_core/classes/Ship.py`, which is never an on-disk
+   prefix. `index.resolveModule` now adds a Python unique-suffix fallback: when
+   exactly one indexed file ends with `/<candidate>`, it binds to it (ambiguous
+   suffixes stay unresolved rather than guessed).
+
+2. **No more cross-language false edges.** `callers Ship` (a Python class) used
+   to list TSX components that merely mention "Ship". `chooseTarget` now refuses
+   to bind a bare reference across language families — Python `Ship` and a TSX
+   `Ship` share a name, not a namespace. The only intended cross-language edge
+   (client call → route) is a `route_call`, resolved separately.
+
+3. **`unused` is no longer buried in framework entry points.** `isDeadCandidate`
+   skips `__dunder__` methods, `test_*` functions, and everything in
+   test/`conftest.py`/`*.spec.*` files (tests + fixtures are framework-invoked).
+
+4. **`routes` applies the router prefix.** `admin_router = APIRouter(prefix=
+   "/api/admin")` + `@admin_router.get("/users")` now reports
+   `GET /api/admin/users` (via `api.matchRouterDecl`). This also fixes the
+   cross-language link, since a frontend `fetch("/api/admin/users")` now matches.
+
+5. **Truncation is visible.** When output is capped by `-l`, a
+   `… (stopped at -l N; …)` line is printed for `outline`/`search`/`routes`/
+   `unused`, so a truncated result is never mistaken for the whole project.
+
+## Test-environment dogfooding round — 22 bugs found & fixed
+
+Seven purpose-built test applications under `testenv/` (excluded from the tool's
+own indexing) give **full-coverage** exercise of every language and verb: a Zig
+VM, a C container lib, a C++ classes/namespaces app, a Python FastAPI backend, a
+JS Express backend (CommonJS + ESM), a TS/TSX frontend, and a cross-language
+Flask+TS full-stack app. Probing NavGraph against each app's known ground truth
+(then adversarially verifying every candidate against source) surfaced 18
+confirmed defects; fixing them exposed 3 more latent ones, and a second
+adversarial verification pass over the fixed binary found 1 more. All 22 are
+fixed with regression tests (43 unit tests, up from 29).
+
+**C / C++ (the biggest coverage gap).** The C scanner recognised only
+`struct/enum/union` records and free functions, so entire language features were
+invisible:
+- `namespace X { ... }` bodies were skipped wholesale — every class, method and
+  function inside (i.e. essentially all real C++) vanished. `parseCppNamespace`
+  now recurses transparently and emits the namespace as a `module`.
+- `class` was never dispatched to record parsing; classes and their methods are
+  now indexed (`parseCRecord` handles `class` + inheritance; `parseCppMembers`
+  extracts inline **and** declared methods). Trailing qualifiers
+  (`const`/`noexcept`/`override`) and constructor member-initializer lists are
+  handled — the latter previously produced phantom functions (`radius_(r)` →
+  `fn radius_`).
+- `static` free functions (internal linkage) were hard-coded `exported = true`,
+  so a genuinely-dead private helper was flagged in `unused` as "may be public
+  API" (risky to remove) and reported `exported:true` in JSON. Now `exported`
+  reflects the `static` qualifier.
+
+**TypeScript type-level decls.** `interface`, `enum` and `type` aliases were in
+the keyword skip-set and emitted nothing — a file of exported interfaces
+outlined as empty. `parseTsContainer`/`parseTsTypeAlias` now emit them (gated to
+`.ts`/`.tsx`; plain JS is unaffected).
+
+**JS/TS module edges.** CommonJS `require('./x')` (and destructured
+`const { a } = require('./x')`) never populated the import graph; both now emit
+import symbols, and a `require` binding resolves member calls (`db.all()`).
+`export { X } from './m'` / `export type { X } from './m'` re-exports now record
+edges too, and `import type { X }` no longer mis-binds the name `type`.
+
+**Python relative imports.** `from ..services.user_service import X` was dropped
+because the module-path scanner rejected the leading dots — so `imports.zig`'s
+relative-resolution logic was dead code. `parsePyImport` now captures the dotted
+prefix; relative/`from .` imports resolve across a package.
+
+**Cross-language API linking.**
+- `fetch(url, { method: "POST" })` (and DELETE/PUT/…) was hard-coded to GET, so a
+  client POST linked to the wrong route. `clientMethodOverride` reads the inline
+  options object.
+- Collection routes `@router.post("")` (empty path) were dropped by `pathOf`,
+  which also made their handlers look **unused**; empty paths are now accepted
+  and prefixed (`/api/users`).
+- An Express inline-arrow route `router.delete("/x", (req,res)=>{})` bound a
+  *phantom* handler (a later top-level function found by the forward `def`/
+  `function` scan). The scan now runs only for decorator-form routes.
+
+**Graph symmetry & precision.** `callers` counted every resolved reference but
+`calls`/`neighbors`/`path` followed only `.call`/`.route_call` edges — so a macro
+or const use showed up under `callers X` yet `calls Y` omitted it (a
+self-contradiction). All directions now traverse every resolved edge; only
+unresolved *calls* are listed as `~ ext`. Surfacing those read edges also exposed
+a name-collision false edge (a local `const candidates = …` binding to a global
+`fn candidates`); a bare reference that names a local variable/parameter is no
+longer bound to a same-named global.
+
 ## Output / UX gaps to address next (ranked)
 
 ### 1. Module-qualified calls don't resolve — ✅ FIXED (Phase 4)

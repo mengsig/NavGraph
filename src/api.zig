@@ -54,6 +54,42 @@ fn verbMethod(verb: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Canonical uppercase HTTP method for a case-insensitive verb literal
+/// (`"post"`, `"POST"`), or null when it is not a recognized method.
+fn canonMethod(verb: []const u8) ?[]const u8 {
+    const map = .{
+        .{ "get", "GET" },     .{ "post", "POST" },    .{ "put", "PUT" },
+        .{ "patch", "PATCH" }, .{ "delete", "DELETE" }, .{ "head", "HEAD" },
+        .{ "options", "OPTIONS" },
+    };
+    inline for (map) |e| if (std.ascii.eqlIgnoreCase(verb, e[0])) return e[1];
+    return null;
+}
+
+/// The HTTP method of a `fetch`/`axios` call whose args open at `open_i`,
+/// honouring an inline options object `{ method: "POST" }`; `default_method`
+/// (GET) when no such option is present. Scans a bounded window and stops at the
+/// call's own matching close paren so a later sibling call can't leak in.
+fn clientMethodOverride(toks: []const Token, source: []const u8, open_i: u32, default_method: []const u8) []const u8 {
+    if (!isPunct(toks, source, open_i, '(')) return default_method;
+    var depth: i32 = 0;
+    var j = open_i;
+    const limit = @min(@as(u32, @intCast(toks.len)), open_i + 64);
+    while (j < limit) : (j += 1) {
+        if (isPunct(toks, source, j, '(') or isPunct(toks, source, j, '{') or isPunct(toks, source, j, '[')) {
+            depth += 1;
+        } else if (isPunct(toks, source, j, ')') or isPunct(toks, source, j, '}') or isPunct(toks, source, j, ']')) {
+            depth -= 1;
+            if (depth <= 0) break;
+        } else if (identEql(toks, source, j, "method") and isPunct(toks, source, j + 1, ':') and
+            j + 2 < toks.len and toks[j + 2].kind == .string)
+        {
+            if (canonMethod(stripQuotes(toks[j + 2].text(source)))) |m| return m;
+        }
+    }
+    return default_method;
+}
+
 fn isPunct(toks: []const Token, source: []const u8, i: u32, c: u8) bool {
     return i < toks.len and toks[i].kind == .punct and source[toks[i].start] == c;
 }
@@ -90,9 +126,48 @@ fn pathOf(raw: []const u8) ?[]const u8 {
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "/";
         s = rest[slash..];
     }
-    if (s.len == 0 or s[0] != '/') return null;
+    // An empty path is valid: a collection route `@router.post("")` mounts at its
+    // router's prefix root (FastAPI/Flask); the prefix is applied by the parser.
+    if (s.len == 0) return s;
+    if (s[0] != '/') return null;
     if (std.mem.indexOfAny(u8, s, "?#")) |cut| s = s[0..cut];
     return s;
+}
+
+/// A router variable declaration that carries a URL prefix, e.g.
+/// `admin_router = APIRouter(prefix="/api/admin")` or a Flask
+/// `bp = Blueprint("admin", __name__, url_prefix="/admin")`. Routes hung off
+/// `name` mount under `prefix`.
+pub const RouterDecl = struct {
+    name: []const u8,
+    prefix: []const u8,
+};
+
+/// Router constructors whose keyword argument sets a mount prefix.
+fn prefixKeyword(ctor: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, ctor, "APIRouter") or std.mem.eql(u8, ctor, "Router")) return "prefix";
+    if (std.mem.eql(u8, ctor, "Blueprint")) return "url_prefix";
+    return null;
+}
+
+/// At token `i`, recognize `name = Ctor( ... <kw>="/prefix" ... )` where `Ctor`
+/// is a router constructor. Returns the bound name and its prefix path, or null.
+pub fn matchRouterDecl(toks: []const Token, source: []const u8, i: u32) ?RouterDecl {
+    if (!isIdent(toks, i) or i + 3 >= toks.len) return null;
+    if (!isPunct(toks, source, i + 1, '=') or !isIdent(toks, i + 2)) return null;
+    const kw = prefixKeyword(toks[i + 2].text(source)) orelse return null;
+    if (!isPunct(toks, source, i + 3, '(')) return null;
+    // Scan a bounded window of the argument list for `<kw> = "/path"`.
+    var j = i + 4;
+    const limit = @min(@as(u32, @intCast(toks.len)), i + 4 + 48);
+    while (j + 2 < limit) : (j += 1) {
+        if (isPunct(toks, source, j, ')')) break;
+        if (!identEql(toks, source, j, kw)) continue;
+        if (!isPunct(toks, source, j + 1, '=')) continue;
+        const prefix = stringPath(toks, source, j + 2) orelse return null;
+        return .{ .name = toks[i].text(source), .prefix = prefix };
+    }
+    return null;
 }
 
 /// At token `i`, recognize a route definition `recv.verb("path", ...)`, either
@@ -117,10 +192,13 @@ pub fn matchRouteDef(toks: []const Token, source: []const u8, i: u32) ?RouteDef 
 /// or `client.verb("path")` for a known client receiver. Null otherwise.
 pub fn matchClientCall(toks: []const Token, source: []const u8, i: u32) ?Endpoint {
     if (!isIdent(toks, i)) return null;
-    // Bare `fetch("path")` / `axios("path")`.
+    // Bare `fetch("path")` / `axios("path")`. The method defaults to GET but is
+    // overridden by an inline `{ method: "POST" }` options argument, so a
+    // `fetch("/x", { method: "POST" })` links to the POST route, not the GET one.
     if (identEql(toks, source, i, "fetch") or identEql(toks, source, i, "axios")) {
         if (isPunct(toks, source, i + 1, '(')) {
-            if (stringPath(toks, source, i + 2)) |p| return .{ .method = "GET", .path = p };
+            if (stringPath(toks, source, i + 2)) |p|
+                return .{ .method = clientMethodOverride(toks, source, i + 1, "GET"), .path = p };
         }
     }
     // `recv.verb("path")` for a known client receiver.
@@ -191,4 +269,54 @@ test "route and client recognition + path matching" {
     try t.expectEqualStrings("/users", pathOf("https://api.example.com/users?x=1").?);
     try t.expectEqualStrings("/x", pathOf("/x#frag").?);
     try t.expect(pathOf("relative") == null);
+}
+
+test "router prefix declaration recognized" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const src = "admin_router = APIRouter(prefix=\"/api/admin\")\n";
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try lexer.tokenize(gpa, src, @import("language.zig").configFor(.python), &toks);
+
+    var found: ?RouterDecl = null;
+    var i: u32 = 0;
+    while (i < toks.items.len) : (i += 1) {
+        if (matchRouterDecl(toks.items, src, i)) |rd| found = rd;
+    }
+    try t.expect(found != null);
+    try t.expectEqualStrings("admin_router", found.?.name);
+    try t.expectEqualStrings("/api/admin", found.?.prefix);
+}
+
+test "empty route path is accepted; non-slash relative still rejected" {
+    const t = std.testing;
+    try t.expectEqualStrings("", pathOf("").?);
+    try t.expect(pathOf("relative") == null);
+}
+
+fn firstClientCall(src: []const u8) ?Endpoint {
+    const gpa = std.testing.allocator;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    lexer.tokenize(gpa, src, @import("language.zig").configFor(.typescript), &toks) catch return null;
+    var i: u32 = 0;
+    while (i < toks.items.len) : (i += 1) {
+        if (matchClientCall(toks.items, src, i)) |ep| return ep;
+    }
+    return null;
+}
+
+test "fetch options object overrides the default GET method" {
+    const t = std.testing;
+    const post = firstClientCall("fetch('/orders', { method: 'POST' });\n").?;
+    try t.expectEqualStrings("POST", post.method);
+    try t.expectEqualStrings("/orders", post.path);
+
+    const del = firstClientCall("fetch(`/users/${id}`, { method: 'DELETE' });\n").?;
+    try t.expectEqualStrings("DELETE", del.method);
+
+    // No options → still GET.
+    const get = firstClientCall("fetch('/orders');\n").?;
+    try t.expectEqualStrings("GET", get.method);
 }

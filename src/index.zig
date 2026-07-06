@@ -160,7 +160,7 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
     .{"dist"},        .{"build"},        .{".next"},     .{"target"},
     .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},   .{".advantage"},
     .{".nvime"},      .{".idea"},        .{".vscode"},   .{"coverage"},
-    .{".navgraph"},
+    .{".navgraph"},   .{"testenv"},
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
@@ -309,7 +309,7 @@ fn resolveFileImports(
     while (i < f.sym_end) : (i += 1) {
         const s = idx.graph.symbols[i];
         if (s.kind != .import or s.import_path.len == 0) continue;
-        const target = resolveModule(arena, f, s.import_path, by_path) orelse continue;
+        const target = resolveModule(idx, arena, f, s.import_path, by_path) orelse continue;
         if (target == f.id) continue; // ignore self-imports
         try tmp.append(idx.gpa, .{ .binding = s.name, .target = target });
     }
@@ -317,7 +317,15 @@ fn resolveFileImports(
 }
 
 /// Match a module string to an indexed file via language-aware candidate paths.
+///
+/// After exact path matching fails, Python absolute imports fall back to a
+/// unique-suffix match: `from ccso_core.classes.Ship import Ship` yields the
+/// candidate `ccso_core/classes/Ship.py`, which in a src-layout monorepo lives
+/// at `packages/ccso_core/src/ccso_core/classes/Ship.py`. When exactly one
+/// indexed file ends with `/<candidate>` we bind to it; ambiguous suffixes are
+/// left unresolved rather than guessed.
 fn resolveModule(
+    idx: *const Index,
     arena: std.mem.Allocator,
     importer: model.SourceFile,
     module: []const u8,
@@ -325,7 +333,26 @@ fn resolveModule(
 ) ?FileId {
     const cands = imports.candidates(arena, importer.path, module, importer.language) catch return null;
     for (cands) |c| if (by_path.get(c)) |fid| return fid;
+    if (importer.language.family() == .python) {
+        for (cands) |c| if (uniqueSuffixMatch(idx, c)) |fid| return fid;
+    }
     return null;
+}
+
+/// The single indexed file whose path is `<something>/<cand>`, or null when
+/// there is no such file or more than one (ambiguous → don't guess).
+fn uniqueSuffixMatch(idx: *const Index, cand: []const u8) ?FileId {
+    var found: FileId = undefined;
+    var count: u32 = 0;
+    for (idx.graph.files) |f| {
+        if (f.path.len <= cand.len) continue;
+        if (f.path[f.path.len - cand.len - 1] != '/') continue;
+        if (!std.mem.endsWith(u8, f.path, cand)) continue;
+        found = f.id;
+        count += 1;
+        if (count > 1) return null;
+    }
+    return if (count == 1) found else null;
 }
 
 fn resolveReferences(idx: *Index) void {
@@ -346,10 +373,20 @@ fn resolveReferences(idx: *Index) void {
 fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
     if (ref.kind == .route_call) return; // resolved later by linkRoutes
     if (ref.qualifier.len != 0) return resolveQualified(idx, from, ref);
+    // A bare name that is a local variable/parameter of `from` is a value read,
+    // not a reference to a same-named global — don't bind it (kills false edges
+    // like a local `const candidates = ...` pointing at a global `fn candidates`).
+    if (isLocalBinding(from, ref.name)) return;
     const candidates = idx.by_name.get(ref.name) orelse return;
     const choice = chooseTarget(idx, from, candidates);
     ref.target = choice.id;
     ref.exact = choice.confident;
+}
+
+/// Whether `name` is a local binding (typed local or parameter) of `from`.
+fn isLocalBinding(from: model.Symbol, name: []const u8) bool {
+    for (from.bindings) |b| if (std.mem.eql(u8, b.name, name)) return true;
+    return false;
 }
 
 /// Resolve a member access `recv.name`: first by the receiver's known type
@@ -451,11 +488,15 @@ fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const Symbo
     var eligible: u32 = 0;
     for (candidates) |cid| {
         if (cid == from.id) continue;
-        eligible += 1;
         const cand = idx.graph.symbols[cid];
+        // Never bind a bare reference across language families: a Python `Ship`
+        // and a TSX component `Ship` share a name but not a namespace. The only
+        // intended cross-language edge (client call → route) is a route_call,
+        // resolved separately in `linkRoutes`.
+        if (idx.graph.files[cand.file].language.family() != from_lang) continue;
+        eligible += 1;
         var score: i32 = 0;
         if (cand.file == from.file) score += 4;
-        if (idx.graph.files[cand.file].language.family() == from_lang) score += 2;
         if (cand.kind == .function or cand.kind == .method) score += 1;
         if (score > best_score) {
             best_score = score;
@@ -567,6 +608,53 @@ test "qualified call to a same-named function in another module resolves" {
         linked = true;
     }
     try testing.expect(linked);
+}
+
+test "src-layout package imports resolve by unique suffix, no cross-language edge" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A src-layout monorepo: the installed package name `pkg` sits under
+    // `libs/pkg/src/pkg/`, so the import path never matches an on-disk prefix.
+    try tmp.dir.createDirPath(io, "libs/pkg/src/pkg");
+    try tmp.dir.createDirPath(io, "app");
+    try tmp.dir.createDirPath(io, "web");
+    try tmp.dir.writeFile(io, .{ .sub_path = "libs/pkg/src/pkg/ship.py", .data = 
+        \\class Ship:
+        \\    def sail(self):
+        \\        return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app/main.py", .data = 
+        \\from pkg.ship import Ship
+        \\def run():
+        \\    return Ship()
+    });
+    // A TS component that only mentions the name "Ship" — must not become an edge.
+    try tmp.dir.writeFile(io, .{ .sub_path = "web/editor.ts", .data = 
+        \\export function ShipEditor() {
+        \\    return Ship;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The cross-package import binds to the real file despite the src-layout.
+    const main_file = idx.graph.symbols[idx.lookup("run")[0]].file;
+    const ship_file = idx.graph.symbols[idx.lookup("Ship")[0]].file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+    try testing.expectEqual(ship_file, idx.importsOf(main_file)[0].target);
+
+    // The Python class `Ship` is referenced only from Python `run`, never from
+    // the TS component that merely shares the name.
+    const ship = idx.lookup("Ship")[0];
+    const callers = idx.callersOf(ship);
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqual(idx.lookup("run")[0], callers[0]);
 }
 
 fn qualifiedFileSym(idx: *const Index, file_suffix: []const u8, name: []const u8) ?SymbolId {
@@ -770,4 +858,134 @@ test "build index over a temp project resolves cross-file calls" {
     const callers = idx.callersOf(helper_ids[0]);
     try testing.expectEqual(@as(usize, 1), callers.len);
     try testing.expectEqual(run_ids[0], callers[0]);
+}
+
+test "a POST fetch with a method option links to the POST route, not the GET route" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
+        \\app = FastAPI()
+        \\@app.get("/orders")
+        \\def list_orders():
+        \\    return []
+        \\@app.post("/orders")
+        \\def create_order():
+        \\    return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function createOrder(o) {
+        \\  return fetch('/orders', { method: 'POST' });
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const post_route = routeByName(&idx, "POST /orders").?;
+    const creator = idx.graph.symbols[idx.lookup("createOrder")[0]];
+    var linked_target: SymbolId = invalid;
+    for (creator.refs) |ref| {
+        if (ref.kind == .route_call) linked_target = ref.target;
+    }
+    try testing.expectEqual(post_route, linked_target); // POST, not the GET route
+}
+
+fn routeByName(idx: *const Index, name: []const u8) ?SymbolId {
+    for (idx.graph.symbols) |s| {
+        if (s.kind == .route and std.mem.eql(u8, s.name, name)) return s.id;
+    }
+    return null;
+}
+
+test "an inline-arrow route gets no phantom handler; an identifier arg is linked" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "routes.js", .data =
+        \\const router = express.Router();
+        \\router.get('/items', listItems);
+        \\router.delete('/items/:id', (req, res) => { return del(); });
+        \\function listItems(req, res) { return 1; }
+        \\function del() { return 2; }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // GET route → its identifier handler `listItems`.
+    const get_route = idx.graph.symbols[routeByName(&idx, "GET /items").?];
+    var get_handler: SymbolId = invalid;
+    for (get_route.refs) |r| if (r.kind == .call and r.target != invalid) {
+        get_handler = r.target;
+    };
+    try testing.expectEqual(idx.lookup("listItems")[0], get_handler);
+
+    // DELETE route has an inline anonymous arrow → NO handler ref at all (the
+    // forward `function` scan must not bind the unrelated `listItems`/`del`).
+    const del_route = idx.graph.symbols[routeByName(&idx, "DELETE /items/:id").?];
+    for (del_route.refs) |r| try testing.expect(r.kind != .call);
+}
+
+test "python relative imports resolve to package files" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "app/services");
+    try tmp.dir.writeFile(io, .{ .sub_path = "app/services/user_service.py", .data =
+        \\class UserService:
+        \\    def fetch(self, id):
+        \\        return id
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app/routes.py", .data =
+        \\from .services.user_service import UserService
+        \\def get_user(id):
+        \\    return UserService().fetch(id)
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const routes_file = idx.graph.symbols[idx.lookup("get_user")[0]].file;
+    const svc_file = idx.graph.symbols[idx.lookup("UserService")[0]].file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(routes_file).len);
+    try testing.expectEqual(svc_file, idx.importsOf(routes_file)[0].target);
+}
+
+test "a bare read of a local variable is not bound to a same-named global" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn candidates() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn use() u32 {
+        \\    const candidates = Thing.init();
+        \\    return candidates.len;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `use`'s local `candidates` must not create an edge to the global fn.
+    const cand_fn = idx.lookup("candidates")[0];
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(cand_fn).len);
 }

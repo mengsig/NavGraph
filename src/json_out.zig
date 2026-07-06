@@ -135,15 +135,15 @@ fn walkCallees(
     var wrote: u32 = 0;
     var ext: u32 = 0;
     for (sym.refs) |ref| {
-        if (ref.kind != .call and ref.kind != .route_call) continue;
-        const followed = ref.target != invalid and (!opts.strict or ref.exact);
-        if (!followed) {
+        // Symmetric with the callers index: every resolved edge is a callee; only
+        // unresolved *calls* become externals (see query.walkCallees).
+        if (ref.target != invalid and (!opts.strict or ref.exact)) {
+            if (wrote != 0) try w.writeByte(',');
+            try walkNode(w, idx, ref.target, false, opts, depth + 1, visited);
+            wrote += 1;
+        } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
-            continue;
         }
-        if (wrote != 0) try w.writeByte(',');
-        try walkNode(w, idx, ref.target, false, opts, depth + 1, visited);
-        wrote += 1;
     }
     try w.writeByte(']');
     if (ext != 0) try writeExternals(w, sym, opts.strict);
@@ -244,7 +244,6 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
 fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
     var wrote: u32 = 0;
     for (sym.refs) |ref| {
-        if (ref.kind != .call and ref.kind != .route_call) continue;
         if (ref.target == invalid or (strict and !ref.exact)) continue;
         if (wrote != 0) try w.writeByte(',');
         try nodeHead(w, idx, idx.graph.symbols[ref.target]);

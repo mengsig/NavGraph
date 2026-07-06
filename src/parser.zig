@@ -123,18 +123,43 @@ pub fn parse(
 /// call. `index.zig` later resolves those references to matching routes.
 fn detectApi(ctx: *Ctx, n: u32) !void {
     const route_start: u32 = @intCast(ctx.out.items.len);
+    // First pass: collect router variables that carry a mount prefix
+    // (`admin_router = APIRouter(prefix="/api/admin")`).
+    var prefixes = std.StringHashMap([]const u8).init(ctx.gpa);
+    defer prefixes.deinit();
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        if (api.matchRouteDef(ctx.toks, ctx.source, i)) |rd| try emitRoute(ctx, rd, n);
+        if (api.matchRouterDecl(ctx.toks, ctx.source, i)) |rd|
+            try prefixes.put(rd.name, rd.prefix);
+    }
+    i = 0;
+    while (i < n) : (i += 1) {
+        if (api.matchRouteDef(ctx.toks, ctx.source, i)) |rd| try emitRoute(ctx, rd, n, &prefixes);
     }
     try attachClientCalls(ctx, route_start, n);
+}
+
+/// The route endpoint with its router's mount prefix applied, when the receiver
+/// (`admin_router`) was declared with one. Falls back to the bare endpoint.
+fn prefixedEndpoint(ctx: *Ctx, rd: api.RouteDef, prefixes: *const std.StringHashMap([]const u8)) !api.Endpoint {
+    const raw = ctx.textOf(rd.recv_i);
+    const recv = if (raw.len != 0 and raw[0] == '@') raw[1..] else raw;
+    const prefix = prefixes.get(recv) orelse return normEmptyPath(rd.endpoint);
+    if (prefix.len == 0) return normEmptyPath(rd.endpoint);
+    const path = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, rd.endpoint.path });
+    return .{ .method = rd.endpoint.method, .path = path };
+}
+
+/// An unprefixed empty route path (`@app.get("")`) normalizes to "/".
+fn normEmptyPath(ep: api.Endpoint) api.Endpoint {
+    return if (ep.path.len == 0) .{ .method = ep.method, .path = "/" } else ep;
 }
 
 fn apiKey(ctx: *Ctx, ep: api.Endpoint) ![]const u8 {
     return std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ ep.method, ep.path });
 }
 
-fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32) !void {
+fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32, prefixes: *const std.StringHashMap([]const u8)) !void {
     const close = ctx.close[rd.open_i];
     const span_start = lineStartOffset(ctx, rd.recv_i);
     const span_end = if (close != sentinel) ctx.toks[close].end else ctx.toks[rd.open_i].end;
@@ -146,7 +171,7 @@ fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32) !void {
         refs = r;
     }
     _ = try emit(ctx, .{
-        .name = try apiKey(ctx, rd.endpoint),
+        .name = try apiKey(ctx, try prefixedEndpoint(ctx, rd, prefixes)),
         .kind = .route,
         .line = ctx.toks[rd.recv_i].line,
         .span_start = span_start,
@@ -167,9 +192,15 @@ fn routeHandler(ctx: *const Ctx, rd: api.RouteDef, n: u32) ?[]const u8 {
         const name = ctx.textOf(path_i + 2);
         if (!isDefKeyword(name)) return name;
     }
-    var j = rd.open_i;
+    // The forward `def`/`function` scan is only valid for a *decorator*
+    // (`@app.get(...)` immediately above a def). For a call-form route
+    // (`router.get("/x", (req, res) => {...})`) the handler is inline and
+    // anonymous, so scanning forward would bind an unrelated later function.
+    if (!routeIsDecorator(ctx, rd)) return null;
+    const from = if (ctx.close[rd.open_i] != sentinel) ctx.close[rd.open_i] + 1 else rd.open_i + 1;
+    var j = from;
     var scanned: u32 = 0;
-    while (j < n and scanned < 60) : ({
+    while (j < n and scanned < 24) : ({
         j += 1;
         scanned += 1;
     }) {
@@ -177,6 +208,14 @@ fn routeHandler(ctx: *const Ctx, rd: api.RouteDef, n: u32) ?[]const u8 {
             j + 1 < n and ctx.toks[j + 1].kind == .identifier) return ctx.textOf(j + 1);
     }
     return null;
+}
+
+/// Whether the route at `rd` is decorator-form: `@recv.verb(...)` (the `@` is
+/// glued to the receiver by the Python lexer, or a separate token before it).
+fn routeIsDecorator(ctx: *const Ctx, rd: api.RouteDef) bool {
+    const recv = ctx.textOf(rd.recv_i);
+    if (recv.len != 0 and recv[0] == '@') return true;
+    return rd.recv_i >= 1 and ctx.isPunct(rd.recv_i - 1, '@');
 }
 
 fn isDefKeyword(name: []const u8) bool {
@@ -785,7 +824,7 @@ const c_keywords = KeywordSet.initComptime(.{
     .{"volatile"}, .{"class"}, .{"public"}, .{"private"}, .{"namespace"}, .{"template"},
 });
 
-fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) !void {
+fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
     var stmt_start = lo;
     var i = lo;
     while (i < hi) {
@@ -799,7 +838,17 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) !void {
             stmt_start = i;
             continue;
         }
-        if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or ctx.identEql(i, "union")) {
+        if (ctx.identEql(i, "namespace")) {
+            const adv = try parseCppNamespace(ctx, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                stmt_start = i;
+                continue;
+            }
+        }
+        if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
+            ctx.identEql(i, "union") or ctx.identEql(i, "class"))
+        {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
                 i = adv;
@@ -849,15 +898,65 @@ fn parseCPreproc(ctx: *Ctx, hash_i: u32, hi: u32) !u32 {
     return i;
 }
 
-fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) !u32 {
-    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
-    const name_i = kw_i + 1;
-    if (kw_i + 2 >= hi or !ctx.isPunct(kw_i + 2, '{')) return kw_i;
-    const open = kw_i + 2;
+/// `namespace [A::B] { ... }` — recurse transparently so members stay top-level,
+/// and emit the (last-named) namespace as a module symbol for outline visibility.
+/// Returns `kw_i` (no advance) for `using namespace X;` and other non-block forms.
+fn parseCppNamespace(ctx: *Ctx, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    var open = kw_i + 1;
+    var name_i: ?u32 = null;
+    if (open < hi and ctx.toks[open].kind == .identifier) {
+        name_i = open;
+        open += 1;
+    }
+    // `namespace A::B { ... }`
+    while (open + 1 < hi and ctx.isPunct(open, ':') and ctx.isPunct(open + 1, ':')) {
+        open += 2;
+        if (open < hi and ctx.toks[open].kind == .identifier) {
+            name_i = open;
+            open += 1;
+        }
+    }
+    if (open >= hi or !ctx.isPunct(open, '{')) return kw_i;
     const close = ctx.close[open];
     if (close == sentinel) return kw_i;
-    const kind: SymbolKind = if (ctx.identEql(kw_i, "enum")) .@"enum" else .@"struct";
-    _ = try emit(ctx, .{
+    if (name_i) |ni| {
+        _ = try emit(ctx, .{
+            .name = ctx.textOf(ni),
+            .kind = .module,
+            .line = ctx.toks[ni].line,
+            .span_start = lineStartOffset(ctx, kw_i),
+            .span_end = ctx.toks[close].end,
+            .sig_end = ctx.toks[open].start,
+            .doc = collectDoc(ctx, kw_i),
+            .exported = true,
+            .parent_local = parent,
+            .refs = &.{},
+        });
+    }
+    try parseCScope(ctx, open + 1, close, parent); // transparent scope
+    return close + 1;
+}
+
+fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
+    const name_i = kw_i + 1;
+    // The body `{` must come before any `;` (forward decl / typed variable) and
+    // before any `(` (a function returning the type). Inheritance is allowed:
+    // `class C : public B { ... }`.
+    const open = findNext(ctx, name_i + 1, hi, '{');
+    if (open == sentinel or ctx.close[open] == sentinel) return kw_i;
+    const semi = findNext(ctx, name_i + 1, hi, ';');
+    if (semi != sentinel and semi < open) return kw_i;
+    const paren = findNext(ctx, name_i + 1, hi, '(');
+    if (paren != sentinel and paren < open) return kw_i;
+    const close = ctx.close[open];
+    const kind: SymbolKind = if (ctx.identEql(kw_i, "enum"))
+        .@"enum"
+    else if (ctx.identEql(kw_i, "class"))
+        .class
+    else
+        .@"struct";
+    const my_idx = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = kind,
         .line = ctx.toks[name_i].line,
@@ -869,19 +968,159 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) !u
         .parent_local = parent,
         .refs = &.{},
     });
+    // C++ class/struct bodies hold methods; parse them as members (enums do not).
+    if (ctx.cfg.language == .cpp and kind != .@"enum") {
+        try parseCppMembers(ctx, open + 1, close, my_idx);
+    }
     return close + 1;
 }
 
-fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) !u32 {
+/// Parse the members of a C++ class/struct body [lo, hi): method definitions and
+/// declarations, plus nested records. Fields and member initializers are skipped.
+fn parseCppMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
+    var i = lo;
+    var stmt_start = lo;
+    while (i < hi) {
+        if (ctx.isPunct(i, ';') or ctx.isPunct(i, '}') or ctx.isPunct(i, ':')) {
+            i += 1;
+            stmt_start = i;
+            continue;
+        }
+        if (ctx.identEql(i, "struct") or ctx.identEql(i, "class") or
+            ctx.identEql(i, "enum") or ctx.identEql(i, "union"))
+        {
+            const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                stmt_start = i;
+                continue;
+            }
+        }
+        // A member function: `NAME ( ... )` where NAME is not a keyword and there
+        // is no `=` since the member-statement start (a field initializer
+        // `int x = f();` must not be read as a method named `f`).
+        if (ctx.toks[i].kind == .identifier and !c_keywords.has(ctx.textOf(i)) and
+            i + 1 < hi and ctx.isPunct(i + 1, '(') and !hasAssignBetween(ctx, stmt_start, i))
+        {
+            const adv = try tryCppMethod(ctx, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                stmt_start = i;
+                continue;
+            }
+        }
+        if (ctx.isPunct(i, '{') or ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
+            i = skipBracket(ctx, i);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn hasAssignBetween(ctx: *const Ctx, lo: u32, hi: u32) bool {
+    var j = lo;
+    while (j < hi) : (j += 1) {
+        if (ctx.toks[j].kind == .punct and ctx.ch(j) == '=') return true;
+    }
+    return false;
+}
+
+/// A C++ member function (definition `{...}` or declaration `;`) whose name is at
+/// `name_i` and params open at `name_i + 1`. Returns the index just past it.
+fn tryCppMethod(ctx: *Ctx, name_i: u32, hi: u32, parent: u32) AllocError!u32 {
     const params_open = name_i + 1;
     const params_close = ctx.close[params_open];
     if (params_close == sentinel) return name_i;
-    // A definition has `{` right after the parameter list; otherwise it is a
-    // declaration or a call, which we ignore at this level.
-    if (params_close + 1 >= hi or !ctx.isPunct(params_close + 1, '{')) return name_i;
+    const body_open = cBodyOpen(ctx, params_close, hi);
+    if (body_open != sentinel) {
+        const body_close = ctx.close[body_open];
+        if (body_close == sentinel) return name_i;
+        const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), c_keywords);
+        _ = try emit(ctx, .{
+            .name = ctx.textOf(name_i),
+            .kind = .method,
+            .line = ctx.toks[name_i].line,
+            .span_start = lineStartOffset(ctx, name_i),
+            .span_end = ctx.toks[body_close].end,
+            .sig_end = ctx.toks[body_open].start,
+            .doc = collectDoc(ctx, name_i),
+            .exported = true,
+            .parent_local = parent,
+            .refs = body.refs,
+            .bindings = body.bindings,
+        });
+        return body_close + 1;
+    }
+    // Declaration `NAME(params) [qualifiers] ;`
+    const semi = declEnd(ctx, params_close, hi);
+    if (semi == sentinel) return name_i;
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = .method,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, name_i),
+        .span_end = ctx.toks[semi].end,
+        .sig_end = ctx.toks[params_close].end,
+        .doc = collectDoc(ctx, name_i),
+        .exported = true,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return semi + 1;
+}
+
+/// The `{` opening a function body after a parameter list closing at
+/// `params_close`, skipping trailing qualifiers (`const`, `noexcept`,
+/// `override`, `final`) and a C++ constructor member-initializer list
+/// (`: a(1), b(2)`). `sentinel` when the next token is not such a body.
+fn cBodyOpen(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
+    var j = params_close + 1;
+    var guard: u32 = 0;
+    while (j < hi and guard < 6) : ({
+        j += 1;
+        guard += 1;
+    }) {
+        if (ctx.isPunct(j, '{')) return j;
+        // Constructor init list `C(...) : field(x), other(y) { ... }`: the body is
+        // the next top-level `{` (bracket-aware, so `field(x)` is skipped). This
+        // stops the init-list members being mis-read as their own functions.
+        if (ctx.cfg.language == .cpp and ctx.isPunct(j, ':') and !ctx.isPunct(j + 1, ':')) {
+            return findNext(ctx, j + 1, hi, '{');
+        }
+        if (ctx.toks[j].kind == .identifier) continue; // const / noexcept / override / final
+        return sentinel;
+    }
+    return sentinel;
+}
+
+/// Index of the terminating `;` of a member declaration whose params close at
+/// `params_close`, allowing trailing qualifiers and a `= 0` / `= default`.
+/// `sentinel` when no plain declaration terminator follows.
+fn declEnd(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
+    var j = params_close + 1;
+    var guard: u32 = 0;
+    while (j < hi and guard < 8) : ({
+        j += 1;
+        guard += 1;
+    }) {
+        if (ctx.isPunct(j, ';')) return j;
+        const ok = ctx.toks[j].kind == .identifier or ctx.toks[j].kind == .number or
+            ctx.isPunct(j, '=');
+        if (!ok) return sentinel;
+    }
+    return sentinel;
+}
+
+fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    const params_open = name_i + 1;
+    const params_close = ctx.close[params_open];
+    if (params_close == sentinel) return name_i;
     // Guard: the token before the name must not itself be a call keyword.
     if (c_keywords.has(ctx.textOf(name_i))) return name_i;
-    const body_open = params_close + 1;
+    // A definition has `{` right after the parameter list (allowing C++ trailing
+    // qualifiers); otherwise it is a declaration or a call, which we ignore here.
+    const body_open = cBodyOpen(ctx, params_close, hi);
+    if (body_open == sentinel) return name_i;
     const body_close = ctx.close[body_open];
     if (body_close == sentinel) return name_i;
     const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), c_keywords);
@@ -893,12 +1132,23 @@ fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) 
         .span_end = ctx.toks[body_close].end,
         .sig_end = ctx.toks[body_open].start,
         .doc = collectDoc(ctx, stmt_start),
-        .exported = true,
+        // A `static` free function has internal linkage — not exported/public.
+        .exported = parent != null or !hasKeywordBetween(ctx, stmt_start, name_i, "static"),
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
     });
     return body_close + 1;
+}
+
+/// Whether keyword `kw` appears as a token in [lo, name_i) — used to detect a
+/// leading `static` linkage qualifier on a C function definition.
+fn hasKeywordBetween(ctx: *const Ctx, lo: u32, name_i: u32, kw: []const u8) bool {
+    var j = lo;
+    while (j < name_i) : (j += 1) {
+        if (ctx.identEql(j, kw)) return true;
+    }
+    return false;
 }
 
 fn lineEndOffset(ctx: *const Ctx, from: u32) u32 {
@@ -947,6 +1197,14 @@ fn parseJsScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
             at_stmt = true;
             continue;
         }
+        if (at_stmt and ctx.identEql(i, "export")) {
+            const adv = try parseJsReexport(ctx, i, hi);
+            if (adv > i) {
+                i = adv;
+                at_stmt = true;
+                continue;
+            }
+        }
         if (at_stmt) {
             const adv = try parseJsDecl(ctx, i, hi, parent);
             if (adv > i) {
@@ -974,11 +1232,44 @@ fn parseJsImport(ctx: *Ctx, i: u32, hi: u32) !u32 {
     return j;
 }
 
+/// Re-export forms that pull from another module: `export { a } from "mod"`,
+/// `export * from "mod"`, `export * as ns from "mod"` and their `export type`
+/// variants. Emits a module import edge (binding is the `* as ns` name, else "").
+/// Returns `i` unchanged for a plain `export const/function/class/{...}` (no
+/// `from`), which `parseJsDecl` then handles.
+fn parseJsReexport(ctx: *Ctx, i: u32, hi: u32) !u32 {
+    var j = i + 1;
+    if (ctx.identEql(j, "type")) j += 1; // `export type { X } from "mod"`
+    var binding: []const u8 = "";
+    if (ctx.isPunct(j, '{')) {
+        const close = ctx.close[j];
+        if (close == sentinel) return i;
+        j = close + 1;
+    } else if (ctx.isPunct(j, '*')) {
+        j += 1;
+        if (ctx.identEql(j, "as") and j + 1 < hi and ctx.toks[j + 1].kind == .identifier) {
+            binding = ctx.textOf(j + 1);
+            j += 2;
+        }
+    } else {
+        return i; // not a re-export form
+    }
+    if (!ctx.identEql(j, "from") or j + 1 >= hi or ctx.toks[j + 1].kind != .string) return i;
+    const mod = stripQuotes(ctx.textOf(j + 1));
+    if (mod.len == 0) return i;
+    _ = try emit(ctx, importSymbol(binding, mod, ctx.toks[i].line, lineStartOffset(ctx, i), ctx.toks[j + 1].end));
+    return j + 2;
+}
+
 /// The namespace/default binding of an ES import (`import X ...` or
 /// `import * as X ...`), used to resolve `X.member()`. Named imports
 /// (`import { a } ...`) are called bare, so they need no binding here → "".
 fn jsImportBinding(ctx: *const Ctx, import_i: u32, end_j: u32) []const u8 {
-    const first = import_i + 1;
+    var first = import_i + 1;
+    // `import type { ... }` / `import type * as ns` — the `type` keyword is not a
+    // binding; skip it so a type-only import doesn't bind the name "type".
+    if (ctx.identEql(first, "type") and first + 1 < end_j and
+        (ctx.isPunct(first + 1, '{') or ctx.isPunct(first + 1, '*'))) first += 1;
     if (first >= end_j) return "";
     // `import * as NAME from ...`
     if (ctx.isPunct(first, '*') and first + 2 < end_j and ctx.identEql(first + 1, "as") and
@@ -1002,8 +1293,78 @@ fn parseJsDecl(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !u32 {
     if (ctx.identEql(k, "const") or ctx.identEql(k, "let") or ctx.identEql(k, "var")) {
         return parseJsBinding(ctx, i, k, hi, parent, exported);
     }
+    // TypeScript type-level declarations. Gated to ts/tsx so a stray `type`/
+    // `interface` identifier in plain JS is never mistaken for one.
+    if (ctx.cfg.language == .typescript or ctx.cfg.language == .tsx) {
+        if (ctx.identEql(k, "interface") or ctx.identEql(k, "enum")) {
+            return parseTsContainer(ctx, i, k, hi, parent, exported);
+        }
+        if (ctx.identEql(k, "type")) {
+            const adv = try parseTsTypeAlias(ctx, i, k, hi, parent, exported);
+            if (adv > i) return adv;
+        }
+    }
     if (parent != null) return parseJsMember(ctx, i, k, hi, parent.?);
     return i;
+}
+
+/// A `require("PATH")` module string at the RHS of `= require(...)` (`eq_i` is the
+/// `=` token), or null when the initializer is not a CommonJS require.
+fn jsRequirePath(ctx: *const Ctx, eq_i: u32, hi: u32) ?[]const u8 {
+    if (eq_i == sentinel or eq_i + 3 >= hi) return null;
+    if (!ctx.identEql(eq_i + 1, "require")) return null;
+    if (!ctx.isPunct(eq_i + 2, '(') or ctx.toks[eq_i + 3].kind != .string) return null;
+    return stripQuotes(ctx.textOf(eq_i + 3));
+}
+
+/// TS `interface NAME {...}` / `enum NAME {...}` → an interface/enum symbol.
+fn parseTsContainer(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return start_i;
+    const name_i = kw_i + 1;
+    const open = findNext(ctx, name_i + 1, hi, '{');
+    if (open == sentinel or ctx.close[open] == sentinel) return start_i;
+    const close = ctx.close[open];
+    const kind: SymbolKind = if (ctx.identEql(kw_i, "enum")) .@"enum" else .interface;
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = kind,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, start_i),
+        .span_end = ctx.toks[close].end,
+        .sig_end = ctx.toks[open].start,
+        .doc = collectDoc(ctx, start_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return close + 1;
+}
+
+/// TS `type NAME = ...;` → a type-alias symbol. Returns `start_i` when the RHS is
+/// absent (so `type` used as a plain identifier is not swallowed).
+fn parseTsTypeAlias(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return start_i;
+    const name_i = kw_i + 1;
+    const eq = findNext(ctx, name_i + 1, hi, '=');
+    if (eq == sentinel) return start_i;
+    const semi = findNext(ctx, eq + 1, hi, ';');
+    const end_i = if (ctx.isPunct(eq + 1, '{') and ctx.close[eq + 1] != sentinel)
+        ctx.close[eq + 1]
+    else if (semi != sentinel) semi else eq + 1;
+    const span_end = ctx.toks[end_i].end;
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = .type,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, start_i),
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = collectDoc(ctx, start_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return tokenAfterOffset(ctx, span_end, hi);
 }
 
 /// Skip a `<...>` generic list, returning the index after `>` (or `i` unchanged
@@ -1093,10 +1454,34 @@ fn parseJsClass(ctx: *Ctx, start_i: u32, class_i: u32, hi: u32, parent: ?u32, ex
 }
 
 fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
+    // Destructured CommonJS import: `const { a, b } = require("mod")`. Only the
+    // module edge is recorded (the destructured names are called bare).
+    if (kw_i + 1 < hi and (ctx.isPunct(kw_i + 1, '{') or ctx.isPunct(kw_i + 1, '['))) {
+        const brace_close = ctx.close[kw_i + 1];
+        if (brace_close != sentinel) {
+            const eq = findNext(ctx, brace_close + 1, hi, '=');
+            if (jsRequirePath(ctx, eq, hi)) |mod| {
+                const semi = findNext(ctx, brace_close + 1, hi, ';');
+                const end_i = if (semi != sentinel) semi else eq + 4;
+                const span_end = ctx.toks[end_i].end;
+                _ = try emit(ctx, importSymbol("", mod, ctx.toks[kw_i].line, lineStartOffset(ctx, start_i), span_end));
+                return tokenAfterOffset(ctx, span_end, hi);
+            }
+        }
+        return start_i;
+    }
     if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return start_i;
     const name_i = kw_i + 1;
     const eq_i = findNext(ctx, name_i + 1, hi, '=');
     const semi_i = findNext(ctx, name_i + 1, hi, ';');
+
+    // `const NAME = require("mod")` — a CommonJS import binding (name → module).
+    if (jsRequirePath(ctx, eq_i, hi)) |mod| {
+        const end_i = if (semi_i != sentinel) semi_i else eq_i + 4;
+        const span_end = ctx.toks[end_i].end;
+        _ = try emit(ctx, importSymbol(ctx.textOf(name_i), mod, ctx.toks[name_i].line, lineStartOffset(ctx, start_i), span_end));
+        return tokenAfterOffset(ctx, span_end, hi);
+    }
     const arrow_body = detectJsArrow(ctx, eq_i, hi, semi_i);
     if (arrow_body.open != sentinel) {
         return emitJsArrow(ctx, start_i, name_i, arrow_body, parent, exported, hi);
@@ -1283,8 +1668,22 @@ fn parsePyImport(ctx: *Ctx, i: u32, hi: u32) !void {
     const line = ctx.toks[i].line;
     const span_start = lineStartOffset(ctx, i);
     if (ctx.identEql(i, "from")) {
-        const m = pyModulePath(ctx, i + 1, hi, line) orelse return;
-        _ = try emit(ctx, importSymbol("", m.path, line, span_start, ctx.toks[m.after - 1].end));
+        // Relative imports carry leading dots (`from ..services.user_service import
+        // X` → module string "..services.user_service"). The dots are separate
+        // punct tokens; capture them so `imports.pyCandidates` can resolve them.
+        const first = i + 1;
+        var j = first;
+        while (j < hi and ctx.toks[j].line == line and ctx.isPunct(j, '.')) j += 1;
+        const has_dots = j > first;
+        var last: u32 = if (has_dots) j - 1 else j;
+        if (j < hi and ctx.toks[j].line == line and ctx.toks[j].kind == .identifier and !ctx.identEql(j, "import")) {
+            const m = pyModulePath(ctx, j, hi, line) orelse return;
+            last = m.after - 1;
+        } else if (!has_dots) {
+            return; // malformed `from` with no module
+        }
+        const path = ctx.source[ctx.toks[first].start..ctx.toks[last].end];
+        _ = try emit(ctx, importSymbol("", path, line, span_start, ctx.toks[last].end));
         return;
     }
     var j = i + 1;
@@ -1579,6 +1978,17 @@ test "c: function and macro" {
     try testing.expect(found);
 }
 
+test "c: static functions have internal linkage (not exported)" {
+    const src =
+        \\int public_fn(void) { return 1; }
+        \\static int private_fn(void) { return 2; }
+    ;
+    var out = try parseForTest(src, .c);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "public_fn").?.exported);
+    try testing.expect(!findSym(out.items, "private_fn").?.exported);
+}
+
 test "zig: captures member qualifiers and local/param bindings" {
     const src =
         \\pub fn run(ctx: *Ctx) void {
@@ -1635,6 +2045,128 @@ test "ts: methods with return types and generics are parsed and typed" {
         }
     }
     try testing.expect(saw);
+}
+
+test "cpp: classes, namespaces, methods, and ctor init-lists" {
+    const src =
+        \\namespace geo {
+        \\class Shape {
+        \\public:
+        \\    double area() const;
+        \\    const char* name() const { return "s"; }
+        \\};
+        \\class Circle : public Shape {
+        \\public:
+        \\    Circle(double r) : radius_(r) {}
+        \\    double area() const { return 3.14 * radius_; }
+        \\private:
+        \\    double radius_;
+        \\};
+        \\template<typename T> T max_of(T a, T b) { return a > b ? a : b; }
+        \\double total_area(const Shape& s) { return s.area(); }
+        \\}
+    ;
+    var out = try parseForTest(src, .cpp);
+    defer freeRefs(&out);
+    // Namespace surfaces as a module; both classes and their methods are indexed.
+    try testing.expect(findSym(out.items, "geo") != null);
+    const shape = findSym(out.items, "Shape").?;
+    try testing.expectEqual(SymbolKind.class, shape.kind);
+    try testing.expect(findSym(out.items, "Circle") != null);
+    try testing.expect(findSym(out.items, "area") != null);
+    try testing.expect(findSym(out.items, "name") != null);
+    // Namespace-scoped free/template functions are visible (not swallowed).
+    try testing.expect(findSym(out.items, "max_of") != null);
+    try testing.expect(findSym(out.items, "total_area") != null);
+    // The ctor member-initializer `radius_(r)` must NOT become a function.
+    for (out.items) |s| {
+        if (std.mem.eql(u8, s.name, "radius_")) try testing.expect(s.kind != .function and s.kind != .method);
+    }
+}
+
+test "ts: interface, enum, and type alias are indexed" {
+    const src =
+        \\export interface User { id: number; name: string; }
+        \\export type Id = number;
+        \\export enum Role { Admin, Editor }
+        \\export function make(): User { return { id: 1, name: "x" }; }
+    ;
+    var out = try parseForTest(src, .typescript);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.interface, findSym(out.items, "User").?.kind);
+    try testing.expectEqual(SymbolKind.type, findSym(out.items, "Id").?.kind);
+    try testing.expectEqual(SymbolKind.@"enum", findSym(out.items, "Role").?.kind);
+    try testing.expect(findSym(out.items, "make") != null);
+}
+
+test "ts: interface/type/enum are NOT extracted from plain JS" {
+    // These are TS-only; a `.js` file must not spuriously emit them.
+    const src =
+        \\function type(x) { return x; }
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "type") != null); // a function named `type`
+}
+
+test "js: require() emits a CommonJS import binding; destructured emits module edge" {
+    const src =
+        \\const db = require('./db');
+        \\const { readFile } = require('fs');
+        \\function run() { return db.all(); }
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    var db_binding = false;
+    var fs_edge = false;
+    for (out.items) |s| {
+        if (s.kind != .import) continue;
+        if (std.mem.eql(u8, s.name, "db") and std.mem.eql(u8, s.import_path, "./db")) db_binding = true;
+        if (std.mem.eql(u8, s.import_path, "fs")) fs_edge = true;
+    }
+    try testing.expect(db_binding);
+    try testing.expect(fs_edge);
+}
+
+test "ts: export-from re-export records a module import edge" {
+    const src =
+        \\export { ApiClient } from './client';
+        \\export type { User } from './client';
+        \\export * from './helpers';
+    ;
+    var out = try parseForTest(src, .typescript);
+    defer freeRefs(&out);
+    var to_client = false;
+    var to_helpers = false;
+    for (out.items) |s| {
+        if (s.kind != .import) continue;
+        if (std.mem.eql(u8, s.import_path, "./client")) to_client = true;
+        if (std.mem.eql(u8, s.import_path, "./helpers")) to_helpers = true;
+    }
+    try testing.expect(to_client);
+    try testing.expect(to_helpers);
+}
+
+test "python: relative imports keep their leading dots in the module path" {
+    const src =
+        \\from ..services.user_service import UserService
+        \\from .routes import router
+        \\from . import models
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    var rel2 = false;
+    var rel1 = false;
+    var dot_only = false;
+    for (out.items) |s| {
+        if (s.kind != .import) continue;
+        if (std.mem.eql(u8, s.import_path, "..services.user_service")) rel2 = true;
+        if (std.mem.eql(u8, s.import_path, ".routes")) rel1 = true;
+        if (std.mem.eql(u8, s.import_path, ".")) dot_only = true;
+    }
+    try testing.expect(rel2);
+    try testing.expect(rel1);
+    try testing.expect(dot_only);
 }
 
 fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {

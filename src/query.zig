@@ -42,6 +42,15 @@ pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Opt
         if (shown >= opts.limit) break;
     }
     if (!any) try w.print("(no source symbols under '{s}')\n", .{path_filter});
+    try truncationNote(w, opts, shown);
+}
+
+/// Warn when output was capped by `-l`, so a truncated result is never mistaken
+/// for the complete set. Printed to the same stream as the results.
+fn truncationNote(w: *Writer, opts: Options, shown: u32) !void {
+    if (shown >= opts.limit) {
+        try w.print("… (stopped at -l {d}; more results may exist — raise -l to see them)\n", .{opts.limit});
+    }
 }
 
 fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Options, shown: *u32) !u32 {
@@ -146,11 +155,13 @@ fn walkCallees(
     var externals: std.ArrayList(u8) = .empty;
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
-        if (ref.kind != .call and ref.kind != .route_call) continue;
-        const followed = ref.target != invalid and (!opts.strict or ref.exact);
-        if (followed) {
+        // Follow every *resolved* edge (call, use, type-use), so the callee tree
+        // is symmetric with the callers index (which counts all resolved refs).
+        // Only unresolved *calls* are surfaced as externals; unresolved reads of
+        // stdlib/locals would be noise.
+        if (ref.target != invalid and (!opts.strict or ref.exact)) {
             try walkNode(w, idx, ref.target, false, opts, indent + 1, visited);
-        } else {
+        } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
         }
@@ -197,6 +208,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         if (shown >= opts.limit) break;
     }
     if (shown == 0) try w.print("(no symbol matching '{s}')\n", .{pattern});
+    try truncationNote(w, opts, shown);
 }
 
 /// List HTTP route definitions and, under each, its handler (callee) and the
@@ -215,6 +227,7 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
         if (shown >= opts.limit) break;
     }
     if (!any) try w.print("(no routes under '{s}')\n", .{filter});
+    try truncationNote(w, opts, shown);
 }
 
 fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
@@ -256,10 +269,9 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
     var externals: std.ArrayList(u8) = .empty;
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
-        if (ref.kind != .call and ref.kind != .route_call) continue;
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             try render.symbol(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true);
-        } else {
+        } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
         }
@@ -284,6 +296,7 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         if (shown >= opts.limit) break;
     }
     if (shown == 0) try w.print("(no unused functions under '{s}')\n", .{filter});
+    try truncationNote(w, opts, shown);
 }
 
 /// A symbol worth reporting as possibly-unused: a callable, in-scope of the
@@ -292,7 +305,32 @@ pub fn isDeadCandidate(idx: *const Index, sym: model.Symbol, filter: []const u8)
     if (sym.kind != .function and sym.kind != .method) return false;
     if (idx.callersOf(sym.id).len != 0) return false;
     if (std.mem.eql(u8, sym.name, "main")) return false;
-    return matchesFilter(idx.graph.files[sym.file].path, filter);
+    // Framework/entry-point callables are invoked implicitly, never by name, so
+    // they always look "dead": dunder methods (`__init__`, `__call__`), pytest
+    // test functions, and everything in test/conftest files (tests + fixtures).
+    if (isDunder(sym.name)) return false;
+    if (std.mem.startsWith(u8, sym.name, "test_")) return false;
+    const path = idx.graph.files[sym.file].path;
+    if (isTestPath(path)) return false;
+    return matchesFilter(path, filter);
+}
+
+/// A `__dunder__` name (implicitly invoked by the language/runtime).
+fn isDunder(name: []const u8) bool {
+    return name.len >= 4 and std.mem.startsWith(u8, name, "__") and std.mem.endsWith(u8, name, "__");
+}
+
+/// Whether `path` is a test/fixture module (pytest, jest): its functions are
+/// invoked by the framework, not referenced by name.
+fn isTestPath(path: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const base = if (slash) |s| path[s + 1 ..] else path;
+    if (std.mem.eql(u8, base, "conftest.py")) return true;
+    if (std.mem.startsWith(u8, base, "test_")) return true;
+    inline for (.{ "_test.py", ".test.ts", ".test.tsx", ".test.js", ".spec.ts", ".spec.tsx", ".spec.js" }) |suf| {
+        if (std.mem.endsWith(u8, base, suf)) return true;
+    }
+    return false;
 }
 
 /// List, per in-scope file, the local modules it imports (resolved edges only).
@@ -407,7 +445,8 @@ fn bfsPrev(idx: *const Index, from_ids: []const SymbolId, to_ids: []const Symbol
         const cur = queue.items[head];
         if (contains(to_ids, cur) and !contains(from_ids, cur)) break;
         for (idx.graph.symbols[cur].refs) |ref| {
-            if (ref.kind != .call and ref.kind != .route_call) continue;
+            // Any resolved dependency edge is a valid path hop (symmetric with the
+            // callers index), not just `.call`/`.route_call`.
             if (ref.target == invalid or (strict and !ref.exact)) continue;
             if (prev[ref.target] != invalid) continue;
             prev[ref.target] = cur;
@@ -512,4 +551,54 @@ test "shortest path and dead-code detection over a call chain" {
     const gamma = idx.graph.symbols[idx.lookup("gamma")[0]];
     try testing.expect(isDeadCandidate(&idx, orphan, ""));
     try testing.expect(!isDeadCandidate(&idx, gamma, ""));
+}
+
+test "calls shows resolved non-call use edges, symmetric with callers" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub const LIMIT: u32 = 10;
+        \\pub fn helper() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn run() u32 {
+        \\    return helper() + LIMIT;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `run` calls `helper` and reads `LIMIT`; `calls run` must show BOTH.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "LIMIT") != null);
+
+    // Symmetry: `LIMIT`'s callers include `run`.
+    const limit_id = idx.lookup("LIMIT")[0];
+    try testing.expectEqual(idx.lookup("run")[0], idx.callersOf(limit_id)[0]);
+}
+
+test "dead-code filter skips dunders, tests and fixtures" {
+    try std.testing.expect(isDunder("__init__"));
+    try std.testing.expect(isDunder("__call__"));
+    try std.testing.expect(!isDunder("__"));
+    try std.testing.expect(!isDunder("run"));
+    try std.testing.expect(!isDunder("_private"));
+
+    try std.testing.expect(isTestPath("tests/test_ship.py"));
+    try std.testing.expect(isTestPath("a/b/conftest.py"));
+    try std.testing.expect(isTestPath("src/ship_test.py"));
+    try std.testing.expect(isTestPath("web/App.test.tsx"));
+    try std.testing.expect(!isTestPath("src/ship.py"));
+    try std.testing.expect(!isTestPath("src/latest.py"));
 }
