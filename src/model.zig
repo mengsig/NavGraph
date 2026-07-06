@@ -133,6 +133,31 @@ pub const Symbol = struct {
         std.debug.assert(self.span_end <= source.len);
         return source[self.span_start..self.span_end];
     }
+
+    /// 1-based line where the definition ends (line of the last body byte). Equal
+    /// to `line` for a single-line definition. Lets a caller read exactly the
+    /// symbol's source range (`file:line-endLine`) instead of guessing.
+    ///
+    /// Computed absolutely — the line of the definition's last real byte — rather
+    /// than as an offset from `line`, because a span can legitimately begin on an
+    /// earlier line than the name (a `template <…>` prefix, a multi-line return
+    /// type, a leading doc comment), which would otherwise skew the result.
+    pub fn endLine(self: Symbol, source: []const u8) u32 {
+        std.debug.assert(self.span_end <= source.len);
+        // Trim trailing newlines/CR so the end is the line of the last real byte
+        // (span_end usually points just past the closing brace's newline).
+        var end = self.span_end;
+        while (end > self.span_start and (source[end - 1] == '\n' or source[end - 1] == '\r')) end -= 1;
+        if (end == 0) return self.line;
+        var nl: u32 = 0;
+        var i: usize = 0;
+        const last = end - 1;
+        while (i < last) : (i += 1) {
+            if (source[i] == '\n') nl += 1;
+        }
+        // Never report before the definition's own (name) line.
+        return @max(nl + 1, self.line);
+    }
 };
 
 pub const SourceFile = struct {
@@ -186,4 +211,16 @@ test "symbol signature and body slice within bounds" {
     };
     try std.testing.expectEqualStrings("pub fn add(a: i32) i32", sym.signature(src));
     try std.testing.expectEqualStrings(src, sym.body(src));
+    // Body spans 3 lines (1: signature, 2: return, 3: closing brace).
+    try std.testing.expectEqual(@as(u32, 3), sym.endLine(src));
+}
+
+test "endLine equals line for a single-line definition" {
+    const src = "const x = 1;\n";
+    const sym = Symbol{
+        .id = 0, .file = 0, .name = "x", .kind = .constant, .line = 1,
+        .span_start = 0, .span_end = 12, .sig_end = 12, .doc = "",
+        .parent = invalid_symbol, .exported = false, .refs = &.{},
+    };
+    try std.testing.expectEqual(@as(u32, 1), sym.endLine(src));
 }

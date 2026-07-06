@@ -74,11 +74,44 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
+        if (!query.kindAllowed(sym.kind, opts.kinds)) continue;
         if (std.mem.indexOf(u8, sym.name, pattern) == null) continue;
         if (shown != 0) try w.writeByte(',');
         try symbolObject(w, idx, sym, opts.verbosity);
         shown += 1;
         if (shown >= opts.limit) break;
+    }
+    try w.writeAll("]\n");
+}
+
+/// `search --refs --json`: array of `{name, file, line, in, qualifier?, target?}`
+/// reference objects (use sites), mirroring the text usages listing.
+pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+    std.debug.assert(pattern.len > 0);
+    var shown: u32 = 0;
+    try w.writeByte('[');
+    outer: for (idx.graph.symbols) |sym| {
+        for (sym.refs) |ref| {
+            if (std.mem.indexOf(u8, ref.name, pattern) == null) continue;
+            if (shown != 0) try w.writeByte(',');
+            try w.writeAll("{\"name\":");
+            try writeString(w, ref.name);
+            try w.writeAll(",\"file\":");
+            try writeString(w, idx.graph.files[sym.file].path);
+            try w.print(",\"line\":{d},\"in\":", .{ref.line});
+            try writeString(w, sym.name);
+            if (ref.qualifier.len != 0) {
+                try w.writeAll(",\"qualifier\":");
+                try writeString(w, ref.qualifier);
+            }
+            if (ref.target != invalid) {
+                try w.writeAll(",\"target\":");
+                try writeString(w, idx.graph.files[idx.graph.symbols[ref.target].file].path);
+            }
+            try w.writeByte('}');
+            shown += 1;
+            if (shown >= opts.limit) break :outer;
+        }
     }
     try w.writeAll("]\n");
 }
@@ -93,7 +126,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     for (ids, 0..) |id, k| {
         if (k != 0) try w.writeByte(',');
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, &visited);
     }
     try w.writeAll("]\n");
 }
@@ -105,10 +138,13 @@ fn walkNode(
     incoming: bool,
     opts: Options,
     depth: u32,
+    site: u32,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
     std.debug.assert(id < idx.graph.symbols.len);
     try nodeHead(w, idx, idx.graph.symbols[id]);
+    // The call-site line of the edge to this node's parent (0 = root/no edge).
+    if (site != 0) try w.print(",\"site\":{d}", .{site});
     if (depth >= opts.depth) return try w.writeByte('}');
     if ((try visited.getOrPut(id)).found_existing) {
         try w.writeAll(",\"recursion\":true}");
@@ -139,7 +175,7 @@ fn walkCallees(
         // unresolved *calls* become externals (see query.walkCallees).
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, ref.target, false, opts, depth + 1, visited);
+            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, visited);
             wrote += 1;
         } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
@@ -175,10 +211,27 @@ fn walkCallers(
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
         if (wrote != 0) try w.writeByte(',');
-        try walkNode(w, idx, cid, true, opts, depth + 1, visited);
+        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), visited);
         wrote += 1;
     }
     try w.writeByte(']');
+}
+
+/// Hot: array of `{...symbol, fan_in, fan_out}` ranked by connectivity.
+pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    const ranked = try query.collectHot(idx, filter);
+    defer idx.gpa.free(ranked);
+    const cap = @min(ranked.len, query.hotLimit(opts));
+    try w.writeByte('[');
+    for (ranked[0..cap], 0..) |e, k| {
+        if (k != 0) try w.writeByte(',');
+        const sym = idx.graph.symbols[e.id];
+        try nodeHead(w, idx, sym);
+        try w.writeAll(",\"sig\":");
+        try writeCollapsedString(w, sym.signature(idx.graph.files[sym.file].text), max_sig_len);
+        try w.print(",\"fan_in\":{d},\"fan_out\":{d}}}", .{ e.fan_in, e.fan_out });
+    }
+    try w.writeAll("]\n");
 }
 
 /// Routes: array of `{route, file, line, handler, callers}` objects.
@@ -234,6 +287,8 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         for (idx.callersOf(id), 0..) |cid, j| {
             if (j != 0) try w.writeByte(',');
             try nodeHead(w, idx, idx.graph.symbols[cid]);
+            const site = query.callSiteLine(idx, cid, id);
+            if (site != 0) try w.print(",\"site\":{d}", .{site});
             try w.writeByte('}');
         }
         try w.writeAll("]}");
@@ -247,6 +302,7 @@ fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
         if (ref.target == invalid or (strict and !ref.exact)) continue;
         if (wrote != 0) try w.writeByte(',');
         try nodeHead(w, idx, idx.graph.symbols[ref.target]);
+        if (ref.line != 0) try w.print(",\"site\":{d}", .{ref.line});
         try w.writeByte('}');
         wrote += 1;
     }
@@ -360,7 +416,8 @@ fn nodeHead(w: *Writer, idx: *const Index, sym: Symbol) !void {
     try writeString(w, sym.name);
     try w.print(",\"file\":", .{});
     try writeString(w, idx.graph.files[sym.file].path);
-    try w.print(",\"line\":{d}", .{sym.line});
+    const source = idx.graph.files[sym.file].text;
+    try w.print(",\"line\":{d},\"line_end\":{d}", .{ sym.line, sym.endLine(source) });
 }
 
 /// A full symbol object; fields grow with verbosity (sig, then doc, then body).

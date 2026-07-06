@@ -18,14 +18,59 @@ const invalid = model.invalid_symbol;
 /// Output encoding: compact text for agents, or JSON for tooling/MCP.
 pub const OutputFormat = enum { text, json };
 
+/// Default result cap (also a sentinel: `limit == default_limit` means "the user
+/// did not pass -l", which `hot` uses to pick its own shorter default).
+pub const default_limit: u32 = 300;
+/// `hot`'s brief default when no explicit `-l` was given.
+pub const hot_default: u32 = 25;
+
+/// The effective cap for `hot`: its own short default unless `-l` was given.
+pub fn hotLimit(opts: Options) u32 {
+    return if (opts.limit == default_limit) hot_default else opts.limit;
+}
+
 pub const Options = struct {
     verbosity: render.Verbosity = .sig,
     depth: u32 = 1,
-    limit: u32 = 300,
+    limit: u32 = default_limit,
     /// Follow only high-confidence (type/self-bound or unambiguous) edges.
     strict: bool = false,
     format: OutputFormat = .text,
+    /// `search`: match reference/use sites (usages), not just definition names.
+    refs: bool = false,
+    /// Restrict `outline`/`search` to symbols whose kind tag is in this
+    /// comma-separated set (e.g. "fn,method"). Empty means all kinds.
+    kinds: []const u8 = "",
 };
+
+/// Whether `kind` passes the (comma-separated) `--kind` filter. Empty filter
+/// matches everything. Matches against the short tag (`fn`, `struct`, `route`…)
+/// and also accepts `function`/`func` as aliases for `fn`.
+pub fn kindAllowed(kind: model.SymbolKind, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    const tag = kind.tag();
+    var it = std.mem.tokenizeScalar(u8, filter, ',');
+    while (it.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " ");
+        if (std.mem.eql(u8, t, tag)) return true;
+        if (kind == .function and (std.mem.eql(u8, t, "function") or std.mem.eql(u8, t, "func"))) return true;
+        if (kind == .constant and std.mem.eql(u8, t, "constant")) return true;
+        if (kind == .variable and std.mem.eql(u8, t, "variable")) return true;
+    }
+    return false;
+}
+
+/// The line where symbol `from` references symbol `to` (its earliest such
+/// reference), or 0 if none. Used to annotate a call-graph edge with its real
+/// call-site line rather than the caller's own definition line.
+pub fn callSiteLine(idx: *const Index, from: SymbolId, to: SymbolId) u32 {
+    var best: u32 = 0;
+    for (idx.graph.symbols[from].refs) |ref| {
+        if (ref.target != to) continue;
+        if (best == 0 or ref.line < best) best = ref.line;
+    }
+    return best;
+}
 
 /// Print an outline of the file(s) under `path_filter` (a path prefix, or ""
 /// for the whole project). Symbols are grouped by file and indented by nesting.
@@ -60,6 +105,7 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
         const sym = idx.graph.symbols[i];
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
+        if (!kindAllowed(sym.kind, opts.kinds)) continue;
         const indent = 1 + parentDepth(idx, sym);
         try render.symbol(w, idx, sym, opts.verbosity, indent, false);
         count += 1;
@@ -116,7 +162,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     defer visited.deinit();
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, &visited);
     }
 }
 
@@ -127,10 +173,11 @@ fn walkNode(
     incoming: bool,
     opts: Options,
     indent: usize,
+    site: u32,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
     const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
-    try render.symbol(w, idx, idx.graph.symbols[id], v, indent, true);
+    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site);
     if (indent >= opts.depth) return;
     if ((try visited.getOrPut(id)).found_existing) {
         try indentLine(w, indent + 1, "… (recursion)");
@@ -160,7 +207,8 @@ fn walkCallees(
         // Only unresolved *calls* are surfaced as externals; unresolved reads of
         // stdlib/locals would be noise.
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
-            try walkNode(w, idx, ref.target, false, opts, indent + 1, visited);
+            // The edge (this symbol → callee) lives at ref.line in this file.
+            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, visited);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -183,7 +231,8 @@ fn walkCallers(
 ) !void {
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
-        try walkNode(w, idx, cid, true, opts, indent + 1, visited);
+        // The edge (caller → this symbol) lives at its call site in the caller.
+        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), visited);
     }
 }
 
@@ -195,13 +244,17 @@ pub fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
     return false;
 }
 
-/// Substring search over symbol names; prints matches like `def`.
+/// Substring search over symbol names; prints matches like `def`. With
+/// `--refs`, searches *use sites* (references) instead — a resolved-graph grep
+/// that answers "where is this used", which name-only search cannot.
 pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
     std.debug.assert(pattern.len > 0);
+    if (opts.refs) return searchRefs(w, idx, pattern, opts);
     if (opts.format == .json) return json_out.search(w, idx, pattern, opts);
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
+        if (!kindAllowed(sym.kind, opts.kinds)) continue;
         if (std.mem.indexOf(u8, sym.name, pattern) == null) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         shown += 1;
@@ -209,6 +262,96 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     }
     if (shown == 0) try w.print("(no symbol matching '{s}')\n", .{pattern});
     try truncationNote(w, opts, shown);
+}
+
+/// List every reference (use site) whose name contains `pattern`, grouped by the
+/// enclosing symbol, with the call-site line and whether it resolved. This is the
+/// "find usages" verb — structured, comment/string-free, resolution-aware.
+fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.searchRefs(w, idx, pattern, opts);
+    var shown: u32 = 0;
+    for (idx.graph.symbols) |sym| {
+        for (sym.refs) |ref| {
+            if (std.mem.indexOf(u8, ref.name, pattern) == null) continue;
+            try w.print("{s}:{d}  {s}", .{ idx.graph.files[sym.file].path, ref.line, ref.name });
+            if (ref.qualifier.len != 0) try w.print(" (on {s})", .{ref.qualifier});
+            try w.print("  in {s}", .{sym.name});
+            if (ref.target != invalid) {
+                try w.print("  → {s}", .{idx.graph.files[idx.graph.symbols[ref.target].file].path});
+            } else if (ref.kind == .call or ref.kind == .route_call) {
+                try w.writeAll("  → ~ext");
+            }
+            try w.writeByte('\n');
+            shown += 1;
+            if (shown >= opts.limit) break;
+        }
+        if (shown >= opts.limit) break;
+    }
+    if (shown == 0) try w.print("(no reference matching '{s}')\n", .{pattern});
+    try truncationNote(w, opts, shown);
+}
+
+/// The number of distinct resolved callees (outgoing edges) of `sym`.
+fn fanOut(sym: model.Symbol) u32 {
+    var out: u32 = 0;
+    for (sym.refs) |ref| {
+        if (ref.target != invalid) out += 1;
+    }
+    return out;
+}
+
+/// Rank functions/methods by connectivity (callers = fan-in, callees = fan-out)
+/// and list the busiest — the load-bearing symbols an agent should read first to
+/// understand a repo, and where changes ripple widest. Ranked by fan-in, then
+/// fan-out. Honors an optional path `filter` and `-l` for the count.
+pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.hot(w, idx, filter, opts);
+    const ranked = try collectHot(idx, filter);
+    defer idx.gpa.free(ranked);
+    // `hot` is an orientation view — a short ranked list is the point, so it
+    // caps at a small default (raise `-l` for more) via the limit sentinel.
+    const cap = @min(ranked.len, hotLimit(opts));
+    if (cap == 0) {
+        try w.print("(no functions under '{s}')\n", .{filter});
+        return;
+    }
+    for (ranked[0..cap]) |e| {
+        const sym = idx.graph.symbols[e.id];
+        try render.symbol(w, idx, sym, headerVerbosity(opts.verbosity), 0, true);
+        // Trim the trailing newline render wrote, then append the fan counts.
+        // (render always ends the line; we add the score as a suffix line note.)
+        try w.print("    ←{d} callers  →{d} callees\n", .{ e.fan_in, e.fan_out });
+    }
+    if (ranked.len > cap) {
+        try w.print("… ({d} more; raise -l to see them)\n", .{ranked.len - cap});
+    }
+}
+
+pub const HotEntry = struct { id: SymbolId, fan_in: u32, fan_out: u32 };
+
+/// Collect callable symbols under `filter`, sorted by fan-in then fan-out
+/// (descending). Caller frees the returned slice.
+pub fn collectHot(idx: *const Index, filter: []const u8) ![]HotEntry {
+    var list: std.ArrayList(HotEntry) = .empty;
+    errdefer list.deinit(idx.gpa);
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind != .function and sym.kind != .method) continue;
+        if (!matchesFilter(idx.graph.files[sym.file].path, filter)) continue;
+        const fan_in: u32 = @intCast(idx.callersOf(sym.id).len);
+        const fan_out = fanOut(sym);
+        if (fan_in == 0 and fan_out == 0) continue; // isolated: not informative
+        try list.append(idx.gpa, .{ .id = sym.id, .fan_in = fan_in, .fan_out = fan_out });
+    }
+    const items = try list.toOwnedSlice(idx.gpa);
+    std.mem.sort(HotEntry, items, {}, hotLessThan);
+    return items;
+}
+
+/// Descending order: higher fan-in first, then higher fan-out, then stable by id.
+fn hotLessThan(_: void, a: HotEntry, b: HotEntry) bool {
+    if (a.fan_in != b.fan_in) return a.fan_in > b.fan_in;
+    if (a.fan_out != b.fan_out) return a.fan_out > b.fan_out;
+    return a.id < b.id;
 }
 
 /// List HTTP route definitions and, under each, its handler (callee) and the
@@ -237,7 +380,7 @@ fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
         }
     }
     for (idx.callersOf(route.id)) |cid| {
-        try render.symbol(w, idx, idx.graph.symbols[cid], .sig, 1, true);
+        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id));
     }
 }
 
@@ -257,7 +400,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         try renderCallees(w, idx, id, opts, 2);
         try w.writeAll("  ↑ callers\n");
         for (idx.callersOf(id)) |cid| {
-            try render.symbol(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true);
+            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id));
         }
     }
 }
@@ -270,7 +413,7 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
-            try render.symbol(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true);
+            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -477,10 +620,33 @@ fn indentLine(w: *Writer, indent: usize, text: []const u8) !void {
     if (!std.mem.endsWith(u8, text, " ")) try w.writeByte('\n');
 }
 
-/// Resolve a query name to symbol ids. Supports a `Parent.child` qualifier.
-/// Results are written into `buf` and a sub-slice is returned.
+/// Resolve a query name to symbol ids. Supports a `Parent.child` qualifier and a
+/// trailing `@path` selector (`build@build.zig`, `parse@parser`) that keeps only
+/// matches whose file path contains the given substring — the way to
+/// disambiguate same-named symbols across files. Results are written into `buf`.
 pub fn resolveIds(idx: *const Index, name: []const u8, buf: []SymbolId) []const SymbolId {
     std.debug.assert(buf.len > 0);
+    var nm = name;
+    var path_sel: []const u8 = "";
+    if (std.mem.lastIndexOfScalar(u8, name, '@')) |at| {
+        nm = name[0..at];
+        path_sel = name[at + 1 ..];
+    }
+    const ids = resolveBare(idx, nm, buf);
+    if (path_sel.len == 0) return ids;
+    // Compact in place to the ids whose file path contains the selector.
+    var n: usize = 0;
+    for (ids) |id| {
+        if (std.mem.indexOf(u8, idx.graph.files[idx.graph.symbols[id].file].path, path_sel) != null) {
+            buf[n] = id;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+/// Resolve `name` (optionally `Parent.child`) without a path selector.
+fn resolveBare(idx: *const Index, name: []const u8, buf: []SymbolId) []const SymbolId {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
         const parent = name[0..dot];
         const child = name[dot + 1 ..];
@@ -586,6 +752,184 @@ test "calls shows resolved non-call use edges, symmetric with callers" {
     // Symmetry: `LIMIT`'s callers include `run`.
     const limit_id = idx.lookup("LIMIT")[0];
     try testing.expectEqual(idx.lookup("run")[0], idx.callersOf(limit_id)[0]);
+}
+
+test "kindAllowed matches tags, aliases, and empty-is-all" {
+    try std.testing.expect(kindAllowed(.function, ""));
+    try std.testing.expect(kindAllowed(.function, "fn"));
+    try std.testing.expect(kindAllowed(.function, "function"));
+    try std.testing.expect(kindAllowed(.function, "struct,fn,enum"));
+    try std.testing.expect(kindAllowed(.@"struct", "struct"));
+    try std.testing.expect(!kindAllowed(.function, "struct"));
+    try std.testing.expect(!kindAllowed(.method, "fn"));
+    try std.testing.expect(kindAllowed(.method, "method"));
+    // Whitespace around a comma token is tolerated.
+    try std.testing.expect(kindAllowed(.@"enum", "fn, enum"));
+}
+
+test "call-site line annotation, usages search, and @path disambiguation" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn helper() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn run() u32 {
+        \\    const a = helper();
+        \\    return a;
+        \\}
+    });
+    // A second file with a same-named `run` to exercise the `@path` selector.
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.zig", .data =
+        \\pub fn run() void {}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `callers helper` must annotate the caller with the call-site line (5), not
+    // just the caller's own definition line (4).
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "↳:5") != null);
+    }
+
+    // `search helper --refs` lists the use site at line 5 inside `run`.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "helper", .{ .refs = true });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "m.zig:5") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "in run") != null);
+    }
+
+    // `run@other` resolves to exactly the `run` in other.zig.
+    {
+        var rbuf: [8]SymbolId = undefined;
+        const ids = resolveIds(&idx, "run@other", &rbuf);
+        try testing.expectEqual(@as(usize, 1), ids.len);
+        try testing.expectEqualStrings("other.zig", idx.graph.files[idx.graph.symbols[ids[0]].file].path);
+        // Bare `run` finds both.
+        var abuf: [8]SymbolId = undefined;
+        const all = resolveIds(&idx, "run", &abuf);
+        try testing.expectEqual(@as(usize, 2), all.len);
+    }
+}
+
+test "end line is correct despite a leading comment or template prefix" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A C function preceded by a doc comment, and a C++ template function whose
+    // `template<...>` prefix sits on the line above the name — both used to make
+    // endLine overshoot (it was measured as an offset from the name line).
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.hpp", .data =
+        \\/* leading doc comment on its own line */
+        \\int plain(int x) {
+        \\    return x + 1;
+        \\}
+        \\
+        \\template <typename T>
+        \\T max_of(T a, T b) {
+        \\    return a > b ? a : b;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // plain: name on line 2, closing brace on line 4.
+    const plain = idx.graph.symbols[idx.lookup("plain")[0]];
+    try testing.expectEqual(@as(u32, 2), plain.line);
+    try testing.expectEqual(@as(u32, 4), plain.endLine(idx.graph.files[plain.file].text));
+    // max_of: name on line 7 (after the template line), closing brace on line 9.
+    const max_of = idx.graph.symbols[idx.lookup("max_of")[0]];
+    try testing.expectEqual(@as(u32, 7), max_of.line);
+    try testing.expectEqual(@as(u32, 9), max_of.endLine(idx.graph.files[max_of.file].text));
+}
+
+test "hot ranks the most-called function first" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "h.zig", .data =
+        \\pub fn shared() void {}
+        \\pub fn a() void { shared(); }
+        \\pub fn b() void { shared(); }
+        \\pub fn c() void { shared(); a(); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const ranked = try collectHot(&idx, "");
+    defer idx.gpa.free(ranked);
+    try testing.expect(ranked.len >= 2);
+    // `shared` has 3 callers (a, b, c) — the most, so it ranks first.
+    try testing.expectEqualStrings("shared", idx.graph.symbols[ranked[0].id].name);
+    try testing.expectEqual(@as(u32, 3), ranked[0].fan_in);
+
+    // Text output leads with `shared` and shows its fan counts.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try hot(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "shared") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "←3 callers") != null);
+}
+
+test "line range renders end line for a multi-line definition" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "r.zig", .data =
+        \\pub fn multi() void {
+        \\    var x: u32 = 0;
+        \\    x += 1;
+        \\}
+        \\pub const single = 1;
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try outline(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // `multi` spans lines 1–4 (outline uses `L<start>-<end>` for nested rows);
+    // `single` is a one-liner rendered without a range suffix.
+    try testing.expect(std.mem.indexOf(u8, out, "L1-4") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "multi") != null);
+    // The one-liner ends at its own line with no range suffix.
+    try testing.expect(std.mem.indexOf(u8, out, "single") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "L5") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "L5-") == null);
 }
 
 test "dead-code filter skips dunders, tests and fixtures" {

@@ -64,6 +64,7 @@ fn dispatch(out: *std.Io.Writer, idx: *index_mod.Index, parsed: cli.Parsed) !voi
         .imports => try query.listImports(out, idx, parsed.arg, parsed.options),
         .importers => try query.listImporters(out, idx, parsed.arg, parsed.options),
         .path => try query.shortestPath(out, idx, parsed.arg, parsed.arg2, parsed.options),
+        .hot => try query.hot(out, idx, parsed.arg, parsed.options),
         .help => unreachable,
     }
 }

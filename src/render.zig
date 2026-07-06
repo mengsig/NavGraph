@@ -35,6 +35,9 @@ pub const Verbosity = enum {
 };
 
 const max_sig_len: usize = 160;
+/// Cap for const/var initializer values in `sig` view — short enough that a big
+/// comptime literal collapses to its type/constructor head instead of dumping.
+const max_value_len: usize = 60;
 
 /// Render one symbol as an indented line (or block, for `.full`).
 pub fn symbol(
@@ -44,6 +47,23 @@ pub fn symbol(
     v: Verbosity,
     indent: usize,
     show_path: bool,
+) !void {
+    return symbolSite(w, idx, sym, v, indent, show_path, 0);
+}
+
+/// Like `symbol`, but annotates the line with the call-site `site` (the source
+/// line of the graph edge connecting this node to its parent in a call tree).
+/// `site == 0` means no edge (a root, or a plain listing) and renders like
+/// `symbol`. The annotation is `↳:N` — N lives in the file of whichever endpoint
+/// is the *caller* (this row in a callers tree; the parent row in a callees tree).
+pub fn symbolSite(
+    w: *Writer,
+    idx: *const Index,
+    sym: Symbol,
+    v: Verbosity,
+    indent: usize,
+    show_path: bool,
+    site: u32,
 ) !void {
     try writeIndent(w, indent);
     try w.writeAll(sym.kind.tag());
@@ -56,7 +76,8 @@ pub fn symbol(
         .sig, .doc => try writeSigSuffix(w, sym, source),
         .full => {},
     }
-    try writeLocation(w, idx, sym, show_path);
+    try writeLocation(w, idx, sym, source, show_path);
+    if (site != 0) try w.print("  ↳:{d}", .{site});
     try w.writeByte('\n');
 
     if (v == .doc) try writeDocLine(w, sym, indent);
@@ -79,14 +100,23 @@ fn writeQualifiedName(w: *Writer, idx: *const Index, sym: Symbol) !void {
 
 /// Append the collapsed signature after the name, minus the redundant name/kind.
 fn writeSigSuffix(w: *Writer, sym: Symbol, source: []const u8) !void {
-    const suffix = switch (sym.kind) {
-        .function, .method => paramSlice(sym.signature(source)),
-        .class, .@"struct", .@"enum", .interface, .import, .macro, .module => "",
-        else => valueSlice(sym.signature(source), sym.name),
+    const is_value = switch (sym.kind) {
+        .function, .method => false,
+        .class, .@"struct", .@"enum", .interface, .import, .macro, .module => return,
+        else => true,
     };
+    const suffix = if (is_value)
+        valueSlice(sym.signature(source), sym.name)
+    else
+        paramSlice(sym.signature(source));
     if (suffix.len == 0) return;
     try w.writeByte(' ');
-    try writeCollapsed(w, suffix, max_sig_len);
+    // A const/var initializer (comptime map, keyword set, big array) is noise
+    // when you only want the shape, so values get a much shorter cap than a
+    // function signature — enough to show the type/constructor head, not the
+    // whole literal. `outline -v full` still shows the complete definition.
+    const cap: usize = if (is_value) max_value_len else max_sig_len;
+    try writeCollapsed(w, suffix, cap);
 }
 
 /// The parameter/return portion of a function signature (from the first `(`).
@@ -103,7 +133,7 @@ fn valueSlice(sig: []const u8, name: []const u8) []const u8 {
     return rest;
 }
 
-fn writeLocation(w: *Writer, idx: *const Index, sym: Symbol, show_path: bool) !void {
+fn writeLocation(w: *Writer, idx: *const Index, sym: Symbol, source: []const u8, show_path: bool) !void {
     try w.writeAll("  ");
     if (show_path) {
         try w.writeAll(idx.graph.files[sym.file].path);
@@ -111,7 +141,11 @@ fn writeLocation(w: *Writer, idx: *const Index, sym: Symbol, show_path: bool) !v
     } else {
         try w.writeByte('L');
     }
+    // A line range (`start-end`) lets a reader open exactly the definition; a
+    // single-line symbol stays a bare line number.
+    const end = sym.endLine(source);
     try w.print("{d}", .{sym.line});
+    if (end > sym.line) try w.print("-{d}", .{end});
 }
 
 /// Collapse runs of whitespace to single spaces, capping length with an ellipsis.
