@@ -14,11 +14,25 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_file.interface;
 
+    var stderr_buffer: [4 * 1024]u8 = undefined;
+    var stderr_file: std.Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    const err_out = &stderr_file.interface;
+
     const argv = try init.minimal.args.toSlice(arena);
-    const parsed = cli.parse(argv[1..]) catch {
+    const args = argv[1..];
+    // Bare `navgraph` (no args) prints help and succeeds.
+    if (args.len == 0) {
         try cli.usage(out);
         try out.flush();
         return;
+    }
+    const parsed = cli.parse(args) catch |err| {
+        // A malformed invocation is a usage error: explain it on stderr and exit
+        // non-zero so callers (agents, scripts) can detect the failure.
+        try err_out.print("navgraph: {s}\n\n", .{cli.reason(err)});
+        try cli.usage(err_out);
+        try err_out.flush();
+        std.process.exit(2);
     };
     if (parsed.command == .help) {
         try cli.usage(out);

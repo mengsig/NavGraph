@@ -67,6 +67,9 @@ pub const Config = struct {
     string_delims: []const u8,
     /// Whether backtick template strings are supported (js/ts).
     template_strings: bool,
+    /// Marker that begins a to-end-of-line string literal (Zig's `\\`). Empty
+    /// means none. Prevents string contents being tokenized as code.
+    line_string: []const u8 = "",
     doc_style: DocStyle,
     /// True for indentation-scoped languages (python) vs brace-scoped.
     brace_scoped: bool,
@@ -81,6 +84,7 @@ pub fn configFor(language: Language) Config {
             .block_close = "",
             .string_delims = "\"'",
             .template_strings = false,
+            .line_string = "\\\\",
             .doc_style = .zig_slashes,
             .brace_scoped = true,
         },

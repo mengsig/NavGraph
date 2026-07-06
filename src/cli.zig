@@ -56,6 +56,16 @@ pub fn usage(w: *std.Io.Writer) !void {
     try w.writeAll(usage_text);
 }
 
+/// A short human explanation for a parse failure, shown before the usage text.
+pub fn reason(err: ParseError) []const u8 {
+    return switch (err) {
+        error.Usage => "expected a command and (for most commands) an argument",
+        error.UnknownFlag => "unknown flag",
+        error.MissingValue => "a flag is missing its value (use `-d 2`, not `-d2`)",
+        error.BadValue => "invalid flag value (expected a number or a known keyword)",
+    };
+}
+
 /// Parse argv (excluding the program name at index 0).
 pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
     if (args.len == 0) return error.Usage;

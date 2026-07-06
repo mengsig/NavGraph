@@ -58,6 +58,8 @@ const Builder = struct {
     stats: std.ArrayList(cache.FileStat),
     /// Loaded on-disk cache of previously parsed files (null when disabled).
     store: ?cache.Store,
+    /// Count of files served from `store` (vs. freshly parsed) this build.
+    cache_hits: u32,
 };
 
 /// Build an index rooted at `root_path` (relative to cwd or absolute). When
@@ -85,6 +87,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .symbols = .empty,
         .stats = .empty,
         .store = if (use_cache) cache.load(gpa, io, root_dir) else null,
+        .cache_hits = 0,
     };
     defer b.files.deinit(gpa);
     defer b.symbols.deinit(gpa);
@@ -111,8 +114,18 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     resolveReferences(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
-    if (use_cache) persistCache(&b, &idx);
+    if (use_cache and cacheStale(&b)) persistCache(&b, &idx);
     return idx;
+}
+
+/// Whether the on-disk cache differs from what we just built. When every file
+/// was a cache hit and no file was added or removed (hit count == file count ==
+/// stored entry count) the cache is already current, so we skip rewriting it —
+/// avoiding a full-repo-sized write on every no-op query.
+fn cacheStale(b: *const Builder) bool {
+    const store = b.store orelse return true; // no prior cache: must write
+    const files = b.files.items.len;
+    return b.cache_hits != files or store.entries.count() != files;
 }
 
 /// Best-effort cache write. A failure here (e.g. a read-only tree) must never
@@ -167,6 +180,7 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
         if (s.restore(b.arena, rel_path, stat)) |hit| {
             std.debug.assert(hit.text.len == stat.size);
             try appendFile(b, rel_path, lang, hit.text, hit.symbols, stat);
+            b.cache_hits += 1;
             return;
         }
     }

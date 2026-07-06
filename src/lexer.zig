@@ -96,6 +96,10 @@ pub fn tokenize(
             continue;
         }
         if (try lexComment(&lx, out)) continue;
+        if (cfg.line_string.len != 0 and lx.matches(cfg.line_string)) {
+            try lexLineString(&lx, out);
+            continue;
+        }
         if (isStringDelim(cfg, c) or (cfg.template_strings and c == '`')) {
             try lexString(&lx, out, c);
             continue;
@@ -166,6 +170,25 @@ fn lexBlockComment(lx: *Lexer, out: *std.ArrayList(Token)) !void {
         .line = line,
         .col = col,
         .is_doc = is_doc,
+    });
+}
+
+/// Lex a to-end-of-line string literal (Zig `\\...`). Each such line becomes one
+/// `.string` token so its contents are never mistaken for code (e.g. a route
+/// decorator embedded in a test fixture must not be parsed as a real route).
+fn lexLineString(lx: *Lexer, out: *std.ArrayList(Token)) !void {
+    const start = lx.pos;
+    const line = lx.line;
+    const col = lx.col;
+    while (lx.pos < lx.source.len and lx.peek() != '\n') lx.advance();
+    std.debug.assert(lx.pos >= start);
+    try out.append(lx.gpa, .{
+        .kind = .string,
+        .start = start,
+        .end = lx.pos,
+        .line = line,
+        .col = col,
+        .is_doc = false,
     });
 }
 
@@ -261,4 +284,30 @@ test "tokenize skips strings and comments" {
     }
     try std.testing.expect(saw_bar);
     try std.testing.expect(idents > 0);
+}
+
+test "tokenize treats Zig multiline strings as strings, not code" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.zig);
+    // A `\\` line-string embedding code-shaped text (as test fixtures do).
+    const src =
+        \\const fixture =
+        \\    \\pub fn ghost() void {}
+        \\    \\@app.get("/phantom")
+        \\;
+        \\pub fn real() void {}
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+
+    var saw_real = false;
+    for (toks.items) |t| {
+        if (t.kind != .identifier) continue;
+        // Names living only inside the multiline string must not surface.
+        try std.testing.expect(!std.mem.eql(u8, t.text(src), "ghost"));
+        try std.testing.expect(!std.mem.eql(u8, t.text(src), "phantom"));
+        if (std.mem.eql(u8, t.text(src), "real")) saw_real = true;
+    }
+    try std.testing.expect(saw_real);
 }
