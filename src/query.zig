@@ -228,6 +228,205 @@ fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
     }
 }
 
+/// Show `name`'s callees and callers together (each one level deep) — a quick
+/// "what's around this symbol" view without choosing a direction.
+pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.neighbors(w, idx, name, opts);
+    var buf: [64]SymbolId = undefined;
+    const ids = resolveIds(idx, name, &buf);
+    if (ids.len == 0) {
+        try w.print("(no symbol named '{s}')\n", .{name});
+        return;
+    }
+    for (ids) |id| {
+        try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 0, true);
+        try w.writeAll("  ↓ calls\n");
+        try renderCallees(w, idx, id, opts, 2);
+        try w.writeAll("  ↑ callers\n");
+        for (idx.callersOf(id)) |cid| {
+            try render.symbol(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true);
+        }
+    }
+}
+
+/// Render the resolved callees of `id` at `indent`, listing unresolved names on
+/// a trailing `~ ext:` line (mirrors the `calls` tree's leaf formatting).
+fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, indent: usize) !void {
+    const sym = idx.graph.symbols[id];
+    var externals: std.ArrayList(u8) = .empty;
+    defer externals.deinit(idx.gpa);
+    for (sym.refs) |ref| {
+        if (ref.kind != .call and ref.kind != .route_call) continue;
+        if (ref.target != invalid and (!opts.strict or ref.exact)) {
+            try render.symbol(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true);
+        } else {
+            if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
+            try externals.appendSlice(idx.gpa, ref.name);
+        }
+    }
+    if (externals.items.len != 0) {
+        try indentLine(w, indent, "~ ext: ");
+        try w.writeAll(externals.items);
+        try w.writeByte('\n');
+    }
+}
+
+/// List functions/methods that have no callers — candidate dead code. Exported
+/// symbols may legitimately be external API, so they are marked, not hidden.
+pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.unused(w, idx, filter, opts);
+    var shown: u32 = 0;
+    for (idx.graph.symbols) |sym| {
+        if (!isDeadCandidate(idx, sym, filter)) continue;
+        try render.symbol(w, idx, sym, opts.verbosity, 0, true);
+        if (sym.exported) try w.writeAll("  (exported — may be public API)\n") else try w.writeByte('\n');
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    if (shown == 0) try w.print("(no unused functions under '{s}')\n", .{filter});
+}
+
+/// A symbol worth reporting as possibly-unused: a callable, in-scope of the
+/// filter, with zero callers and not an obvious entry point.
+pub fn isDeadCandidate(idx: *const Index, sym: model.Symbol, filter: []const u8) bool {
+    if (sym.kind != .function and sym.kind != .method) return false;
+    if (idx.callersOf(sym.id).len != 0) return false;
+    if (std.mem.eql(u8, sym.name, "main")) return false;
+    return matchesFilter(idx.graph.files[sym.file].path, filter);
+}
+
+/// List, per in-scope file, the local modules it imports (resolved edges only).
+pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.listImports(w, idx, filter, opts);
+    var any = false;
+    for (idx.graph.files) |file| {
+        const imps = idx.importsOf(file.id);
+        if (imps.len == 0 or !matchesFilter(file.path, filter)) continue;
+        any = true;
+        try w.print("# {s}\n", .{file.path});
+        for (imps) |imp| {
+            try w.print("  → {s}", .{idx.graph.files[imp.target].path});
+            if (imp.binding.len != 0) try w.print("  ({s})", .{imp.binding});
+            try w.writeByte('\n');
+        }
+    }
+    if (!any) try w.print("(no local imports under '{s}')\n", .{filter});
+}
+
+/// List files that import the file(s) matching `path` — reverse dependencies.
+pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.listImporters(w, idx, path, opts);
+    var any = false;
+    for (idx.graph.files) |target| {
+        if (!matchesFilter(target.path, path)) continue;
+        var printed_header = false;
+        for (idx.graph.files) |src| {
+            if (!fileImports(idx, src.id, target.id)) continue;
+            if (!printed_header) {
+                try w.print("# {s} ← imported by\n", .{target.path});
+                printed_header = true;
+                any = true;
+            }
+            try w.print("  {s}\n", .{src.path});
+        }
+    }
+    if (!any) try w.print("(no importers of '{s}')\n", .{path});
+}
+
+fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool {
+    for (idx.importsOf(src)) |imp| if (imp.target == target) return true;
+    return false;
+}
+
+/// Print the shortest call path from `from_name` to `to_name` (BFS over call
+/// edges), or a "no path" note. Renders the chain as an indented cascade.
+pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.shortestPath(w, idx, from_name, to_name, opts);
+    var fbuf: [64]SymbolId = undefined;
+    var tbuf: [64]SymbolId = undefined;
+    const chain = try shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf);
+    defer idx.gpa.free(chain);
+    if (chain.len == 0) {
+        try w.print("(no call path from '{s}' to '{s}')\n", .{ from_name, to_name });
+        return;
+    }
+    for (chain, 0..) |id, indent| {
+        const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
+        try render.symbol(w, idx, idx.graph.symbols[id], v, indent, true);
+    }
+}
+
+/// The shortest call path from `from_name` to `to_name` as source→…→target
+/// symbol ids (gpa-owned; caller frees). Empty when either name is unknown or
+/// no path exists. `fbuf`/`tbuf` are scratch for name resolution.
+pub fn shortestPathIds(
+    idx: *const Index,
+    from_name: []const u8,
+    to_name: []const u8,
+    fbuf: []SymbolId,
+    tbuf: []SymbolId,
+) ![]SymbolId {
+    const from_ids = resolveIds(idx, from_name, fbuf);
+    const to_ids = resolveIds(idx, to_name, tbuf);
+    if (from_ids.len == 0 or to_ids.len == 0) return idx.gpa.alloc(SymbolId, 0);
+    const prev = try bfsPrev(idx, from_ids, to_ids, false);
+    defer idx.gpa.free(prev);
+    const end = firstReached(prev, to_ids) orelse return idx.gpa.alloc(SymbolId, 0);
+    return reconstruct(idx.gpa, prev, end);
+}
+
+/// Walk `prev` from `end` back to its source, returning the path source-first.
+fn reconstruct(gpa: std.mem.Allocator, prev: []const SymbolId, end: SymbolId) ![]SymbolId {
+    var chain: std.ArrayList(SymbolId) = .empty;
+    defer chain.deinit(gpa);
+    var cur = end;
+    while (true) {
+        try chain.append(gpa, cur);
+        if (prev[cur] == cur) break; // reached a source
+        cur = prev[cur];
+    }
+    std.mem.reverse(SymbolId, chain.items);
+    return chain.toOwnedSlice(gpa);
+}
+
+/// BFS from all `from_ids` over call edges; returns a `prev` array where
+/// `prev[n]` is the predecessor of `n` (self for sources, `invalid` if unseen).
+fn bfsPrev(idx: *const Index, from_ids: []const SymbolId, to_ids: []const SymbolId, strict: bool) ![]SymbolId {
+    const n = idx.graph.symbols.len;
+    var prev = try idx.gpa.alloc(SymbolId, n);
+    errdefer idx.gpa.free(prev);
+    @memset(prev, invalid);
+    var queue = std.array_list.Managed(SymbolId).init(idx.gpa);
+    defer queue.deinit();
+    for (from_ids) |s| {
+        prev[s] = s; // sources mark themselves as seen
+        try queue.append(s);
+    }
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        if (contains(to_ids, cur) and !contains(from_ids, cur)) break;
+        for (idx.graph.symbols[cur].refs) |ref| {
+            if (ref.kind != .call and ref.kind != .route_call) continue;
+            if (ref.target == invalid or (strict and !ref.exact)) continue;
+            if (prev[ref.target] != invalid) continue;
+            prev[ref.target] = cur;
+            try queue.append(ref.target);
+        }
+    }
+    return prev;
+}
+
+fn firstReached(prev: []const SymbolId, to_ids: []const SymbolId) ?SymbolId {
+    for (to_ids) |t| if (prev[t] != invalid) return t;
+    return null;
+}
+
+fn contains(ids: []const SymbolId, id: SymbolId) bool {
+    for (ids) |x| if (x == id) return true;
+    return false;
+}
+
 fn headerVerbosity(v: render.Verbosity) render.Verbosity {
     return if (v == .full) .sig else v;
 }
@@ -273,6 +472,44 @@ fn resolveQualified(idx: *const Index, parent: []const u8, child: []const u8, bu
     return buf[0..n];
 }
 
-test "resolve handles qualified names" {
-    try std.testing.expect(true);
+test "shortest path and dead-code detection over a call chain" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "chain.zig", .data = 
+        \\pub fn alpha() void {
+        \\    beta();
+        \\}
+        \\pub fn beta() void {
+        \\    gamma();
+        \\}
+        \\pub fn gamma() void {}
+        \\pub fn orphan() void {}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // alpha -> beta -> gamma is the shortest path.
+    var fbuf: [8]SymbolId = undefined;
+    var tbuf: [8]SymbolId = undefined;
+    const chain = try shortestPathIds(&idx, "alpha", "gamma", &fbuf, &tbuf);
+    defer testing.allocator.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+    try testing.expectEqual(idx.lookup("alpha")[0], chain[0]);
+    try testing.expectEqual(idx.lookup("gamma")[0], chain[2]);
+
+    // No reverse path gamma -> alpha.
+    const none = try shortestPathIds(&idx, "gamma", "alpha", &fbuf, &tbuf);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // `orphan` is called by nobody → dead candidate; `gamma` is called → not.
+    const orphan = idx.graph.symbols[idx.lookup("orphan")[0]];
+    const gamma = idx.graph.symbols[idx.lookup("gamma")[0]];
+    try testing.expect(isDeadCandidate(&idx, orphan, ""));
+    try testing.expect(!isDeadCandidate(&idx, gamma, ""));
 }

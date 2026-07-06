@@ -12,11 +12,17 @@ const language = @import("language.zig");
 const parser = @import("parser.zig");
 const api = @import("api.zig");
 const cache = @import("cache.zig");
+const imports = @import("imports.zig");
 
 const SymbolId = model.SymbolId;
 const FileId = model.FileId;
 const invalid = model.invalid_symbol;
 const max_file_bytes: usize = 8 * 1024 * 1024;
+
+/// An import binding within a file: `binding` (e.g. `api`) resolves to file
+/// `target`. `binding` is "" for imports that only contribute a module edge
+/// (named/`from` imports), which still populate the import dependency graph.
+pub const FileImport = struct { binding: []const u8, target: FileId };
 
 pub const Index = struct {
     gpa: std.mem.Allocator,
@@ -24,6 +30,8 @@ pub const Index = struct {
     graph: model.Graph,
     by_name: std.StringHashMapUnmanaged([]SymbolId),
     callers: [][]SymbolId,
+    /// Per-file resolved imports (arena-owned), indexed by `FileId`.
+    file_imports: [][]const FileImport,
     root: []const u8,
 
     pub fn deinit(self: *Index) void {
@@ -44,6 +52,12 @@ pub const Index = struct {
     pub fn callersOf(self: *const Index, id: SymbolId) []const SymbolId {
         std.debug.assert(id < self.callers.len);
         return self.callers[id];
+    }
+
+    /// Imports declared by file `id` (outgoing module edges).
+    pub fn importsOf(self: *const Index, id: FileId) []const FileImport {
+        std.debug.assert(id < self.file_imports.len);
+        return self.file_imports[id];
     }
 };
 
@@ -108,9 +122,11 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .graph = graph,
         .by_name = .empty,
         .callers = &.{},
+        .file_imports = &.{},
         .root = try arena.dupe(u8, root_path),
     };
     try buildNameIndex(&idx);
+    try buildImportTable(&idx);
     resolveReferences(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
@@ -233,6 +249,7 @@ fn appendFile(
             .exported = p.exported,
             .refs = p.refs,
             .bindings = p.bindings,
+            .import_path = p.import_path,
         });
     }
     try b.files.append(b.gpa, .{
@@ -266,6 +283,51 @@ fn buildNameIndex(idx: *Index) !void {
     }
 }
 
+/// Resolve every file's import statements to target `FileId`s (arena-owned),
+/// building the per-file import table used for module-qualified resolution and
+/// the imports/importers dependency graph.
+fn buildImportTable(idx: *Index) !void {
+    var by_path = std.StringHashMapUnmanaged(FileId){};
+    defer by_path.deinit(idx.gpa);
+    for (idx.graph.files) |f| try by_path.put(idx.gpa, f.path, f.id);
+
+    const a = idx.arena.allocator();
+    const lists = try a.alloc([]const FileImport, idx.graph.files.len);
+    for (idx.graph.files) |f| lists[f.id] = try resolveFileImports(idx, a, f, &by_path);
+    idx.file_imports = lists;
+}
+
+fn resolveFileImports(
+    idx: *const Index,
+    arena: std.mem.Allocator,
+    f: model.SourceFile,
+    by_path: *const std.StringHashMapUnmanaged(FileId),
+) ![]const FileImport {
+    var tmp: std.ArrayList(FileImport) = .empty;
+    defer tmp.deinit(idx.gpa);
+    var i = f.sym_start;
+    while (i < f.sym_end) : (i += 1) {
+        const s = idx.graph.symbols[i];
+        if (s.kind != .import or s.import_path.len == 0) continue;
+        const target = resolveModule(arena, f, s.import_path, by_path) orelse continue;
+        if (target == f.id) continue; // ignore self-imports
+        try tmp.append(idx.gpa, .{ .binding = s.name, .target = target });
+    }
+    return arena.dupe(FileImport, tmp.items);
+}
+
+/// Match a module string to an indexed file via language-aware candidate paths.
+fn resolveModule(
+    arena: std.mem.Allocator,
+    importer: model.SourceFile,
+    module: []const u8,
+    by_path: *const std.StringHashMapUnmanaged(FileId),
+) ?FileId {
+    const cands = imports.candidates(arena, importer.path, module, importer.language) catch return null;
+    for (cands) |c| if (by_path.get(c)) |fid| return fid;
+    return null;
+}
+
 fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
@@ -283,16 +345,50 @@ fn resolveReferences(idx: *Index) void {
 /// A bare `name(...)` falls back to a heuristic global name match.
 fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
     if (ref.kind == .route_call) return; // resolved later by linkRoutes
-    if (ref.qualifier.len != 0) {
-        const type_name = receiverType(idx, from, ref.qualifier) orelse return;
-        ref.target = memberOf(idx, type_name, ref.name);
-        ref.exact = ref.target != invalid;
-        return;
-    }
+    if (ref.qualifier.len != 0) return resolveQualified(idx, from, ref);
     const candidates = idx.by_name.get(ref.name) orelse return;
     const choice = chooseTarget(idx, from, candidates);
     ref.target = choice.id;
     ref.exact = choice.confident;
+}
+
+/// Resolve a member access `recv.name`: first by the receiver's known type
+/// (self/this or a local binding), then by treating `recv` as an imported
+/// module bound to a file. If neither applies, leave it external.
+fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    if (receiverType(idx, from, ref.qualifier)) |type_name| {
+        ref.target = memberOf(idx, type_name, ref.name);
+        ref.exact = ref.target != invalid;
+        return;
+    }
+    if (importTarget(idx, from.file, ref.qualifier)) |file_id| {
+        ref.target = topLevelIn(idx, file_id, ref.name);
+        ref.exact = ref.target != invalid;
+    }
+}
+
+/// The file an imported module `binding` refers to inside `file`, if any.
+fn importTarget(idx: *const Index, file: FileId, binding: []const u8) ?FileId {
+    for (idx.importsOf(file)) |imp| {
+        if (imp.binding.len != 0 and std.mem.eql(u8, imp.binding, binding)) return imp.target;
+    }
+    return null;
+}
+
+/// A top-level (non-nested) symbol named `name` in file `file_id`, preferring an
+/// exported one. `invalid` when the file has no such definition.
+fn topLevelIn(idx: *const Index, file_id: FileId, name: []const u8) SymbolId {
+    const f = idx.graph.files[file_id];
+    var fallback: SymbolId = invalid;
+    var i = f.sym_start;
+    while (i < f.sym_end) : (i += 1) {
+        const s = idx.graph.symbols[i];
+        if (s.parent != invalid or s.kind == .import) continue;
+        if (!std.mem.eql(u8, s.name, name)) continue;
+        if (s.exported) return s.id;
+        if (fallback == invalid) fallback = s.id;
+    }
+    return fallback;
 }
 
 /// Resolve `route_call` references (HTTP client calls) to the `route` symbol
@@ -392,6 +488,93 @@ fn buildCallers(idx: *Index) !void {
         }
     }
     idx.callers = try idx.gpa.dupe([]SymbolId, lists);
+}
+
+test "module-qualified calls resolve through imports" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = 
+        \\pub fn helper(x: i32) i32 {
+        \\    return x;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = 
+        \\const util = @import("util.zig");
+        \\pub fn run() i32 {
+        \\    return util.helper(41);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const helper = idx.lookup("helper")[0];
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    var linked = false;
+    for (run.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "helper")) continue;
+        try testing.expectEqualStrings("util", ref.qualifier);
+        try testing.expectEqual(helper, ref.target); // resolved via import, not name
+        try testing.expect(ref.exact);
+        linked = true;
+    }
+    try testing.expect(linked);
+    // The reverse edge and the import dependency graph both exist.
+    try testing.expectEqual(run.id, idx.callersOf(helper)[0]);
+    const main_file = idx.graph.symbols[run.id].file;
+    try testing.expect(idx.importsOf(main_file).len == 1);
+}
+
+test "qualified call to a same-named function in another module resolves" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = 
+        \\pub fn run() i32 {
+        \\    return 1;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = 
+        \\const util = @import("util.zig");
+        \\pub fn run() i32 {
+        \\    return util.run();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `main.run` calls `util.run` — the shared name must not be dropped as a
+    // self-reference; the qualified edge must point at util's run, not itself.
+    const util_run = qualifiedFileSym(&idx, "util.zig", "run").?;
+    const main_run = qualifiedFileSym(&idx, "main.zig", "run").?;
+    const caller = idx.graph.symbols[main_run];
+    var linked = false;
+    for (caller.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "run")) continue;
+        try testing.expectEqualStrings("util", ref.qualifier);
+        try testing.expectEqual(util_run, ref.target);
+        try testing.expect(ref.target != main_run);
+        linked = true;
+    }
+    try testing.expect(linked);
+}
+
+fn qualifiedFileSym(idx: *const Index, file_suffix: []const u8, name: []const u8) ?SymbolId {
+    for (idx.graph.symbols) |s| {
+        if (!std.mem.eql(u8, s.name, name)) continue;
+        if (std.mem.endsWith(u8, idx.graph.files[s.file].path, file_suffix)) return s.id;
+    }
+    return null;
 }
 
 test "incremental cache: second build restores identical symbols from disk" {

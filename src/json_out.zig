@@ -219,6 +219,128 @@ fn routeObject(w: *Writer, idx: *const Index, route: Symbol) !void {
     try w.writeAll("]}");
 }
 
+/// Neighbors: `{symbol, callees:[...], callers:[...]}` per resolved id.
+pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+    var buf: [64]SymbolId = undefined;
+    const ids = query.resolveIds(idx, name, &buf);
+    try w.writeByte('[');
+    for (ids, 0..) |id, k| {
+        if (k != 0) try w.writeByte(',');
+        const sym = idx.graph.symbols[id];
+        try nodeHead(w, idx, sym);
+        try w.writeAll(",\"callees\":[");
+        try calleeArray(w, idx, sym, opts.strict);
+        try w.writeAll("],\"callers\":[");
+        for (idx.callersOf(id), 0..) |cid, j| {
+            if (j != 0) try w.writeByte(',');
+            try nodeHead(w, idx, idx.graph.symbols[cid]);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]\n");
+}
+
+fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
+    var wrote: u32 = 0;
+    for (sym.refs) |ref| {
+        if (ref.kind != .call and ref.kind != .route_call) continue;
+        if (ref.target == invalid or (strict and !ref.exact)) continue;
+        if (wrote != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[ref.target]);
+        try w.writeByte('}');
+        wrote += 1;
+    }
+}
+
+/// Unused: a JSON array of zero-caller function/method symbols.
+pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    var shown: u32 = 0;
+    try w.writeByte('[');
+    for (idx.graph.symbols) |sym| {
+        if (!query.isDeadCandidate(idx, sym, filter)) continue;
+        if (shown != 0) try w.writeByte(',');
+        try symbolObject(w, idx, sym, opts.verbosity);
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    try w.writeAll("]\n");
+}
+
+/// Imports: `{file, imports:[{target, binding}]}` per in-scope file.
+pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    _ = opts;
+    var first = true;
+    try w.writeByte('[');
+    for (idx.graph.files) |file| {
+        const imps = idx.importsOf(file.id);
+        if (imps.len == 0 or !query.matchesFilter(file.path, filter)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"file\":");
+        try writeString(w, file.path);
+        try w.writeAll(",\"imports\":[");
+        for (imps, 0..) |imp, k| {
+            if (k != 0) try w.writeByte(',');
+            try w.writeAll("{\"target\":");
+            try writeString(w, idx.graph.files[imp.target].path);
+            try w.writeAll(",\"binding\":");
+            try writeString(w, imp.binding);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]\n");
+}
+
+/// Importers: `{file, importers:[path...]}` per file matching `path`.
+pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !void {
+    _ = opts;
+    var first = true;
+    try w.writeByte('[');
+    for (idx.graph.files) |target| {
+        if (!query.matchesFilter(target.path, path)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"file\":");
+        try writeString(w, target.path);
+        try w.writeAll(",\"importers\":[");
+        var wrote: u32 = 0;
+        for (idx.graph.files) |src| {
+            if (!fileImports(idx, src.id, target.id)) continue;
+            if (wrote != 0) try w.writeByte(',');
+            try writeString(w, src.path);
+            wrote += 1;
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]\n");
+}
+
+fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool {
+    for (idx.importsOf(src)) |imp| if (imp.target == target) return true;
+    return false;
+}
+
+/// Path: a JSON array of the symbols on the shortest call path (empty if none).
+pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !void {
+    _ = opts;
+    var fbuf: [64]SymbolId = undefined;
+    var tbuf: [64]SymbolId = undefined;
+    const chain = query.shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf) catch {
+        try w.writeAll("[]\n");
+        return;
+    };
+    defer idx.gpa.free(chain);
+    try w.writeByte('[');
+    for (chain, 0..) |id, k| {
+        if (k != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[id]);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]\n");
+}
+
 // ---------------------------------------------------------------------------
 // Shared object writers
 // ---------------------------------------------------------------------------

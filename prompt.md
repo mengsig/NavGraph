@@ -19,6 +19,10 @@ Languages: Zig, C/C++, Python, JavaScript, TypeScript, TSX.
 | Who calls/uses X (impact of changing it)            | `navgraph callers <name> -d <depth>` |
 | Find a symbol by name fragment across the repo      | `navgraph search <fragment>` |
 | The HTTP API surface + who calls each endpoint       | `navgraph routes [filter]` |
+| Callees **and** callers of X in one view             | `navgraph neighbors <name>` |
+| Possible dead code (functions with no callers)       | `navgraph unused [filter]` |
+| What a file imports / who imports a file             | `navgraph imports [filter]` · `navgraph importers <file>` |
+| Shortest call path from A to B                       | `navgraph path <A> <B>` |
 
 ## Flags
 
@@ -96,5 +100,11 @@ navgraph callers get_user       # who (any language) calls this endpoint
   left external rather than guessed — so a stdlib `x.deinit()` no longer
   resolves to a same-named project symbol. Bare `name()` calls still use a
   heuristic global match (shown by default; hidden under `--strict`).
+- **Module-qualified calls resolve** through imports: `mod.func()` binds to the
+  imported file's `func` (Zig `@import`, JS/TS relative imports, Python
+  `import mod`). So `callers`, `unused`, and `imports`/`importers` see across
+  files. Calls on values whose type isn't tracked (e.g. an enum method
+  `x.tag()`) still fall through to external, so `unused` can list a used-but-
+  untracked method — exported entries are marked as possible public API.
 - Callee trees follow **calls** only; `callers` includes all references
   (calls + reads), so it's the right tool for "who uses this variable/type".

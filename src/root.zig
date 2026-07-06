@@ -5,6 +5,7 @@ pub const language = @import("language.zig");
 pub const lexer = @import("lexer.zig");
 pub const model = @import("model.zig");
 pub const api = @import("api.zig");
+pub const imports = @import("imports.zig");
 pub const parser = @import("parser.zig");
 pub const index = @import("index.zig");
 pub const cache = @import("cache.zig");

@@ -33,6 +33,8 @@ pub const ParsedSymbol = struct {
     parent_local: ?u32,
     refs: []Reference,
     bindings: []const Binding = &.{},
+    /// For an `import` symbol: the raw module string (see `model.Symbol`).
+    import_path: []const u8 = "",
 };
 
 /// References plus local bindings collected from one symbol body.
@@ -329,9 +331,12 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (t.kind != .identifier) continue;
         const name = t.text(ctx.source);
         if (name.len < 2 or kw.has(name)) continue;
-        if (std.mem.eql(u8, name, self_name)) continue;
+        const qualifier = memberQualifier(ctx, i, lo);
+        // Skip only a *bare* self-reference (recursion noise). A qualified call
+        // like `other.foo()` from inside `foo` is a real edge to keep.
+        if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
-        try recordRef(ctx, &refs, &seen, name, memberQualifier(ctx, i, lo), t.line, is_call);
+        try recordRef(ctx, &refs, &seen, name, qualifier, t.line, is_call);
     }
     return .{
         .refs = try ctx.arena.dupe(Reference, refs.items),
@@ -629,6 +634,13 @@ fn parseZigConst(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, expo
 
     const end_i = if (semi_i != sentinel) semi_i else name_i;
     const span_end = ctx.toks[end_i].end;
+
+    // `const NAME = @import("PATH");` — a module binding, not a plain const.
+    if (zigImportPath(ctx, eq_i, hi)) |mod_path| {
+        _ = try emit(ctx, importSymbol(ctx.textOf(name_i), mod_path, ctx.toks[name_i].line, span_start, span_end));
+        return tokenAfterOffset(ctx, span_end, hi);
+    }
+
     const is_fn_val = eq_i != sentinel and eq_i + 1 < hi and ctx.identEql(eq_i + 1, "fn");
     const kind: SymbolKind = if (is_fn_val) .function else if (ctx.identEql(kw_i, "const")) .constant else .variable;
     _ = try emit(ctx, .{
@@ -644,6 +656,32 @@ fn parseZigConst(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, expo
         .refs = &.{},
     });
     return tokenAfterOffset(ctx, span_end, hi);
+}
+
+/// If the RHS at `= @import("PATH")` is a Zig import, return `PATH`.
+fn zigImportPath(ctx: *const Ctx, eq_i: u32, hi: u32) ?[]const u8 {
+    if (eq_i == sentinel or eq_i + 3 >= hi) return null;
+    if (!ctx.identEql(eq_i + 1, "@import")) return null;
+    if (!ctx.isPunct(eq_i + 2, '(') or ctx.toks[eq_i + 3].kind != .string) return null;
+    return stripQuotes(ctx.textOf(eq_i + 3));
+}
+
+/// Build a `.import` ParsedSymbol binding `name` to module `path`.
+fn importSymbol(name: []const u8, path: []const u8, line: u32, span_start: u32, span_end: u32) ParsedSymbol {
+    std.debug.assert(span_start <= span_end);
+    return .{
+        .name = name,
+        .kind = .import,
+        .line = line,
+        .span_start = span_start,
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = false,
+        .parent_local = null,
+        .refs = &.{},
+        .import_path = path,
+    };
 }
 
 const ZigContainer = struct { open: u32, kind: SymbolKind };
@@ -930,20 +968,24 @@ fn parseJsImport(ctx: *Ctx, i: u32, hi: u32) !u32 {
         if (ctx.toks[j].kind == .string) module = stripQuotes(ctx.textOf(j));
     }
     if (module.len != 0) {
-        _ = try emit(ctx, .{
-            .name = module,
-            .kind = .import,
-            .line = line,
-            .span_start = lineStartOffset(ctx, i),
-            .span_end = ctx.toks[j - 1].end,
-            .sig_end = ctx.toks[j - 1].end,
-            .doc = "",
-            .exported = false,
-            .parent_local = null,
-            .refs = &.{},
-        });
+        const binding = jsImportBinding(ctx, i, j);
+        _ = try emit(ctx, importSymbol(binding, module, line, lineStartOffset(ctx, i), ctx.toks[j - 1].end));
     }
     return j;
+}
+
+/// The namespace/default binding of an ES import (`import X ...` or
+/// `import * as X ...`), used to resolve `X.member()`. Named imports
+/// (`import { a } ...`) are called bare, so they need no binding here → "".
+fn jsImportBinding(ctx: *const Ctx, import_i: u32, end_j: u32) []const u8 {
+    const first = import_i + 1;
+    if (first >= end_j) return "";
+    // `import * as NAME from ...`
+    if (ctx.isPunct(first, '*') and first + 2 < end_j and ctx.identEql(first + 1, "as") and
+        ctx.toks[first + 2].kind == .identifier) return ctx.textOf(first + 2);
+    // `import NAME from ...` (default) — a leading identifier, not `{`.
+    if (ctx.toks[first].kind == .identifier and !ctx.identEql(first, "from")) return ctx.textOf(first);
+    return "";
 }
 
 fn parseJsDecl(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !u32 {
@@ -1207,6 +1249,8 @@ fn parsePython(ctx: *Ctx) !void {
         } else if (ctx.identEql(i, "class")) {
             const idx = try parsePyClass(ctx, i, hi, parent);
             if (idx != sentinel) try stack.append(ctx.gpa, .{ .indent = indent, .local_idx = idx, .is_class = true });
+        } else if (ctx.identEql(i, "import") or ctx.identEql(i, "from")) {
+            try parsePyImport(ctx, i, hi);
         } else if (isPyKeyword(ctx, i)) {
             continue;
         } else {
@@ -1218,6 +1262,53 @@ fn parsePython(ctx: *Ctx) !void {
 
 fn isPyKeyword(ctx: *const Ctx, i: u32) bool {
     return py_keywords.has(ctx.textOf(i));
+}
+
+const PyModule = struct { path: []const u8, after: u32 };
+
+/// A dotted module path `a.b.c` starting at token `start` (same line), plus the
+/// token index just past it. Null when `start` is not an identifier.
+fn pyModulePath(ctx: *const Ctx, start: u32, hi: u32, line: u32) ?PyModule {
+    if (start >= hi or ctx.toks[start].line != line or ctx.toks[start].kind != .identifier) return null;
+    var last = start;
+    while (last + 2 < hi and ctx.isPunct(last + 1, '.') and
+        ctx.toks[last + 2].kind == .identifier and ctx.toks[last + 2].line == line) : (last += 2)
+    {}
+    return .{ .path = ctx.source[ctx.toks[start].start..ctx.toks[last].end], .after = last + 1 };
+}
+
+/// Emit `.import` symbols for `import a[, b as c]` and `from mod import ...`.
+/// Named `from` targets are bare-callable, so only the module edge is recorded.
+fn parsePyImport(ctx: *Ctx, i: u32, hi: u32) !void {
+    const line = ctx.toks[i].line;
+    const span_start = lineStartOffset(ctx, i);
+    if (ctx.identEql(i, "from")) {
+        const m = pyModulePath(ctx, i + 1, hi, line) orelse return;
+        _ = try emit(ctx, importSymbol("", m.path, line, span_start, ctx.toks[m.after - 1].end));
+        return;
+    }
+    var j = i + 1;
+    while (j < hi and ctx.toks[j].line == line) {
+        const m = pyModulePath(ctx, j, hi, line) orelse break;
+        const bind = pyImportBinding(ctx, m, hi);
+        _ = try emit(ctx, importSymbol(bind.name, m.path, line, span_start, ctx.toks[m.after - 1].end));
+        j = bind.after;
+        while (j < hi and ctx.toks[j].line == line and !ctx.isPunct(j, ',')) j += 1;
+        if (j >= hi or !ctx.isPunct(j, ',')) break;
+        j += 1;
+    }
+}
+
+const PyBinding = struct { name: []const u8, after: u32 };
+
+/// The name a Python `import` binds: an explicit `as ALIAS`, else the module
+/// itself when it is a single (non-dotted) segment, else "" (dotted).
+fn pyImportBinding(ctx: *const Ctx, m: PyModule, hi: u32) PyBinding {
+    if (m.after + 1 < hi and ctx.identEql(m.after, "as") and ctx.toks[m.after + 1].kind == .identifier) {
+        return .{ .name = ctx.textOf(m.after + 1), .after = m.after + 2 };
+    }
+    const dotted = std.mem.indexOfScalar(u8, m.path, '.') != null;
+    return .{ .name = if (dotted) "" else m.path, .after = m.after };
 }
 
 fn popPyScopes(stack: *std.ArrayList(PyScope), indent: u32) void {
@@ -1242,11 +1333,16 @@ fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_met
     if (def_i + 1 >= hi or ctx.toks[def_i + 1].kind != .identifier) return sentinel;
     const name_i = def_i + 1;
     const indent = ctx.toks[start_i].col;
-    const term = pyBlockEnd(ctx, start_i, indent, hi);
-    const span_end = if (term < hi) lineStartTrimEnd(ctx, term) else @as(u32, @intCast(ctx.source.len));
+    // Find the signature-terminating colon first (bracket-aware), then measure
+    // the block from the colon's line. A multi-line signature whose closing
+    // paren dedents to the def's column would otherwise end the block early.
     const colon = findNext(ctx, name_i + 1, hi, ':');
+    const block_from = if (colon != sentinel) colon else start_i;
+    const term = pyBlockEnd(ctx, block_from, indent, hi);
+    const span_end = if (term < hi) lineStartTrimEnd(ctx, term) else @as(u32, @intCast(ctx.source.len));
     const sig_end = if (colon != sentinel) ctx.toks[colon].end else ctx.toks[name_i].end;
     const body_lo = if (colon != sentinel) colon + 1 else name_i + 1;
+    std.debug.assert(body_lo <= term);
     const body = try collectRefs(ctx, name_i + 1, body_lo, term, ctx.textOf(name_i), py_keywords);
     return emit(ctx, .{
         .name = ctx.textOf(name_i),
@@ -1267,9 +1363,10 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
     if (start_i + 1 >= hi or ctx.toks[start_i + 1].kind != .identifier) return sentinel;
     const name_i = start_i + 1;
     const indent = ctx.toks[start_i].col;
-    const term = pyBlockEnd(ctx, start_i, indent, hi);
-    const span_end = if (term < hi) lineStartTrimEnd(ctx, term) else @as(u32, @intCast(ctx.source.len));
     const colon = findNext(ctx, name_i + 1, hi, ':');
+    const block_from = if (colon != sentinel) colon else start_i;
+    const term = pyBlockEnd(ctx, block_from, indent, hi);
+    const span_end = if (term < hi) lineStartTrimEnd(ctx, term) else @as(u32, @intCast(ctx.source.len));
     const sig_end = if (colon != sentinel) ctx.toks[colon].end else ctx.toks[name_i].end;
     return emit(ctx, .{
         .name = ctx.textOf(name_i),
@@ -1394,6 +1491,43 @@ test "python: def, class, method, refs" {
         if (std.mem.eql(u8, r.name, "helper")) found = true;
     }
     try testing.expect(found);
+}
+
+test "python: multi-line signature with dedented close paren does not crash" {
+    // Regression: the closing `)` aligned to the def's column used to end the
+    // block before the `:` was seen, producing body_lo > term (lo > hi).
+    const src =
+        \\def combine(
+        \\    x,
+        \\    y,
+        \\):
+        \\    return helper(x, y)
+        \\
+        \\
+        \\class Node(
+        \\    Base,
+        \\):
+        \\    def run(self):
+        \\        return combine(1, 2)
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const combine = findSym(out.items, "combine").?;
+    try testing.expectEqual(SymbolKind.function, combine.kind);
+    const node = findSym(out.items, "Node").?;
+    try testing.expectEqual(SymbolKind.class, node.kind);
+    const run = findSym(out.items, "run").?;
+    try testing.expectEqual(SymbolKind.method, run.kind);
+    var calls_combine = false;
+    for (run.refs) |r| {
+        if (std.mem.eql(u8, r.name, "combine")) calls_combine = true;
+    }
+    try testing.expect(calls_combine);
+    var calls_helper = false;
+    for (combine.refs) |r| {
+        if (std.mem.eql(u8, r.name, "helper")) calls_helper = true;
+    }
+    try testing.expect(calls_helper);
 }
 
 test "js: function, arrow, class method" {

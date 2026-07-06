@@ -5,13 +5,18 @@ const std = @import("std");
 const query = @import("query.zig");
 const render = @import("render.zig");
 
-pub const Command = enum { outline, def, calls, callers, search, routes, help };
+pub const Command = enum {
+    outline, def, calls, callers, search, routes,
+    neighbors, unused, imports, importers, path, help,
+};
 
 pub const Parsed = struct {
     command: Command,
     /// Positional argument: a path (outline), a name (def/calls/callers) or a
     /// pattern (search). Empty when not provided.
     arg: []const u8 = "",
+    /// Second positional (only `path <A> <B>` uses it). Empty otherwise.
+    arg2: []const u8 = "",
     root: []const u8 = ".",
     options: query.Options = .{},
     /// Use the incremental on-disk cache (`.navgraph/cache`). Disabled by
@@ -33,6 +38,11 @@ const usage_text =
     \\  callers <name>     Symbols that call/use <name> (callers), as a tree
     \\  search <pattern>   Find symbols whose name contains <pattern>
     \\  routes [filter]    List HTTP routes and the client calls that hit them
+    \\  neighbors <name>   Callees and callers of <name> in one view
+    \\  unused [filter]    Functions/methods with no callers (possible dead code)
+    \\  imports [filter]   Modules each file imports (local dependency edges)
+    \\  importers <file>   Files that import <file>
+    \\  path <A> <B>       Shortest call path from <A> to <B>
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -49,6 +59,9 @@ const usage_text =
     \\  navgraph def parseZigScope -v full
     \\  navgraph calls build -d 2
     \\  navgraph callers collectRefs
+    \\  navgraph neighbors resolveOne
+    \\  navgraph imports src/main.zig
+    \\  navgraph path parse emit
     \\
 ;
 
@@ -80,12 +93,13 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
             i = try parseFlag(args, i, &result);
         } else if (result.arg.len == 0) {
             result.arg = a;
+        } else if (result.arg2.len == 0 and command == .path) {
+            result.arg2 = a;
         } else {
             return error.Usage; // extra positional
         }
     }
-    const arg_optional = command == .outline or command == .routes;
-    if (!arg_optional and result.arg.len == 0) return error.Usage;
+    if (!hasRequiredArgs(command, result)) return error.Usage;
     return result;
 }
 
@@ -97,11 +111,25 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "callers", Command.callers }, .{ "uses", Command.callers },
         .{ "search", Command.search },   .{ "grep", Command.search },
         .{ "routes", Command.routes },   .{ "api", Command.routes },
+        .{ "neighbors", Command.neighbors }, .{ "near", Command.neighbors },
+        .{ "unused", Command.unused },   .{ "dead", Command.unused },
+        .{ "imports", Command.imports }, .{ "importers", Command.importers },
+        .{ "path", Command.path },
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },
     };
     inline for (map) |e| if (std.mem.eql(u8, s, e[0])) return e[1];
     return null;
+}
+
+/// Whether `command` has the positional arguments it requires. `outline`,
+/// `routes`, `unused` and `imports` accept an optional filter; `path` needs two.
+fn hasRequiredArgs(command: Command, p: Parsed) bool {
+    return switch (command) {
+        .outline, .routes, .unused, .imports => true,
+        .path => p.arg.len != 0 and p.arg2.len != 0,
+        else => p.arg.len != 0,
+    };
 }
 
 /// Parse a flag at index `i`, returning the index of the last token consumed.

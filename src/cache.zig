@@ -23,7 +23,7 @@ const Binding = model.Binding;
 const invalid_local: u32 = std.math.maxInt(u32);
 
 /// Bump the trailing digit whenever the on-disk layout changes.
-const magic = "NGCACHE2";
+const magic = "NGCACHE3";
 const cache_dir = ".navgraph";
 const cache_path = ".navgraph/cache";
 const max_cache_bytes: usize = 256 * 1024 * 1024;
@@ -112,6 +112,7 @@ fn skipSymbol(cur: *Cursor) !void {
     while (f < 5) : (f += 1) _ = try cur.getU32(); // line, span_start, span_end, sig_end, parent_local
     _ = try cur.getU8(); // exported
     _ = try cur.getStr(); // doc
+    _ = try cur.getStr(); // import_path
     const ref_count = try cur.getU32();
     var r: u32 = 0;
     while (r < ref_count) : (r += 1) {
@@ -153,6 +154,7 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
     const parent_raw = try cur.getU32();
     const exported = (try cur.getU8()) != 0;
     const doc = try arena.dupe(u8, try cur.getStr());
+    const import_path = try arena.dupe(u8, try cur.getStr());
     std.debug.assert(span_start <= sig_end and sig_end <= span_end);
     return .{
         .name = name,
@@ -166,6 +168,7 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
         .parent_local = if (parent_raw == invalid_local) null else parent_raw,
         .refs = try readRefs(arena, cur),
         .bindings = try readBindings(arena, cur),
+        .import_path = import_path,
     };
 }
 
@@ -249,6 +252,7 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
     try putU32(gpa, buf, localParent(sym, base));
     try buf.append(gpa, @intFromBool(sym.exported));
     try putStr(gpa, buf, sym.doc);
+    try putStr(gpa, buf, sym.import_path);
     try putU32(gpa, buf, @intCast(sym.refs.len));
     for (sym.refs) |ref| {
         try putStr(gpa, buf, ref.name);

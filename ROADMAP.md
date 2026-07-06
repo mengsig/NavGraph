@@ -22,9 +22,17 @@ not fully captured as edges.
    which removed the dominant false-positive class (e.g. a stdlib `x.deinit()`
    pointing at `Index.deinit`). Each edge carries an `exact` confidence flag and
    `--strict` follows only high-confidence edges.
-   - *Still open:* **import-aware module resolution** — use the recorded `import`
-     edges to bind a qualifier that names an imported module/file to that file's
-     symbols (currently such qualifiers fall through to external).
+
+1a. **Import-aware module resolution.** ✅ *Done.* `.import` symbols now carry
+   the module string (`import_path`) plus the binding name; `src/imports.zig`
+   turns `(importer, module, language)` into candidate repo-relative paths
+   (Zig `@import`, JS/TS relative + extension/`index` resolution, Python dotted
+   and relative imports); `index.buildImportTable` binds each to a `FileId`
+   (`Index.importsOf`). `resolveOne` then resolves `mod.func()` against the
+   imported file's top-level symbols when the receiver type is unknown. This
+   fixed the dominant `callers`/`calls` blind spot — module-qualified calls like
+   `render.symbol(...)` now resolve. (Also fixed a `collectRefs` bug that dropped
+   a qualified call sharing the enclosing function's name.)
 
 2. **Richer edge kinds.** Capture references from signatures/returns
    (type uses beyond params), plus `extends` / `implements` / base classes.
@@ -74,12 +82,15 @@ not fully captured as edges.
 
 ## Tier 4 — Smarter views
 
-8. **New query verbs:**
-   - `path <A> <B>` — shortest call path between two symbols.
-   - `neighbors <name>` — callers + callees in one view.
-   - `unused` — dead code (symbols with no callers).
-   - `imports <file>` / `importers <file>` — module dependency graph.
-   - `changed <gitrev>` — symbols touched since a revision + their blast radius.
+8. **New query verbs.** ✅ *Done.*
+   - `path <A> <B>` — shortest call path between two symbols (BFS). ✅
+   - `neighbors <name>` — callees + callers in one view. ✅
+   - `unused [filter]` — functions/methods with no callers (candidate dead
+     code; exported symbols are marked, not hidden). ✅
+   - `imports [filter]` / `importers <file>` — local module dependency graph,
+     built from the resolved import table. ✅
+   - *Still open:* `changed <gitrev>` — symbols touched since a revision + their
+     blast radius (needs git integration).
 
 9. **Relevance ranking.** PageRank / centrality on the call graph so `search`
    and `outline` surface important symbols first; show fan-in/out counts
@@ -95,8 +106,8 @@ not fully captured as edges.
 
 ## Suggested next step
 
-Tier 1 receiver-type resolution, Tier 2 API linking, and Tier 3 speed/JSON are
-done. Next highest-value: **import-aware module resolution** (Tier 1.1) to
-recover edges through imported module qualifiers, then **new query verbs**
-(Tier 4.8: `path`, `neighbors`, `unused`, `imports`/`importers`) which compose
-directly on the existing graph.
+Tiers 1–4 core items are done (type-scoped + import-aware resolution, API
+linking, cache + JSON, and the new query verbs). Next highest-value:
+**relevance ranking** (Tier 4.9: fan-in/out counts, PageRank on the call graph
+so `search`/`outline` surface important symbols first) and `changed <gitrev>`
+for blast-radius review, then the robustness items (Tier 4.10).

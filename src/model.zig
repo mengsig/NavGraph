@@ -114,6 +114,10 @@ pub const Symbol = struct {
     refs: []Reference,
     /// Local variable -> type-name bindings discovered in the body.
     bindings: []const Binding = &.{},
+    /// For an `import` symbol: the raw module string (`"util.zig"`, `"./api"`,
+    /// `os.path`). Empty for every other kind. `name` holds the binding it is
+    /// imported as, so `import_path` + `name` gives `alias -> module`.
+    import_path: []const u8 = "",
 
     /// The single-line signature slice (declaration up to sig_end), trimmed.
     pub fn signature(self: Symbol, source: []const u8) []const u8 {
