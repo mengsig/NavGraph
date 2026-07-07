@@ -145,6 +145,15 @@ fn lexToken(lx: *Lexer, out: *std.ArrayList(Token)) std.mem.Allocator.Error!void
         try appendSingle(lx, out, .punct);
         return;
     }
+    // Rust lifetimes/labels (`'a`, `'static`) share the `'` that opens a char
+    // literal. A char literal is short and closes fast (`'x'`, `'\n'`); a
+    // lifetime is `'` + identifier with no closing `'`. Emit the `'` as punct in
+    // the lifetime case so the following identifier lexes as code, not a string
+    // that swallows to the next quote.
+    if (cfg.language == .rust and c == '\'' and !isRustCharLiteral(lx)) {
+        try appendSingle(lx, out, .punct);
+        return;
+    }
     if (isStringDelim(cfg, c) or (cfg.template_strings and c == '`')) {
         try lexString(lx, out, c);
         return;
@@ -162,6 +171,14 @@ fn lexToken(lx: *Lexer, out: *std.ArrayList(Token)) std.mem.Allocator.Error!void
 
 fn isQuoteChar(c: u8) bool {
     return c == '"' or c == '\'';
+}
+
+/// Whether the `'` at the cursor opens a Rust char literal (`'x'`, `'\n'`) rather
+/// than a lifetime/label (`'a`). A char literal has its closing `'` within a few
+/// bytes; an escape (`'\`) is always a char literal.
+fn isRustCharLiteral(lx: *const Lexer) bool {
+    if (lx.at(1) == '\\') return true;
+    return lx.at(2) == '\'';
 }
 
 /// A Python f-string at the cursor: its quote char and prefix length (`f"`,

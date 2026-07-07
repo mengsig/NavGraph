@@ -17,6 +17,9 @@ pub const Language = enum {
     typescript,
     tsx,
     lua,
+    go,
+    rust,
+    ruby,
     unknown,
 
     /// Human-readable short tag used in compressed output.
@@ -31,6 +34,9 @@ pub const Language = enum {
             .typescript => "ts",
             .tsx => "tsx",
             .lua => "lua",
+            .go => "go",
+            .rust => "rs",
+            .ruby => "rb",
             .unknown => "?",
         };
     }
@@ -44,12 +50,15 @@ pub const Language = enum {
             .python => .python,
             .javascript, .typescript, .tsx => .js,
             .lua => .lua,
+            .go => .go,
+            .rust => .rust,
+            .ruby => .ruby,
             .unknown => .other,
         };
     }
 };
 
-pub const Family = enum { zig, c, csharp, python, js, lua, other };
+pub const Family = enum { zig, c, csharp, python, js, lua, go, rust, ruby, other };
 
 /// Doc-comment extraction style differs enough between languages to name it.
 pub const DocStyle = enum {
@@ -134,6 +143,39 @@ pub fn configFor(language: Language) Config {
             .doc_style = .none,
             .brace_scoped = false,
         },
+        .go => .{
+            .language = .go,
+            .line_comment = "//",
+            .block_open = "/*",
+            .block_close = "*/",
+            .string_delims = "\"'",
+            // Backtick raw strings.
+            .template_strings = true,
+            .doc_style = .block_star,
+            .brace_scoped = true,
+        },
+        .rust => .{
+            .language = .rust,
+            .line_comment = "//",
+            .block_open = "/*",
+            .block_close = "*/",
+            // `'` is included for char literals; the lexer's Rust guard keeps a
+            // lifetime (`&'a T`) from opening one and swallowing code.
+            .string_delims = "\"'",
+            .template_strings = false,
+            .doc_style = .block_star,
+            .brace_scoped = true,
+        },
+        .ruby => .{
+            .language = .ruby,
+            .line_comment = "#",
+            .block_open = "",
+            .block_close = "",
+            .string_delims = "\"'",
+            .template_strings = false,
+            .doc_style = .block_star,
+            .brace_scoped = false,
+        },
         .unknown => .{
             .language = .unknown,
             .line_comment = "",
@@ -171,6 +213,9 @@ pub fn detect(path: []const u8) Language {
         .{ ".mts", Language.typescript },
         .{ ".tsx", Language.tsx },
         .{ ".lua", Language.lua },
+        .{ ".go", Language.go },
+        .{ ".rs", Language.rust },
+        .{ ".rb", Language.ruby },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, ext, entry[0])) return entry[1];
@@ -195,6 +240,9 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.tsx, detect("web/App.tsx"));
     try std.testing.expectEqual(Language.csharp, detect("Shop/Order.cs"));
     try std.testing.expectEqual(Language.lua, detect("config/init.lua"));
+    try std.testing.expectEqual(Language.go, detect("cmd/server/main.go"));
+    try std.testing.expectEqual(Language.rust, detect("src/lib.rs"));
+    try std.testing.expectEqual(Language.ruby, detect("app/models/user.rb"));
     try std.testing.expectEqual(Language.unknown, detect("README.md"));
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
 }

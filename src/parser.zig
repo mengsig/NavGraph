@@ -108,7 +108,13 @@ pub fn parse(
         .toks = toks.items,
         .close = close,
         .out = out,
-        .ckw = if (lang == .csharp) cs_keywords else c_keywords,
+        .ckw = switch (lang) {
+            .csharp => cs_keywords,
+            .go => go_keywords,
+            .rust => rust_keywords,
+            .ruby => ruby_keywords,
+            else => c_keywords,
+        },
     };
     const n: u32 = @intCast(toks.items.len - 1); // exclude eof from scans
     switch (lang.family()) {
@@ -117,6 +123,9 @@ pub fn parse(
         .js => try parseJsScope(&ctx, 0, n, null),
         .python => try parsePython(&ctx),
         .lua => try parseLuaScope(&ctx, 0, n, null),
+        .go => try parseGoScope(&ctx, 0, n, null),
+        .rust => try parseRustScope(&ctx, 0, n, null, false),
+        .ruby => try parseRubyScope(&ctx, 0, n, null),
         .other => {},
     }
     try detectApi(&ctx, n);
@@ -2352,6 +2361,834 @@ fn parseLuaTableFields(ctx: *Ctx, open: u32, close: u32, parent: u32) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Go
+// ---------------------------------------------------------------------------
+
+const go_keywords = KeywordSet.initComptime(.{
+    .{"break"},  .{"case"},    .{"chan"},   .{"const"},  .{"continue"}, .{"default"},
+    .{"defer"},  .{"else"},    .{"fallthrough"}, .{"for"}, .{"func"},   .{"go"},
+    .{"goto"},   .{"if"},      .{"import"}, .{"interface"}, .{"map"},    .{"package"},
+    .{"range"},  .{"return"},  .{"select"}, .{"struct"}, .{"switch"},   .{"type"},
+    .{"var"},    .{"nil"},     .{"true"},   .{"false"},
+});
+
+/// A Go identifier is exported when its first letter is upper-case.
+fn goExported(name: []const u8) bool {
+    return name.len != 0 and name[0] >= 'A' and name[0] <= 'Z';
+}
+
+/// Last `/`-separated segment of an import path (`net/http` → `http`).
+fn lastPathSegment(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    return path[slash + 1 ..];
+}
+
+fn parseGoScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
+    var i = lo;
+    while (i < hi) {
+        if (ctx.identEql(i, "func")) {
+            const adv = try parseGoFunc(ctx, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                continue;
+            }
+        }
+        if (ctx.identEql(i, "type") and isLineStart(ctx, i)) {
+            const adv = try parseGoType(ctx, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                continue;
+            }
+        }
+        if (ctx.identEql(i, "import") and isLineStart(ctx, i)) {
+            const adv = try parseGoImport(ctx, i, hi);
+            if (adv > i) {
+                i = adv;
+                continue;
+            }
+        }
+        if (ctx.isPunct(i, '{') or ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
+            i = skipBracket(ctx, i);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    var j = func_i + 1;
+    var is_method = false;
+    // Optional receiver: `func (r T) Name(...)`.
+    if (j < hi and ctx.isPunct(j, '(')) {
+        const rc = ctx.close[j];
+        if (rc == sentinel) return func_i;
+        j = rc + 1;
+        is_method = true;
+    }
+    if (j >= hi or ctx.toks[j].kind != .identifier) return func_i;
+    const name_i = j;
+    var p = name_i + 1;
+    // Type parameters `func F[T any](...)` precede the value parameters.
+    if (ctx.isPunct(p, '[')) {
+        const c = ctx.close[p];
+        if (c == sentinel) return func_i;
+        p = c + 1;
+    }
+    if (!ctx.isPunct(p, '(') or ctx.close[p] == sentinel) return func_i;
+    const params_open = p;
+    const params_close = ctx.close[p];
+    const body_open = goBodyOpen(ctx, params_close, hi);
+    if (body_open == sentinel or ctx.close[body_open] == sentinel) return func_i;
+    const body_close = ctx.close[body_open];
+    const name = ctx.textOf(name_i);
+    const body = try collectRefs(ctx, params_open, body_open + 1, body_close, name, go_keywords);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = if (is_method) .method else .function,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, func_i),
+        .span_end = ctx.toks[body_close].end,
+        .sig_end = ctx.toks[body_open].start,
+        .doc = collectDoc(ctx, func_i),
+        .exported = goExported(name),
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return body_close + 1;
+}
+
+/// The `{` opening a Go function body after its parameter list closes at
+/// `params_close`, skipping the return type — including `interface{}`/`struct{}`
+/// (whose braces are not the body), named/multiple returns `(...)`, and slice/map
+/// types `[]T`. `sentinel` when a declaration has no body or another top-level
+/// keyword is reached first.
+fn goBodyOpen(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
+    var j = params_close + 1;
+    while (j < hi) {
+        if (ctx.isPunct(j, '{')) return j;
+        if (ctx.identEql(j, "func") or ctx.identEql(j, "type") or
+            ctx.identEql(j, "var") or ctx.identEql(j, "const")) return sentinel;
+        if ((ctx.identEql(j, "interface") or ctx.identEql(j, "struct")) and ctx.isPunct(j + 1, '{')) {
+            j = skipBracket(ctx, j + 1);
+            continue;
+        }
+        if (ctx.isPunct(j, '(') or ctx.isPunct(j, '[')) {
+            j = skipBracket(ctx, j);
+            continue;
+        }
+        j += 1;
+    }
+    return sentinel;
+}
+
+fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    const name_i = type_i + 1;
+    if (name_i >= hi or ctx.toks[name_i].kind != .identifier) return type_i;
+    const name = ctx.textOf(name_i);
+    var p = name_i + 1;
+    if (ctx.isPunct(p, '[')) {
+        const c = ctx.close[p];
+        if (c != sentinel) p = c + 1;
+    }
+    if (ctx.isPunct(p, '=')) p += 1; // `type Name = Underlying` alias
+    if ((ctx.identEql(p, "struct") or ctx.identEql(p, "interface")) and ctx.isPunct(p + 1, '{')) {
+        const open = p + 1;
+        const close = ctx.close[open];
+        if (close == sentinel) return type_i;
+        const is_iface = ctx.identEql(p, "interface");
+        const my = try emit(ctx, .{
+            .name = name,
+            .kind = if (is_iface) .interface else .@"struct",
+            .line = ctx.toks[name_i].line,
+            .span_start = lineStartOffset(ctx, type_i),
+            .span_end = ctx.toks[close].end,
+            .sig_end = ctx.toks[open].start,
+            .doc = collectDoc(ctx, type_i),
+            .exported = goExported(name),
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        if (is_iface) try parseGoInterfaceMethods(ctx, open + 1, close, my);
+        return close + 1;
+    }
+    // Defined type or alias to a non-container type: span the declaration line.
+    const end = lineEndOffset(ctx, ctx.toks[name_i].start);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = .type,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, type_i),
+        .span_end = end,
+        .sig_end = end,
+        .doc = collectDoc(ctx, type_i),
+        .exported = goExported(name),
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return tokenAfterOffset(ctx, end, hi);
+}
+
+/// Emit a `method` for each `Name(params) ret` signature line in a Go interface
+/// body [lo, hi). Embedded interfaces (a bare type name, no `(`) are skipped.
+fn parseGoInterfaceMethods(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier or !isLineStart(ctx, i)) continue;
+        if (go_keywords.has(ctx.textOf(i)) or !ctx.isPunct(i + 1, '(')) continue;
+        const pc = ctx.close[i + 1];
+        if (pc == sentinel) continue;
+        const name = ctx.textOf(i);
+        _ = try emit(ctx, .{
+            .name = name,
+            .kind = .method,
+            .line = ctx.toks[i].line,
+            .span_start = lineStartOffset(ctx, i),
+            .span_end = ctx.toks[pc].end,
+            .sig_end = ctx.toks[pc].end,
+            .doc = collectDoc(ctx, i),
+            .exported = goExported(name),
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        i = pc;
+    }
+}
+
+fn parseGoImport(ctx: *Ctx, import_i: u32, hi: u32) AllocError!u32 {
+    const j = import_i + 1;
+    if (ctx.isPunct(j, '(')) {
+        const close = ctx.close[j];
+        if (close == sentinel) return import_i;
+        var k = j + 1;
+        while (k < close) : (k += 1) {
+            if (ctx.toks[k].kind != .string) continue;
+            try emitGoImport(ctx, k);
+        }
+        return close + 1;
+    }
+    // Single: `import [alias|.|_] "path"`.
+    var k = j;
+    if (k < hi and (ctx.toks[k].kind == .identifier or ctx.isPunct(k, '.'))) k += 1;
+    if (k >= hi or ctx.toks[k].kind != .string) return import_i;
+    try emitGoImport(ctx, k);
+    return tokenAfterOffset(ctx, ctx.toks[k].end, hi);
+}
+
+/// Emit an import for the path string at `str_i`, binding it to the preceding
+/// alias identifier when one sits on the same line, else the path's last segment.
+fn emitGoImport(ctx: *Ctx, str_i: u32) AllocError!void {
+    const path = stripQuotes(ctx.textOf(str_i));
+    if (path.len == 0) return;
+    var binding = lastPathSegment(path);
+    var span_start_tok = str_i;
+    if (str_i > 0 and ctx.toks[str_i - 1].kind == .identifier and
+        ctx.toks[str_i - 1].line == ctx.toks[str_i].line)
+    {
+        binding = ctx.textOf(str_i - 1);
+        span_start_tok = str_i - 1;
+    }
+    _ = try emit(ctx, importSymbol(binding, path, ctx.toks[str_i].line, lineStartOffset(ctx, span_start_tok), ctx.toks[str_i].end));
+}
+
+// ---------------------------------------------------------------------------
+// Rust
+// ---------------------------------------------------------------------------
+
+const rust_keywords = KeywordSet.initComptime(.{
+    .{"as"},     .{"break"},  .{"const"},  .{"continue"}, .{"crate"},  .{"dyn"},
+    .{"else"},   .{"enum"},   .{"extern"}, .{"false"},    .{"fn"},     .{"for"},
+    .{"if"},     .{"impl"},   .{"in"},     .{"let"},      .{"loop"},   .{"match"},
+    .{"mod"},    .{"move"},   .{"mut"},    .{"pub"},      .{"ref"},    .{"return"},
+    .{"self"},   .{"Self"},   .{"static"}, .{"struct"},   .{"super"},  .{"trait"},
+    .{"true"},   .{"type"},   .{"union"},  .{"unsafe"},   .{"use"},    .{"where"},
+    .{"while"},  .{"async"},  .{"await"},
+});
+
+/// Whether `pub` appears as a modifier in [lo, kw_i) — the export marker.
+fn rustHasPubBetween(ctx: *const Ctx, lo: u32, kw_i: u32) bool {
+    var j = lo;
+    while (j < kw_i) : (j += 1) {
+        if (ctx.identEql(j, "pub")) return true;
+    }
+    return false;
+}
+
+/// Skip a `<...>` generic clause starting at `i`, returning the index just past
+/// the matching `>`. A `->` return arrow inside a bound is not counted as a
+/// closing `>`. Returns `i` unchanged when `i` is not a `<`.
+fn skipRustGenerics(ctx: *const Ctx, i: u32, hi: u32) u32 {
+    if (!ctx.isPunct(i, '<')) return i;
+    var depth: u32 = 0;
+    var j = i;
+    while (j < hi) : (j += 1) {
+        if (ctx.isPunct(j, '<')) {
+            depth += 1;
+        } else if (ctx.isPunct(j, '>')) {
+            if (j > i and ctx.isPunct(j - 1, '-')) continue; // `->` arrow
+            depth -= 1;
+            if (depth == 0) return j + 1;
+        }
+    }
+    return i;
+}
+
+/// The `{` opening a Rust item body after `from`, skipping a return type and
+/// `where` clause. `sentinel` when the item is a declaration terminated by `;`
+/// (a trait method signature) before any `{`.
+fn rustBodyOpen(ctx: *const Ctx, from: u32, hi: u32) u32 {
+    var j = from;
+    while (j < hi) {
+        if (ctx.isPunct(j, '{')) return j;
+        if (ctx.isPunct(j, ';')) return sentinel;
+        if (ctx.isPunct(j, '(') or ctx.isPunct(j, '[')) {
+            j = skipBracket(ctx, j);
+            continue;
+        }
+        j += 1;
+    }
+    return sentinel;
+}
+
+fn parseRustScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32, methods: bool) AllocError!void {
+    var i = lo;
+    var stmt_start = lo;
+    while (i < hi) {
+        if (ctx.isPunct(i, '{')) {
+            i = skipBracket(ctx, i);
+            stmt_start = i;
+            continue;
+        }
+        if (ctx.isPunct(i, ';') or ctx.isPunct(i, '}')) {
+            i += 1;
+            stmt_start = i;
+            continue;
+        }
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
+            i = skipBracket(ctx, i);
+            stmt_start = i;
+            continue;
+        }
+        // `macro_rules! name { ... }`
+        if (ctx.identEql(i, "macro_rules") and ctx.isPunct(i + 1, '!')) {
+            const adv = try parseRustMacro(ctx, stmt_start, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                stmt_start = i;
+                continue;
+            }
+        }
+        if (ctx.toks[i].kind == .identifier and rustItemKeyword(ctx, i)) {
+            const adv = try parseRustItem(ctx, stmt_start, i, hi, parent, methods);
+            if (adv > i) {
+                i = adv;
+                stmt_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn rustItemKeyword(ctx: *const Ctx, i: u32) bool {
+    return ctx.identEql(i, "fn") or ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
+        ctx.identEql(i, "union") or ctx.identEql(i, "trait") or ctx.identEql(i, "impl") or
+        ctx.identEql(i, "mod") or ctx.identEql(i, "type") or ctx.identEql(i, "use") or
+        ctx.identEql(i, "const") or ctx.identEql(i, "static");
+}
+
+fn parseRustItem(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32, methods: bool) AllocError!u32 {
+    const exported = rustHasPubBetween(ctx, stmt_start, kw_i);
+    // Doc/span begin at the statement's first code token (`pub`/`async`), so the
+    // comment on the line above is attributed, not skipped past a modifier.
+    const doc_i = firstCodeToken(ctx, stmt_start);
+    if (ctx.identEql(kw_i, "fn")) return parseRustFn(ctx, doc_i, kw_i, hi, parent, exported, methods);
+    if (ctx.identEql(kw_i, "use")) return parseRustUse(ctx, kw_i, hi);
+    if (ctx.identEql(kw_i, "mod")) return parseRustMod(ctx, doc_i, kw_i, hi, parent);
+    if (ctx.identEql(kw_i, "impl")) return parseRustImpl(ctx, kw_i, hi);
+    if (ctx.identEql(kw_i, "const") or ctx.identEql(kw_i, "static")) {
+        // A `const fn` / `const unsafe fn` is a function modifier, not an item;
+        // let the loop reach the `fn`.
+        if (rustConstIsFnModifier(ctx, kw_i, hi)) return kw_i;
+        return parseRustConst(ctx, doc_i, kw_i, hi, parent, exported);
+    }
+    if (ctx.identEql(kw_i, "type")) return parseRustTypeAlias(ctx, doc_i, kw_i, hi, parent, exported);
+    // struct / enum / union / trait
+    return parseRustRecord(ctx, doc_i, kw_i, hi, parent, exported);
+}
+
+fn rustConstIsFnModifier(ctx: *const Ctx, kw_i: u32, hi: u32) bool {
+    var j = kw_i + 1;
+    while (j < hi and j < kw_i + 4) : (j += 1) {
+        if (ctx.identEql(j, "fn")) return true;
+        if (!ctx.identEql(j, "unsafe") and !ctx.identEql(j, "extern")) return false;
+    }
+    return false;
+}
+
+fn parseRustFn(ctx: *Ctx, doc_i: u32, fn_i: u32, hi: u32, parent: ?u32, exported: bool, methods: bool) AllocError!u32 {
+    if (fn_i + 1 >= hi or ctx.toks[fn_i + 1].kind != .identifier) return fn_i;
+    const name_i = fn_i + 1;
+    const name = ctx.textOf(name_i);
+    const p = skipRustGenerics(ctx, name_i + 1, hi);
+    if (!ctx.isPunct(p, '(') or ctx.close[p] == sentinel) return fn_i;
+    const params_open = p;
+    const params_close = ctx.close[p];
+    const body_open = rustBodyOpen(ctx, params_close + 1, hi);
+    const kind: SymbolKind = if (methods) .method else .function;
+    if (body_open == sentinel) {
+        // Trait method signature (no body): `fn f(&self) -> T;`.
+        const semi = findNext(ctx, params_close + 1, hi, ';');
+        const end = if (semi != sentinel) ctx.toks[semi].end else ctx.toks[params_close].end;
+        _ = try emit(ctx, .{
+            .name = name,
+            .kind = kind,
+            .line = ctx.toks[name_i].line,
+            .span_start = lineStartOffset(ctx, doc_i),
+            .span_end = end,
+            .sig_end = end,
+            .doc = collectDoc(ctx, doc_i),
+            .exported = exported,
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        return if (semi != sentinel) semi + 1 else params_close + 1;
+    }
+    const body_close = ctx.close[body_open];
+    if (body_close == sentinel) return fn_i;
+    const body = try collectRefs(ctx, params_open, body_open + 1, body_close, name, rust_keywords);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = kind,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, doc_i),
+        .span_end = ctx.toks[body_close].end,
+        .sig_end = ctx.toks[body_open].start,
+        .doc = collectDoc(ctx, doc_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return body_close + 1;
+}
+
+fn parseRustRecord(ctx: *Ctx, doc_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) AllocError!u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
+    const name_i = kw_i + 1;
+    const name = ctx.textOf(name_i);
+    const kind: SymbolKind = if (ctx.identEql(kw_i, "enum"))
+        .@"enum"
+    else if (ctx.identEql(kw_i, "trait"))
+        .interface
+    else
+        .@"struct";
+    const p = skipRustGenerics(ctx, name_i + 1, hi);
+    const open = rustBodyOpen(ctx, p, hi);
+    if (open == sentinel) {
+        // Unit or tuple struct: `struct Name;` / `struct Name(T);`.
+        const end = lineEndOffset(ctx, ctx.toks[name_i].start);
+        _ = try emit(ctx, .{
+            .name = name,
+            .kind = kind,
+            .line = ctx.toks[name_i].line,
+            .span_start = lineStartOffset(ctx, doc_i),
+            .span_end = end,
+            .sig_end = end,
+            .doc = collectDoc(ctx, doc_i),
+            .exported = exported,
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        return tokenAfterOffset(ctx, end, hi);
+    }
+    const close = ctx.close[open];
+    if (close == sentinel) return kw_i;
+    const my = try emit(ctx, .{
+        .name = name,
+        .kind = kind,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, doc_i),
+        .span_end = ctx.toks[close].end,
+        .sig_end = ctx.toks[open].start,
+        .doc = collectDoc(ctx, doc_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    // A trait body holds method signatures and default methods.
+    if (kind == .interface) try parseRustScope(ctx, open + 1, close, my, true);
+    return close + 1;
+}
+
+fn parseRustImpl(ctx: *Ctx, impl_i: u32, hi: u32) AllocError!u32 {
+    const open = rustImplBodyOpen(ctx, impl_i + 1, hi);
+    if (open == sentinel or ctx.close[open] == sentinel) return impl_i;
+    const close = ctx.close[open];
+    // Nest methods under the implemented type when it is a known container, so
+    // outline groups them; otherwise leave them parentless but still methods.
+    const type_name = rustImplTypeName(ctx, impl_i + 1, open);
+    const parent = if (type_name.len != 0) findEmittedContainer(ctx, type_name) else null;
+    try parseRustScope(ctx, open + 1, close, parent, true);
+    return close + 1;
+}
+
+/// The `{` that opens an `impl ... { }` body, skipping generics, the `for` type,
+/// and any `where` clause. Angle/paren groups are stepped over.
+fn rustImplBodyOpen(ctx: *const Ctx, from: u32, hi: u32) u32 {
+    var j = from;
+    while (j < hi) {
+        if (ctx.isPunct(j, '{')) return j;
+        if (ctx.isPunct(j, '<')) {
+            const after = skipRustGenerics(ctx, j, hi);
+            j = if (after > j) after else j + 1;
+            continue;
+        }
+        if (ctx.isPunct(j, '(') or ctx.isPunct(j, '[')) {
+            j = skipBracket(ctx, j);
+            continue;
+        }
+        j += 1;
+    }
+    return sentinel;
+}
+
+/// The last path segment of the type an `impl` targets: the identifier after
+/// `for` in `impl Trait for Type`, else the first path's last segment.
+fn rustImplTypeName(ctx: *const Ctx, from: u32, open: u32) []const u8 {
+    var last_ident: []const u8 = "";
+    var j = from;
+    var after_for = false;
+    var for_ident: []const u8 = "";
+    while (j < open) : (j += 1) {
+        if (ctx.identEql(j, "for")) {
+            after_for = true;
+            for_ident = "";
+            continue;
+        }
+        if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) {
+            last_ident = ctx.textOf(j);
+            if (after_for) for_ident = ctx.textOf(j);
+        }
+    }
+    return if (after_for and for_ident.len != 0) for_ident else last_ident;
+}
+
+/// Index of an already-emitted struct/enum/interface named `name`, for nesting
+/// an `impl`'s methods; null when none was parsed (yet) in this file.
+fn findEmittedContainer(ctx: *const Ctx, name: []const u8) ?u32 {
+    var i: u32 = 0;
+    while (i < ctx.out.items.len) : (i += 1) {
+        const s = ctx.out.items[i];
+        const is_container = s.kind == .@"struct" or s.kind == .@"enum" or
+            s.kind == .interface or s.kind == .class;
+        if (is_container and std.mem.eql(u8, s.name, name)) return i;
+    }
+    return null;
+}
+
+fn parseRustMod(ctx: *Ctx, doc_i: u32, mod_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    if (mod_i + 1 >= hi or ctx.toks[mod_i + 1].kind != .identifier) return mod_i;
+    const name_i = mod_i + 1;
+    const name = ctx.textOf(name_i);
+    if (ctx.isPunct(name_i + 1, '{')) {
+        const open = name_i + 1;
+        const close = ctx.close[open];
+        if (close == sentinel) return mod_i;
+        const my = try emit(ctx, .{
+            .name = name,
+            .kind = .module,
+            .line = ctx.toks[name_i].line,
+            .span_start = lineStartOffset(ctx, doc_i),
+            .span_end = ctx.toks[close].end,
+            .sig_end = ctx.toks[open].start,
+            .doc = collectDoc(ctx, doc_i),
+            .exported = true,
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        try parseRustScope(ctx, open + 1, close, my, false);
+        return close + 1;
+    }
+    // `mod name;` declares a submodule living in `name.rs` — record as an import.
+    if (ctx.isPunct(name_i + 1, ';')) {
+        _ = try emit(ctx, importSymbol(name, name, ctx.toks[name_i].line, lineStartOffset(ctx, doc_i), ctx.toks[name_i + 1].end));
+        return name_i + 2;
+    }
+    return mod_i;
+}
+
+fn parseRustUse(ctx: *Ctx, use_i: u32, hi: u32) AllocError!u32 {
+    const semi = findNext(ctx, use_i + 1, hi, ';');
+    if (semi == sentinel) return use_i;
+    const path = std.mem.trim(u8, ctx.source[ctx.toks[use_i + 1].start..ctx.toks[semi].start], " \t\r\n");
+    const span_start = lineStartOffset(ctx, use_i);
+    const line = ctx.toks[use_i].line;
+    const brace = findNext(ctx, use_i + 1, semi, '{');
+    if (brace != sentinel and ctx.close[brace] != sentinel) {
+        const bclose = ctx.close[brace];
+        var k = brace + 1;
+        while (k < bclose) : (k += 1) {
+            if (ctx.toks[k].kind != .identifier or rust_keywords.has(ctx.textOf(k))) continue;
+            // A leaf item, not a path segment: not followed by `::`.
+            if (ctx.isPunct(k + 1, ':')) continue;
+            _ = try emit(ctx, importSymbol(ctx.textOf(k), path, line, span_start, ctx.toks[k].end));
+        }
+        return semi + 1;
+    }
+    // Single path: binding is the alias (`as X`) or the final segment.
+    const binding_i = rustUseBinding(ctx, use_i + 1, semi);
+    if (binding_i != sentinel) {
+        _ = try emit(ctx, importSymbol(ctx.textOf(binding_i), path, line, span_start, ctx.toks[semi].start));
+    }
+    return semi + 1;
+}
+
+/// The token that a single `use` path binds: the identifier after `as`, else the
+/// last identifier before the terminating `;`. `sentinel` when none.
+fn rustUseBinding(ctx: *const Ctx, from: u32, semi: u32) u32 {
+    var j = from;
+    var last: u32 = sentinel;
+    while (j < semi) : (j += 1) {
+        if (ctx.identEql(j, "as") and j + 1 < semi and ctx.toks[j + 1].kind == .identifier) return j + 1;
+        if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) last = j;
+    }
+    return last;
+}
+
+fn parseRustConst(ctx: *Ctx, doc_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) AllocError!u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
+    const name_i = kw_i + 1;
+    const semi = findNext(ctx, name_i + 1, hi, ';');
+    const end = if (semi != sentinel) ctx.toks[semi].end else lineEndOffset(ctx, ctx.toks[name_i].start);
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = .constant,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, doc_i),
+        .span_end = end,
+        .sig_end = end,
+        .doc = collectDoc(ctx, doc_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return if (semi != sentinel) semi + 1 else tokenAfterOffset(ctx, end, hi);
+}
+
+fn parseRustTypeAlias(ctx: *Ctx, doc_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) AllocError!u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
+    const name_i = kw_i + 1;
+    const semi = findNext(ctx, name_i + 1, hi, ';');
+    const end = if (semi != sentinel) ctx.toks[semi].end else lineEndOffset(ctx, ctx.toks[name_i].start);
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = .type,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, doc_i),
+        .span_end = end,
+        .sig_end = end,
+        .doc = collectDoc(ctx, doc_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return if (semi != sentinel) semi + 1 else tokenAfterOffset(ctx, end, hi);
+}
+
+fn parseRustMacro(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    _ = stmt_start;
+    if (kw_i + 2 >= hi or ctx.toks[kw_i + 2].kind != .identifier) return kw_i;
+    const name_i = kw_i + 2;
+    const open = findNext(ctx, name_i + 1, hi, '{');
+    if (open == sentinel or ctx.close[open] == sentinel) return kw_i;
+    const close = ctx.close[open];
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = .macro,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, kw_i),
+        .span_end = ctx.toks[close].end,
+        .sig_end = ctx.toks[open].start,
+        .doc = collectDoc(ctx, kw_i),
+        .exported = true,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    return close + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Ruby
+// ---------------------------------------------------------------------------
+
+const ruby_keywords = KeywordSet.initComptime(.{
+    .{"def"},     .{"end"},    .{"if"},     .{"elsif"},  .{"else"},   .{"unless"},
+    .{"while"},   .{"until"},  .{"for"},    .{"in"},     .{"do"},     .{"begin"},
+    .{"rescue"},  .{"ensure"}, .{"retry"},  .{"return"}, .{"yield"},  .{"then"},
+    .{"case"},    .{"when"},   .{"class"},  .{"module"}, .{"self"},   .{"nil"},
+    .{"true"},    .{"false"},  .{"and"},    .{"or"},     .{"not"},    .{"super"},
+    .{"break"},   .{"next"},   .{"redo"},   .{"require"}, .{"require_relative"},
+});
+
+/// Whether the `do` at `i` merely re-marks a block already opened by a
+/// same-line, line-leading `while`/`until`/`for` (avoiding a double count).
+fn rubyDoIsRedundant(ctx: *const Ctx, i: u32) bool {
+    const line = ctx.toks[i].line;
+    var j = i;
+    while (j > 0 and ctx.toks[j - 1].line == line) j -= 1;
+    return ctx.identEql(j, "while") or ctx.identEql(j, "until") or ctx.identEql(j, "for");
+}
+
+/// Whether the identifier at `i` opens an `end`-terminated Ruby block.
+/// `if`/`unless`/`while`/`until`/`for` open only at line start (mid-line they are
+/// statement modifiers with no `end`); `do` opens unless it is redundant.
+fn rubyOpensBlock(ctx: *const Ctx, i: u32) bool {
+    if (ctx.identEql(i, "def") or ctx.identEql(i, "class") or ctx.identEql(i, "module") or
+        ctx.identEql(i, "case") or ctx.identEql(i, "begin")) return true;
+    if (ctx.identEql(i, "do")) return !rubyDoIsRedundant(ctx, i);
+    if (ctx.identEql(i, "if") or ctx.identEql(i, "unless") or ctx.identEql(i, "while") or
+        ctx.identEql(i, "until") or ctx.identEql(i, "for")) return isLineStart(ctx, i);
+    return false;
+}
+
+/// Index of the `end` closing a block whose opener precedes `from` (depth starts
+/// at 1). `hi` when unterminated.
+fn rubyBlockEnd(ctx: *const Ctx, from: u32, hi: u32) u32 {
+    var depth: u32 = 1;
+    var i = from;
+    while (i < hi) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier) continue;
+        if (ctx.identEql(i, "end")) {
+            depth -= 1;
+            if (depth == 0) return i;
+        } else if (rubyOpensBlock(ctx, i)) {
+            depth += 1;
+        }
+    }
+    return hi;
+}
+
+fn parseRubyScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
+    var i = lo;
+    while (i < hi) {
+        if (ctx.toks[i].kind != .identifier or !isLineStart(ctx, i)) {
+            i += 1;
+            continue;
+        }
+        const adv = try parseRubyStmt(ctx, i, hi, parent);
+        i = if (adv > i) adv else i + 1;
+    }
+}
+
+fn parseRubyStmt(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    if (ctx.identEql(i, "def")) return parseRubyDef(ctx, i, hi, parent);
+    if (ctx.identEql(i, "class")) return parseRubyContainer(ctx, i, hi, parent, .class);
+    if (ctx.identEql(i, "module")) return parseRubyContainer(ctx, i, hi, parent, .module);
+    if (ctx.identEql(i, "require") or ctx.identEql(i, "require_relative"))
+        return parseRubyRequire(ctx, i, hi);
+    return i;
+}
+
+fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    var j = def_i + 1;
+    var is_singleton = false;
+    // `def self.name` / `def Recv.name` — a class-level method.
+    if (j + 1 < hi and ctx.toks[j].kind == .identifier and ctx.isPunct(j + 1, '.')) {
+        is_singleton = true;
+        j += 2;
+    }
+    if (j >= hi or ctx.toks[j].kind != .identifier) return def_i;
+    const name_i = j;
+    const name = ctx.textOf(name_i);
+    var after = name_i + 1;
+    if (ctx.isPunct(after, '(')) {
+        const pc = ctx.close[after];
+        if (pc == sentinel) return def_i;
+        after = pc + 1;
+    }
+    const kind: SymbolKind = if (parent != null or is_singleton) .method else .function;
+    // Endless method (Ruby 3): `def foo = expr` — a single-line body.
+    if (ctx.isPunct(after, '=') and !ctx.isPunct(after + 1, '=')) {
+        const end = lineEndOffset(ctx, ctx.toks[def_i].start);
+        const body_hi = tokenAfterOffset(ctx, end, hi);
+        const body = try collectRefs(ctx, sentinel, after + 1, body_hi, name, ruby_keywords);
+        _ = try emit(ctx, .{
+            .name = name,
+            .kind = kind,
+            .line = ctx.toks[name_i].line,
+            .span_start = lineStartOffset(ctx, def_i),
+            .span_end = end,
+            .sig_end = end,
+            .doc = collectDoc(ctx, def_i),
+            .exported = true,
+            .parent_local = parent,
+            .refs = body.refs,
+            .bindings = body.bindings,
+        });
+        return body_hi;
+    }
+    const end_i = rubyBlockEnd(ctx, after, hi);
+    const span_end = if (end_i < hi) ctx.toks[end_i].end else @as(u32, @intCast(ctx.source.len));
+    const sig_end = @min(lineEndOffset(ctx, ctx.toks[def_i].start), span_end);
+    const body = try collectRefs(ctx, sentinel, after, end_i, name, ruby_keywords);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = kind,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, def_i),
+        .span_end = span_end,
+        .sig_end = sig_end,
+        .doc = collectDoc(ctx, def_i),
+        .exported = true,
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return if (end_i < hi) end_i + 1 else hi;
+}
+
+fn parseRubyContainer(ctx: *Ctx, kw_i: u32, hi: u32, parent: ?u32, kind: SymbolKind) AllocError!u32 {
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i; // e.g. `class << self`
+    const name_i = kw_i + 1;
+    const end_i = rubyBlockEnd(ctx, name_i + 1, hi);
+    const span_end = if (end_i < hi) ctx.toks[end_i].end else @as(u32, @intCast(ctx.source.len));
+    const sig_end = @min(lineEndOffset(ctx, ctx.toks[kw_i].start), span_end);
+    const my = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = kind,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, kw_i),
+        .span_end = span_end,
+        .sig_end = sig_end,
+        .doc = collectDoc(ctx, kw_i),
+        .exported = true,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    try parseRubyScope(ctx, name_i + 1, end_i, my);
+    return if (end_i < hi) end_i + 1 else hi;
+}
+
+fn parseRubyRequire(ctx: *Ctx, req_i: u32, hi: u32) AllocError!u32 {
+    var j = req_i + 1;
+    if (ctx.isPunct(j, '(')) j += 1;
+    if (j >= hi or ctx.toks[j].kind != .string) return req_i;
+    const path = stripQuotes(ctx.textOf(j));
+    if (path.len == 0) return req_i;
+    const binding = rubyRequireBase(path);
+    const end = lineEndOffset(ctx, ctx.toks[req_i].start);
+    _ = try emit(ctx, importSymbol(binding, path, ctx.toks[req_i].line, lineStartOffset(ctx, req_i), end));
+    return tokenAfterOffset(ctx, end, hi);
+}
+
+/// The bound name of a Ruby require path: its last `/` segment (`lib/user` →
+/// `user`), which is the constant/file the require introduces.
+fn rubyRequireBase(path: []const u8) []const u8 {
+    return lastPathSegment(path);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3031,6 +3868,165 @@ test "lua: function fields of a table constructor become methods" {
     try testing.expectEqual(SymbolKind.method, run.kind);
     try testing.expect(run.parent_local != null);
     try testing.expect(findSym(out.items, "dead") != null);
+}
+
+test "go: funcs, methods, structs, interfaces, imports, and refs" {
+    const src =
+        \\package main
+        \\
+        \\import (
+        \\    "fmt"
+        \\    ndb "database/sql"
+        \\)
+        \\
+        \\// Add returns the sum.
+        \\func Add(a, b int) int {
+        \\    return a + b
+        \\}
+        \\
+        \\type Server struct {
+        \\    port int
+        \\}
+        \\
+        \\type Handler interface {
+        \\    Serve(w int) error
+        \\}
+        \\
+        \\func (s *Server) Start() int {
+        \\    return Add(s.port, 1)
+        \\}
+        \\
+        \\func makeIface() interface{} { return nil }
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+
+    const add = findSym(out.items, "Add").?;
+    try testing.expectEqual(SymbolKind.function, add.kind);
+    try testing.expect(add.exported); // upper-case first letter
+    try testing.expect(std.mem.indexOf(u8, add.doc, "returns the sum") != null);
+
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Server").?.kind);
+    try testing.expectEqual(SymbolKind.interface, findSym(out.items, "Handler").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "Serve").?.kind);
+
+    const start = findSym(out.items, "Start").?;
+    try testing.expectEqual(SymbolKind.method, start.kind);
+    var saw_add = false;
+    for (start.refs) |r| {
+        if (std.mem.eql(u8, r.name, "Add")) saw_add = true;
+    }
+    try testing.expect(saw_add);
+
+    // `interface{}` in the return type must not be mistaken for the body.
+    try testing.expectEqual(SymbolKind.function, findSym(out.items, "makeIface").?.kind);
+
+    // Aliased and plain imports both bind.
+    const fmt_imp = findSym(out.items, "fmt").?;
+    try testing.expectEqual(SymbolKind.import, fmt_imp.kind);
+    try testing.expectEqualStrings("database/sql", findSym(out.items, "ndb").?.import_path);
+}
+
+test "rust: fn, struct, trait, impl methods, use, and lifetimes" {
+    const src =
+        \\use crate::util::{parse, Helper};
+        \\
+        \\/// A widget.
+        \\pub struct Widget {
+        \\    name: String,
+        \\}
+        \\
+        \\pub trait Draw {
+        \\    fn draw(&self) -> u32;
+        \\}
+        \\
+        \\impl Widget {
+        \\    pub fn render(&self, s: &'a str) -> u32 {
+        \\        return parse(s);
+        \\    }
+        \\}
+        \\
+        \\fn helper<T: Clone>(x: T) -> T { x }
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+
+    const widget = findSym(out.items, "Widget").?;
+    try testing.expectEqual(SymbolKind.@"struct", widget.kind);
+    try testing.expect(widget.exported);
+    try testing.expect(std.mem.indexOf(u8, widget.doc, "A widget") != null);
+
+    try testing.expectEqual(SymbolKind.interface, findSym(out.items, "Draw").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "draw").?.kind);
+
+    const render = findSym(out.items, "render").?;
+    try testing.expectEqual(SymbolKind.method, render.kind);
+    // The lifetime `&'a str` must not swallow the rest of the signature/body.
+    var saw_parse = false;
+    for (render.refs) |r| {
+        if (std.mem.eql(u8, r.name, "parse")) {
+            saw_parse = true;
+            try testing.expectEqual(RefKind.call, r.kind);
+        }
+    }
+    try testing.expect(saw_parse);
+
+    // Generic free function is a function, not a method.
+    try testing.expectEqual(SymbolKind.function, findSym(out.items, "helper").?.kind);
+
+    // `use` leaves bind as imports.
+    try testing.expectEqual(SymbolKind.import, findSym(out.items, "parse").?.kind);
+    try testing.expect(findSym(out.items, "Helper") != null);
+}
+
+test "ruby: class, methods, self-method, require_relative, and refs" {
+    const src =
+        \\require_relative "lib/util"
+        \\
+        \\class Server
+        \\  def start
+        \\    data = fetch
+        \\    data.each do |row|
+        \\      process(row)
+        \\    end
+        \\  end
+        \\
+        \\  def self.build
+        \\    new
+        \\  end
+        \\end
+        \\
+        \\def top_level
+        \\  1
+        \\end
+    ;
+    var out = try parseForTest(src, .ruby);
+    defer freeRefs(&out);
+
+    const server = findSym(out.items, "Server").?;
+    try testing.expectEqual(SymbolKind.class, server.kind);
+
+    const start = findSym(out.items, "start").?;
+    try testing.expectEqual(SymbolKind.method, start.kind);
+    try testing.expect(start.parent_local != null);
+    // The `do ... end` block inside must not truncate the method early: `process`
+    // is a ref of `start`.
+    var saw_process = false;
+    for (start.refs) |r| {
+        if (std.mem.eql(u8, r.name, "process")) saw_process = true;
+    }
+    try testing.expect(saw_process);
+
+    // A singleton `def self.build` is a method.
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "build").?.kind);
+
+    // A top-level def is a function, not a method.
+    try testing.expectEqual(SymbolKind.function, findSym(out.items, "top_level").?.kind);
+
+    // require_relative binds an import.
+    const imp = findSym(out.items, "util").?;
+    try testing.expectEqual(SymbolKind.import, imp.kind);
+    try testing.expectEqualStrings("lib/util", imp.import_path);
 }
 
 fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {

@@ -12,7 +12,7 @@ Ask precise questions ("what does `foo()` call, 2 levels deep?", "who calls
 information needed — nothing more.
 
 - **Language-agnostic core.** Ships with Zig, C/C++, C#, Python, JavaScript,
-  TypeScript, TSX and Lua.
+  TypeScript, TSX, Lua, Go, Rust and Ruby.
 - **Depth control.** Walk the call graph outward (callees) or inward (callers)
   to a bounded depth.
 - **Verbosity levels.** `names` → `sig` → `doc` → `full`, so you spend tokens

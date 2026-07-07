@@ -23,10 +23,13 @@ navgraph-supported languages (by extension):
 - **C++** — `.cpp .hpp .cc .cxx .hh`
 - **C#** — `.cs`
 - **Lua** — `.lua`
+- **Go** — `.go`
+- **Rust** — `.rs`
+- **Ruby** — `.rb`
 
-For any of the above, navgraph is mandatory. For anything else (Go, Rust, Java,
-Ruby, Kotlin, Swift, Elixir, shell, config, markdown, plain text), fall
-back to grep/read — see "Escape hatches".
+For any of the above, navgraph is mandatory. For anything else (Java, Kotlin,
+Swift, Elixir, shell, config, markdown, plain text), fall back to grep/read —
+see "Escape hatches".
 
 ### Before you act, obey this order
 

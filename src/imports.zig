@@ -30,8 +30,37 @@ pub fn candidates(
         .js => try jsCandidates(arena, importer_path, module),
         .python => try pyCandidates(arena, importer_path, module),
         .lua => try luaCandidates(arena, importer_path, module),
+        .rust => try rustCandidates(arena, importer_path, module),
+        .ruby => try rubyCandidates(arena, importer_path, module),
         else => &.{},
     };
+}
+
+/// Rust `mod name;` resolves to a sibling `name.rs` or a subdir `name/mod.rs`.
+/// A `use` path is intra-crate (`crate::a::b`) and unresolvable to a file
+/// without the crate root, so `::`-bearing modules yield no candidates.
+fn rustCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+    if (std.mem.indexOf(u8, module, "::") != null) return &.{};
+    const dir = dirOf(importer);
+    const stem = try joinNormalize(arena, dir, module);
+    if (stem.len == 0) return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.append(arena, try concat(arena, stem, ".rs"));
+    try list.append(arena, try concat(arena, stem, "/mod.rs"));
+    return list.toOwnedSlice(arena);
+}
+
+/// Ruby `require_relative "lib/user"` resolves from the importer's directory;
+/// a plain `require "user"` may be a gem, but we also offer a repo-relative
+/// `user.rb` in case it names a local file. Non-existent candidates are simply
+/// never matched by the index.
+fn rubyCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    const rel = try joinNormalize(arena, dirOf(importer), module);
+    if (rel.len != 0) try list.append(arena, try concat(arena, rel, ".rb"));
+    const root = try joinNormalize(arena, "", module);
+    if (root.len != 0 and !std.mem.eql(u8, root, rel)) try list.append(arena, try concat(arena, root, ".rb"));
+    return list.toOwnedSlice(arena);
 }
 
 /// Lua `require "a.b.c"` maps the dotted module to `a/b/c.lua` or the package
@@ -170,6 +199,28 @@ fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     const one = try arena.alloc([]const u8, 1);
     one[0] = s;
     return one;
+}
+
+test "rust mod resolves to sibling file or subdir mod.rs; use is unresolved" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const c = try candidates(arena, "src/main.rs", "parser", .rust);
+    try std.testing.expectEqualStrings("src/parser.rs", c[0]);
+    try std.testing.expectEqualStrings("src/parser/mod.rs", c[1]);
+    // A `use crate::a::b` path is intra-crate; no file candidates.
+    try std.testing.expectEqual(@as(usize, 0), (try candidates(arena, "src/main.rs", "crate::a::b", .rust)).len);
+}
+
+test "ruby require_relative resolves to a sibling .rb file" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const c = try candidates(arena, "app/main.rb", "lib/user", .ruby);
+    try std.testing.expectEqualStrings("app/lib/user.rb", c[0]);
+    try std.testing.expectEqualStrings("lib/user.rb", c[1]);
 }
 
 test "zig imports resolve relative to importer dir" {
