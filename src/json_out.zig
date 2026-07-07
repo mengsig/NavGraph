@@ -126,7 +126,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     for (ids, 0..) |id, k| {
         if (k != 0) try w.writeByte(',');
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, true, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, true, &visited);
     }
     try w.writeAll("]\n");
 }
@@ -139,6 +139,7 @@ fn walkNode(
     opts: Options,
     depth: u32,
     site: u32,
+    sites: u32,
     exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
@@ -146,6 +147,8 @@ fn walkNode(
     try nodeHead(w, idx, idx.graph.symbols[id]);
     // The call-site line of the edge to this node's parent (0 = root/no edge).
     if (site != 0) try w.print(",\"site\":{d}", .{site});
+    // Number of call sites this edge represents (omitted when 1).
+    if (site != 0 and sites > 1) try w.print(",\"sites\":{d}", .{sites});
     // Only heuristic (name-match) edges are annotated; absence means confident.
     if (site != 0 and !exact) try w.writeAll(",\"exact\":false");
     if (depth >= opts.depth) return try w.writeByte('}');
@@ -178,7 +181,7 @@ fn walkCallees(
         // unresolved *calls* become externals (see query.walkCallees).
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, ref.exact, visited);
+            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.exact, visited);
             wrote += 1;
         } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
@@ -214,7 +217,7 @@ fn walkCallers(
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
         if (wrote != 0) try w.writeByte(',');
-        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.hasExactEdge(idx, cid, id), visited);
+        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), query.hasExactEdge(idx, cid, id), visited);
         wrote += 1;
     }
     try w.writeByte(']');
@@ -321,14 +324,16 @@ fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
 
 /// Unused: a JSON array of zero-caller function/method symbols.
 pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
-    var ref_names = try query.buildReferencedNames(idx);
-    defer ref_names.deinit();
+    var refs = try query.buildReferencedNames(idx);
+    defer refs.deinit();
     var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
-        if (!query.isDeadCandidate(idx, sym, filter, &ref_names)) continue;
+        if (!query.isDeadCandidate(idx, sym, filter, &refs)) continue;
         if (shown != 0) try w.writeByte(',');
-        try symbolObject(w, idx, sym, opts.verbosity);
+        // A name used only from tests is a real cleanup target — flag it so JSON
+        // consumers can separate it from truly-unreferenced code.
+        try symbolObjectExtra(w, idx, sym, opts.verbosity, refs.tests.contains(sym.name));
         shown += 1;
         if (shown >= opts.limit) break;
     }
@@ -435,6 +440,10 @@ fn nodeHead(w: *Writer, idx: *const Index, sym: Symbol) !void {
 
 /// A full symbol object; fields grow with verbosity (sig, then doc, then body).
 fn symbolObject(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity) !void {
+    return symbolObjectExtra(w, idx, sym, v, false);
+}
+
+fn symbolObjectExtra(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity, test_only: bool) !void {
     try nodeHead(w, idx, sym);
     if (sym.parent != invalid) {
         try w.writeAll(",\"parent\":");
@@ -457,6 +466,7 @@ fn symbolObject(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity)
         try w.writeAll(",\"body\":");
         try writeString(w, sym.body(source));
     }
+    if (test_only) try w.writeAll(",\"test_only\":true");
     try w.writeByte('}');
 }
 

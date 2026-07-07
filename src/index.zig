@@ -33,6 +33,10 @@ pub const Index = struct {
     /// Per-file resolved imports (arena-owned), indexed by `FileId`.
     file_imports: [][]const FileImport,
     root: []const u8,
+    /// Unique names of directories the walker pruned (build/vendor/fixture dirs
+    /// from `ignored_dirs`). Surfaced on empty results so a skipped subtree reads
+    /// as "not indexed" rather than "absent". Arena-owned.
+    skipped_dirs: []const []const u8 = &.{},
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -74,6 +78,8 @@ const Builder = struct {
     store: ?cache.Store,
     /// Count of files served from `store` (vs. freshly parsed) this build.
     cache_hits: u32,
+    /// Unique names of directories pruned during the walk (arena-owned strings).
+    skipped: std.ArrayList([]const u8),
 };
 
 /// Build an index rooted at `root_path` (relative to cwd or absolute). When
@@ -102,10 +108,12 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .stats = .empty,
         .store = if (use_cache) cache.load(gpa, io, root_dir) else null,
         .cache_hits = 0,
+        .skipped = .empty,
     };
     defer b.files.deinit(gpa);
     defer b.symbols.deinit(gpa);
     defer b.stats.deinit(gpa);
+    defer b.skipped.deinit(gpa);
     defer if (b.store) |*s| s.deinit();
 
     var path_buf: std.ArrayList(u8) = .empty;
@@ -124,6 +132,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .callers = &.{},
         .file_imports = &.{},
         .root = try arena.dupe(u8, root_path),
+        .skipped_dirs = try arena.dupe([]const u8, b.skipped.items),
     };
     try buildNameIndex(&idx);
     try buildImportTable(&idx);
@@ -181,10 +190,33 @@ fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerr
 }
 
 fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.ArrayList(u8)) !void {
-    if (ignored_dirs.has(name)) return;
+    if (ignored_dirs.has(name)) {
+        try noteSkipped(b, name);
+        return;
+    }
     var sub = parent.openDir(b.io, name, .{ .iterate = true }) catch return;
     defer sub.close(b.io);
     try collectDir(b, sub, path_buf);
+}
+
+/// Directories whose skip is universally expected (VCS, dependency, build, cache
+/// and editor dirs) — never worth surfacing. Anything else in `ignored_dirs`
+/// (e.g. `vendor`, `testenv`) can plausibly hold real source, so its skip is
+/// reported to avoid the silent-failure trap.
+const silent_skip = std.StaticStringMap(void).initComptime(.{
+    .{".git"},        .{"node_modules"}, .{"zig-out"},    .{".zig-cache"},
+    .{"zig-cache"},   .{"__pycache__"},  .{".venv"},      .{"venv"},
+    .{"dist"},        .{"build"},        .{".next"},      .{"target"},
+    .{".mypy_cache"}, .{".pytest_cache"}, .{".idea"},     .{".vscode"},
+    .{"coverage"},    .{".navgraph"},    .{".advantage"}, .{".nvime"},
+});
+
+/// Record a pruned, potentially-source directory's name once (deduped) for the
+/// skipped-dirs note. Silent (build/VCS/cache) skips are not recorded.
+fn noteSkipped(b: *Builder, name: []const u8) !void {
+    if (silent_skip.has(name)) return;
+    for (b.skipped.items) |s| if (std.mem.eql(u8, s, name)) return;
+    try b.skipped.append(b.gpa, try b.arena.dupe(u8, name));
 }
 
 fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {

@@ -409,8 +409,13 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     // `recv.name`
     if (i >= lo + 2 and ctx.isPunct(i - 1, '.') and ctx.toks[i - 2].kind == .identifier)
         return ctx.textOf(i - 2);
-    // `recv->name` / `Scope::name` (each operator is two punct tokens).
+    // Two-punct member operators, receiver two tokens back:
+    //   `recv?.name` / `recv!.name` — JS/TS optional-chaining & non-null assertion
+    //   `recv->name`                — C/C++ pointer member
+    //   `Scope::name`               — C++ scope resolution
     if (i >= lo + 3 and ctx.toks[i - 3].kind == .identifier) {
+        if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
+            return ctx.textOf(i - 3);
         if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
         if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
     }
@@ -2105,6 +2110,23 @@ test "cpp: -> and :: member calls record the receiver as the qualifier" {
     }
     try testing.expectEqualStrings("e", arrow_q);
     try testing.expectEqualStrings("Engine", scope_q);
+}
+
+test "ts: optional-chaining and non-null member calls record the receiver" {
+    const src =
+        \\function a(s: any) { return s?.runJob(1); }
+        \\function b(s: any) { return s!.runJob(2); }
+    ;
+    var out = try parseForTest(src, .typescript);
+    defer freeRefs(&out);
+    inline for (.{ "a", "b" }) |fname| {
+        const f = findSym(out.items, fname).?;
+        var q: []const u8 = "";
+        for (f.refs) |r| {
+            if (std.mem.eql(u8, r.name, "runJob")) q = r.qualifier;
+        }
+        try testing.expectEqualStrings("s", q);
+    }
 }
 
 test "c: function and macro" {

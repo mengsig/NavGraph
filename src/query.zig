@@ -74,6 +74,17 @@ pub fn callSiteLine(idx: *const Index, from: SymbolId, to: SymbolId) u32 {
     return best;
 }
 
+/// The number of call sites from `from` to `to` (summed over its references, so
+/// a caller that invokes the target several times reports the true multiplicity
+/// rather than collapsing to a single edge). Rendered as `↳:N ×C` when > 1.
+pub fn callSiteCount(idx: *const Index, from: SymbolId, to: SymbolId) u32 {
+    var total: u32 = 0;
+    for (idx.graph.symbols[from].refs) |ref| {
+        if (ref.target == to) total += ref.count;
+    }
+    return total;
+}
+
 /// Print an outline of the file(s) under `path_filter` (a path prefix, or ""
 /// for the whole project). Symbols are grouped by file and indented by nesting.
 pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
@@ -88,7 +99,10 @@ pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Opt
         shown += try outlineFile(w, idx, file, opts, &shown);
         if (shown >= opts.limit) break;
     }
-    if (!any) try w.print("(no source symbols under '{s}')\n", .{path_filter});
+    if (!any) {
+        try w.print("(no source symbols under '{s}')\n", .{path_filter});
+        try skippedNote(w, idx);
+    }
     try truncationNote(w, opts, shown);
 }
 
@@ -98,6 +112,20 @@ fn truncationNote(w: *Writer, opts: Options, shown: u32) !void {
     if (shown >= opts.limit) {
         try w.print("… (stopped at -l {d}; more results may exist — raise -l to see them)\n", .{opts.limit});
     }
+}
+
+/// After an empty result, name the directories the walker pruned so "nothing
+/// here" isn't misread as "does not exist" — the code may simply live in a
+/// skipped subtree (a fixture/vendor/build dir). Only prints when a dir with the
+/// requested content could plausibly be hiding there, i.e. something was skipped.
+fn skippedNote(w: *Writer, idx: *const Index) !void {
+    if (idx.skipped_dirs.len == 0) return;
+    try w.writeAll("  (not indexed — skipped: ");
+    for (idx.skipped_dirs, 0..) |d, i| {
+        if (i != 0) try w.writeAll(", ");
+        try w.print("{s}/", .{d});
+    }
+    try w.writeAll("; index one with `-C <dir>`)\n");
 }
 
 fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Options, shown: *u32) !u32 {
@@ -158,6 +186,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no symbol named '{s}')\n", .{name});
+        try skippedNote(w, idx);
         return;
     }
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
@@ -165,7 +194,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     var heuristic: usize = 0;
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, true, &visited, &heuristic);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, true, &visited, &heuristic);
     }
     // If any ambiguous name-match (`?`) edges were shown, tell the agent how to
     // drop them rather than making it discover `-s` on its own. Only when they
@@ -185,12 +214,13 @@ fn walkNode(
     opts: Options,
     indent: usize,
     site: u32,
+    sites: u32,
     exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
 ) anyerror!void {
     const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
-    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, exact);
+    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, sites, exact);
     if (indent > 0 and !exact) heuristic.* += 1;
     if (indent >= opts.depth) return;
     if ((try visited.getOrPut(id)).found_existing) {
@@ -223,7 +253,7 @@ fn walkCallees(
         // stdlib/locals would be noise.
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.exact, visited, heuristic);
+            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.exact, visited, heuristic);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -248,7 +278,7 @@ fn walkCallers(
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
         // The edge (caller → this symbol) lives at its call site in the caller.
-        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), hasExactEdge(idx, cid, id), visited, heuristic);
+        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), hasExactEdge(idx, cid, id), visited, heuristic);
     }
 }
 
@@ -276,7 +306,10 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         shown += 1;
         if (shown >= opts.limit) break;
     }
-    if (shown == 0) try w.print("(no symbol matching '{s}')\n", .{pattern});
+    if (shown == 0) {
+        try w.print("(no symbol matching '{s}')\n", .{pattern});
+        try skippedNote(w, idx);
+    }
     try truncationNote(w, opts, shown);
 }
 
@@ -303,7 +336,10 @@ fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         }
         if (shown >= opts.limit) break;
     }
-    if (shown == 0) try w.print("(no reference matching '{s}')\n", .{pattern});
+    if (shown == 0) {
+        try w.print("(no reference matching '{s}')\n", .{pattern});
+        try skippedNote(w, idx);
+    }
     try truncationNote(w, opts, shown);
 }
 
@@ -351,6 +387,7 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !vo
     }
     if (shown == 0) {
         try w.print("(no functions under '{s}')\n", .{filter});
+        try skippedNote(w, idx);
         return;
     }
     if (eligible > shown) {
@@ -442,7 +479,10 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
         shown += 1;
         if (shown >= opts.limit) break;
     }
-    if (!any) try w.print("(no routes under '{s}')\n", .{filter});
+    if (!any) {
+        try w.print("(no routes under '{s}')\n", .{filter});
+        try skippedNote(w, idx);
+    }
     try truncationNote(w, opts, shown);
 }
 
@@ -455,7 +495,7 @@ fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
     for (idx.callersOf(route.id)) |cid| {
         // A route↔client link is a path match (its own resolver), not a name
         // guess, so it is always rendered as confident.
-        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id), true);
+        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id), callSiteCount(idx, cid, route.id), true);
     }
 }
 
@@ -467,6 +507,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
     const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no symbol named '{s}')\n", .{name});
+        try skippedNote(w, idx);
         return;
     }
     for (ids) |id| {
@@ -475,7 +516,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         try renderCallees(w, idx, id, opts, 2);
         try w.writeAll("  ↑ callers\n");
         for (idx.callersOf(id)) |cid| {
-            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), hasExactEdge(idx, cid, id));
+            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), hasExactEdge(idx, cid, id));
         }
     }
 }
@@ -488,7 +529,7 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
-            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line, ref.exact);
+            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line, ref.count, ref.exact);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -505,17 +546,28 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
 /// symbols may legitimately be external API, so they are marked, not hidden.
 pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.unused(w, idx, filter, opts);
-    var ref_names = try buildReferencedNames(idx);
-    defer ref_names.deinit();
+    var refs = try buildReferencedNames(idx);
+    defer refs.deinit();
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
-        if (!isDeadCandidate(idx, sym, filter, &ref_names)) continue;
+        if (!isDeadCandidate(idx, sym, filter, &refs)) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
-        if (sym.exported) try w.writeAll("  (exported — may be public API)\n") else try w.writeByte('\n');
+        // A name reached only from tests is a genuine cleanup target (no
+        // application caller) — flag it as such; otherwise note public API.
+        if (refs.tests.contains(sym.name)) {
+            try w.writeAll("  (only used by tests)\n");
+        } else if (sym.exported) {
+            try w.writeAll("  (exported — may be public API)\n");
+        } else {
+            try w.writeByte('\n');
+        }
         shown += 1;
         if (shown >= opts.limit) break;
     }
-    if (shown == 0) try w.print("(no unused functions under '{s}')\n", .{filter});
+    if (shown == 0) {
+        try w.print("(no unused functions under '{s}')\n", .{filter});
+        try skippedNote(w, idx);
+    }
     try truncationNote(w, opts, shown);
 }
 
@@ -532,54 +584,191 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
 /// code as dead — the false positive that makes the whole verb untrustworthy.
 /// It ignores comments and strings (the lexer classifies those separately), so
 /// it is stricter than a raw `grep`. Caller owns the returned map.
-pub fn buildReferencedNames(idx: *const Index) !std.StringHashMap(void) {
+/// Where a name is used, split by production vs test code. `prod` holds names
+/// used somewhere outside test files; `tests` holds names *used* (not just
+/// imported) inside test files. `unused` treats a name absent from `prod` as
+/// dead, and annotates it "(only used by tests)" when it is in `tests` — the
+/// "no application caller" definition a dead-code audit actually wants.
+pub const RefSets = struct {
+    prod: std.StringHashMap(void),
+    tests: std.StringHashMap(void),
+    pub fn deinit(self: *RefSets) void {
+        self.prod.deinit();
+        self.tests.deinit();
+    }
+};
+
+pub fn buildReferencedNames(idx: *const Index) !RefSets {
     const gpa = idx.gpa;
-    // Definition count per name (a name's own declaration tokens don't count as
-    // "use"): a name defined N times needs N+1 occurrences to be considered used.
+    // Definition count per name in *non-test* files (a name's own declaration
+    // isn't a use): a name defined N times needs N+1 production occurrences to
+    // count as used in production.
     var def_counts = std.StringHashMap(u32).init(gpa);
     defer def_counts.deinit();
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
+        if (isTestPath(idx.graph.files[sym.file].path)) continue;
         const gop = try def_counts.getOrPut(sym.name);
         gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
     }
 
-    // Total identifier-token occurrences per name, across every file.
-    var occ = std.StringHashMap(u32).init(gpa);
-    defer occ.deinit();
+    // Identifier-token occurrences, tallied into production vs test buckets.
+    var occ_prod = std.StringHashMap(u32).init(gpa);
+    defer occ_prod.deinit();
+    var occ_test = std.StringHashMap(u32).init(gpa);
+    defer occ_test.deinit();
     var toks: std.ArrayList(lexer.Token) = .empty;
     defer toks.deinit(gpa);
     for (idx.graph.files) |file| {
         toks.clearRetainingCapacity();
         lexer.tokenize(gpa, file.text, language.configFor(file.language), &toks) catch continue;
-        for (toks.items) |t| {
-            if (t.kind == .identifier) {
-                const name = t.text(file.text);
-                if (name.len >= 2) try bumpOccurrence(&occ, name);
-            } else if (t.kind == .string) {
-                // A JS/TS template literal is kept whole by the lexer (so
-                // `fetch(`/x/${id}`)` still matches its route), which would hide
-                // a call used only inside `${…}`. Scan those interpolations here
-                // so a helper referenced only from a template isn't called dead.
-                const s = t.text(file.text);
-                if (s.len != 0 and s[0] == '`') try addTemplateIdents(s, &occ);
-            }
-        }
+        const bucket = if (isTestPath(file.path)) &occ_test else &occ_prod;
+        try tallyUses(toks.items, file.text, file.language, bucket);
     }
 
-    var referenced = std.StringHashMap(void).init(gpa);
-    errdefer referenced.deinit();
-    var it = occ.iterator();
-    while (it.next()) |e| {
+    var prod = std.StringHashMap(void).init(gpa);
+    errdefer prod.deinit();
+    var pit = occ_prod.iterator();
+    while (pit.next()) |e| {
         const defs = def_counts.get(e.key_ptr.*) orelse 0;
-        if (e.value_ptr.* > defs) try referenced.put(e.key_ptr.*, {});
+        if (e.value_ptr.* > defs) try prod.put(e.key_ptr.*, {});
     }
-    return referenced;
+    var tests = std.StringHashMap(void).init(gpa);
+    errdefer tests.deinit();
+    var tit = occ_test.keyIterator();
+    while (tit.next()) |k| try tests.put(k.*, {});
+    return .{ .prod = prod, .tests = tests };
 }
 
 fn bumpOccurrence(occ: *std.StringHashMap(u32), name: []const u8) !void {
     const gop = try occ.getOrPut(name);
     gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+}
+
+/// Tally identifier occurrences in one file into `occ`, skipping names that only
+/// appear in an import/export *declaration* — an ESM `import {…}`/`export {…}`, a
+/// CommonJS `module.exports = {…}` / `exports.x`, or a Python `from x import …`.
+/// A merely re-exported or imported name is a mention, not a use; counting it
+/// would hide genuinely-dead code (a re-exported function nobody calls). A JS/TS
+/// template literal's `${…}` interpolations are scanned so a call used only there
+/// still counts.
+fn tallyUses(toks: []const lexer.Token, text: []const u8, lang: language.Language, occ: *std.StringHashMap(u32)) !void {
+    const js = switch (lang) {
+        .javascript, .typescript, .tsx => true,
+        else => false,
+    };
+    const py = lang == .python;
+    var i: usize = 0;
+    while (i < toks.len) {
+        const t = toks[i];
+        if (t.kind == .string) {
+            const s = t.text(text);
+            if (js and s.len != 0 and s[0] == '`') try addTemplateIdents(s, occ);
+            i += 1;
+            continue;
+        }
+        if (t.kind != .identifier) {
+            i += 1;
+            continue;
+        }
+        if (js and jsDeclHead(toks, text, i)) {
+            i = try scanJsDecl(toks, text, i, occ);
+            continue;
+        }
+        if (py and (tokIs(toks, text, i, "import") or tokIs(toks, text, i, "from"))) {
+            i = try scanPyStmt(toks, text, i, occ);
+            continue;
+        }
+        const name = t.text(text);
+        if (name.len >= 2) try bumpOccurrence(occ, name);
+        i += 1;
+    }
+}
+
+fn tokIs(toks: []const lexer.Token, text: []const u8, i: usize, kw: []const u8) bool {
+    return i < toks.len and toks[i].kind == .identifier and std.mem.eql(u8, toks[i].text(text), kw);
+}
+
+fn punctIs(toks: []const lexer.Token, text: []const u8, i: usize, c: u8) bool {
+    return i < toks.len and toks[i].kind == .punct and text[toks[i].start] == c;
+}
+
+/// Head of a JS/TS import/export declaration whose listed names are mentions, not
+/// uses: `import …`, `export {`/`export *`/`export type {`, or CommonJS
+/// `module.exports` / `exports.…`. `export function/const/class …` (a definition)
+/// is not one — its name is a real symbol handled elsewhere.
+fn jsDeclHead(toks: []const lexer.Token, text: []const u8, i: usize) bool {
+    if (tokIs(toks, text, i, "import")) return true;
+    if (tokIs(toks, text, i, "export")) {
+        var j = i + 1;
+        if (tokIs(toks, text, j, "type")) j += 1;
+        return punctIs(toks, text, j, '{') or punctIs(toks, text, j, '*');
+    }
+    if (tokIs(toks, text, i, "module") and punctIs(toks, text, i + 1, '.') and tokIs(toks, text, i + 2, "exports")) return true;
+    if (tokIs(toks, text, i, "exports") and punctIs(toks, text, i + 1, '.')) return true;
+    return false;
+}
+
+/// Walk a JS/TS import/export declaration, counting only the *original* name of
+/// a rename (`X as Y` — X is used via its alias Y, e.g. `removeRequests as
+/// apiRemoveRequests`), and skipping the plain listed names. Returns the index
+/// just past the declaration (a closed `{…}` list, a `from "module"` string, or
+/// a `;`).
+fn scanJsDecl(toks: []const lexer.Token, text: []const u8, start: usize, occ: *std.StringHashMap(u32)) !usize {
+    var j = start + 1;
+    var depth: i32 = 0;
+    var opened = false;
+    while (j < toks.len) : (j += 1) {
+        const t = toks[j];
+        try countIfAlias(toks, text, j, occ);
+        if (t.kind == .punct) {
+            switch (text[t.start]) {
+                '{', '(', '[' => {
+                    depth += 1;
+                    opened = true;
+                },
+                '}', ')', ']' => depth -= 1,
+                ';' => if (depth <= 0) return j + 1,
+                else => {},
+            }
+        } else if (t.kind == .string and depth <= 0) {
+            return j + 1; // the `from "module"` path ends an import / re-export
+        }
+        if (opened and depth <= 0) return j + 1; // a `{…}` list closed with no trailing `from`
+    }
+    return j;
+}
+
+/// Walk a Python `import …` / `from x import …` statement (respecting a `(`
+/// continuation), counting the original name of an `a as b` rename; returns the
+/// first token index of the next statement.
+fn scanPyStmt(toks: []const lexer.Token, text: []const u8, start: usize, occ: *std.StringHashMap(u32)) !usize {
+    var j = start + 1;
+    const line = toks[start].line;
+    var depth: i32 = 0;
+    while (j < toks.len) : (j += 1) {
+        const t = toks[j];
+        try countIfAlias(toks, text, j, occ);
+        if (t.kind == .punct) {
+            switch (text[t.start]) {
+                '(', '[', '{' => depth += 1,
+                ')', ']', '}' => depth -= 1,
+                else => {},
+            }
+        }
+        if (depth <= 0 and t.line != line) return j;
+    }
+    return j;
+}
+
+/// If token `j` begins an `IDENT as IDENT` rename, count the first identifier —
+/// it's the real definition, used here under an alias.
+fn countIfAlias(toks: []const lexer.Token, text: []const u8, j: usize, occ: *std.StringHashMap(u32)) !void {
+    if (toks[j].kind != .identifier) return;
+    if (!tokIs(toks, text, j + 1, "as")) return;
+    if (j + 2 >= toks.len or toks[j + 2].kind != .identifier) return;
+    const name = toks[j].text(text);
+    if (name.len >= 2) try bumpOccurrence(occ, name);
 }
 
 fn isIdentStartByte(c: u8) bool {
@@ -624,16 +813,16 @@ fn addTemplateIdents(text: []const u8, occ: *std.StringHashMap(u32)) !void {
 }
 
 /// A symbol worth reporting as possibly-unused: a callable, in-scope of the
-/// filter, with zero callers, not an obvious entry point, and whose name is
-/// referenced nowhere in the repo. `ref_names` is `buildReferencedNames(idx)`.
+/// filter, not an obvious entry point, and not used by any *production* code.
+/// A test-only-used function still qualifies (it's a real cleanup target) — the
+/// caller distinguishes it via `refs.tests`. `refs` is `buildReferencedNames`.
 pub fn isDeadCandidate(
     idx: *const Index,
     sym: model.Symbol,
     filter: []const u8,
-    ref_names: *const std.StringHashMap(void),
+    refs: *const RefSets,
 ) bool {
     if (sym.kind != .function and sym.kind != .method) return false;
-    if (idx.callersOf(sym.id).len != 0) return false;
     if (std.mem.eql(u8, sym.name, "main")) return false;
     // Framework/entry-point callables are invoked implicitly, never by name, so
     // they always look "dead": dunder methods (`__init__`, `__call__`), a JS/TS
@@ -646,11 +835,10 @@ pub fn isDeadCandidate(
     // (`@field_validator`, `@app.on_event`, `@pytest.fixture`, `@abstractmethod`).
     // Treat it like a route handler: invoked, just not by a visible call site.
     if (precededByDecorator(idx, sym)) return false;
-    // Used somewhere by name — keep it out of the report. Reporting a live
-    // symbol as dead is the false positive that costs trust, so we trade recall
-    // (a truly-dead name that collides with a live one elsewhere is skipped) for
-    // precision: what survives is safe-to-delete with high confidence.
-    if (ref_names.contains(sym.name)) return false;
+    // Used by production code (any non-test file) → live. Reporting a live symbol
+    // as dead is the false positive that costs trust. A name used *only* from
+    // tests is NOT excluded here — it surfaces as a cleanup candidate, annotated.
+    if (refs.prod.contains(sym.name)) return false;
     const path = idx.graph.files[sym.file].path;
     if (isTestPath(path)) return false;
     return matchesFilter(path, filter);
@@ -1202,6 +1390,115 @@ test "unused: a helper used only via a template literal or past JSX prose is not
     try testing.expect(std.mem.indexOf(u8, out, "reallyDead") != null);
     try testing.expect(std.mem.indexOf(u8, out, "afterProse") == null);
     try testing.expect(std.mem.indexOf(u8, out, "tmpl") == null);
+}
+
+test "unused: a name only re-exported/imported is dead; called or aliased-and-used is live" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.ts", .data =
+        \\export function reExportedDead() { return 0; }
+        \\export function calledDirectly() { return 1; }
+        \\export function renamedLive() { return 2; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "consumer.ts", .data =
+        \\import { calledDirectly, renamedLive as aliasUsed } from "./lib";
+        \\export function run() { return calledDirectly() + aliasUsed(); }
+    });
+    // A barrel that only *re-exports* the name — a mention, not a call.
+    try tmp.dir.writeFile(io, .{ .sub_path = "barrel.ts", .data =
+        \\export { reExportedDead } from "./lib";
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // Only re-exported through a barrel, never called → dead.
+    try testing.expect(std.mem.indexOf(u8, out, "reExportedDead") != null);
+    // Imported and called → live.
+    try testing.expect(std.mem.indexOf(u8, out, "calledDirectly") == null);
+    // Imported under an alias that IS called → live.
+    try testing.expect(std.mem.indexOf(u8, out, "renamedLive") == null);
+}
+
+test "unused: used-only-from-tests is flagged and annotated; production use is not" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.py", .data =
+        \\def prod_used():
+        \\    return 1
+        \\def helper_tested_only():
+        \\    return 2
+        \\def truly_dead():
+        \\    return 3
+        \\def entry():
+        \\    return prod_used()
+    });
+    // A test module (basename `test_*`) whose only production reference is a call
+    // to `helper_tested_only` — the "no application caller" cleanup target.
+    try tmp.dir.writeFile(io, .{ .sub_path = "test_lib.py", .data =
+        \\from lib import helper_tested_only
+        \\def test_it():
+        \\    assert helper_tested_only() == 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // Used in production → not reported.
+    try testing.expect(std.mem.indexOf(u8, out, "prod_used") == null);
+    // Reached only by a test → reported, and flagged as such.
+    try testing.expect(std.mem.indexOf(u8, out, "helper_tested_only") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "only used by tests") != null);
+    // Referenced nowhere → reported (plainly, no test annotation of its own).
+    try testing.expect(std.mem.indexOf(u8, out, "truly_dead") != null);
+}
+
+test "callers shows call-site multiplicity (×N) when a caller invokes the target repeatedly" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\def helper(x):
+        \\    return x
+        \\def dashboard():
+        \\    return helper(1) + helper(2) + helper(3)
+        \\def once():
+        \\    return helper(9)
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
+    const out = aw.written();
+    // `dashboard` calls it three times → the edge is annotated ×3, not collapsed
+    // to a single call site; `once` (a single call) carries no multiplier.
+    try testing.expect(std.mem.indexOf(u8, out, "×3") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "once") != null);
 }
 
 test "end line is correct despite a leading comment or template prefix" {

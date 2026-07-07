@@ -48,7 +48,7 @@ pub fn symbol(
     indent: usize,
     show_path: bool,
 ) !void {
-    return symbolSite(w, idx, sym, v, indent, show_path, 0, true);
+    return symbolSite(w, idx, sym, v, indent, show_path, 0, 1, true);
 }
 
 /// Like `symbol`, but annotates the line with the call-site `site` (the source
@@ -64,6 +64,9 @@ pub fn symbolSite(
     indent: usize,
     show_path: bool,
     site: u32,
+    /// Number of call sites this edge represents; `↳:N ×C` is shown when C > 1 so
+    /// a caller that invokes the target repeatedly isn't undercounted as one.
+    sites: u32,
     /// False marks a heuristic (name-match) edge to this node, rendered with a
     /// trailing `?`; true (the default for roots and exact edges) renders plain.
     exact: bool,
@@ -80,7 +83,11 @@ pub fn symbolSite(
         .full => {},
     }
     try writeLocation(w, idx, sym, source, show_path);
-    if (site != 0) try w.print("  ↳:{d}{s}", .{ site, if (exact) "" else " ?" });
+    if (site != 0) {
+        try w.print("  ↳:{d}", .{site});
+        if (sites > 1) try w.print(" ×{d}", .{sites});
+        if (!exact) try w.writeAll(" ?");
+    }
     try w.writeByte('\n');
 
     if (v == .doc) try writeDocLine(w, sym, indent);

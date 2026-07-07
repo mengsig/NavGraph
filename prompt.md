@@ -42,7 +42,10 @@ top-level statements, config, comments, a specific arbitrary line), fall back to
 
 Every symbol prints as `path:start-end` (1-based, inclusive) — e.g.
 `app/routes/users.py:18-21`. In call trees each edge also shows the **call-site
-line** as `↳:N` (the line where the call happens, in the *caller*), and a
+line** as `↳:N` (the line where the call happens, in the *caller*); when that
+caller invokes the target more than once the edge is annotated `↳:N ×C` (C call
+sites), so `callers` is function-granular but never *under*-counts — sum the
+`×C` to get the total number of call sites, and a
 trailing **`?`** marks a **heuristic edge** — one resolved by a name match
 rather than a traceable receiver/type. Two things produce `?` edges: a bare name
 with several same-named definitions, and a **method call on a receiver whose
@@ -68,17 +71,20 @@ Two views are built to be trustworthy at repo scale:
   share prints it as `←42 callers (30 ?)`; `-s` reports exact-only and hides
   symbols whose connectivity is entirely heuristic. Don't read a bare `?`-share
   count as ground truth.
-- **`unused`** reports a callable only when its name appears **nowhere else** in
-  the repo — decided by a repo-wide identifier-token count (comments and strings
+- **`unused`** reports a callable with no **production** caller — decided by a
+  repo-wide identifier-token count over non-test files (comments and strings
   excluded), not by the resolved call graph. So a use inside a template literal,
-  JSX, a Zig `test {}` block, module scope, or a body NavGraph parses only
-  partially still keeps a symbol off the list. It's high-precision (what it lists
-  is very likely dead) and won't flag live code, at the cost of recall (a dead
-  name colliding with a live one elsewhere is skipped). Decorated definitions,
-  dunder/`constructor` methods, and test files are treated as invoked. Note:
-  framework entry points reached only by reflection (alembic `upgrade`/
-  `downgrade`, ASGI middleware `dispatch`) can still appear — they are, strictly,
-  never called by name.
+  JSX, a Zig `test {}` block, module scope, or a partially-parsed body still
+  keeps a symbol off the list; a name only in an `import`/`export`/
+  `module.exports` list is a *mention*, not a use (a re-exported-but-uncalled
+  function IS reported; an `X as Y` rename counts as a use of `X`). A symbol
+  reached **only from tests** is reported and annotated `(only used by tests)` —
+  the real cleanup target — separately from truly-unreferenced code. Decorated
+  definitions, dunder/`constructor` methods, and `main` are treated as invoked.
+  It won't flag production-live code; the cost is recall (a dead name colliding
+  with a live one is skipped). Framework entry points reached only by reflection
+  (alembic `upgrade`/`downgrade`, ASGI middleware `dispatch`) can still appear —
+  strictly, they are never called by name. Verify a candidate with `callers`.
 
 ## Commands
 

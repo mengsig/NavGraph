@@ -133,6 +133,18 @@ fn lexToken(lx: *Lexer, out: *std.ArrayList(Token)) std.mem.Allocator.Error!void
         try appendSingle(lx, out, .punct);
         return;
     }
+    // C/C++ digit separators (`1'000'000`, `0xFF'FF`): a `'` immediately after a
+    // number token is a separator, not a char-literal opener — otherwise it would
+    // swallow to the next quote (often EOF, erasing the whole file). Keyed on the
+    // previous *token* being a number so char prefixes like `L'a'`/`u'a'` (whose
+    // previous token is an identifier) are untouched.
+    if ((cfg.language == .c or cfg.language == .cpp) and c == '\'' and
+        out.items.len > 0 and out.items[out.items.len - 1].kind == .number and
+        out.items[out.items.len - 1].end == lx.pos)
+    {
+        try appendSingle(lx, out, .punct);
+        return;
+    }
     if (isStringDelim(cfg, c) or (cfg.template_strings and c == '`')) {
         try lexString(lx, out, c);
         return;
@@ -546,4 +558,44 @@ test "a real single-quoted JS string (in value position) is still a string" {
     for (toks.items) |t| {
         if (t.kind == .identifier) try std.testing.expect(!std.mem.eql(u8, t.text(src), "production"));
     }
+}
+
+test "C++ digit separators do not open a char literal and swallow the file" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.cpp);
+    // `1'000` (a single separator) would otherwise open a char literal that runs
+    // to EOF, erasing every symbol after it.
+    const src =
+        \\int budget() { return 1'000; }
+        \\int laterFn(int x) { return x; }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    var saw_later = false;
+    for (toks.items) |t| {
+        if (t.kind == .identifier and std.mem.eql(u8, t.text(src), "laterFn")) saw_later = true;
+    }
+    try std.testing.expect(saw_later);
+}
+
+test "C++ char prefix (L'a') stays a char literal; code after it survives" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.cpp);
+    const src =
+        \\wchar_t w = L'a';
+        \\int fnTwo(int q) { return q; }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    var leaked_a = false;
+    var saw_fn = false;
+    for (toks.items) |t| {
+        if (t.kind != .identifier) continue;
+        if (std.mem.eql(u8, t.text(src), "a")) leaked_a = true; // would mean the char literal was broken
+        if (std.mem.eql(u8, t.text(src), "fnTwo")) saw_fn = true;
+    }
+    try std.testing.expect(!leaked_a);
+    try std.testing.expect(saw_fn);
 }
