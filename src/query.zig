@@ -64,6 +64,11 @@ pub const Options = struct {
     /// tests). Passing both `unused_skip_*` flags leaves only the symbols
     /// referenced nowhere: the "actually unused" set.
     unused_skip_test_only: bool = false,
+    /// `unused`: disambiguate same-named symbols by import reachability instead of
+    /// the (safe) family-wide name tally. Surfaces dead code masked by a used
+    /// same-name twin in another package, at the cost of depending on import
+    /// resolution — an unresolved import can hide a real use (false positive).
+    unused_follow_imports: bool = false,
     /// `files`: result ordering (discovery order or descending symbol count).
     file_sort: FileSort = .path,
 };
@@ -1240,16 +1245,17 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     if (opts.format == .json) return json_out.unused(w, idx, filter, opts);
     var refs = try buildReferencedNames(idx);
     defer refs.deinit();
+    if (opts.unused_follow_imports) refs.scope = try buildCollisionScope(idx);
     var shown: u32 = 0;
     var hidden_test: u32 = 0;
     var hidden_exported: u32 = 0;
     for (idx.graph.symbols) |sym| {
-        if (!isDeadCandidate(idx, sym, filter, &refs)) continue;
-        if (!deadCandidateShown(sym, opts, &refs)) {
+        if (!try isDeadCandidate(idx, sym, filter, &refs)) continue;
+        if (!deadCandidateShown(idx, sym, opts, &refs)) {
             // Attribute the suppression to the flag that hid it (test-only takes
             // precedence, matching deadCandidateShown's order) so the note below
             // can nudge a re-run without that flag.
-            if (opts.unused_skip_test_only and refs.tests.contains(sym.name)) {
+            if (opts.unused_skip_test_only and refs.testsContains(familyOf(idx, sym), sym.name)) {
                 hidden_test += 1;
             } else if (opts.unused_skip_exported and sym.exported) {
                 hidden_exported += 1;
@@ -1259,7 +1265,7 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         // A name reached only from tests is a genuine cleanup target (no
         // application caller) — flag it as such; otherwise note public API.
-        if (refs.tests.contains(sym.name)) {
+        if (refs.testsContains(familyOf(idx, sym), sym.name)) {
             try w.writeAll("  (only used by tests)\n");
         } else if (sym.exported) {
             try w.writeAll("  (exported — may be public API)\n");
@@ -1282,11 +1288,14 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     try truncationNote(w, opts, shown);
 }
 
-/// Names that are used *somewhere* in the repo, decided by a repo-wide
-/// identifier-token count rather than the resolved call graph. A name counts as
-/// used when its identifier appears more times across all files than the number
-/// of definitions carrying that name — i.e. it appears somewhere beyond its own
-/// declaration(s).
+/// Names used *somewhere*, decided by an identifier-token count rather than the
+/// resolved call graph. A name counts as used within a language family when its
+/// identifier appears more times across that family's files than the number of
+/// definitions carrying it there — i.e. it appears somewhere beyond its own
+/// declaration(s). The per-family scope is the fix for the name-collision false
+/// negative: a `getOptions` used in a Python backend can no longer mask a dead
+/// `getOptions` in a TS frontend, since NavGraph never resolves a reference
+/// across families.
 ///
 /// This is deliberately independent of body-scoping: it re-lexes every file and
 /// tallies identifier tokens, so a use inside a Zig `test {}` block, a JS
@@ -1294,60 +1303,251 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
 /// only partially still counts. `unused` relies on this to avoid reporting live
 /// code as dead — the false positive that makes the whole verb untrustworthy.
 /// It ignores comments and strings (the lexer classifies those separately), so
-/// it is stricter than a raw `grep`. Caller owns the returned map.
-/// Where a name is used, split by production vs test code. `prod` holds names
-/// used somewhere outside test files; `tests` holds names *used* (not just
-/// imported) inside test files. `unused` treats a name absent from `prod` as
-/// dead, and annotates it "(only used by tests)" when it is in `tests` — the
-/// "no application caller" definition a dead-code audit actually wants.
+/// it is stricter than a raw `grep`. Caller owns the returned maps.
+/// Usage is split by production vs test code: `prod` holds names used outside
+/// test files; `tests` holds names *used* (not just imported) inside test files.
+/// `unused` treats a name absent from its family's `prod` as dead, and annotates
+/// it "(only used by tests)" when it is in `tests`.
+/// Number of language families (buckets the usage tally is scoped by).
+const family_count = @typeInfo(language.Family).@"enum".fields.len;
+
+/// Membership is scoped *per language family* because NavGraph only resolves a
+/// reference against files in the same family: a `getOptions` used in a Python
+/// backend is not a use of a `getOptions` defined in a TS frontend. Scoping the
+/// tally by family stops such a cross-family (or cross-package, same-named) twin
+/// from masking genuinely-dead code — the name-collision false negative.
 pub const RefSets = struct {
-    prod: std.StringHashMap(void),
-    tests: std.StringHashMap(void),
+    prod: [family_count]std.StringHashMap(void),
+    tests: [family_count]std.StringHashMap(void),
+    /// Present only under `--follow-imports`: import-reachability data used to
+    /// resolve same-name collisions the family-wide tally can't disambiguate.
+    scope: ?CollisionScope = null,
+
     pub fn deinit(self: *RefSets) void {
-        self.prod.deinit();
-        self.tests.deinit();
+        for (&self.prod) |*m| m.deinit();
+        for (&self.tests) |*m| m.deinit();
+        if (self.scope) |*s| s.deinit();
+    }
+
+    /// Whether `name` is used by production code within `fam`.
+    pub fn prodContains(self: *const RefSets, fam: language.Family, name: []const u8) bool {
+        return self.prod[@intFromEnum(fam)].contains(name);
+    }
+
+    /// Whether `name` is used by test code within `fam`.
+    pub fn testsContains(self: *const RefSets, fam: language.Family, name: []const u8) bool {
+        return self.tests[@intFromEnum(fam)].contains(name);
     }
 };
 
+/// The language family of the file that defines `sym`.
+pub fn familyOf(idx: *const Index, sym: model.Symbol) language.Family {
+    return idx.graph.files[sym.file].language.family();
+}
+
 pub fn buildReferencedNames(idx: *const Index) !RefSets {
     const gpa = idx.gpa;
-    // Definition count per name in *non-test* files (a name's own declaration
-    // isn't a use): a name defined N times needs N+1 production occurrences to
-    // count as used in production.
-    var def_counts = std.StringHashMap(u32).init(gpa);
-    defer def_counts.deinit();
+    // Per-family definition counts (a name's own declaration isn't a use): a name
+    // defined N times in a family needs N+1 occurrences there to count as used.
+    var def_counts: [family_count]std.StringHashMap(u32) = undefined;
+    for (&def_counts) |*m| m.* = std.StringHashMap(u32).init(gpa);
+    defer for (&def_counts) |*m| m.deinit();
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
         if (isTestPath(idx.graph.files[sym.file].path)) continue;
-        const gop = try def_counts.getOrPut(sym.name);
+        const gop = try def_counts[@intFromEnum(familyOf(idx, sym))].getOrPut(sym.name);
         gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
     }
 
-    // Identifier-token occurrences, tallied into production vs test buckets.
-    var occ_prod = std.StringHashMap(u32).init(gpa);
-    defer occ_prod.deinit();
-    var occ_test = std.StringHashMap(u32).init(gpa);
-    defer occ_test.deinit();
+    // Per-family identifier-token occurrences, split into production vs test.
+    var occ_prod: [family_count]std.StringHashMap(u32) = undefined;
+    var occ_test: [family_count]std.StringHashMap(u32) = undefined;
+    for (&occ_prod) |*m| m.* = std.StringHashMap(u32).init(gpa);
+    for (&occ_test) |*m| m.* = std.StringHashMap(u32).init(gpa);
+    defer for (&occ_prod) |*m| m.deinit();
+    defer for (&occ_test) |*m| m.deinit();
     var toks: std.ArrayList(lexer.Token) = .empty;
     defer toks.deinit(gpa);
     for (idx.graph.files) |file| {
         toks.clearRetainingCapacity();
         lexer.tokenize(gpa, file.text, language.configFor(file.language), &toks) catch continue;
-        try tallyUses(toks.items, file.text, file.language, &occ_prod, &occ_test, isTestPath(file.path));
+        const fam = @intFromEnum(file.language.family());
+        try tallyUses(toks.items, file.text, file.language, &occ_prod[fam], &occ_test[fam], isTestPath(file.path));
     }
 
-    var prod = std.StringHashMap(void).init(gpa);
-    errdefer prod.deinit();
-    var pit = occ_prod.iterator();
-    while (pit.next()) |e| {
-        const defs = def_counts.get(e.key_ptr.*) orelse 0;
-        if (e.value_ptr.* > defs) try prod.put(e.key_ptr.*, {});
+    var result: RefSets = .{ .prod = undefined, .tests = undefined };
+    for (&result.prod) |*m| m.* = std.StringHashMap(void).init(gpa);
+    for (&result.tests) |*m| m.* = std.StringHashMap(void).init(gpa);
+    errdefer result.deinit();
+    for (0..family_count) |f| {
+        var pit = occ_prod[f].iterator();
+        while (pit.next()) |e| {
+            const defs = def_counts[f].get(e.key_ptr.*) orelse 0;
+            if (e.value_ptr.* > defs) try result.prod[f].put(e.key_ptr.*, {});
+        }
+        var tit = occ_test[f].keyIterator();
+        while (tit.next()) |k| try result.tests[f].put(k.*, {});
     }
-    var tests = std.StringHashMap(void).init(gpa);
-    errdefer tests.deinit();
-    var tit = occ_test.keyIterator();
-    while (tit.next()) |k| try tests.put(k.*, {});
-    return .{ .prod = prod, .tests = tests };
+    return result;
+}
+
+/// Import-reachability data for resolving same-name collisions (`--follow-imports`).
+/// Because NavGraph's resolver guesses which same-named twin a bare call binds to,
+/// the resolved graph can't be trusted for collisions; this reconstructs "is this
+/// specific definition used" from import edges + per-file textual use.
+pub const CollisionScope = struct {
+    /// Names defined more than once within a family (the ambiguous set).
+    colliding: [family_count]std.StringHashMap(void),
+    /// Per file: the colliding names actually *used* (occurrences beyond the
+    /// definitions) in that file. Re-exports are not uses (tallyUses skips them).
+    file_uses: []std.StringHashMap(void),
+    /// Reverse import edges: `rev_imports[F]` lists the files that import `F`.
+    rev_imports: [][]model.FileId,
+    gpa: std.mem.Allocator,
+
+    pub fn deinit(self: *CollisionScope) void {
+        for (&self.colliding) |*m| m.deinit();
+        for (self.file_uses) |*m| m.deinit();
+        self.gpa.free(self.file_uses);
+        for (self.rev_imports) |list| self.gpa.free(list);
+        self.gpa.free(self.rev_imports);
+    }
+
+    fn isColliding(self: *const CollisionScope, fam: language.Family, name: []const u8) bool {
+        return self.colliding[@intFromEnum(fam)].contains(name);
+    }
+};
+
+/// Build the `--follow-imports` collision data: which names collide per family,
+/// where each colliding name is used, and the reverse import graph.
+pub fn buildCollisionScope(idx: *const Index) !CollisionScope {
+    const gpa = idx.gpa;
+    var colliding: [family_count]std.StringHashMap(void) = undefined;
+    for (&colliding) |*m| m.* = std.StringHashMap(void).init(gpa);
+    errdefer for (&colliding) |*m| m.deinit();
+    try fillColliding(idx, &colliding);
+
+    const file_uses = try buildFileUses(idx, &colliding);
+    errdefer {
+        for (file_uses) |*m| m.deinit();
+        gpa.free(file_uses);
+    }
+    const rev_imports = try buildReverseImports(idx);
+    return .{ .colliding = colliding, .file_uses = file_uses, .rev_imports = rev_imports, .gpa = gpa };
+}
+
+/// Mark every name defined ≥2 times (in non-test files) within a family colliding.
+fn fillColliding(idx: *const Index, colliding: *[family_count]std.StringHashMap(void)) !void {
+    var counts: [family_count]std.StringHashMap(u32) = undefined;
+    for (&counts) |*m| m.* = std.StringHashMap(u32).init(idx.gpa);
+    defer for (&counts) |*m| m.deinit();
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import) continue;
+        if (isTestPath(idx.graph.files[sym.file].path)) continue;
+        const f = @intFromEnum(familyOf(idx, sym));
+        const gop = try counts[f].getOrPut(sym.name);
+        gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+        if (gop.value_ptr.* == 2) try colliding[f].put(sym.name, {});
+    }
+}
+
+/// Per file, the set of colliding names *used* there (token occurrences exceed
+/// the definitions of that name in the file — a real use, not just the decl).
+fn buildFileUses(idx: *const Index, colliding: *const [family_count]std.StringHashMap(void)) ![]std.StringHashMap(void) {
+    const gpa = idx.gpa;
+    const file_defs = try perFileCollidingDefs(idx, colliding);
+    defer {
+        for (file_defs) |*m| m.deinit();
+        gpa.free(file_defs);
+    }
+    var uses = try gpa.alloc(std.StringHashMap(void), idx.graph.files.len);
+    for (uses) |*m| m.* = std.StringHashMap(void).init(gpa);
+    errdefer {
+        for (uses) |*m| m.deinit();
+        gpa.free(uses);
+    }
+    var occ = std.StringHashMap(u32).init(gpa);
+    defer occ.deinit();
+    var toks: std.ArrayList(lexer.Token) = .empty;
+    defer toks.deinit(gpa);
+    for (idx.graph.files) |file| {
+        occ.clearRetainingCapacity();
+        toks.clearRetainingCapacity();
+        lexer.tokenize(gpa, file.text, language.configFor(file.language), &toks) catch continue;
+        // Route both buckets to one map: we want total uses per name, prod+test.
+        try tallyUses(toks.items, file.text, file.language, &occ, &occ, false);
+        const fam = @intFromEnum(file.language.family());
+        var it = occ.iterator();
+        while (it.next()) |e| {
+            if (!colliding[fam].contains(e.key_ptr.*)) continue;
+            const defs = file_defs[file.id].get(e.key_ptr.*) orelse 0;
+            if (e.value_ptr.* > defs) try uses[file.id].put(e.key_ptr.*, {});
+        }
+    }
+    return uses;
+}
+
+/// Per file, the number of definitions of each colliding name (subtracted from
+/// occurrences so a name's own declaration doesn't read as a use).
+fn perFileCollidingDefs(idx: *const Index, colliding: *const [family_count]std.StringHashMap(void)) ![]std.StringHashMap(u32) {
+    const gpa = idx.gpa;
+    var defs = try gpa.alloc(std.StringHashMap(u32), idx.graph.files.len);
+    for (defs) |*m| m.* = std.StringHashMap(u32).init(gpa);
+    errdefer {
+        for (defs) |*m| m.deinit();
+        gpa.free(defs);
+    }
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import) continue;
+        if (!colliding[@intFromEnum(familyOf(idx, sym))].contains(sym.name)) continue;
+        const gop = try defs[sym.file].getOrPut(sym.name);
+        gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+    }
+    return defs;
+}
+
+/// Reverse of the import table: `rev[F]` = files that import `F` (gpa-owned).
+fn buildReverseImports(idx: *const Index) ![][]model.FileId {
+    const gpa = idx.gpa;
+    const n = idx.graph.files.len;
+    var counts = try gpa.alloc(u32, n);
+    defer gpa.free(counts);
+    @memset(counts, 0);
+    for (idx.graph.files) |file| {
+        for (idx.importsOf(file.id)) |imp| counts[imp.target] += 1;
+    }
+    var rev = try gpa.alloc([]model.FileId, n);
+    for (rev, 0..) |*slot, i| slot.* = try gpa.alloc(model.FileId, counts[i]);
+    @memset(counts, 0);
+    for (idx.graph.files) |file| {
+        for (idx.importsOf(file.id)) |imp| {
+            rev[imp.target][counts[imp.target]] = file.id;
+            counts[imp.target] += 1;
+        }
+    }
+    return rev;
+}
+
+/// Whether a colliding symbol is used anywhere it is *reachable* — its own file
+/// or any file that (transitively) imports it. Over-approximating reachability
+/// (transitive importers) is deliberate: it can only mask dead code, never flag
+/// live code, so a missing import edge won't manufacture a false positive here.
+fn reachablyUsed(scope: *const CollisionScope, idx: *const Index, sym: model.Symbol) !bool {
+    var visited = std.AutoHashMap(model.FileId, void).init(scope.gpa);
+    defer visited.deinit();
+    var stack: std.ArrayList(model.FileId) = .empty;
+    defer stack.deinit(scope.gpa);
+    try stack.append(scope.gpa, sym.file);
+    while (stack.pop()) |fid| {
+        const gop = try visited.getOrPut(fid);
+        if (gop.found_existing) continue;
+        std.debug.assert(fid < idx.graph.files.len);
+        if (scope.file_uses[fid].contains(sym.name)) return true;
+        for (scope.rev_imports[fid]) |importer| {
+            if (!visited.contains(importer)) try stack.append(scope.gpa, importer);
+        }
+    }
+    return false;
 }
 
 fn bumpOccurrence(occ: *std.StringHashMap(u32), name: []const u8) !void {
@@ -1626,7 +1826,7 @@ pub fn isDeadCandidate(
     sym: model.Symbol,
     filter: []const u8,
     refs: *const RefSets,
-) bool {
+) !bool {
     if (!isReportableDeadKind(sym.kind)) return false;
     if (std.mem.eql(u8, sym.name, "main")) return false;
     // Framework/entry-point callables are invoked implicitly, never by name, so
@@ -1640,13 +1840,25 @@ pub fn isDeadCandidate(
     // (`@field_validator`, `@app.on_event`, `@pytest.fixture`, `@abstractmethod`).
     // Treat it like a route handler: invoked, just not by a visible call site.
     if (precededByDecorator(idx, sym)) return false;
-    // Used by production code (any non-test file) → live. Reporting a live symbol
-    // as dead is the false positive that costs trust. A name used *only* from
-    // tests is NOT excluded here — it surfaces as a cleanup candidate, annotated.
-    if (refs.prod.contains(sym.name)) return false;
+    // Used somewhere → live. Reporting a live symbol as dead is the false positive
+    // that costs trust. A name used *only* from tests is NOT excluded here — it
+    // surfaces as a cleanup candidate, annotated.
+    if (try symbolUsed(idx, sym, refs)) return false;
     const path = idx.graph.files[sym.file].path;
     if (isTestPath(path)) return false;
     return matchesFilter(path, filter);
+}
+
+/// Whether `sym` counts as used. By default this is the safe family-wide name
+/// tally. Under `--follow-imports` a *colliding* name (defined more than once in
+/// its family, which the tally can't disambiguate) is instead resolved by import
+/// reachability, so a dead symbol isn't masked by a used same-name twin.
+fn symbolUsed(idx: *const Index, sym: model.Symbol, refs: *const RefSets) !bool {
+    const fam = familyOf(idx, sym);
+    if (refs.scope) |*scope| {
+        if (scope.isColliding(fam, sym.name)) return reachablyUsed(scope, idx, sym);
+    }
+    return refs.prodContains(fam, sym.name);
 }
 
 /// Apply the `unused` visibility filters to a symbol already known to be a dead
@@ -1654,10 +1866,10 @@ pub fn isDeadCandidate(
 /// real use, just not production); `unused_skip_exported` drops exported symbols
 /// (possible public API). With both set, only symbols referenced nowhere survive
 /// — the "actually unused" set. `refs` is `buildReferencedNames`.
-pub fn deadCandidateShown(sym: model.Symbol, opts: Options, refs: *const RefSets) bool {
+pub fn deadCandidateShown(idx: *const Index, sym: model.Symbol, opts: Options, refs: *const RefSets) bool {
     std.debug.assert(isReportableDeadKind(sym.kind));
     std.debug.assert(sym.name.len != 0);
-    if (opts.unused_skip_test_only and refs.tests.contains(sym.name)) return false;
+    if (opts.unused_skip_test_only and refs.testsContains(familyOf(idx, sym), sym.name)) return false;
     if (opts.unused_skip_exported and sym.exported) return false;
     return true;
 }
@@ -1984,8 +2196,8 @@ test "shortest path and dead-code detection over a call chain" {
     defer ref_names.deinit();
     const orphan = idx.graph.symbols[idx.lookup("orphan")[0]];
     const gamma = idx.graph.symbols[idx.lookup("gamma")[0]];
-    try testing.expect(isDeadCandidate(&idx, orphan, "", &ref_names));
-    try testing.expect(!isDeadCandidate(&idx, gamma, "", &ref_names));
+    try testing.expect(try isDeadCandidate(&idx, orphan, "", &ref_names));
+    try testing.expect(!try isDeadCandidate(&idx, gamma, "", &ref_names));
 }
 
 test "calls hides var/const data reads by default, shows them with --refs; graph stays symmetric" {
@@ -2196,7 +2408,7 @@ test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly
     // The dispatch heuristic gives it a caller, so it is NOT dead code.
     var ref_names = try buildReferencedNames(&idx);
     defer ref_names.deinit();
-    try testing.expect(!isDeadCandidate(&idx, create_run, "", &ref_names));
+    try testing.expect(!try isDeadCandidate(&idx, create_run, "", &ref_names));
     try testing.expect(idx.callersOf(create_run.id).len > 0);
 
     // Its fan-in is entirely heuristic: total > 0, exact == 0.
@@ -2298,6 +2510,86 @@ test "unused: a class never instantiated is dead; an instantiated one is live" {
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "DeadThing") != null);
     try testing.expect(std.mem.indexOf(u8, out, "UsedThing") == null);
+}
+
+test "unused: a dead symbol is flagged despite a used same-name twin in another language" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A TS frontend `getOptions` nothing calls, and a Python backend `getOptions`
+    // that IS used. The tally is scoped per language family, so the used Python
+    // twin must not mask the dead TS wrapper (the name-collision false negative).
+    try tmp.dir.writeFile(io, .{ .sub_path = "endpoints.ts", .data =
+        \\export const getOptions = () => fetch("/options");
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "service.py", .data =
+        \\def getOptions():
+        \\    return 1
+        \\def handler():
+        \\    return getOptions()
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var refs = try buildReferencedNames(&idx);
+    defer refs.deinit();
+    var tbuf: [8]SymbolId = undefined;
+    var pbuf: [8]SymbolId = undefined;
+    const ts_ids = resolveIds(&idx, "getOptions@endpoints.ts", &tbuf);
+    const py_ids = resolveIds(&idx, "getOptions@service.py", &pbuf);
+    try testing.expect(ts_ids.len == 1 and py_ids.len == 1);
+    // Dead in the JS family, live in the Python family — scoped independently.
+    try testing.expect(try isDeadCandidate(&idx, idx.graph.symbols[ts_ids[0]], "", &refs));
+    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[py_ids[0]], "", &refs));
+}
+
+test "unused --follow-imports flags a same-family dead twin the tally masks" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Two same-family `getOptions`; a consumer imports and uses only b's. The
+    // family tally sees the name used and masks both; import reachability must
+    // flag a's (unimported) while keeping b's (used via import) live. A barrel
+    // re-export exercises transitive reachability (b reached through index.ts).
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.ts", .data =
+        \\export const getOptions = () => 1;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.ts", .data =
+        \\export const getOptions = () => 2;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.ts", .data =
+        \\export { getOptions } from "./b";
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "consumer.ts", .data =
+        \\import { getOptions } from "./index";
+        \\export function run() { return getOptions(); }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var abuf: [8]SymbolId = undefined;
+    var bbuf: [8]SymbolId = undefined;
+    const a_id = resolveIds(&idx, "getOptions@a.ts", &abuf)[0];
+    const b_id = resolveIds(&idx, "getOptions@b.ts", &bbuf)[0];
+
+    // Default: family tally masks both (each is "used" because the name is used).
+    var refs = try buildReferencedNames(&idx);
+    defer refs.deinit();
+    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[a_id], "", &refs));
+    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[b_id], "", &refs));
+
+    // --follow-imports: a is unreachable (dead), b is used via the barrel (live).
+    var scoped = try buildReferencedNames(&idx);
+    defer scoped.deinit();
+    scoped.scope = try buildCollisionScope(&idx);
+    try testing.expect(try isDeadCandidate(&idx, idx.graph.symbols[a_id], "", &scoped));
+    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[b_id], "", &scoped));
 }
 
 test "unused: a multi-line decorator suppresses a framework-wired handler" {

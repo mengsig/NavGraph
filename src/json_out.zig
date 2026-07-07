@@ -467,15 +467,16 @@ fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
 pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     var refs = try query.buildReferencedNames(idx);
     defer refs.deinit();
+    if (opts.unused_follow_imports) refs.scope = try query.buildCollisionScope(idx);
     var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
-        if (!query.isDeadCandidate(idx, sym, filter, &refs)) continue;
-        if (!query.deadCandidateShown(sym, opts, &refs)) continue;
+        if (!try query.isDeadCandidate(idx, sym, filter, &refs)) continue;
+        if (!query.deadCandidateShown(idx, sym, opts, &refs)) continue;
         if (shown != 0) try w.writeByte(',');
         // A name used only from tests is a real cleanup target — flag it so JSON
         // consumers can separate it from truly-unreferenced code.
-        try symbolObjectExtra(w, idx, sym, opts.verbosity, refs.tests.contains(sym.name));
+        try symbolObjectExtra(w, idx, sym, opts.verbosity, refs.testsContains(query.familyOf(idx, sym), sym.name));
         shown += 1;
         if (shown >= opts.limit) break;
     }

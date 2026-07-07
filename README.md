@@ -51,6 +51,7 @@ navgraph <command> [arg] [flags]
 | `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
 | `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
+| `unused [filter]`  | Dead-code candidates; `--no-public`/`--no-test` narrow it, `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
 | `help`             | Show help.                                                    |
 
 **Flags**

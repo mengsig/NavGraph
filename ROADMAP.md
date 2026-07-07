@@ -89,8 +89,11 @@ not fully captured as edges.
      (candidate dead code; exported symbols are marked, not hidden). ✅
    - `imports [filter]` / `importers <file>` — local module dependency graph,
      built from the resolved import table. ✅
-   - *Still open:* `changed <gitrev>` — symbols touched since a revision + their
-     blast radius (needs git integration).
+   - `events [filter]` — string-keyed message-bus dispatch: pairs handler
+     registrations (`register`/`on`) with emitters (`send`/`emit`) by key,
+     the event-bus analogue of `routes`. ✅
+   - `diff [ref]` — symbols touched since a git revision (default `HEAD`) plus
+     their direct callers: the blast radius of a change. ✅
 
 9. **Relevance ranking.** PageRank / centrality on the call graph so `search`
    and `outline` surface important symbols first; show fan-in/out counts

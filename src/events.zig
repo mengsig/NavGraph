@@ -31,19 +31,20 @@ pub const EventRef = struct {
 /// Max event-key length; longer literals are prose (log/error text), not keys.
 const max_key_len = 64;
 
-/// Verbs that register/subscribe a handler for a key (the receiving side).
+/// Verbs that register/subscribe a handler for a key (the receiving side). Kept
+/// to unambiguous dispatch verbs — generic ones (`handle`, `bind`, `event`, DOM
+/// `addEventListener`) matched HTTP/DOM calls that `routes` already covers.
 const handler_verbs = std.StaticStringMap(void).initComptime(.{
-    .{"register"}, .{"on"},         .{"subscribe"}, .{"handler"},
-    .{"handle"},   .{"listen"},     .{"addlistener"}, .{"addeventlistener"},
-    .{"bind"},     .{"connect"},    .{"when"},      .{"command"},
-    .{"event"},    .{"onmessage"},
+    .{"register"},    .{"on"},     .{"subscribe"},
+    .{"listen"},      .{"addlistener"},
 });
 
-/// Verbs that fire/emit a key (the sending side).
+/// Verbs that fire/emit a key (the sending side). `post`/`call`/`invoke` were
+/// dropped: they matched HTTP client calls and generic invocations, not the bus.
 const emitter_verbs = std.StaticStringMap(void).initComptime(.{
-    .{"emit"},     .{"send"},       .{"dispatch"},  .{"publish"},
-    .{"trigger"},  .{"fire"},       .{"broadcast"}, .{"notify"},
-    .{"post"},     .{"sendmessage"},.{"invoke"},    .{"call"},
+    .{"emit"},      .{"send"},   .{"dispatch"},  .{"publish"},
+    .{"trigger"},   .{"fire"},   .{"broadcast"}, .{"notify"},
+    .{"sendmessage"},
 });
 
 /// The dispatch role of `verb` (case-insensitive; a leading decorator `@` is
@@ -84,24 +85,39 @@ pub fn collect(toks: []const Token, source: []const u8, out: *std.ArrayList(Even
     }
 }
 
-/// The event key inside a string literal, or null when the literal is not a
-/// plausible key (empty, too long, dynamic `${…}`, or containing whitespace —
-/// the signals that separate a key from a prose message).
+/// The event key inside a (possibly prefixed) string literal, or null when the
+/// literal is not a plausible key: empty, too long, whitespace/prose, a URL path
+/// (`/`-bearing — that is `routes`' domain), or an interpolated/dynamic fragment.
+/// An f-string key like `f"start"` reads as `start`; a cut f-string fragment such
+/// as `f"/api/jobs/` (the lexer stops at the first `{`) has no closing quote and
+/// is dropped as dynamic.
 fn eventKey(raw: []const u8) ?[]const u8 {
-    const key = stripQuotes(raw);
+    const lit = stripStringPrefix(raw);
+    if (lit.len < 2) return null;
+    const q = lit[0];
+    if (q != '"' and q != '\'' and q != '`') return null;
+    if (lit[lit.len - 1] != q) return null;
+    const key = lit[1 .. lit.len - 1];
     if (key.len == 0 or key.len > max_key_len) return null;
     for (key) |c| {
         if (c == ' ' or c == '\t' or c == '\n' or c == '\r') return null;
+        if (c == '/') return null;
+        if (c == '{') return null;
     }
     if (std.mem.indexOf(u8, key, "${") != null) return null;
     return key;
 }
 
-fn stripQuotes(s: []const u8) []const u8 {
-    if (s.len < 2) return s;
-    const q = s[0];
-    if ((q == '"' or q == '\'' or q == '`') and s[s.len - 1] == q) return s[1 .. s.len - 1];
-    return s;
+/// Strip a leading string prefix (Python `f`/`r`/`b`/`u` and combinations) so an
+/// f-string literal is read by its quoted body. Returns `raw` unchanged when no
+/// letters precede the opening quote, or the empty tail when there is no quote.
+fn stripStringPrefix(raw: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < raw.len and raw[i] != '"' and raw[i] != '\'' and raw[i] != '`') : (i += 1) {
+        const lower = raw[i] | 0x20;
+        if (lower < 'a' or lower > 'z') return raw;
+    }
+    return raw[i..];
 }
 
 fn isPunct(toks: []const Token, source: []const u8, i: usize, c: u8) bool {

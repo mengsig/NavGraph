@@ -69,6 +69,9 @@ const usage_text =
     \\  --no-public                            unused: drop exported symbols (possible public API)
     \\  --no-test                              unused: drop symbols used only by tests
     \\                                         (pass both to find the actually-unused set)
+    \\  --follow-imports                       unused: disambiguate same-name symbols by
+    \\                                         import reachability (finds dead code masked
+    \\                                         by a used twin; relies on import resolution)
     \\
     \\  Locations are `path:line-endLine`; call trees annotate each edge with its
     \\  call-site line as `↳:N`, and a trailing `?` marks a heuristic (ambiguous
@@ -222,6 +225,10 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.unused_skip_exported = true;
         return i;
     }
+    if (eqAny(f.name, &.{"--follow-imports"})) {
+        out.options.unused_follow_imports = true;
+        return i;
+    }
     return error.UnknownFlag;
 }
 
@@ -322,6 +329,9 @@ test "unused narrowing flags: --no-public, --no-test" {
 
     // Boolean flags reject an attached value.
     try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-public=1" }));
+
+    const c = try parse(&.{ "unused", "--follow-imports" });
+    try std.testing.expect(c.options.unused_follow_imports);
 }
 
 test "new flags: --refs, --kind" {
