@@ -13,11 +13,13 @@ const parser = @import("parser.zig");
 const api = @import("api.zig");
 const cache = @import("cache.zig");
 const imports = @import("imports.zig");
+const gitignore = @import("gitignore.zig");
 
 const SymbolId = model.SymbolId;
 const FileId = model.FileId;
 const invalid = model.invalid_symbol;
 const max_file_bytes: usize = 8 * 1024 * 1024;
+const max_gitignore_bytes: usize = 1024 * 1024;
 
 /// An import binding within a file: `binding` (e.g. `api`) resolves to file
 /// `target`. `binding` is "" for imports that only contribute a module edge
@@ -80,6 +82,8 @@ const Builder = struct {
     cache_hits: u32,
     /// Unique names of directories pruned during the walk (arena-owned strings).
     skipped: std.ArrayList([]const u8),
+    /// Accumulated `.gitignore` rules, matched to skip git-ignored files/dirs.
+    ignore: gitignore.Matcher,
 };
 
 /// Build an index rooted at `root_path` (relative to cwd or absolute). When
@@ -109,11 +113,13 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .store = if (use_cache) cache.load(gpa, io, root_dir) else null,
         .cache_hits = 0,
         .skipped = .empty,
+        .ignore = gitignore.Matcher.init(gpa),
     };
     defer b.files.deinit(gpa);
     defer b.symbols.deinit(gpa);
     defer b.stats.deinit(gpa);
     defer b.skipped.deinit(gpa);
+    defer b.ignore.deinit();
     defer if (b.store) |*s| s.deinit();
 
     var path_buf: std.ArrayList(u8) = .empty;
@@ -173,6 +179,7 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
+    try loadGitignore(b, dir, path_buf.items);
     var it = dir.iterate();
     const base_len = path_buf.items.len;
     while (try it.next(b.io)) |entry| {
@@ -189,6 +196,14 @@ fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerr
     path_buf.shrinkRetainingCapacity(base_len);
 }
 
+/// Load `dir`'s `.gitignore` (if any) into the matcher, tagged with `base` (the
+/// directory's path relative to the root). Rule text and base are duped into the
+/// arena so they outlive this call. Absent/unreadable files are simply skipped.
+fn loadGitignore(b: *Builder, dir: std.Io.Dir, base: []const u8) !void {
+    const text = dir.readFileAlloc(b.io, ".gitignore", b.arena, .limited(max_gitignore_bytes)) catch return;
+    try b.ignore.addFile(try b.arena.dupe(u8, base), text);
+}
+
 fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.ArrayList(u8)) !void {
     if (ignored_dirs.has(name)) {
         // A build-output-conventional name (`coverage`, `build`, `dist`, `target`)
@@ -202,6 +217,9 @@ fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.Ar
             return;
         }
     }
+    // A git-ignored directory is pruned silently: its skip is expected, not a
+    // could-be-source surprise worth reporting.
+    if (b.ignore.isIgnored(path_buf.items, true)) return;
     var sub = parent.openDir(b.io, name, .{ .iterate = true }) catch return;
     defer sub.close(b.io);
     try collectDir(b, sub, path_buf);
@@ -254,6 +272,7 @@ fn noteSkipped(b: *Builder, name: []const u8) !void {
 fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     const lang = language.detect(rel_path);
     if (lang == .unknown) return;
+    if (b.ignore.isIgnored(rel_path, false)) return;
     const stat = statOf(b, rel_path) orelse return;
 
     if (b.store) |*s| {

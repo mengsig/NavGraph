@@ -11,10 +11,13 @@ Binary: `navgraph`. Runs from a repo root (or point it with `-C <root>`). It
 `node_modules`, `zig-out`, `__pycache__`, `dist`, `build`, `vendor`, etc. A
 build-output name that sits **inside a source tree** (`frontend/src/coverage/`,
 `app/build/`) is treated as real source and indexed anyway — only a top-level
-`coverage/`/`build/`/`dist/` (the actual artifact) is pruned. Run `navgraph
-files` to see exactly what got indexed, and if a query comes back empty check
-there first — an empty result plus a `(not indexed — skipped: …)` note means the
-code lives in a pruned subtree, not that it's absent.
+`coverage/`/`build/`/`dist/` (the actual artifact) is pruned. It also **honors
+`.gitignore`**: any file or directory a `.gitignore` excludes is skipped (nested
+per-directory files, negation with `!`, and `*`/`?`/`**` globs are all
+respected), so the index tracks what git tracks. Run `navgraph files` to see
+exactly what got indexed, and if a query comes back empty check there first — an
+empty result plus a `(not indexed — skipped: …)` note means the code lives in a
+pruned subtree, not that it's absent.
 Languages: Zig, C/C++, Python, JavaScript, TypeScript, TSX.
 
 ## Edit without reading first
@@ -122,6 +125,10 @@ Two views are built to be trustworthy at repo scale:
   with a live one is skipped). Framework entry points reached only by reflection
   (alembic `upgrade`/`downgrade`, ASGI middleware `dispatch`) can still appear —
   strictly, they are never called by name. Verify a candidate with `callers`.
+  Two flags **narrow the list toward genuinely-dead code**: `--no-public` drops
+  exported symbols (they may be public API you can't delete), and `--no-test`
+  drops the `(only used by tests)` names (they *are* used, just by tests). Pass
+  **both** to get only symbols referenced nowhere — the actually-unused set.
 
 ## Commands
 
@@ -139,6 +146,7 @@ Two views are built to be trustworthy at repo scale:
 | Find text **inside string literals** (URLs, logs, regexes) | `navgraph strings <pattern>` |
 | The HTTP API surface + who calls each endpoint      | `navgraph routes [filter]` |
 | Possible dead code (functions with no callers)      | `navgraph unused [filter]` |
+| **Actually-unused** code (no callers, not API, not test-only) | `navgraph unused --no-public --no-test` |
 | What a file imports / who imports a file            | `navgraph imports [filter]` · `navgraph importers <file>` |
 | Shortest call path from A to B                      | `navgraph path <A> <B>` |
 | **Every indexed file + its symbol count** (coverage)| `navgraph files [filter]` |
@@ -167,6 +175,9 @@ Flags come **after** the command (`navgraph outline src -v full`, not
   root so it doesn't walk unrelated trees.
 - `-l N` — cap results (default `300`). Output tells you when it truncated.
 - `-s, --strict` — `calls`/`callers` follow only high-confidence edges (no `?`).
+- `--no-public` — for `unused`, drop exported symbols (possible public API).
+- `--no-test` — for `unused`, drop symbols used only by tests. Combine with
+  `--no-public` to report only the symbols referenced nowhere.
 - `-j, --json` — stable JSON (for tooling/MCP). Edges carry `site` (first
   call-site line), `sites` (count), `lines` (every distinct call-site line, when
   more than one), `line`/`line_end`, and `"exact":false` on heuristic edges.

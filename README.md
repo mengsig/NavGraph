@@ -121,7 +121,8 @@ method Server.start (self):  app/server.py:15
 ## How it works
 
 1. **Walk** the project tree, skipping vendored/build dirs (`node_modules`,
-   `.git`, `zig-out`, `__pycache__`, `dist`, …).
+   `.git`, `zig-out`, `__pycache__`, `dist`, …) and any file or directory
+   matched by a `.gitignore` (per-directory files, negation, and `*`/`**` globs).
 2. **Tokenize** each file with a shared, language-configured lexer that
    correctly skips strings/comments.
 3. **Extract** definitions and their in-body references with per-language
