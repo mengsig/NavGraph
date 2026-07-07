@@ -843,6 +843,49 @@ fn routeId(idx: *const Index) ?SymbolId {
     return null;
 }
 
+test "links a frontend call through a request() wrapper to a backend route" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
+        \\app = FastAPI()
+        \\@app.get("/things/{id}")
+        \\def get_thing(id):
+        \\    return id
+    });
+    // A generic wrapper that forwards its path to fetch, plus a client function
+    // that calls the wrapper (never fetch directly) with a template path — the
+    // pattern that produced zero edges before wrapper detection.
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\const BASE = "/api";
+        \\async function request(path, opts) {
+        \\  return fetch(`${BASE}${path}`, opts);
+        \\}
+        \\function loadThing(id) {
+        \\  return request(`/things/${id}`);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const route_id = routeId(&idx).?;
+    // The client function reaches the route through the wrapper call, not fetch.
+    const loader = idx.graph.symbols[idx.lookup("loadThing")[0]];
+    var linked = false;
+    for (loader.refs) |ref| {
+        if (ref.kind != .route_call) continue;
+        try testing.expectEqual(route_id, ref.target);
+        linked = true;
+    }
+    try testing.expect(linked);
+    try testing.expectEqual(loader.id, idx.callersOf(route_id)[0]);
+}
+
 test "member calls: typed receiver is exact; unknown receiver is a heuristic guess" {
     const testing = std.testing;
     const io = testing.io;

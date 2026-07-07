@@ -136,7 +136,29 @@ fn detectApi(ctx: *Ctx, n: u32) !void {
     while (i < n) : (i += 1) {
         if (api.matchRouteDef(ctx.toks, ctx.source, i)) |rd| try emitRoute(ctx, rd, n, &prefixes);
     }
-    try attachClientCalls(ctx, route_start, n);
+    var wrappers = try detectWrappers(ctx, route_start, n);
+    defer wrappers.deinit();
+    try attachClientCalls(ctx, route_start, n, &wrappers);
+}
+
+/// Names of request-wrapper functions in this file: a function whose body issues
+/// a `fetch`/`axios` with a fully-dynamic URL (`` fetch(`${BASE}${path}`) ``).
+/// A call to such a function forwards a path to fetch, so it is treated as a
+/// client call to that path — this is what links a frontend that routes every
+/// request through a generic `request(path)` helper to its backend routes.
+fn detectWrappers(ctx: *Ctx, sym_hi: u32, n: u32) !std.StringHashMap(void) {
+    var wrappers = std.StringHashMap(void).init(ctx.gpa);
+    errdefer wrappers.deinit();
+    if (ctx.cfg.language.family() != .js) return wrappers;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (!api.isDynamicFetch(ctx.toks, ctx.source, i)) continue;
+        const owner = enclosingSymbol(ctx, ctx.toks[i].start, sym_hi) orelse continue;
+        const sym = ctx.out.items[owner];
+        if (sym.kind != .function and sym.kind != .method) continue;
+        try wrappers.put(sym.name, {});
+    }
+    return wrappers;
 }
 
 /// The route endpoint with its router's mount prefix applied, when the receiver
@@ -230,7 +252,7 @@ fn isDefKeyword(name: []const u8) bool {
         std.mem.eql(u8, name, "def");
 }
 
-fn attachClientCalls(ctx: *Ctx, sym_hi: u32, n: u32) !void {
+fn attachClientCalls(ctx: *Ctx, sym_hi: u32, n: u32, wrappers: *const std.StringHashMap(void)) !void {
     var extra = std.AutoHashMap(u32, std.ArrayList(Reference)).init(ctx.gpa);
     defer {
         var vit = extra.valueIterator();
@@ -239,7 +261,8 @@ fn attachClientCalls(ctx: *Ctx, sym_hi: u32, n: u32) !void {
     }
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        const ep = api.matchClientCall(ctx.toks, ctx.source, i) orelse continue;
+        const ep = api.matchClientCall(ctx.toks, ctx.source, i) orelse
+            api.matchWrapperCall(ctx.toks, ctx.source, i, wrappers) orelse continue;
         const owner = enclosingSymbol(ctx, ctx.toks[i].start, sym_hi) orelse continue;
         try addClientRef(ctx, &extra, owner, ep, ctx.toks[i].line);
     }

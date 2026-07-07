@@ -134,9 +134,13 @@ Flags come **after** the command (`navgraph outline src -v full`, not
 
 NavGraph links HTTP **route definitions** (FastAPI/Flask `@app.get`, Express
 `app.get(...)`, `APIRouter(prefix=…)` mounts included) to **client calls**
-(`fetch`, `axios`, `requests`) by method + path. So a frontend
-`fetch("/users/1")` shows up as a call into `GET /users/{id}` and on to its
-handler:
+(`fetch`, `axios`, `requests`) by method + path. It also follows a **generic
+request wrapper**: a function whose body does `` fetch(`${BASE}${path}`) `` is
+recognized, so a frontend that routes everything through `request("/users/1")`
+(instead of a literal `fetch`) still links — the call to the wrapper is treated
+as the client call, and a `${BASE}` URL prefix is stripped when matching. So a
+frontend `fetch("/users/1")` **or** `request(`/users/${id}`)` shows up as a call
+into `GET /users/{id}` and on to its handler:
 
 ```
 navgraph routes                 # every endpoint + handler + the clients that hit it

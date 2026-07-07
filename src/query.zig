@@ -622,8 +622,7 @@ pub fn buildReferencedNames(idx: *const Index) !RefSets {
     for (idx.graph.files) |file| {
         toks.clearRetainingCapacity();
         lexer.tokenize(gpa, file.text, language.configFor(file.language), &toks) catch continue;
-        const bucket = if (isTestPath(file.path)) &occ_test else &occ_prod;
-        try tallyUses(toks.items, file.text, file.language, bucket);
+        try tallyUses(toks.items, file.text, file.language, &occ_prod, &occ_test, isTestPath(file.path));
     }
 
     var prod = std.StringHashMap(void).init(gpa);
@@ -645,25 +644,73 @@ fn bumpOccurrence(occ: *std.StringHashMap(u32), name: []const u8) !void {
     gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
 }
 
-/// Tally identifier occurrences in one file into `occ`, skipping names that only
-/// appear in an import/export *declaration* — an ESM `import {…}`/`export {…}`, a
-/// CommonJS `module.exports = {…}` / `exports.x`, or a Python `from x import …`.
-/// A merely re-exported or imported name is a mention, not a use; counting it
-/// would hide genuinely-dead code (a re-exported function nobody calls). A JS/TS
-/// template literal's `${…}` interpolations are scanned so a call used only there
-/// still counts.
-fn tallyUses(toks: []const lexer.Token, text: []const u8, lang: language.Language, occ: *std.StringHashMap(u32)) !void {
+/// Tally identifier occurrences in one file into the production (`prod`) or test
+/// (`tst`) bucket, skipping names that only appear in an import/export
+/// *declaration* — an ESM `import {…}`/`export {…}`, a CommonJS
+/// `module.exports = {…}` / `exports.x`, or a Python `from x import …`. A merely
+/// re-exported or imported name is a mention, not a use; counting it would hide
+/// genuinely-dead code (a re-exported function nobody calls). A JS/TS template
+/// literal's `${…}` interpolations are scanned so a call used only there still
+/// counts.
+///
+/// `file_is_test` selects the default bucket for the whole file (Python/JS keep
+/// tests in separate files, caught by `isTestPath`). Zig is the exception: it
+/// keeps tests inline as `test {}` blocks *inside* production files, so an
+/// identifier used only from a `test {}` block must still count as test-only, not
+/// production. For a Zig file we track brace depth and route identifiers inside a
+/// `test {}` block to `tst` regardless of `file_is_test`.
+fn tallyUses(
+    toks: []const lexer.Token,
+    text: []const u8,
+    lang: language.Language,
+    prod: *std.StringHashMap(u32),
+    tst: *std.StringHashMap(u32),
+    file_is_test: bool,
+) !void {
     const js = switch (lang) {
         .javascript, .typescript, .tsx => true,
         else => false,
     };
     const py = lang == .python;
+    const zig = lang == .zig;
+    const default_bucket = if (file_is_test) tst else prod;
+    // Zig `test {}` tracking: `test_level` is the brace depth at which the active
+    // test block opened (-1 = not inside one); `pending_test` marks a seen `test`
+    // keyword whose opening `{` hasn't arrived yet (its name tokens count as test).
+    var brace_depth: i32 = 0;
+    var test_level: i32 = -1;
+    var pending_test = false;
     var i: usize = 0;
     while (i < toks.len) {
         const t = toks[i];
+        if (zig) {
+            if (t.kind == .punct) {
+                switch (text[t.start]) {
+                    '{' => {
+                        brace_depth += 1;
+                        if (pending_test) {
+                            test_level = brace_depth - 1;
+                            pending_test = false;
+                        }
+                    },
+                    '}' => {
+                        brace_depth -= 1;
+                        if (test_level >= 0 and brace_depth <= test_level) test_level = -1;
+                    },
+                    else => {},
+                }
+                i += 1;
+                continue;
+            }
+            if (t.kind == .identifier and test_level < 0 and !pending_test and zigTestBlockStart(toks, text, i)) {
+                pending_test = true;
+                i += 1;
+                continue;
+            }
+        }
         if (t.kind == .string) {
             const s = t.text(text);
-            if (js and s.len != 0 and s[0] == '`') try addTemplateIdents(s, occ);
+            if (js and s.len != 0 and s[0] == '`') try addTemplateIdents(s, default_bucket);
             i += 1;
             continue;
         }
@@ -671,18 +718,38 @@ fn tallyUses(toks: []const lexer.Token, text: []const u8, lang: language.Languag
             i += 1;
             continue;
         }
+        const bucket = if (zig and (test_level >= 0 or pending_test)) tst else default_bucket;
         if (js and jsDeclHead(toks, text, i)) {
-            i = try scanJsDecl(toks, text, i, occ);
+            i = try scanJsDecl(toks, text, i, bucket);
             continue;
         }
         if (py and (tokIs(toks, text, i, "import") or tokIs(toks, text, i, "from"))) {
-            i = try scanPyStmt(toks, text, i, occ);
+            i = try scanPyStmt(toks, text, i, bucket);
             continue;
         }
         const name = t.text(text);
-        if (name.len >= 2) try bumpOccurrence(occ, name);
+        if (name.len >= 2) try bumpOccurrence(bucket, name);
         i += 1;
     }
+}
+
+/// True when token `i` begins a Zig `test {}` block: the `test` keyword, an
+/// optional name (a `"string"` or an identifier path like `decltest.Foo`), then
+/// `{`. Requiring the trailing `{` keeps a stray `test` identifier from being
+/// misread as a block start.
+fn zigTestBlockStart(toks: []const lexer.Token, text: []const u8, i: usize) bool {
+    if (!tokIs(toks, text, i, "test")) return false;
+    var j = i + 1;
+    if (j < toks.len and toks[j].kind == .string) {
+        j += 1;
+    } else {
+        while (j < toks.len and toks[j].kind == .identifier) {
+            j += 1;
+            if (!punctIs(toks, text, j, '.')) break;
+            j += 1;
+        }
+    }
+    return punctIs(toks, text, j, '{');
 }
 
 fn tokIs(toks: []const lexer.Token, text: []const u8, i: usize, kw: []const u8) bool {
@@ -1468,6 +1535,51 @@ test "unused: used-only-from-tests is flagged and annotated; production use is n
     try testing.expect(std.mem.indexOf(u8, out, "helper_tested_only") != null);
     try testing.expect(std.mem.indexOf(u8, out, "only used by tests") != null);
     // Referenced nowhere → reported (plainly, no test annotation of its own).
+    try testing.expect(std.mem.indexOf(u8, out, "truly_dead") != null);
+}
+
+test "unused: a Zig fn used only inside an inline test {} block is test-only, not live" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Zig keeps tests inline, so `tested_only` is called only from a `test {}`
+    // block *in a production file* — it must still be reported (test-only), not
+    // hidden as if the block were production use.
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.zig", .data =
+        \\fn prod_used() i32 {
+        \\    return 1;
+        \\}
+        \\fn tested_only() i32 {
+        \\    return 2;
+        \\}
+        \\fn truly_dead() i32 {
+        \\    return 3;
+        \\}
+        \\pub fn entry() i32 {
+        \\    return prod_used();
+        \\}
+        \\test "exercises the helper" {
+        \\    _ = tested_only();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // Called from a production body → live.
+    try testing.expect(std.mem.indexOf(u8, out, "prod_used") == null);
+    // Called only from the inline `test {}` block → reported and annotated.
+    try testing.expect(std.mem.indexOf(u8, out, "tested_only") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "only used by tests") != null);
+    // Referenced nowhere → reported.
     try testing.expect(std.mem.indexOf(u8, out, "truly_dead") != null);
 }
 

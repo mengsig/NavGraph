@@ -118,7 +118,10 @@ fn stripQuotes(s: []const u8) []const u8 {
 }
 
 /// Extract a leading-'/' path from a raw literal, dropping scheme+host and any
-/// `?query`/`#fragment`. Returns null when there is no path component.
+/// `?query`/`#fragment`. A leading JS template interpolation is treated as a
+/// base-URL prefix and skipped: `${API_BASE}/logs` → `/logs`. Returns null when
+/// there is no literal path (a fully-dynamic URL like `${BASE}${path}`, a bare
+/// variable, or a relative string).
 fn pathOf(raw: []const u8) ?[]const u8 {
     var s = raw;
     if (std.mem.indexOf(u8, s, "://")) |p| {
@@ -126,9 +129,19 @@ fn pathOf(raw: []const u8) ?[]const u8 {
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "/";
         s = rest[slash..];
     }
-    // An empty path is valid: a collection route `@router.post("")` mounts at its
-    // router's prefix root (FastAPI/Flask); the prefix is applied by the parser.
-    if (s.len == 0) return s;
+    // Skip leading `${…}` interpolations — a base-URL prefix like `${API_BASE}`
+    // added by a client wrapper. After skipping, an empty/non-`/` remainder means
+    // the URL is fully dynamic (no literal path to match on).
+    var skipped_interp = false;
+    while (s.len >= 2 and s[0] == '$' and s[1] == '{') {
+        const close = std.mem.indexOfScalar(u8, s, '}') orelse return null;
+        s = s[close + 1 ..];
+        skipped_interp = true;
+    }
+    // An empty path is valid ONLY when the literal was genuinely empty (a
+    // collection route `@router.post("")` at its router's prefix root) — not when
+    // it emptied out after dropping a `${…}` prefix.
+    if (s.len == 0) return if (skipped_interp) null else s;
     if (s[0] != '/') return null;
     if (std.mem.indexOfAny(u8, s, "?#")) |cut| s = s[0..cut];
     return s;
@@ -211,6 +224,35 @@ pub fn matchClientCall(toks: []const Token, source: []const u8, i: u32) ?Endpoin
     return .{ .method = method, .path = path };
 }
 
+/// True at token `i` for a bare `fetch(...)`/`axios(...)` whose URL argument has
+/// no literal path — a fully-dynamic URL (`` `${BASE}${path}` ``) or a bare
+/// variable. This is the signature of a request-wrapper's own fetch: the real
+/// path is supplied by the wrapper's callers, so the enclosing function is a
+/// wrapper rather than a direct client call.
+pub fn isDynamicFetch(toks: []const Token, source: []const u8, i: u32) bool {
+    if (!identEql(toks, source, i, "fetch") and !identEql(toks, source, i, "axios")) return false;
+    if (!isPunct(toks, source, i + 1, '(')) return false;
+    return stringPath(toks, source, i + 2) == null;
+}
+
+/// At token `i`, recognize a call to a known request-wrapper function
+/// (`request("/x", { method: "POST" })`). The wrapper forwards its path argument
+/// to `fetch`, so the call is effectively a client call to that path; the method
+/// comes from an inline `{ method: … }` options argument (default GET). Only a
+/// literal path argument links — a variable path stays unresolved.
+pub fn matchWrapperCall(
+    toks: []const Token,
+    source: []const u8,
+    i: u32,
+    wrappers: *const std.StringHashMap(void),
+) ?Endpoint {
+    if (!isIdent(toks, i) or i + 2 >= toks.len) return null;
+    if (!wrappers.contains(toks[i].text(source))) return null;
+    if (!isPunct(toks, source, i + 1, '(')) return null;
+    const path = stringPath(toks, source, i + 2) orelse return null;
+    return .{ .method = clientMethodOverride(toks, source, i + 1, "GET"), .path = path };
+}
+
 /// A route/client key is "METHOD /path"; split it back into its parts.
 pub fn splitKey(name: []const u8) ?Endpoint {
     const sp = std.mem.indexOfScalar(u8, name, ' ') orelse return null;
@@ -269,6 +311,53 @@ test "route and client recognition + path matching" {
     try t.expectEqualStrings("/users", pathOf("https://api.example.com/users?x=1").?);
     try t.expectEqualStrings("/x", pathOf("/x#frag").?);
     try t.expect(pathOf("relative") == null);
+    // A `${BASE}` prefix (a client wrapper's base URL) is skipped to the literal.
+    try t.expectEqualStrings("/logs/bundle", pathOf("${BASE}/logs/bundle").?);
+    try t.expectEqualStrings("/planning/runs/${id}", pathOf("${API_BASE}/planning/runs/${id}").?);
+    // A fully-dynamic URL has no literal path to match on.
+    try t.expect(pathOf("${BASE}${path}") == null);
+    try t.expect(pathOf("${url}") == null);
+    // A genuinely empty route path (`@router.post("")`) stays valid.
+    try t.expectEqualStrings("", pathOf("").?);
+}
+
+test "request wrapper: dynamic fetch is detected; a call to it resolves the path" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const cfg = @import("language.zig").configFor(.typescript);
+    const src =
+        \\async function request(path, opts) { return fetch(`${BASE}${path}`, opts); }
+        \\function listThings() { return request("/things"); }
+        \\function makeThing() { return request("/things", { method: "POST" }); }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try lexer.tokenize(gpa, src, cfg, &toks);
+
+    // The wrapper's own `fetch(`${BASE}${path}`)` is dynamic (no literal path).
+    var saw_dynamic = false;
+    var i: u32 = 0;
+    while (i < toks.items.len) : (i += 1) {
+        if (isDynamicFetch(toks.items, src, i)) saw_dynamic = true;
+    }
+    try t.expect(saw_dynamic);
+
+    // With `request` registered as a wrapper, its calls resolve to method+path.
+    var wrappers = std.StringHashMap(void).init(gpa);
+    defer wrappers.deinit();
+    try wrappers.put("request", {});
+    var get_ep: ?Endpoint = null;
+    var post_ep: ?Endpoint = null;
+    i = 0;
+    while (i < toks.items.len) : (i += 1) {
+        if (matchWrapperCall(toks.items, src, i, &wrappers)) |ep| {
+            if (std.mem.eql(u8, ep.method, "POST")) post_ep = ep else get_ep = ep;
+        }
+    }
+    try t.expectEqualStrings("/things", get_ep.?.path);
+    try t.expectEqualStrings("GET", get_ep.?.method);
+    try t.expectEqualStrings("/things", post_ep.?.path);
+    try t.expectEqualStrings("POST", post_ep.?.method);
 }
 
 test "router prefix declaration recognized" {
