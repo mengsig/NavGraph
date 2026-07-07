@@ -40,7 +40,8 @@ const usage_text =
     \\  search <pattern>   Find symbols by name (or use sites with --refs)
     \\  routes [filter]    List HTTP routes and the client calls that hit them
     \\  neighbors <name>   Callees and callers of <name> in one view
-    \\  unused [filter]    Functions/methods with no callers (possible dead code)
+    \\  unused [filter]    Functions/methods with no callers (possible dead code);
+    \\                     add --no-public and/or --no-test to narrow it
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
@@ -60,6 +61,9 @@ const usage_text =
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
+    \\  --no-public                            unused: drop exported symbols (possible public API)
+    \\  --no-test                              unused: drop symbols used only by tests
+    \\                                         (pass both to find the actually-unused set)
     \\
     \\  Locations are `path:line-endLine`; call trees annotate each edge with its
     \\  call-site line as `↳:N`, and a trailing `?` marks a heuristic (ambiguous
@@ -73,6 +77,7 @@ const usage_text =
     \\  navgraph callers collectRefs
     \\  navgraph search resolve --refs
     \\  navgraph neighbors resolveOne
+    \\  navgraph unused --no-public --no-test
     \\  navgraph path parse emit
     \\
 ;
@@ -196,6 +201,14 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.use_cache = false;
         return i;
     }
+    if (eqAny(f.name, &.{"--no-test"})) {
+        out.options.unused_skip_test_only = true;
+        return i;
+    }
+    if (eqAny(f.name, &.{"--no-public"})) {
+        out.options.unused_skip_exported = true;
+        return i;
+    }
     return error.UnknownFlag;
 }
 
@@ -282,6 +295,20 @@ test "attached flag values: -d2, --depth=2, -l50" {
     try std.testing.expectError(error.BadValue, parse(&.{ "outline", "--json=1" }));
     // An attached-but-empty value is a missing value.
     try std.testing.expectError(error.MissingValue, parse(&.{ "calls", "x", "--depth=" }));
+}
+
+test "unused narrowing flags: --no-public, --no-test" {
+    const a = try parse(&.{ "unused", "--no-public" });
+    try std.testing.expect(a.options.unused_skip_exported);
+    try std.testing.expect(!a.options.unused_skip_test_only);
+
+    const b = try parse(&.{ "unused", "src", "--no-test", "--no-public" });
+    try std.testing.expect(b.options.unused_skip_exported);
+    try std.testing.expect(b.options.unused_skip_test_only);
+    try std.testing.expectEqualStrings("src", b.arg);
+
+    // Boolean flags reject an attached value.
+    try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-public=1" }));
 }
 
 test "new flags: --refs, --kind" {

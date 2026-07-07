@@ -43,6 +43,12 @@ pub const Options = struct {
     /// Restrict `outline`/`search` to symbols whose kind tag is in this
     /// comma-separated set (e.g. "fn,method"). Empty means all kinds.
     kinds: []const u8 = "",
+    /// `unused`: drop exported symbols (they may be public API, not dead code).
+    unused_skip_exported: bool = false,
+    /// `unused`: drop symbols referenced only from tests (they are used — by
+    /// tests). Passing both `unused_skip_*` flags leaves only the symbols
+    /// referenced nowhere: the "actually unused" set.
+    unused_skip_test_only: bool = false,
 };
 
 /// Whether `kind` passes the (comma-separated) `--kind` filter. Empty filter
@@ -863,6 +869,7 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (!isDeadCandidate(idx, sym, filter, &refs)) continue;
+        if (!deadCandidateShown(sym, opts, &refs)) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         // A name reached only from tests is a genuine cleanup target (no
         // application caller) — flag it as such; otherwise note public API.
@@ -1221,6 +1228,19 @@ pub fn isDeadCandidate(
     const path = idx.graph.files[sym.file].path;
     if (isTestPath(path)) return false;
     return matchesFilter(path, filter);
+}
+
+/// Apply the `unused` visibility filters to a symbol already known to be a dead
+/// candidate. `unused_skip_test_only` drops names referenced only from tests (a
+/// real use, just not production); `unused_skip_exported` drops exported symbols
+/// (possible public API). With both set, only symbols referenced nowhere survive
+/// — the "actually unused" set. `refs` is `buildReferencedNames`.
+pub fn deadCandidateShown(sym: model.Symbol, opts: Options, refs: *const RefSets) bool {
+    std.debug.assert(sym.kind == .function or sym.kind == .method);
+    std.debug.assert(sym.name.len != 0);
+    if (opts.unused_skip_test_only and refs.tests.contains(sym.name)) return false;
+    if (opts.unused_skip_exported and sym.exported) return false;
+    return true;
 }
 
 /// A `__dunder__` name (implicitly invoked by the language/runtime).

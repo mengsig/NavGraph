@@ -388,6 +388,7 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
         if (!query.isDeadCandidate(idx, sym, filter, &refs)) continue;
+        if (!query.deadCandidateShown(sym, opts, &refs)) continue;
         if (shown != 0) try w.writeByte(',');
         // A name used only from tests is a real cleanup target — flag it so JSON
         // consumers can separate it from truly-unreferenced code.
