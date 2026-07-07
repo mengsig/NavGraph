@@ -58,7 +58,9 @@ const usage_text =
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\
     \\  Locations are `path:line-endLine`; call trees annotate each edge with its
-    \\  call-site line as `↳:N`. Flag values may be attached (`-d2`, `--depth=2`).
+    \\  call-site line as `↳:N`, and a trailing `?` marks a heuristic (ambiguous
+    \\  name-match) edge — verify those or use `-s` to drop them. Flag values may
+    \\  be attached (`-d2`, `--depth=2`).
     \\
     \\EXAMPLES:
     \\  navgraph outline src/parser.zig --kind fn

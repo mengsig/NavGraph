@@ -126,7 +126,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     for (ids, 0..) |id, k| {
         if (k != 0) try w.writeByte(',');
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, true, &visited);
     }
     try w.writeAll("]\n");
 }
@@ -139,12 +139,15 @@ fn walkNode(
     opts: Options,
     depth: u32,
     site: u32,
+    exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
     std.debug.assert(id < idx.graph.symbols.len);
     try nodeHead(w, idx, idx.graph.symbols[id]);
     // The call-site line of the edge to this node's parent (0 = root/no edge).
     if (site != 0) try w.print(",\"site\":{d}", .{site});
+    // Only heuristic (name-match) edges are annotated; absence means confident.
+    if (site != 0 and !exact) try w.writeAll(",\"exact\":false");
     if (depth >= opts.depth) return try w.writeByte('}');
     if ((try visited.getOrPut(id)).found_existing) {
         try w.writeAll(",\"recursion\":true}");
@@ -175,7 +178,7 @@ fn walkCallees(
         // unresolved *calls* become externals (see query.walkCallees).
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, visited);
+            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, ref.exact, visited);
             wrote += 1;
         } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
@@ -211,7 +214,7 @@ fn walkCallers(
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
         if (wrote != 0) try w.writeByte(',');
-        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), visited);
+        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.hasExactEdge(idx, cid, id), visited);
         wrote += 1;
     }
     try w.writeByte(']');

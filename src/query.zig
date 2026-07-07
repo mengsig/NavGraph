@@ -162,7 +162,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     defer visited.deinit();
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, true, &visited);
     }
 }
 
@@ -174,10 +174,11 @@ fn walkNode(
     opts: Options,
     indent: usize,
     site: u32,
+    exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
     const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
-    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site);
+    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, exact);
     if (indent >= opts.depth) return;
     if ((try visited.getOrPut(id)).found_existing) {
         try indentLine(w, indent + 1, "… (recursion)");
@@ -208,7 +209,7 @@ fn walkCallees(
         // stdlib/locals would be noise.
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, visited);
+            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.exact, visited);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -232,7 +233,7 @@ fn walkCallers(
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
         // The edge (caller → this symbol) lives at its call site in the caller.
-        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), visited);
+        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), hasExactEdge(idx, cid, id), visited);
     }
 }
 
@@ -380,7 +381,9 @@ fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
         }
     }
     for (idx.callersOf(route.id)) |cid| {
-        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id));
+        // A route↔client link is a path match (its own resolver), not a name
+        // guess, so it is always rendered as confident.
+        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id), true);
     }
 }
 
@@ -400,7 +403,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         try renderCallees(w, idx, id, opts, 2);
         try w.writeAll("  ↑ callers\n");
         for (idx.callersOf(id)) |cid| {
-            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id));
+            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), hasExactEdge(idx, cid, id));
         }
     }
 }
@@ -413,7 +416,7 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
-            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line);
+            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line, ref.exact);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -825,6 +828,55 @@ test "call-site line annotation, usages search, and @path disambiguation" {
         var abuf: [8]SymbolId = undefined;
         const all = resolveIds(&idx, "run", &abuf);
         try testing.expectEqual(@as(usize, 2), all.len);
+    }
+}
+
+test "heuristic (ambiguous name-match) edges are marked with `?`; strict drops them" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Two same-named `target`s in different files make a bare call ambiguous, so
+    // resolution falls back to a heuristic guess (exact = false).
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn target() u32 {
+        \\    return 1;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn target() u32 {
+        \\    return 2;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "caller.zig", .data =
+        \\pub fn run() u32 {
+        \\    return target();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Default `calls run` marks the ambiguous callee edge with `?`.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
+        try testing.expect(std.mem.indexOf(u8, aw.written(), " ?") != null);
+    }
+    // `--strict` follows only confident edges, so the guess is dropped entirely
+    // (no callee line, hence no `?`).
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .strict = true });
+        try testing.expect(std.mem.indexOf(u8, aw.written(), " ?") == null);
     }
 }
 

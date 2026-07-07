@@ -48,7 +48,7 @@ pub fn symbol(
     indent: usize,
     show_path: bool,
 ) !void {
-    return symbolSite(w, idx, sym, v, indent, show_path, 0);
+    return symbolSite(w, idx, sym, v, indent, show_path, 0, true);
 }
 
 /// Like `symbol`, but annotates the line with the call-site `site` (the source
@@ -64,6 +64,9 @@ pub fn symbolSite(
     indent: usize,
     show_path: bool,
     site: u32,
+    /// False marks a heuristic (name-match) edge to this node, rendered with a
+    /// trailing `?`; true (the default for roots and exact edges) renders plain.
+    exact: bool,
 ) !void {
     try writeIndent(w, indent);
     try w.writeAll(sym.kind.tag());
@@ -77,7 +80,7 @@ pub fn symbolSite(
         .full => {},
     }
     try writeLocation(w, idx, sym, source, show_path);
-    if (site != 0) try w.print("  ↳:{d}", .{site});
+    if (site != 0) try w.print("  ↳:{d}{s}", .{ site, if (exact) "" else " ?" });
     try w.writeByte('\n');
 
     if (v == .doc) try writeDocLine(w, sym, indent);
