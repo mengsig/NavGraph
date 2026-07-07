@@ -191,12 +191,44 @@ fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerr
 
 fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.ArrayList(u8)) !void {
     if (ignored_dirs.has(name)) {
-        try noteSkipped(b, name);
-        return;
+        // A build-output-conventional name (`coverage`, `build`, `dist`, `target`)
+        // is a *real source directory* when it sits under a source tree
+        // (`frontend/src/coverage/`) — a domain dir (satellite coverage, a build
+        // step), not nyc/webpack output. Index it there; prune it only near the
+        // root, where it's almost certainly an artifact. This stops a legit
+        // `src/coverage/` from being silently eaten.
+        if (!(soft_ignore.has(name) and underSourceRoot(path_buf.items))) {
+            try noteSkipped(b, name);
+            return;
+        }
     }
     var sub = parent.openDir(b.io, name, .{ .iterate = true }) catch return;
     defer sub.close(b.io);
     try collectDir(b, sub, path_buf);
+}
+
+/// Build-output-conventional directory names that are *also* common source/domain
+/// directory names. Pruned like the rest of `ignored_dirs` at the root, but kept
+/// (indexed) when nested under a source tree — see `enterDir`/`underSourceRoot`.
+const soft_ignore = std.StaticStringMap(void).initComptime(.{
+    .{"coverage"}, .{"build"}, .{"dist"}, .{"target"},
+});
+
+/// Conventional source-container directory names. A `soft_ignore` dir with any of
+/// these as an ancestor is treated as source, not build output.
+const source_roots = std.StaticStringMap(void).initComptime(.{
+    .{"src"},    .{"lib"},      .{"app"}, .{"source"},
+    .{"sources"}, .{"packages"}, .{"pkg"},
+});
+
+/// True when `path` (a `/`-separated relative dir path) has a `source_roots`
+/// component anywhere in it — i.e. the directory lives inside a source tree.
+fn underSourceRoot(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |comp| {
+        if (source_roots.has(comp)) return true;
+    }
+    return false;
 }
 
 /// Directories whose skip is universally expected (VCS, dependency, build, cache
@@ -736,6 +768,38 @@ test "src-layout package imports resolve by unique suffix, no cross-language edg
     const callers = idx.callersOf(ship);
     try testing.expectEqual(@as(usize, 1), callers.len);
     try testing.expectEqual(idx.lookup("run")[0], callers[0]);
+}
+
+test "a build-output name under a source tree is indexed; at the root it is pruned" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Legit source: satellite-coverage math under a `src` tree. `coverage` is a
+    // build-output convention (nyc/jest), but nested under src it's a domain dir
+    // and must be indexed — the silent-eat bug a trial hit.
+    try tmp.dir.createDirPath(io, "frontend/src/coverage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "frontend/src/coverage/CoverageSystem.js", .data =
+        \\export class CoverageSystem {
+        \\    halfAngle() { return 1; }
+        \\}
+    });
+    // Real build output at the repo root — must stay pruned.
+    try tmp.dir.createDirPath(io, "coverage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "coverage/lcovReport.js", .data =
+        \\export function lcovArtifact() { return 0; }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The nested source directory is indexed…
+    try testing.expectEqual(@as(usize, 1), idx.lookup("CoverageSystem").len);
+    // …while the root-level build artifact stays pruned.
+    try testing.expectEqual(@as(usize, 0), idx.lookup("lcovArtifact").len);
 }
 
 fn qualifiedFileSym(idx: *const Index, file_suffix: []const u8, name: []const u8) ?SymbolId {

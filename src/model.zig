@@ -78,6 +78,12 @@ pub const Reference = struct {
     kind: RefKind,
     /// Number of times this name is referenced within the owning symbol's body.
     count: u32 = 1,
+    /// The distinct 1-based lines this name is referenced on, in source order
+    /// (`line` is the first). Populated only when there is more than one distinct
+    /// line — a single-site reference leaves it empty and callers fall back to
+    /// `line`. Lets `callers`/`calls` show *every* call site, not just the first,
+    /// when a caller invokes the target on several lines.
+    lines: []const u32 = &.{},
     target: SymbolId = invalid_symbol,
     /// True when resolution bound `target` via a known receiver type or self,
     /// rather than a heuristic global name match. `--strict` follows only these.

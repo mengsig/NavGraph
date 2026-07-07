@@ -7,7 +7,8 @@ const render = @import("render.zig");
 
 pub const Command = enum {
     outline, def, calls, callers, search, routes,
-    neighbors, unused, imports, importers, path, hot, help,
+    neighbors, unused, imports, importers, path, hot,
+    files, read, help,
 };
 
 pub const Parsed = struct {
@@ -44,6 +45,8 @@ const usage_text =
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
     \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
+    \\  files [filter]     List every indexed file + its symbol count (index coverage)
+    \\  read <file[:A-B]>  Print raw source lines (numbered) — non-symbol text escape hatch
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -52,7 +55,7 @@ const usage_text =
     \\  -C, --root <path>                      Project root to index (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
-    \\  -r, --refs                             search: match use sites, not just names
+    \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
@@ -124,6 +127,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "imports", Command.imports }, .{ "importers", Command.importers },
         .{ "path", Command.path },
         .{ "hot", Command.hot },         .{ "central", Command.hot },
+        .{ "files", Command.files },     .{ "manifest", Command.files },
+        .{ "read", Command.read },       .{ "cat", Command.read },
 
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },
@@ -136,7 +141,7 @@ fn parseCommand(s: []const u8) ?Command {
 /// `routes`, `unused` and `imports` accept an optional filter; `path` needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .unused, .imports, .hot => true,
+        .outline, .routes, .unused, .imports, .hot, .files => true,
         .path => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };

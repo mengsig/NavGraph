@@ -143,6 +143,9 @@ fn skipSymbol(cur: *Cursor) !void {
         _ = try cur.getU32(); // line
         _ = try cur.getU8(); // kind
         _ = try cur.getU32(); // count
+        const nlines = try cur.getU32(); // distinct call-site lines
+        var l: u32 = 0;
+        while (l < nlines) : (l += 1) _ = try cur.getU32();
     }
     const bind_count = try cur.getU32();
     var b: u32 = 0;
@@ -197,13 +200,24 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
 fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
     const n = try cur.getU32();
     const refs = try arena.alloc(Reference, n);
-    for (refs) |*ref| ref.* = .{
-        .name = try arena.dupe(u8, try cur.getStr()),
-        .qualifier = try arena.dupe(u8, try cur.getStr()),
-        .line = try cur.getU32(),
-        .kind = try cur.getRefKind(),
-        .count = try cur.getU32(),
-    };
+    for (refs) |*ref| {
+        const name = try arena.dupe(u8, try cur.getStr());
+        const qualifier = try arena.dupe(u8, try cur.getStr());
+        const line = try cur.getU32();
+        const kind = try cur.getRefKind();
+        const count = try cur.getU32();
+        const nlines = try cur.getU32();
+        const lines = try arena.alloc(u32, nlines);
+        for (lines) |*ln| ln.* = try cur.getU32();
+        ref.* = .{
+            .name = name,
+            .qualifier = qualifier,
+            .line = line,
+            .kind = kind,
+            .count = count,
+            .lines = lines,
+        };
+    }
     return refs;
 }
 
@@ -284,6 +298,8 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
         try putU32(gpa, buf, ref.line);
         try buf.append(gpa, @intFromEnum(ref.kind));
         try putU32(gpa, buf, ref.count);
+        try putU32(gpa, buf, @intCast(ref.lines.len));
+        for (ref.lines) |ln| try putU32(gpa, buf, ln);
     }
     try putU32(gpa, buf, @intCast(sym.bindings.len));
     for (sym.bindings) |b| {

@@ -8,7 +8,13 @@ from NavGraph to `Edit`/`Write` without a separate `Read`.
 
 Binary: `navgraph`. Runs from a repo root (or point it with `-C <root>`). It
 **recursively indexes the whole tree** under the root, skipping `.git`,
-`node_modules`, `zig-out`, `__pycache__`, `dist`, `build`, `vendor`, etc.
+`node_modules`, `zig-out`, `__pycache__`, `dist`, `build`, `vendor`, etc. A
+build-output name that sits **inside a source tree** (`frontend/src/coverage/`,
+`app/build/`) is treated as real source and indexed anyway — only a top-level
+`coverage/`/`build/`/`dist/` (the actual artifact) is pruned. Run `navgraph
+files` to see exactly what got indexed, and if a query comes back empty check
+there first — an empty result plus a `(not indexed — skipped: …)` note means the
+code lives in a pruned subtree, not that it's absent.
 Languages: Zig, C/C++, Python, JavaScript, TypeScript, TSX.
 
 ## Edit without reading first
@@ -35,17 +41,22 @@ directly from its output — no `Read` step.
   `Edit`/`Write`.
 
 When you genuinely need raw text NavGraph can't attribute to a symbol (module
-top-level statements, config, comments, a specific arbitrary line), fall back to
-`Read`/`grep` — see **Blind spots** below.
+top-level statements, config, comments, a specific arbitrary line), use
+`navgraph read <file>` — it prints numbered source lines, and `read <file:A-B>`
+prints just that range. It works on **any** file, including config and files in
+skipped dirs (it falls back to a disk read), so you can stay in NavGraph instead
+of switching to `Read` for non-symbol text. See **Blind spots** below.
 
 ## Reading locations
 
 Every symbol prints as `path:start-end` (1-based, inclusive) — e.g.
-`app/routes/users.py:18-21`. In call trees each edge also shows the **call-site
-line** as `↳:N` (the line where the call happens, in the *caller*); when that
-caller invokes the target more than once the edge is annotated `↳:N ×C` (C call
-sites), so `callers` is function-granular but never *under*-counts — sum the
-`×C` to get the total number of call sites, and a
+`app/routes/users.py:18-21`. In call trees each edge also shows its **call-site
+line(s)** as `↳:N` (the line where the call happens, in the *caller*); when a
+caller invokes the target on several **distinct** lines they are all listed —
+`↳:120,140,155` (capped at six, with a `,+K` overflow tail for very hot edges) —
+so you can jump to every call site, not just the first. Repeated calls on a
+single line add a `×C` multiplier (`↳:42 ×3`), so `callers` is function-granular
+but never *under*-counts its call sites. A
 trailing **`?`** marks a **heuristic edge** — one resolved by a name match
 rather than a traceable receiver/type. Two things produce `?` edges: a bare name
 with several same-named definitions, and a **method call on a receiver whose
@@ -74,13 +85,14 @@ Two views are built to be trustworthy at repo scale:
 - **`unused`** reports a callable with no **production** caller — decided by a
   repo-wide identifier-token count over non-test files (comments and strings
   excluded), not by the resolved call graph. So a use inside a template literal,
-  JSX, a Zig `test {}` block, module scope, or a partially-parsed body still
-  keeps a symbol off the list; a name only in an `import`/`export`/
-  `module.exports` list is a *mention*, not a use (a re-exported-but-uncalled
-  function IS reported; an `X as Y` rename counts as a use of `X`). A symbol
-  reached **only from tests** is reported and annotated `(only used by tests)` —
-  the real cleanup target — separately from truly-unreferenced code. Decorated
-  definitions, dunder/`constructor` methods, and `main` are treated as invoked.
+  JSX, module scope, or a partially-parsed body still keeps a symbol off the
+  list; a name only in an `import`/`export`/`module.exports` list is a *mention*,
+  not a use (a re-exported-but-uncalled function IS reported; an `X as Y` rename
+  counts as a use of `X`). A symbol reached **only from tests** — a separate
+  test file, **or (in Zig) an inline `test {}` block in the same production
+  file** — is reported and annotated `(only used by tests)`, the real cleanup
+  target, separately from truly-unreferenced code. Decorated definitions,
+  dunder/`constructor` methods, and `main` are treated as invoked.
   It won't flag production-live code; the cost is recall (a dead name colliding
   with a live one is skipped). Framework entry points reached only by reflection
   (alembic `upgrade`/`downgrade`, ASGI middleware `dispatch`) can still appear —
@@ -103,6 +115,8 @@ Two views are built to be trustworthy at repo scale:
 | Possible dead code (functions with no callers)      | `navgraph unused [filter]` |
 | What a file imports / who imports a file            | `navgraph imports [filter]` · `navgraph importers <file>` |
 | Shortest call path from A to B                      | `navgraph path <A> <B>` |
+| **Every indexed file + its symbol count** (coverage)| `navgraph files [filter]` |
+| **Raw source lines** of any file (non-symbol text)  | `navgraph read <file[:A-B]>` |
 
 ## Flags
 
@@ -114,13 +128,20 @@ Flags come **after** the command (`navgraph outline src -v full`, not
 - `-d N` — call-graph depth for `calls`/`callers` (default `1`).
 - `-k, --kind k1,k2` — restrict `outline`/`search` to kinds (`fn`, `method`,
   `class`, `struct`, `route`, …).
-- `-r, --refs` — `search` matches **use sites**, not just definition names.
+- `-r, --refs` — for `search`, match **use sites**, not just definition names;
+  for `calls`/`neighbors`, **also include data reads** (a `var`/`const`/`field`
+  the symbol reads). By default the callee view shows only calls and type
+  dependencies — a `const LIMIT` or module `var` a function merely reads is
+  hidden as dependency noise. Use `--refs` when you want those data edges too.
+  (This filters only the callee *view*; `callers`, `hot` and `unused` always
+  count every reference, reads included.)
 - `-C <path>` — repo root to index (default `.`). Point it at the real project
   root so it doesn't walk unrelated trees.
 - `-l N` — cap results (default `300`). Output tells you when it truncated.
 - `-s, --strict` — `calls`/`callers` follow only high-confidence edges (no `?`).
-- `-j, --json` — stable JSON (for tooling/MCP). Edges carry `site` (call-site
-  line), `line`/`line_end`, and `"exact":false` on heuristic edges.
+- `-j, --json` — stable JSON (for tooling/MCP). Edges carry `site` (first
+  call-site line), `sites` (count), `lines` (every distinct call-site line, when
+  more than one), `line`/`line_end`, and `"exact":false` on heuristic edges.
 - `--no-cache` — ignore `.navgraph/cache` and rebuild. Use this if you ever
   suspect a stale answer.
 
@@ -147,6 +168,13 @@ navgraph routes                 # every endpoint + handler + the clients that hi
 navgraph calls loadUser -d 3    # frontend fetch → route → backend handler
 navgraph callers get_user       # who (any language) hits this endpoint
 ```
+
+**The path must be a literal** (a string or a template with `${…}`
+placeholders). A call whose URL is a *variable* — `` fetch(url) `` where `url`
+came from an array or was computed — does **not** link, and the endpoint shows
+with zero clients even though a caller exists. When `routes` reports an endpoint
+as client-less, confirm with `grep` before concluding it's unused from the
+frontend: the client may just build its URL dynamically.
 
 ## Speed & freshness
 

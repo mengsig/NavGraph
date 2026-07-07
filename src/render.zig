@@ -48,7 +48,7 @@ pub fn symbol(
     indent: usize,
     show_path: bool,
 ) !void {
-    return symbolSite(w, idx, sym, v, indent, show_path, 0, 1, true);
+    return symbolSite(w, idx, sym, v, indent, show_path, 0, 1, &.{}, true);
 }
 
 /// Like `symbol`, but annotates the line with the call-site `site` (the source
@@ -67,6 +67,10 @@ pub fn symbolSite(
     /// Number of call sites this edge represents; `↳:N ×C` is shown when C > 1 so
     /// a caller that invokes the target repeatedly isn't undercounted as one.
     sites: u32,
+    /// The distinct call-site lines of this edge, when it spans more than one
+    /// line (empty = single site → fall back to `site`). Rendered as
+    /// `↳:l1,l2,l3` so every call site is visible, not just the first.
+    lines: []const u32,
     /// False marks a heuristic (name-match) edge to this node, rendered with a
     /// trailing `?`; true (the default for roots and exact edges) renders plain.
     exact: bool,
@@ -84,14 +88,35 @@ pub fn symbolSite(
     }
     try writeLocation(w, idx, sym, source, show_path);
     if (site != 0) {
-        try w.print("  ↳:{d}", .{site});
-        if (sites > 1) try w.print(" ×{d}", .{sites});
+        if (lines.len > 1) {
+            try writeSiteLines(w, lines);
+            // Show the total count only when it exceeds the distinct lines shown
+            // (same-line repeats): the line list already conveys the rest.
+            if (sites > lines.len) try w.print(" ×{d}", .{sites});
+        } else {
+            try w.print("  ↳:{d}", .{site});
+            if (sites > 1) try w.print(" ×{d}", .{sites});
+        }
         if (!exact) try w.writeAll(" ?");
     }
     try w.writeByte('\n');
 
     if (v == .doc) try writeDocLine(w, sym, indent);
     if (v == .full) try writeFullBody(w, sym, source, indent);
+}
+
+/// Render a multi-site edge's call-site lines as `  ↳:l1,l2,l3`, capping the
+/// list so a heavily-repeated call doesn't flood the row; the remainder is
+/// summarized as `,+N`.
+fn writeSiteLines(w: *Writer, lines: []const u32) !void {
+    const cap = 6;
+    const shown = @min(lines.len, cap);
+    try w.writeAll("  ↳:");
+    for (lines[0..shown], 0..) |ln, k| {
+        if (k != 0) try w.writeByte(',');
+        try w.print("{d}", .{ln});
+    }
+    if (lines.len > shown) try w.print(",+{d}", .{lines.len - shown});
 }
 
 fn writeIndent(w: *Writer, indent: usize) !void {

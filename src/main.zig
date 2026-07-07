@@ -47,13 +47,15 @@ pub fn main(init: std.process.Init) !void {
     };
     defer idx.deinit();
 
-    try dispatch(out, &idx, parsed);
+    try dispatch(out, io, &idx, parsed);
     try out.flush();
 }
 
-fn dispatch(out: *std.Io.Writer, idx: *index_mod.Index, parsed: cli.Parsed) !void {
+fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !void {
     switch (parsed.command) {
         .outline => try query.outline(out, idx, parsed.arg, parsed.options),
+        .files => try query.listFiles(out, idx, parsed.arg, parsed.options),
+        .read => try query.readLines(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .def => try query.showDef(out, idx, parsed.arg, parsed.options),
         .calls => try query.walk(out, idx, parsed.arg, false, parsed.options),
         .callers => try query.walk(out, idx, parsed.arg, true, parsed.options),

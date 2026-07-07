@@ -126,7 +126,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     for (ids, 0..) |id, k| {
         if (k != 0) try w.writeByte(',');
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, true, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, &.{}, true, &visited);
     }
     try w.writeAll("]\n");
 }
@@ -140,6 +140,7 @@ fn walkNode(
     depth: u32,
     site: u32,
     sites: u32,
+    lines: []const u32,
     exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
@@ -149,6 +150,15 @@ fn walkNode(
     if (site != 0) try w.print(",\"site\":{d}", .{site});
     // Number of call sites this edge represents (omitted when 1).
     if (site != 0 and sites > 1) try w.print(",\"sites\":{d}", .{sites});
+    // Every distinct call-site line, when the edge spans more than one.
+    if (site != 0 and lines.len > 1) {
+        try w.writeAll(",\"lines\":[");
+        for (lines, 0..) |ln, k| {
+            if (k != 0) try w.writeByte(',');
+            try w.print("{d}", .{ln});
+        }
+        try w.writeByte(']');
+    }
     // Only heuristic (name-match) edges are annotated; absence means confident.
     if (site != 0 and !exact) try w.writeAll(",\"exact\":false");
     if (depth >= opts.depth) return try w.writeByte('}');
@@ -177,11 +187,13 @@ fn walkCallees(
     var wrote: u32 = 0;
     var ext: u32 = 0;
     for (sym.refs) |ref| {
-        // Symmetric with the callers index: every resolved edge is a callee; only
-        // unresolved *calls* become externals (see query.walkCallees).
+        // Every resolved edge is a callee; bare var/const/field reads are hidden
+        // unless `--refs` is set (see query.isDataReadEdge). Only unresolved
+        // *calls* become externals (see query.walkCallees).
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
+            if (!opts.refs and query.isDataReadEdge(idx, ref)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.exact, visited);
+            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, visited);
             wrote += 1;
         } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
@@ -214,10 +226,13 @@ fn walkCallers(
 ) !void {
     try w.writeAll(",\"callers\":[");
     var wrote: u32 = 0;
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
         if (wrote != 0) try w.writeByte(',');
-        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), query.hasExactEdge(idx, cid, id), visited);
+        try query.callSiteLines(idx, cid, id, &lines);
+        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), visited);
         wrote += 1;
     }
     try w.writeByte(']');
@@ -341,6 +356,22 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
 }
 
 /// Imports: `{file, imports:[{target, binding}]}` per in-scope file.
+/// Index coverage manifest: `{file, lang, symbols}` per indexed file.
+pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    _ = opts;
+    var first = true;
+    try w.writeByte('[');
+    for (idx.graph.files) |file| {
+        if (!query.matchesFilter(file.path, filter)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"file\":");
+        try writeString(w, file.path);
+        try w.print(",\"lang\":\"{s}\",\"symbols\":{d}}}", .{ file.language.tag(), query.fileSymbolCount(idx, file) });
+    }
+    try w.writeAll("]\n");
+}
+
 pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     _ = opts;
     var first = true;

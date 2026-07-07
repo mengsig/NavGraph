@@ -85,25 +85,68 @@ pub fn callSiteCount(idx: *const Index, from: SymbolId, to: SymbolId) u32 {
     return total;
 }
 
+/// Collect the distinct call-site lines from `from` to `to` into `out` (sorted
+/// ascending, deduplicated). Combines every matching reference — a target reached
+/// through more than one receiver (e.g. `a.run()` and `b.run()`) contributes each
+/// of its lines — so `callers` shows all sites, not just the earliest. `out` is
+/// cleared first; the caller owns its storage.
+pub fn callSiteLines(idx: *const Index, from: SymbolId, to: SymbolId, out: *std.ArrayList(u32)) !void {
+    out.clearRetainingCapacity();
+    for (idx.graph.symbols[from].refs) |ref| {
+        if (ref.target != to) continue;
+        if (ref.lines.len > 1) {
+            try out.appendSlice(idx.gpa, ref.lines);
+        } else {
+            try out.append(idx.gpa, ref.line);
+        }
+    }
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    // Dedup in place (lines from distinct receivers can coincide).
+    var w: usize = 0;
+    for (out.items) |ln| {
+        if (w == 0 or out.items[w - 1] != ln) {
+            out.items[w] = ln;
+            w += 1;
+        }
+    }
+    out.shrinkRetainingCapacity(w);
+}
+
 /// Print an outline of the file(s) under `path_filter` (a path prefix, or ""
 /// for the whole project). Symbols are grouped by file and indented by nesting.
 pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.outline(w, idx, path_filter, opts);
     var shown: u32 = 0;
     var any = false;
+    var summarized: u32 = 0;
     for (idx.graph.files) |file| {
         if (!matchesFilter(file.path, path_filter)) continue;
         if (!fileHasVisible(idx, file)) continue;
         any = true;
         try w.print("# {s} ({s})\n", .{ file.path, file.language.tag() });
+        // Once the symbol budget is spent, keep naming every remaining file (with
+        // its symbol count) instead of dropping it off the tail — so an agent
+        // never mistakes a truncated-away file for a nonexistent one. Truncation
+        // is per-file, not whole-files-vanish.
+        if (shown >= opts.limit) {
+            const n = visibleSymbolCount(idx, file, opts);
+            try w.print("  … {d} symbol{s} here (raise -l to list)\n", .{ n, if (n == 1) "" else "s" });
+            summarized += 1;
+            continue;
+        }
         shown += try outlineFile(w, idx, file, opts, &shown);
-        if (shown >= opts.limit) break;
     }
     if (!any) {
         try w.print("(no source symbols under '{s}')\n", .{path_filter});
         try skippedNote(w, idx);
     }
-    try truncationNote(w, opts, shown);
+    if (shown >= opts.limit) {
+        if (summarized > 0) {
+            try w.print("… (listed {d} symbols; {d} more file(s) named but not expanded — raise -l)\n", .{ opts.limit, summarized });
+        } else {
+            try w.print("… (stopped at -l {d}; raise -l to see more)\n", .{opts.limit});
+        }
+    }
 }
 
 /// Warn when output was capped by `-l`, so a truncated result is never mistaken
@@ -145,6 +188,22 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
     return count;
 }
 
+/// Count the symbols `outlineFile` would print for `file` (same visibility rules)
+/// — used to summarize a file whose listing was cut by the `-l` budget without
+/// hiding its existence.
+fn visibleSymbolCount(idx: *const Index, file: model.SourceFile, opts: Options) u32 {
+    var count: u32 = 0;
+    var i = file.sym_start;
+    while (i < file.sym_end) : (i += 1) {
+        const sym = idx.graph.symbols[i];
+        if (sym.kind == .import) continue;
+        if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
+        if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        count += 1;
+    }
+    return count;
+}
+
 fn fileHasVisible(idx: *const Index, file: model.SourceFile) bool {
     var i = file.sym_start;
     while (i < file.sym_end) : (i += 1) {
@@ -163,6 +222,145 @@ fn parentDepth(idx: *const Index, sym: model.Symbol) usize {
 pub fn matchesFilter(path: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;
     return std.mem.startsWith(u8, path, filter) or std.mem.indexOf(u8, path, filter) != null;
+}
+
+/// The index's coverage manifest: every indexed file with its language and
+/// symbol count. Lets an agent verify what NavGraph actually parsed — a file
+/// that's absent (in an ignored dir) or shows 0 symbols is visible here, so a
+/// "not found" from another verb can be diagnosed instead of trusted blindly.
+pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.listFiles(w, idx, filter, opts);
+    var any = false;
+    var shown: u32 = 0;
+    for (idx.graph.files) |file| {
+        if (!matchesFilter(file.path, filter)) continue;
+        any = true;
+        const n = fileSymbolCount(idx, file);
+        try w.print("{s}  ({s}, {d} symbol{s})\n", .{ file.path, file.language.tag(), n, if (n == 1) "" else "s" });
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    if (!any) {
+        try w.print("(no indexed files under '{s}')\n", .{filter});
+        try skippedNote(w, idx);
+    }
+    try truncationNote(w, opts, shown);
+}
+
+/// Count non-import symbols in a file (its outline size).
+pub fn fileSymbolCount(idx: *const Index, file: model.SourceFile) u32 {
+    var n: u32 = 0;
+    var i = file.sym_start;
+    while (i < file.sym_end) : (i += 1) {
+        if (idx.graph.symbols[i].kind != .import) n += 1;
+    }
+    return n;
+}
+
+/// Cap on a `read` from disk (indexed files are already bounded at index time).
+const max_read_bytes = 8 * 1024 * 1024;
+
+/// Print raw, numbered source lines of `spec` — a `path` or `path:A-B` range.
+/// The escape hatch for text NavGraph can't attribute to a symbol: module-scope
+/// statements, config, comments, an arbitrary line. Bytes come from the in-memory
+/// index when the file is indexed, else are read from disk relative to `root`, so
+/// config files and files under ignored dirs are reachable too.
+pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !void {
+    _ = opts;
+    var path = spec;
+    var lo: usize = 1;
+    var hi: usize = std.math.maxInt(usize);
+    if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
+        if (parseLineRange(spec[c + 1 ..])) |r| {
+            path = spec[0..c];
+            lo = r.lo;
+            hi = r.hi;
+        }
+    }
+    var owned: ?[]u8 = null;
+    defer if (owned) |b| idx.gpa.free(b);
+    const text = indexedText(idx, path) orelse blk: {
+        var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
+            try w.print("(cannot open root '{s}')\n", .{root});
+            return;
+        };
+        defer rd.close(io);
+        const bytes = rd.readFileAlloc(io, path, idx.gpa, .limited(max_read_bytes)) catch {
+            try w.print("(no such file: '{s}' — give a path relative to the repo root; `navgraph files` lists them)\n", .{path});
+            return;
+        };
+        owned = bytes;
+        break :blk bytes;
+    };
+    try printNumbered(w, path, text, lo, hi);
+}
+
+/// The in-memory text of an indexed file matching `path` (exact, else a unique
+/// suffix match), or null if not indexed / ambiguous — the caller falls back to
+/// a disk read.
+fn indexedText(idx: *const Index, path: []const u8) ?[]const u8 {
+    for (idx.graph.files) |file| {
+        if (std.mem.eql(u8, file.path, path)) return file.text;
+    }
+    var match: ?[]const u8 = null;
+    for (idx.graph.files) |file| {
+        if (std.mem.endsWith(u8, file.path, path) and
+            (file.path.len == path.len or file.path[file.path.len - path.len - 1] == '/'))
+        {
+            if (match != null) return null; // ambiguous suffix
+            match = file.text;
+        }
+    }
+    return match;
+}
+
+const LineRange = struct { lo: usize, hi: usize };
+
+/// Parse a `read` range suffix: `A-B`, `A-` (A to end), or `A` (single line).
+/// Returns null on anything unparseable so a genuine `:` in a path is left alone.
+fn parseLineRange(s: []const u8) ?LineRange {
+    if (s.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, s, '-')) |d| {
+        const lo = std.fmt.parseInt(usize, s[0..d], 10) catch return null;
+        const rest = s[d + 1 ..];
+        const hi = if (rest.len == 0) std.math.maxInt(usize) else std.fmt.parseInt(usize, rest, 10) catch return null;
+        if (lo == 0 or hi < lo) return null;
+        return .{ .lo = lo, .hi = hi };
+    }
+    const only = std.fmt.parseInt(usize, s, 10) catch return null;
+    if (only == 0) return null;
+    return .{ .lo = only, .hi = only };
+}
+
+/// Emit `text`'s lines in `[lo, hi]` as `N\t<line>`, with a header naming the
+/// file and its line count. Handles a trailing newline (not counted as a line).
+fn printNumbered(w: *Writer, path: []const u8, text: []const u8, lo: usize, hi: usize) !void {
+    var total: usize = 0;
+    if (text.len != 0) {
+        total = 1;
+        for (text) |ch| {
+            if (ch == '\n') total += 1;
+        }
+        if (text[text.len - 1] == '\n') total -= 1;
+    }
+    if (hi == std.math.maxInt(usize)) {
+        try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
+    } else {
+        try w.print("# {s} (lines {d}-{d} of {d})\n", .{ path, lo, @min(hi, total), total });
+    }
+    if (lo > total) {
+        try w.print("(no such line: {d}; file has {d})\n", .{ lo, total });
+        return;
+    }
+    var start: usize = 0;
+    var line_no: usize = 1;
+    while (start < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        if (line_no >= lo and line_no <= hi) try w.print("{d}\t{s}\n", .{ line_no, text[start..nl] });
+        if (line_no >= hi) break;
+        start = nl + 1;
+        line_no += 1;
+    }
 }
 
 /// Show the definition(s) of `name` (supports `Parent.name`).
@@ -194,7 +392,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     var heuristic: usize = 0;
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, true, &visited, &heuristic);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, &.{}, true, &visited, &heuristic);
     }
     // If any ambiguous name-match (`?`) edges were shown, tell the agent how to
     // drop them rather than making it discover `-s` on its own. Only when they
@@ -215,12 +413,13 @@ fn walkNode(
     indent: usize,
     site: u32,
     sites: u32,
+    lines: []const u32,
     exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
 ) anyerror!void {
     const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
-    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, sites, exact);
+    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, sites, lines, exact);
     if (indent > 0 and !exact) heuristic.* += 1;
     if (indent >= opts.depth) return;
     if ((try visited.getOrPut(id)).found_existing) {
@@ -232,6 +431,20 @@ fn walkNode(
     } else {
         try walkCallees(w, idx, id, opts, indent, visited, heuristic);
     }
+}
+
+/// A callee edge that is a plain *data read* of a value symbol (a module `var`,
+/// a `const`, a `field`) rather than a call or a type dependency. These are noise
+/// in a "what does this do / blast radius" callee tree — `calls`/`neighbors` hide
+/// them by default and surface them only with `--refs`. Reading a *function* (a
+/// callback passed by name) is a real dependency and stays. The graph itself is
+/// unchanged — `callers`/`hot`/`unused` still count every resolved reference.
+pub fn isDataReadEdge(idx: *const Index, ref: model.Reference) bool {
+    if (ref.kind != .read) return false;
+    return switch (idx.graph.symbols[ref.target].kind) {
+        .variable, .constant, .field => true,
+        else => false,
+    };
 }
 
 fn walkCallees(
@@ -247,13 +460,14 @@ fn walkCallees(
     var externals: std.ArrayList(u8) = .empty;
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
-        // Follow every *resolved* edge (call, use, type-use), so the callee tree
-        // is symmetric with the callers index (which counts all resolved refs).
-        // Only unresolved *calls* are surfaced as externals; unresolved reads of
-        // stdlib/locals would be noise.
+        // Follow every *resolved* edge (call, use, type-use). Bare data reads of
+        // a var/const/field are dependency noise, hidden unless `--refs` asks for
+        // them. Only unresolved *calls* are surfaced as externals; unresolved
+        // reads of stdlib/locals would be noise.
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
+            if (!opts.refs and isDataReadEdge(idx, ref)) continue;
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.exact, visited, heuristic);
+            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, visited, heuristic);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -275,10 +489,13 @@ fn walkCallers(
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
 ) !void {
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
-        // The edge (caller → this symbol) lives at its call site in the caller.
-        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), hasExactEdge(idx, cid, id), visited, heuristic);
+        // The edge (caller → this symbol) lives at its call site(s) in the caller.
+        try callSiteLines(idx, cid, id, &lines);
+        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), visited, heuristic);
     }
 }
 
@@ -492,10 +709,13 @@ fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
             try render.symbol(w, idx, idx.graph.symbols[ref.target], .sig, 1, true);
         }
     }
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
     for (idx.callersOf(route.id)) |cid| {
         // A route↔client link is a path match (its own resolver), not a name
         // guess, so it is always rendered as confident.
-        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id), callSiteCount(idx, cid, route.id), true);
+        try callSiteLines(idx, cid, route.id, &lines);
+        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id), callSiteCount(idx, cid, route.id), lines.items, true);
     }
 }
 
@@ -515,8 +735,11 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         try w.writeAll("  ↓ calls\n");
         try renderCallees(w, idx, id, opts, 2);
         try w.writeAll("  ↑ callers\n");
+        var lines: std.ArrayList(u32) = .empty;
+        defer lines.deinit(idx.gpa);
         for (idx.callersOf(id)) |cid| {
-            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), hasExactEdge(idx, cid, id));
+            try callSiteLines(idx, cid, id, &lines);
+            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id));
         }
     }
 }
@@ -529,7 +752,8 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
     defer externals.deinit(idx.gpa);
     for (sym.refs) |ref| {
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
-            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line, ref.count, ref.exact);
+            if (!opts.refs and isDataReadEdge(idx, ref)) continue;
+            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line, ref.count, ref.lines, ref.exact);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -1194,7 +1418,7 @@ test "shortest path and dead-code detection over a call chain" {
     try testing.expect(!isDeadCandidate(&idx, gamma, "", &ref_names));
 }
 
-test "calls shows resolved non-call use edges, symmetric with callers" {
+test "calls hides var/const data reads by default, shows them with --refs; graph stays symmetric" {
     const testing = std.testing;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1214,17 +1438,32 @@ test "calls shows resolved non-call use edges, symmetric with callers" {
     var idx = try index_mod.build(testing.allocator, io, root, false);
     defer idx.deinit();
 
-    // `run` calls `helper` and reads `LIMIT`; `calls run` must show BOTH.
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
-    defer aw.deinit();
-    try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
-    const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "LIMIT") != null);
+    // Default `calls run`: the call to `helper` shows; the `LIMIT` const read is
+    // dependency noise and is hidden.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "LIMIT") == null);
+    }
+    // `--refs` opts the data read back in.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .refs = true });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "LIMIT") != null);
+    }
 
-    // Symmetry: `LIMIT`'s callers include `run`.
+    // The graph is unchanged: `LIMIT`'s callers still include `run` (the edge is
+    // only hidden from the default callee *view*, not dropped from the index).
     const limit_id = idx.lookup("LIMIT")[0];
     try testing.expectEqual(idx.lookup("run")[0], idx.callersOf(limit_id)[0]);
 }
@@ -1611,6 +1850,109 @@ test "callers shows call-site multiplicity (×N) when a caller invokes the targe
     // to a single call site; `once` (a single call) carries no multiplier.
     try testing.expect(std.mem.indexOf(u8, out, "×3") != null);
     try testing.expect(std.mem.indexOf(u8, out, "once") != null);
+}
+
+test "callers lists every distinct call-site line when a caller hits the target on several lines" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `spread` calls `helper` on three *different* lines (4, 5, 6). The edge must
+    // list each site — `↳:4,5,6` — not collapse to the first line with a bare ×3,
+    // which is the precision a trial's grep agent beat navgraph on.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\def helper(x):
+        \\    return x
+        \\def spread():
+        \\    a = helper(1)
+        \\    b = helper(2)
+        \\    c = helper(3)
+        \\    return a + b + c
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
+    const out = aw.written();
+    // Every distinct call-site line is shown, in order.
+    try testing.expect(std.mem.indexOf(u8, out, "4,5,6") != null);
+}
+
+test "read: numbered lines, a range, and a non-indexed file via disk fallback" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\import os
+        \\def a():
+        \\    return 1
+        \\def b():
+        \\    return 2
+    });
+    // A non-indexed config (unknown language) must still be readable from disk.
+    try tmp.dir.writeFile(io, .{ .sub_path = "conf.json", .data =
+        \\{
+        \\  "port": 8080
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // Indexed file, a line range: lines 2-3 numbered, line 1 excluded.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try readLines(&aw.writer, io, &idx, root, "m.py:2-3", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "2\tdef a():") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "3\t") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "import os") == null);
+    }
+    { // Non-indexed config: reached through the disk fallback.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try readLines(&aw.writer, io, &idx, root, "conf.json", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "\"port\": 8080") != null);
+    }
+}
+
+test "files lists indexed files with their symbol counts" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\def one():
+        \\    return 1
+        \\def two():
+        \\    return 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try listFiles(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "a.py") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "2 symbols") != null);
 }
 
 test "end line is correct despite a leading comment or template prefix" {

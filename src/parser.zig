@@ -404,6 +404,14 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     }
     var refs: std.ArrayList(Reference) = .empty;
     defer refs.deinit(ctx.gpa);
+    // Distinct call-site lines per ref, aligned index-for-index with `refs`, so a
+    // reference to the same name on several lines keeps all of them (not just the
+    // first). Attached to each ref below and duped into the arena.
+    var line_lists: std.ArrayList(std.ArrayList(u32)) = .empty;
+    defer {
+        for (line_lists.items) |*ll| ll.deinit(ctx.gpa);
+        line_lists.deinit(ctx.gpa);
+    }
 
     var i = lo;
     while (i < hi) : (i += 1) {
@@ -416,7 +424,12 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
-        try recordRef(ctx, &refs, &seen, name, qualifier, t.line, is_call);
+        try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call);
+    }
+    // Keep the distinct-line list only when a ref spans more than one line; a
+    // single-site ref falls back to `line` and needs no allocation.
+    for (refs.items, line_lists.items) |*r, ll| {
+        if (ll.items.len > 1) r.lines = try ctx.arena.dupe(u32, ll.items);
     }
     return .{
         .refs = try ctx.arena.dupe(Reference, refs.items),
@@ -448,6 +461,7 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
 fn recordRef(
     ctx: *Ctx,
     refs: *std.ArrayList(Reference),
+    line_lists: *std.ArrayList(std.ArrayList(u32)),
     seen: *std.StringHashMap(u32),
     name: []const u8,
     qualifier: []const u8,
@@ -461,6 +475,10 @@ fn recordRef(
         var r = &refs.items[idx];
         r.count += 1;
         if (is_call) r.kind = .call;
+        // Record a new distinct call-site line. Tokens are scanned in source
+        // order, so lines are non-decreasing — compare against the last kept.
+        const ll = &line_lists.items[idx];
+        if (ll.items.len == 0 or ll.items[ll.items.len - 1] != line) try ll.append(ctx.gpa, line);
         return;
     }
     try seen.put(try ctx.gpa.dupe(u8, key), @intCast(refs.items.len));
@@ -471,6 +489,9 @@ fn recordRef(
         .kind = if (is_call) .call else .read,
         .count = 1,
     });
+    var ll: std.ArrayList(u32) = .empty;
+    try ll.append(ctx.gpa, line);
+    try line_lists.append(ctx.gpa, ll);
 }
 
 /// Factory-method names whose receiver is the constructed type: `T.init(...)`.
@@ -2373,6 +2394,7 @@ fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {
 
 fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     for (out.items) |s| {
+        for (s.refs) |ref| if (ref.lines.len != 0) testing.allocator.free(ref.lines);
         if (s.refs.len != 0) testing.allocator.free(s.refs);
         if (s.bindings.len != 0) testing.allocator.free(s.bindings);
     }
