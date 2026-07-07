@@ -47,7 +47,10 @@ navgraph <command> [arg] [flags]
 | `def <name>`       | Show a definition. Supports `Parent.name` to disambiguate.    |
 | `calls <name>`     | Tree of what `<name>` calls/uses (callees).                   |
 | `callers <name>`   | Tree of who calls/uses `<name>` (callers).                    |
-| `search <pattern>` | Symbols whose name contains `<pattern>`.                      |
+| `search <pattern>` | Symbols whose name contains `<pattern>` (`--refs` for use sites; `Recv.field`/`.field` pins attribute reads). |
+| `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
+| `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
+| `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
 | `help`             | Show help.                                                    |
 
 **Flags**
