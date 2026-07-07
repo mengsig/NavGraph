@@ -9,6 +9,8 @@ const model = @import("model.zig");
 const index_mod = @import("index.zig");
 const render = @import("render.zig");
 const json_out = @import("json_out.zig");
+const lexer = @import("lexer.zig");
+const language = @import("language.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -160,9 +162,18 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     }
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
     defer visited.deinit();
+    var heuristic: usize = 0;
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, true, &visited);
+        try walkNode(w, idx, id, incoming, opts, 0, 0, true, &visited, &heuristic);
+    }
+    // If any ambiguous name-match (`?`) edges were shown, tell the agent how to
+    // drop them rather than making it discover `-s` on its own. Only when they
+    // are actually present and not already filtered.
+    if (heuristic > 0 and !opts.strict) {
+        try w.print("({d} heuristic `?` edge{s} shown — re-run with -s to drop them)\n", .{
+            heuristic, if (heuristic == 1) "" else "s",
+        });
     }
 }
 
@@ -176,18 +187,20 @@ fn walkNode(
     site: u32,
     exact: bool,
     visited: *std.AutoHashMap(SymbolId, void),
+    heuristic: *usize,
 ) anyerror!void {
     const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
     try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, exact);
+    if (indent > 0 and !exact) heuristic.* += 1;
     if (indent >= opts.depth) return;
     if ((try visited.getOrPut(id)).found_existing) {
         try indentLine(w, indent + 1, "… (recursion)");
         return;
     }
     if (incoming) {
-        try walkCallers(w, idx, id, opts, indent, visited);
+        try walkCallers(w, idx, id, opts, indent, visited, heuristic);
     } else {
-        try walkCallees(w, idx, id, opts, indent, visited);
+        try walkCallees(w, idx, id, opts, indent, visited, heuristic);
     }
 }
 
@@ -198,6 +211,7 @@ fn walkCallees(
     opts: Options,
     indent: usize,
     visited: *std.AutoHashMap(SymbolId, void),
+    heuristic: *usize,
 ) !void {
     const sym = idx.graph.symbols[id];
     var externals: std.ArrayList(u8) = .empty;
@@ -209,7 +223,7 @@ fn walkCallees(
         // stdlib/locals would be noise.
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.exact, visited);
+            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.exact, visited, heuristic);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -229,11 +243,12 @@ fn walkCallers(
     opts: Options,
     indent: usize,
     visited: *std.AutoHashMap(SymbolId, void),
+    heuristic: *usize,
 ) !void {
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
         // The edge (caller → this symbol) lives at its call site in the caller.
-        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), hasExactEdge(idx, cid, id), visited);
+        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), hasExactEdge(idx, cid, id), visited, heuristic);
     }
 }
 
@@ -301,6 +316,15 @@ fn fanOut(sym: model.Symbol) u32 {
     return out;
 }
 
+/// Outgoing edges that are exact (heuristic `?` edges excluded).
+fn fanOutExact(sym: model.Symbol) u32 {
+    var out: u32 = 0;
+    for (sym.refs) |ref| {
+        if (ref.target != invalid and ref.exact) out += 1;
+    }
+    return out;
+}
+
 /// Rank functions/methods by connectivity (callers = fan-in, callees = fan-out)
 /// and list the busiest — the load-bearing symbols an agent should read first to
 /// understand a repo, and where changes ripple widest. Ranked by fan-in, then
@@ -311,28 +335,66 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !vo
     defer idx.gpa.free(ranked);
     // `hot` is an orientation view — a short ranked list is the point, so it
     // caps at a small default (raise `-l` for more) via the limit sentinel.
-    const cap = @min(ranked.len, hotLimit(opts));
-    if (cap == 0) {
+    const limit = hotLimit(opts);
+    var shown: u32 = 0;
+    var eligible: u32 = 0;
+    for (ranked) |e| {
+        // `--strict` ranks and reports on exact edges only, and hides a symbol
+        // whose connectivity is entirely heuristic (a name-collision artifact).
+        if (opts.strict and e.fan_in_exact == 0 and e.fan_out_exact == 0) continue;
+        eligible += 1;
+        if (shown >= limit) continue;
+        shown += 1;
+        const sym = idx.graph.symbols[e.id];
+        try render.symbol(w, idx, sym, headerVerbosity(opts.verbosity), 0, true);
+        try printHotCounts(w, e, opts.strict);
+    }
+    if (shown == 0) {
         try w.print("(no functions under '{s}')\n", .{filter});
         return;
     }
-    for (ranked[0..cap]) |e| {
-        const sym = idx.graph.symbols[e.id];
-        try render.symbol(w, idx, sym, headerVerbosity(opts.verbosity), 0, true);
-        // Trim the trailing newline render wrote, then append the fan counts.
-        // (render always ends the line; we add the score as a suffix line note.)
-        try w.print("    ←{d} callers  →{d} callees\n", .{ e.fan_in, e.fan_out });
-    }
-    if (ranked.len > cap) {
-        try w.print("… ({d} more; raise -l to see them)\n", .{ranked.len - cap});
+    if (eligible > shown) {
+        try w.print("… ({d} more; raise -l to see them)\n", .{eligible - shown});
     }
 }
 
-pub const HotEntry = struct { id: SymbolId, fan_in: u32, fan_out: u32 };
+/// Fan-in/out suffix for a `hot` row. Default surfaces the heuristic share as a
+/// `(N ?)` qualifier so an inflated count is never shown bare; `--strict` prints
+/// the exact-only counts.
+fn printHotCounts(w: *Writer, e: HotEntry, strict: bool) !void {
+    if (strict) {
+        try w.print("    ←{d} callers  →{d} callees\n", .{ e.fan_in_exact, e.fan_out_exact });
+        return;
+    }
+    try w.print("    ←{d} callers", .{e.fan_in});
+    if (e.fan_in > e.fan_in_exact) try w.print(" ({d} ?)", .{e.fan_in - e.fan_in_exact});
+    try w.print("  →{d} callees", .{e.fan_out});
+    if (e.fan_out > e.fan_out_exact) try w.print(" ({d} ?)", .{e.fan_out - e.fan_out_exact});
+    try w.writeByte('\n');
+}
 
-/// Collect callable symbols under `filter`, sorted by fan-in then fan-out
-/// (descending). Caller frees the returned slice.
+pub const HotEntry = struct {
+    id: SymbolId,
+    fan_in: u32,
+    fan_in_exact: u32,
+    fan_out: u32,
+    fan_out_exact: u32,
+};
+
+/// Collect callable symbols under `filter`, sorted by *exact* fan-in then exact
+/// fan-out (descending), so heuristic name-collision edges can't float a symbol
+/// to the top. Ties fall back to total fan-in/out. Caller frees the slice.
 pub fn collectHot(idx: *const Index, filter: []const u8) ![]HotEntry {
+    // Exact incoming-edge count per symbol (heuristic `?` edges excluded), so a
+    // symbol's rank reflects edges we can actually stand behind.
+    var exact_in = try idx.gpa.alloc(u32, idx.graph.symbols.len);
+    defer idx.gpa.free(exact_in);
+    @memset(exact_in, 0);
+    for (idx.graph.symbols) |sym| {
+        for (sym.refs) |ref| {
+            if (ref.target != invalid and ref.exact) exact_in[ref.target] += 1;
+        }
+    }
     var list: std.ArrayList(HotEntry) = .empty;
     errdefer list.deinit(idx.gpa);
     for (idx.graph.symbols) |sym| {
@@ -341,15 +403,25 @@ pub fn collectHot(idx: *const Index, filter: []const u8) ![]HotEntry {
         const fan_in: u32 = @intCast(idx.callersOf(sym.id).len);
         const fan_out = fanOut(sym);
         if (fan_in == 0 and fan_out == 0) continue; // isolated: not informative
-        try list.append(idx.gpa, .{ .id = sym.id, .fan_in = fan_in, .fan_out = fan_out });
+        try list.append(idx.gpa, .{
+            .id = sym.id,
+            .fan_in = fan_in,
+            .fan_in_exact = exact_in[sym.id],
+            .fan_out = fan_out,
+            .fan_out_exact = fanOutExact(sym),
+        });
     }
     const items = try list.toOwnedSlice(idx.gpa);
     std.mem.sort(HotEntry, items, {}, hotLessThan);
     return items;
 }
 
-/// Descending order: higher fan-in first, then higher fan-out, then stable by id.
+/// Descending: exact fan-in, then exact fan-out, then total fan-in/out, then id.
+/// Exact-first keeps a symbol whose fan-in is only heuristic guesses from
+/// outranking one with real, verifiable callers.
 fn hotLessThan(_: void, a: HotEntry, b: HotEntry) bool {
+    if (a.fan_in_exact != b.fan_in_exact) return a.fan_in_exact > b.fan_in_exact;
+    if (a.fan_out_exact != b.fan_out_exact) return a.fan_out_exact > b.fan_out_exact;
     if (a.fan_in != b.fan_in) return a.fan_in > b.fan_in;
     if (a.fan_out != b.fan_out) return a.fan_out > b.fan_out;
     return a.id < b.id;
@@ -433,9 +505,11 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
 /// symbols may legitimately be external API, so they are marked, not hidden.
 pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.unused(w, idx, filter, opts);
+    var ref_names = try buildReferencedNames(idx);
+    defer ref_names.deinit();
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
-        if (!isDeadCandidate(idx, sym, filter)) continue;
+        if (!isDeadCandidate(idx, sym, filter, &ref_names)) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         if (sym.exported) try w.writeAll("  (exported — may be public API)\n") else try w.writeByte('\n');
         shown += 1;
@@ -445,17 +519,138 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     try truncationNote(w, opts, shown);
 }
 
+/// Names that are used *somewhere* in the repo, decided by a repo-wide
+/// identifier-token count rather than the resolved call graph. A name counts as
+/// used when its identifier appears more times across all files than the number
+/// of definitions carrying that name — i.e. it appears somewhere beyond its own
+/// declaration(s).
+///
+/// This is deliberately independent of body-scoping: it re-lexes every file and
+/// tallies identifier tokens, so a use inside a Zig `test {}` block, a JS
+/// module-scope statement, JSX (`<App/>`), an import, or a body NavGraph parses
+/// only partially still counts. `unused` relies on this to avoid reporting live
+/// code as dead — the false positive that makes the whole verb untrustworthy.
+/// It ignores comments and strings (the lexer classifies those separately), so
+/// it is stricter than a raw `grep`. Caller owns the returned map.
+pub fn buildReferencedNames(idx: *const Index) !std.StringHashMap(void) {
+    const gpa = idx.gpa;
+    // Definition count per name (a name's own declaration tokens don't count as
+    // "use"): a name defined N times needs N+1 occurrences to be considered used.
+    var def_counts = std.StringHashMap(u32).init(gpa);
+    defer def_counts.deinit();
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import) continue;
+        const gop = try def_counts.getOrPut(sym.name);
+        gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+    }
+
+    // Total identifier-token occurrences per name, across every file.
+    var occ = std.StringHashMap(u32).init(gpa);
+    defer occ.deinit();
+    var toks: std.ArrayList(lexer.Token) = .empty;
+    defer toks.deinit(gpa);
+    for (idx.graph.files) |file| {
+        toks.clearRetainingCapacity();
+        lexer.tokenize(gpa, file.text, language.configFor(file.language), &toks) catch continue;
+        for (toks.items) |t| {
+            if (t.kind == .identifier) {
+                const name = t.text(file.text);
+                if (name.len >= 2) try bumpOccurrence(&occ, name);
+            } else if (t.kind == .string) {
+                // A JS/TS template literal is kept whole by the lexer (so
+                // `fetch(`/x/${id}`)` still matches its route), which would hide
+                // a call used only inside `${…}`. Scan those interpolations here
+                // so a helper referenced only from a template isn't called dead.
+                const s = t.text(file.text);
+                if (s.len != 0 and s[0] == '`') try addTemplateIdents(s, &occ);
+            }
+        }
+    }
+
+    var referenced = std.StringHashMap(void).init(gpa);
+    errdefer referenced.deinit();
+    var it = occ.iterator();
+    while (it.next()) |e| {
+        const defs = def_counts.get(e.key_ptr.*) orelse 0;
+        if (e.value_ptr.* > defs) try referenced.put(e.key_ptr.*, {});
+    }
+    return referenced;
+}
+
+fn bumpOccurrence(occ: *std.StringHashMap(u32), name: []const u8) !void {
+    const gop = try occ.getOrPut(name);
+    gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+}
+
+fn isIdentStartByte(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_' or c == '$';
+}
+
+fn isIdentContByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+/// Tally identifier tokens inside a JS/TS template literal's `${…}`
+/// interpolations (bracket-balanced) into `occ`, so a name used only from a
+/// template still counts as referenced.
+fn addTemplateIdents(text: []const u8, occ: *std.StringHashMap(u32)) !void {
+    var i: usize = 0;
+    while (i + 1 < text.len) {
+        if (text[i] != '$' or text[i + 1] != '{') {
+            i += 1;
+            continue;
+        }
+        i += 2;
+        var depth: usize = 1;
+        while (i < text.len and depth > 0) {
+            const c = text[i];
+            if (c == '{') {
+                depth += 1;
+                i += 1;
+            } else if (c == '}') {
+                depth -= 1;
+                i += 1;
+            } else if (isIdentStartByte(c)) {
+                const s = i;
+                i += 1;
+                while (i < text.len and isIdentContByte(text[i])) i += 1;
+                const name = text[s..i];
+                if (name.len >= 2) try bumpOccurrence(occ, name);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
 /// A symbol worth reporting as possibly-unused: a callable, in-scope of the
-/// filter, with zero callers and not an obvious entry point.
-pub fn isDeadCandidate(idx: *const Index, sym: model.Symbol, filter: []const u8) bool {
+/// filter, with zero callers, not an obvious entry point, and whose name is
+/// referenced nowhere in the repo. `ref_names` is `buildReferencedNames(idx)`.
+pub fn isDeadCandidate(
+    idx: *const Index,
+    sym: model.Symbol,
+    filter: []const u8,
+    ref_names: *const std.StringHashMap(void),
+) bool {
     if (sym.kind != .function and sym.kind != .method) return false;
     if (idx.callersOf(sym.id).len != 0) return false;
     if (std.mem.eql(u8, sym.name, "main")) return false;
     // Framework/entry-point callables are invoked implicitly, never by name, so
-    // they always look "dead": dunder methods (`__init__`, `__call__`), pytest
-    // test functions, and everything in test/conftest files (tests + fixtures).
+    // they always look "dead": dunder methods (`__init__`, `__call__`), a JS/TS
+    // `constructor` (invoked by `new`), pytest test functions, and everything in
+    // test/conftest files (tests + fixtures).
     if (isDunder(sym.name)) return false;
+    if (std.mem.eql(u8, sym.name, "constructor")) return false;
     if (std.mem.startsWith(u8, sym.name, "test_")) return false;
+    // A decorated definition is wired in by the decorator, not called by name
+    // (`@field_validator`, `@app.on_event`, `@pytest.fixture`, `@abstractmethod`).
+    // Treat it like a route handler: invoked, just not by a visible call site.
+    if (precededByDecorator(idx, sym)) return false;
+    // Used somewhere by name — keep it out of the report. Reporting a live
+    // symbol as dead is the false positive that costs trust, so we trade recall
+    // (a truly-dead name that collides with a live one elsewhere is skipped) for
+    // precision: what survives is safe-to-delete with high confidence.
+    if (ref_names.contains(sym.name)) return false;
     const path = idx.graph.files[sym.file].path;
     if (isTestPath(path)) return false;
     return matchesFilter(path, filter);
@@ -464,6 +659,25 @@ pub fn isDeadCandidate(idx: *const Index, sym: model.Symbol, filter: []const u8)
 /// A `__dunder__` name (implicitly invoked by the language/runtime).
 fn isDunder(name: []const u8) bool {
     return name.len >= 4 and std.mem.startsWith(u8, name, "__") and std.mem.endsWith(u8, name, "__");
+}
+
+/// True when the line immediately above `sym`'s definition is a decorator
+/// (`@…`) — a cheap signal that the symbol is framework-invoked rather than
+/// called by name. Handles the common single-line decorator; a decorator whose
+/// closing `)` sits on its own line just above the def is not detected.
+fn precededByDecorator(idx: *const Index, sym: model.Symbol) bool {
+    const text = idx.graph.files[sym.file].text;
+    if (sym.span_start == 0 or sym.span_start > text.len) return false;
+    // Start of the definition's own line.
+    var ls = sym.span_start;
+    while (ls > 0 and text[ls - 1] != '\n') ls -= 1;
+    if (ls == 0) return false;
+    // The previous line is text[ps .. ls-1] (ls-1 is its terminating '\n').
+    var ps = ls - 1;
+    while (ps > 0 and text[ps - 1] != '\n') ps -= 1;
+    var i = ps;
+    while (i + 1 < ls and (text[i] == ' ' or text[i] == '\t')) i += 1;
+    return i < ls and text[i] == '@';
 }
 
 /// Whether `path` is a test/fixture module (pytest, jest): its functions are
@@ -715,11 +929,14 @@ test "shortest path and dead-code detection over a call chain" {
     defer testing.allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
 
-    // `orphan` is called by nobody → dead candidate; `gamma` is called → not.
+    // `orphan` is called by nobody and named nowhere → dead candidate; `gamma`
+    // is called → not.
+    var ref_names = try buildReferencedNames(&idx);
+    defer ref_names.deinit();
     const orphan = idx.graph.symbols[idx.lookup("orphan")[0]];
     const gamma = idx.graph.symbols[idx.lookup("gamma")[0]];
-    try testing.expect(isDeadCandidate(&idx, orphan, ""));
-    try testing.expect(!isDeadCandidate(&idx, gamma, ""));
+    try testing.expect(isDeadCandidate(&idx, orphan, "", &ref_names));
+    try testing.expect(!isDeadCandidate(&idx, gamma, "", &ref_names));
 }
 
 test "calls shows resolved non-call use edges, symmetric with callers" {
@@ -867,9 +1084,11 @@ test "heuristic (ambiguous name-match) edges are marked with `?`; strict drops t
         defer aw.deinit();
         try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
         try testing.expect(std.mem.indexOf(u8, aw.written(), " ?") != null);
+        // A footer nudges the agent to `-s` instead of leaving it to guess.
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "re-run with -s") != null);
     }
     // `--strict` follows only confident edges, so the guess is dropped entirely
-    // (no callee line, hence no `?`).
+    // (no callee line, hence no `?`), and no footer is printed.
     {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
@@ -877,7 +1096,112 @@ test "heuristic (ambiguous name-match) edges are marked with `?`; strict drops t
         defer aw.deinit();
         try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .strict = true });
         try testing.expect(std.mem.indexOf(u8, aw.written(), " ?") == null);
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "re-run with -s") == null);
     }
+}
+
+test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `create_run` is dispatched via a chained, untyped receiver
+    // (`self.planning.create_run(...)`) — the OO pattern that made the repo-scale
+    // trials flag live methods as dead.
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data =
+        \\class PlanningService:
+        \\    def create_run(self, x):
+        \\        return x
+        \\
+        \\class Handler:
+        \\    def __init__(self):
+        \\        self.planning = PlanningService()
+        \\    def handle(self):
+        \\        return self.planning.create_run(1)
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var idbuf: [8]SymbolId = undefined;
+    const cr_ids = resolveIds(&idx, "PlanningService.create_run", &idbuf);
+    try testing.expectEqual(@as(usize, 1), cr_ids.len);
+    const create_run = idx.graph.symbols[cr_ids[0]];
+
+    // The dispatch heuristic gives it a caller, so it is NOT dead code.
+    var ref_names = try buildReferencedNames(&idx);
+    defer ref_names.deinit();
+    try testing.expect(!isDeadCandidate(&idx, create_run, "", &ref_names));
+    try testing.expect(idx.callersOf(create_run.id).len > 0);
+
+    // Its fan-in is entirely heuristic: total > 0, exact == 0.
+    const ranked = try collectHot(&idx, "");
+    defer idx.gpa.free(ranked);
+    var found = false;
+    for (ranked) |e| {
+        if (e.id != create_run.id) continue;
+        found = true;
+        try testing.expect(e.fan_in > 0);
+        try testing.expectEqual(@as(u32, 0), e.fan_in_exact);
+    }
+    try testing.expect(found);
+
+    // Default `hot` qualifies the inflated count with `(N ?)`.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try hot(&aw.writer, &idx, "", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "?)") != null);
+    }
+    // `--strict` drops a symbol whose connectivity is entirely heuristic.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try hot(&aw.writer, &idx, "", .{ .strict = true });
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "create_run") == null);
+    }
+}
+
+test "unused: a helper used only via a template literal or past JSX prose is not dead" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `tmpl` is called only inside a template literal; `afterProse` only after a
+    // JSX apostrophe; `reallyDead` nowhere. The first two must stay out of the
+    // report (they're live), the third must be in it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "View.tsx", .data =
+        \\function tmpl(x: string): string { return x; }
+        \\function afterProse(): number { return 1; }
+        \\function reallyDead(): number { return 0; }
+        \\export function View({ n }: { n: string }) {
+        \\  return (
+        \\    <div>
+        \\      <p>you'll see {afterProse()} items, don't fret</p>
+        \\      <span>{`label ${tmpl(n)}`}</span>
+        \\    </div>
+        \\  );
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "reallyDead") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "afterProse") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "tmpl") == null);
 }
 
 test "end line is correct despite a leading comment or template prefix" {

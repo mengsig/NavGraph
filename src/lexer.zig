@@ -95,26 +95,176 @@ pub fn tokenize(
             lx.advance();
             continue;
         }
-        if (try lexComment(&lx, out)) continue;
-        if (cfg.line_string.len != 0 and lx.matches(cfg.line_string)) {
-            try lexLineString(&lx, out);
-            continue;
-        }
-        if (isStringDelim(cfg, c) or (cfg.template_strings and c == '`')) {
-            try lexString(&lx, out, c);
-            continue;
-        }
-        if (isIdentStart(c)) {
-            try lexIdentifier(&lx, out);
-            continue;
-        }
-        if (std.ascii.isDigit(c)) {
-            try lexNumber(&lx, out);
-            continue;
-        }
-        try appendSingle(&lx, out, .punct);
+        try lexToken(&lx, out);
     }
     try out.append(gpa, .{ .kind = .eof, .start = lx.pos, .end = lx.pos, .line = lx.line, .col = lx.col });
+}
+
+/// Lex exactly one token at a non-whitespace position. Factored out of the main
+/// loop so interpolation-hole lexing (`lexInterpHole`) reuses the same dispatch
+/// — nested strings and f-strings inside `{...}` tokenize identically. Always
+/// consumes at least one byte, so callers can loop without stalling.
+fn lexToken(lx: *Lexer, out: *std.ArrayList(Token)) std.mem.Allocator.Error!void {
+    const cfg = lx.cfg;
+    if (try lexComment(lx, out)) return;
+    if (cfg.line_string.len != 0 and lx.matches(cfg.line_string)) {
+        try lexLineString(lx, out);
+        return;
+    }
+    // Python f-strings: tokenize each `{...}` interpolation as code so a call
+    // like `f"{jsonable_encoder(x)}"` becomes a real edge instead of vanishing
+    // into a string literal. The `f`/`rf` prefix would otherwise lex as a stray
+    // identifier and the whole string swallow its interpolations.
+    if (cfg.language == .python) {
+        if (detectPyFString(lx)) |fs| {
+            try lexFString(lx, out, fs.quote, fs.prefix_len);
+            return;
+        }
+    }
+    const c = lx.peek();
+    // JSX-text apostrophe guard: in JS/TS/JSX a `'` or `"` glued to the end of a
+    // word (`you'll`, `don't`) is prose, not a string opener. Left unchecked, it
+    // would open a string and swallow the rest of the file up to the next quote,
+    // hiding every symbol and call after it. JS has no `b'…'`/`r'…'` string
+    // prefixes, so a quote right after an identifier char is never a real string.
+    if (cfg.template_strings and (c == '\'' or c == '"') and
+        lx.pos > 0 and isIdentCont(lx.source[lx.pos - 1]))
+    {
+        try appendSingle(lx, out, .punct);
+        return;
+    }
+    if (isStringDelim(cfg, c) or (cfg.template_strings and c == '`')) {
+        try lexString(lx, out, c);
+        return;
+    }
+    if (isIdentStart(c)) {
+        try lexIdentifier(lx, out);
+        return;
+    }
+    if (std.ascii.isDigit(c)) {
+        try lexNumber(lx, out);
+        return;
+    }
+    try appendSingle(lx, out, .punct);
+}
+
+fn isQuoteChar(c: u8) bool {
+    return c == '"' or c == '\'';
+}
+
+/// A Python f-string at the cursor: its quote char and prefix length (`f"`,
+/// `rf'`, `F"""`, …), or null. Only f-prefixed strings (the ones that
+/// interpolate) are matched; plain/raw/byte strings lex normally.
+fn detectPyFString(lx: *const Lexer) ?struct { quote: u8, prefix_len: u32 } {
+    const isF = struct {
+        fn f(c: u8) bool {
+            return c == 'f' or c == 'F';
+        }
+    }.f;
+    const isR = struct {
+        fn r(c: u8) bool {
+            return c == 'r' or c == 'R';
+        }
+    }.r;
+    const c0 = lx.at(0);
+    if (isF(c0) and isQuoteChar(lx.at(1))) return .{ .quote = lx.at(1), .prefix_len = 1 };
+    const c1 = lx.at(1);
+    if (((isF(c0) and isR(c1)) or (isR(c0) and isF(c1))) and isQuoteChar(lx.at(2)))
+        return .{ .quote = lx.at(2), .prefix_len = 2 };
+    return null;
+}
+
+/// Lex a Python f-string as byte-ordered pieces: `.string` tokens for the
+/// literal runs and normal code tokens for each `{...}` interpolation. Pieces
+/// stay sorted by start offset, so the token stream's ordering invariant holds.
+fn lexFString(lx: *Lexer, out: *std.ArrayList(Token), quote: u8, prefix_len: u32) std.mem.Allocator.Error!void {
+    var chunk_start = lx.pos;
+    var chunk_line = lx.line;
+    var chunk_col = lx.col;
+    var p: u32 = 0;
+    while (p < prefix_len) : (p += 1) lx.advance();
+    const triple = lx.peek() == quote and lx.at(1) == quote and lx.at(2) == quote;
+    lx.advance();
+    if (triple) {
+        lx.advance();
+        lx.advance();
+    }
+    while (lx.pos < lx.source.len) {
+        if (triple) {
+            if (isTripleClose(lx, quote)) {
+                lx.advance();
+                lx.advance();
+                lx.advance();
+                break;
+            }
+        } else if (lx.peek() == quote) {
+            lx.advance();
+            break;
+        }
+        const c = lx.peek();
+        if (!triple and c == '\\') { // escaped char (`\"`, `\n`, …)
+            lx.advance();
+            if (lx.pos < lx.source.len) lx.advance();
+            continue;
+        }
+        if (c == '{') {
+            if (lx.at(1) == '{') { // `{{` — an escaped literal brace
+                lx.advance();
+                lx.advance();
+                continue;
+            }
+            try emitStringChunk(lx, out, chunk_start, chunk_line, chunk_col);
+            lx.advance(); // consume '{'
+            try lexInterpHole(lx, out);
+            chunk_start = lx.pos;
+            chunk_line = lx.line;
+            chunk_col = lx.col;
+            continue;
+        }
+        if (c == '}' and lx.at(1) == '}') { // `}}` — an escaped literal brace
+            lx.advance();
+            lx.advance();
+            continue;
+        }
+        lx.advance();
+    }
+    try emitStringChunk(lx, out, chunk_start, chunk_line, chunk_col);
+}
+
+/// Emit `[start, pos)` as a `.string` token if non-empty (a literal run of an
+/// interpolated string).
+fn emitStringChunk(lx: *Lexer, out: *std.ArrayList(Token), start: u32, line: u32, col: u32) !void {
+    if (lx.pos <= start) return;
+    try out.append(lx.gpa, .{ .kind = .string, .start = start, .end = lx.pos, .line = line, .col = col });
+}
+
+/// Lex an interpolation hole's expression as code tokens up to (and consuming)
+/// its matching `}` at brace depth 0. Nested `{}` (dict/set/format-spec) and
+/// strings that embed `}` are handled so the true closing brace is found.
+fn lexInterpHole(lx: *Lexer, out: *std.ArrayList(Token)) std.mem.Allocator.Error!void {
+    var depth: u32 = 0;
+    while (lx.pos < lx.source.len) {
+        const c = lx.peek();
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            lx.advance();
+            continue;
+        }
+        if (c == '}') {
+            if (depth == 0) {
+                lx.advance(); // consume the closing brace
+                return;
+            }
+            depth -= 1;
+            try appendSingle(lx, out, .punct);
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            try appendSingle(lx, out, .punct);
+            continue;
+        }
+        try lexToken(lx, out);
+    }
 }
 
 fn isStringDelim(cfg: language.Config, c: u8) bool {
@@ -310,4 +460,90 @@ test "tokenize treats Zig multiline strings as strings, not code" {
         if (std.mem.eql(u8, t.text(src), "real")) saw_real = true;
     }
     try std.testing.expect(saw_real);
+}
+
+test "python f-string interpolations tokenize as code, sorted, and stay balanced" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.python);
+    // A call, a `!r` conversion, a nested dict `{}` and a `}` inside a string —
+    // the closing brace must be found past all of them.
+    const src =
+        \\msg = f"got {compute(x)!r} keys {d['}']} end"
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+
+    var saw_call = false;
+    var last_start: u32 = 0;
+    var open_parens: i32 = 0;
+    for (toks.items, 0..) |t, i| {
+        // Token stream stays sorted by start offset (tokenAfterOffset relies on it).
+        try std.testing.expect(t.start >= last_start);
+        last_start = t.start;
+        if (t.kind == .punct) {
+            const c = src[t.start];
+            if (c == '(') open_parens += 1;
+            if (c == ')') open_parens -= 1;
+        }
+        if (t.kind == .identifier and std.mem.eql(u8, t.text(src), "compute") and
+            i + 1 < toks.items.len and toks.items[i + 1].kind == .punct and
+            src[toks.items[i + 1].start] == '(') saw_call = true;
+    }
+    // `compute(` surfaced as an identifier+`(` (a call the parser can record).
+    try std.testing.expect(saw_call);
+    // Parens introduced by the interpolation are balanced (the `}` in `'}'` did
+    // not truncate the hole early).
+    try std.testing.expectEqual(@as(i32, 0), open_parens);
+}
+
+test "a plain (non-f) python string is still one opaque token" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.python);
+    const src =
+        \\path = "/users/{id}/get"
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    // The `{id}` inside a normal string must NOT become a code token.
+    for (toks.items) |t| {
+        if (t.kind == .identifier) try std.testing.expect(!std.mem.eql(u8, t.text(src), "id"));
+    }
+}
+
+test "JSX prose apostrophes do not open a string and swallow the code after" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.tsx);
+    // `you'll` / `don't` would otherwise start a single-quoted string that runs
+    // to the next quote — hiding every identifier until then.
+    const src =
+        \\function View() {
+        \\  return <p>you'll like it, don't worry about it</p>;
+        \\}
+        \\function after() { return realCallAfterProse(); }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    var saw_after = false;
+    for (toks.items) |t| {
+        if (t.kind == .identifier and std.mem.eql(u8, t.text(src), "realCallAfterProse")) saw_after = true;
+    }
+    try std.testing.expect(saw_after);
+}
+
+test "a real single-quoted JS string (in value position) is still a string" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.typescript);
+    const src =
+        \\const mode = 'production';
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    // `production` lives inside the string, so it must not surface as an ident.
+    for (toks.items) |t| {
+        if (t.kind == .identifier) try std.testing.expect(!std.mem.eql(u8, t.text(src), "production"));
+    }
 }

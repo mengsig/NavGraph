@@ -187,25 +187,32 @@ fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32, prefixes: *const std.StringHas
 /// The handler name a route dispatches to: an Express identifier argument after
 /// the path, or the `def`/`function` that follows a decorator.
 fn routeHandler(ctx: *const Ctx, rd: api.RouteDef, n: u32) ?[]const u8 {
-    const path_i = rd.open_i + 1;
-    if (ctx.isPunct(path_i + 1, ',') and ctx.toks[path_i + 2].kind == .identifier) {
-        const name = ctx.textOf(path_i + 2);
-        if (!isDefKeyword(name)) return name;
+    // Decorator form (`@app.get(...)` immediately above a `def`/`function`): the
+    // handler is the following definition. A decorator's own keyword arguments
+    // (FastAPI's `response_model=Model`, `status_code=201`, …) are NOT handlers,
+    // so we must never read a positional-looking identifier from the arg list
+    // here — always scan forward to the real definition.
+    if (routeIsDecorator(ctx, rd)) {
+        const from = if (ctx.close[rd.open_i] != sentinel) ctx.close[rd.open_i] + 1 else rd.open_i + 1;
+        var j = from;
+        var scanned: u32 = 0;
+        while (j < n and scanned < 24) : ({
+            j += 1;
+            scanned += 1;
+        }) {
+            if ((ctx.identEql(j, "def") or ctx.identEql(j, "function")) and
+                j + 1 < n and ctx.toks[j + 1].kind == .identifier) return ctx.textOf(j + 1);
+        }
+        return null;
     }
-    // The forward `def`/`function` scan is only valid for a *decorator*
-    // (`@app.get(...)` immediately above a def). For a call-form route
-    // (`router.get("/x", (req, res) => {...})`) the handler is inline and
-    // anonymous, so scanning forward would bind an unrelated later function.
-    if (!routeIsDecorator(ctx, rd)) return null;
-    const from = if (ctx.close[rd.open_i] != sentinel) ctx.close[rd.open_i] + 1 else rd.open_i + 1;
-    var j = from;
-    var scanned: u32 = 0;
-    while (j < n and scanned < 24) : ({
-        j += 1;
-        scanned += 1;
-    }) {
-        if ((ctx.identEql(j, "def") or ctx.identEql(j, "function")) and
-            j + 1 < n and ctx.toks[j + 1].kind == .identifier) return ctx.textOf(j + 1);
+    // Call-form route (`router.get("/x", listItems)`): the handler is a bare
+    // identifier argument after the path. Exclude a Python-style keyword argument
+    // (`name=value`) so decorator-less `.add_api_route`-ish kwargs aren't bound,
+    // and reject an inline arrow/anonymous handler (`(req, res) => {...}`).
+    const path_i = rd.open_i + 1;
+    if (path_i + 3 < n and ctx.isPunct(path_i + 1, ',') and ctx.toks[path_i + 2].kind == .identifier) {
+        const name = ctx.textOf(path_i + 2);
+        if (!isDefKeyword(name) and !ctx.isPunct(path_i + 3, '=')) return name;
     }
     return null;
 }
@@ -394,13 +401,20 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     };
 }
 
-/// If token `i` is the trailing member of `recv.name`, return `recv`'s text
-/// (the receiver identifier); otherwise "". `lo` bounds the body start.
+/// If token `i` is the trailing member of a member access, return the receiver
+/// identifier; otherwise "". Recognizes `recv.name` (all languages) and the
+/// C/C++ two-punct operators `recv->name` and `Scope::name`, so instance and
+/// static dispatch there is visible to resolution. `lo` bounds the body start.
 fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
-    if (i < lo + 2) return "";
-    if (!ctx.isPunct(i - 1, '.')) return "";
-    if (ctx.toks[i - 2].kind != .identifier) return "";
-    return ctx.textOf(i - 2);
+    // `recv.name`
+    if (i >= lo + 2 and ctx.isPunct(i - 1, '.') and ctx.toks[i - 2].kind == .identifier)
+        return ctx.textOf(i - 2);
+    // `recv->name` / `Scope::name` (each operator is two punct tokens).
+    if (i >= lo + 3 and ctx.toks[i - 3].kind == .identifier) {
+        if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
+        if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
+    }
+    return "";
 }
 
 fn recordRef(
@@ -1497,6 +1511,12 @@ fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exp
     if (arrow_body.open != sentinel) {
         return emitJsArrow(ctx, start_i, name_i, arrow_body, parent, exported, hi);
     }
+    // Expression-bodied arrow: `const C = () => (<JSX>…)`, `const f = x => g(x)`.
+    // These carry real call sites (a React component's whole render is here), so
+    // treat them as functions and collect refs — not as an opaque variable.
+    if (arrow_body.is_fn and arrow_body.arrow_i != sentinel) {
+        return emitJsArrowExpr(ctx, start_i, name_i, arrow_body.arrow_i, parent, exported, hi);
+    }
     const end_i = if (semi_i != sentinel) semi_i else name_i;
     _ = try emit(ctx, .{
         .name = ctx.textOf(name_i),
@@ -1513,15 +1533,17 @@ fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exp
     return tokenAfterOffset(ctx, ctx.toks[end_i].end, hi);
 }
 
-const JsArrow = struct { open: u32, is_fn: bool };
+const JsArrow = struct { open: u32, arrow_i: u32, is_fn: bool };
 
-/// Detect `= ... => {` arrow functions with block bodies before the statement
-/// terminator. Returns the block `{` index when found.
+/// Detect an arrow function on a binding's RHS. `open` is the block-body `{`
+/// index (sentinel for an expression body); `arrow_i` is the `=>` token's `=`
+/// index; `is_fn` is true once a top-level `=>` is seen.
 fn detectJsArrow(ctx: *const Ctx, eq_i: u32, hi: u32, semi_i: u32) JsArrow {
-    if (eq_i == sentinel) return .{ .open = sentinel, .is_fn = false };
+    if (eq_i == sentinel) return .{ .open = sentinel, .arrow_i = sentinel, .is_fn = false };
     const limit = if (semi_i != sentinel) semi_i else hi;
     var i = eq_i + 1;
     var saw_arrow = false;
+    var arrow_i: u32 = sentinel;
     while (i < limit) {
         if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
             i = skipBracket(ctx, i);
@@ -1529,17 +1551,18 @@ fn detectJsArrow(ctx: *const Ctx, eq_i: u32, hi: u32, semi_i: u32) JsArrow {
         }
         if (ctx.toks[i].kind == .punct and ctx.ch(i) == '=' and i + 1 < limit and ctx.isPunct(i + 1, '>')) {
             saw_arrow = true;
+            arrow_i = i;
             i += 2;
             continue;
         }
-        if (saw_arrow and ctx.isPunct(i, '{')) return .{ .open = i, .is_fn = true };
+        if (saw_arrow and ctx.isPunct(i, '{')) return .{ .open = i, .arrow_i = arrow_i, .is_fn = true };
         if (ctx.isPunct(i, '{')) {
             i = skipBracket(ctx, i);
             continue;
         }
         i += 1;
     }
-    return .{ .open = sentinel, .is_fn = saw_arrow };
+    return .{ .open = sentinel, .arrow_i = arrow_i, .is_fn = saw_arrow };
 }
 
 fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u32, exported: bool, hi: u32) !u32 {
@@ -1564,6 +1587,56 @@ fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u3
     });
     _ = hi;
     return close + 1;
+}
+
+/// Emit an expression-bodied arrow `const NAME = (params) => EXPR` as a function
+/// and collect the call/read refs in EXPR. `arrow_i` is the `=>`'s `=` token.
+fn emitJsArrowExpr(ctx: *Ctx, start_i: u32, name_i: u32, arrow_i: u32, parent: ?u32, exported: bool, hi: u32) !u32 {
+    const body_start = arrow_i + 2; // skip `=` and `>`
+    if (body_start >= hi) return start_i;
+    const end = arrowExprEnd(ctx, body_start, hi);
+    // Params: the `(...)` between the name and `=>`, so param names bind rather
+    // than resolve globally. A bare single param (`x => …`) has none to skip.
+    const popen = findNext(ctx, name_i + 1, arrow_i, '(');
+    const params_open = if (popen != sentinel and ctx.close[popen] != sentinel and
+        ctx.close[popen] < arrow_i) popen else sentinel;
+    const body = try collectRefs(ctx, params_open, body_start, end, ctx.textOf(name_i), js_keywords);
+    const last_tok = if (end > body_start) end - 1 else body_start;
+    _ = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = if (parent != null) .method else .function,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, start_i),
+        .span_end = ctx.toks[last_tok].end,
+        .sig_end = ctx.toks[body_start].start,
+        .doc = collectDoc(ctx, start_i),
+        .exported = exported,
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return end;
+}
+
+/// The exclusive end token of an arrow's expression body: a bracket-balanced
+/// forward scan from `start` that stops at the first top-level `;`, `,` or a
+/// closing bracket belonging to an enclosing scope (or `hi`).
+fn arrowExprEnd(ctx: *const Ctx, start: u32, hi: u32) u32 {
+    var i = start;
+    while (i < hi) {
+        if (ctx.toks[i].kind == .punct) {
+            const c = ctx.ch(i);
+            if (c == '(' or c == '{' or c == '[') {
+                const close = ctx.close[i];
+                if (close == sentinel or close >= hi) return hi;
+                i = close + 1;
+                continue;
+            }
+            if (c == ';' or c == ',' or c == ')' or c == ']' or c == '}') return i;
+        }
+        i += 1;
+    }
+    return hi;
 }
 
 /// Class members: methods `name(...) { }` and accessors.
@@ -1964,6 +2037,74 @@ test "js: function, arrow, class method" {
     try testing.expectEqual(SymbolKind.function, helper.kind);
     const render = findSym(out.items, "render").?;
     try testing.expectEqual(SymbolKind.method, render.kind);
+}
+
+test "js: expression-body arrow is a function and captures its calls" {
+    // React components are commonly `const C = () => (<JSX>{call()}</JSX>)`.
+    // The whole render lives in the expression body — it must be a function
+    // whose call sites are collected, not an opaque variable.
+    const src =
+        \\import { getMission, getStatus } from './api';
+        \\export const Sidebar = () => (
+        \\  <div>{getMission()}{getStatus('x')}</div>
+        \\);
+        \\export const label = (s) => `n:${s}`;
+    ;
+    var out = try parseForTest(src, .tsx);
+    defer freeRefs(&out);
+    const sidebar = findSym(out.items, "Sidebar").?;
+    try testing.expectEqual(SymbolKind.function, sidebar.kind);
+    var saw_mission = false;
+    var saw_status = false;
+    for (sidebar.refs) |r| {
+        if (std.mem.eql(u8, r.name, "getMission")) saw_mission = true;
+        if (std.mem.eql(u8, r.name, "getStatus")) saw_status = true;
+    }
+    try testing.expect(saw_mission);
+    try testing.expect(saw_status);
+    // A call-free expression-body arrow is still recognized as a function.
+    try testing.expectEqual(SymbolKind.function, findSym(out.items, "label").?.kind);
+}
+
+test "python: f-string interpolation exposes the calls inside it" {
+    const src =
+        \\def helper(x):
+        \\    return x
+        \\def use(v):
+        \\    return f"got {helper(v)!r} done"
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const use = findSym(out.items, "use").?;
+    var saw = false;
+    for (use.refs) |r| {
+        if (std.mem.eql(u8, r.name, "helper")) {
+            saw = true;
+            try testing.expectEqual(RefKind.call, r.kind);
+        }
+    }
+    try testing.expect(saw);
+}
+
+test "cpp: -> and :: member calls record the receiver as the qualifier" {
+    const src =
+        \\struct Engine { void spin(); };
+        \\void run(Engine* e) {
+        \\    e->spin();
+        \\    Engine::boot();
+        \\}
+    ;
+    var out = try parseForTest(src, .cpp);
+    defer freeRefs(&out);
+    const run = findSym(out.items, "run").?;
+    var arrow_q: []const u8 = "";
+    var scope_q: []const u8 = "";
+    for (run.refs) |r| {
+        if (std.mem.eql(u8, r.name, "spin")) arrow_q = r.qualifier;
+        if (std.mem.eql(u8, r.name, "boot")) scope_q = r.qualifier;
+    }
+    try testing.expectEqualStrings("e", arrow_q);
+    try testing.expectEqualStrings("Engine", scope_q);
 }
 
 test "c: function and macro" {

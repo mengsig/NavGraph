@@ -220,19 +220,27 @@ fn walkCallers(
     try w.writeByte(']');
 }
 
-/// Hot: array of `{...symbol, fan_in, fan_out}` ranked by connectivity.
+/// Hot: array of `{...symbol, fan_in, fan_in_exact, fan_out, fan_out_exact}`
+/// ranked by connectivity. `*_exact` exclude heuristic `?` edges; `--strict`
+/// drops entries whose connectivity is entirely heuristic.
 pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     const ranked = try query.collectHot(idx, filter);
     defer idx.gpa.free(ranked);
-    const cap = @min(ranked.len, query.hotLimit(opts));
+    const limit = query.hotLimit(opts);
     try w.writeByte('[');
-    for (ranked[0..cap], 0..) |e, k| {
-        if (k != 0) try w.writeByte(',');
+    var shown: u32 = 0;
+    for (ranked) |e| {
+        if (opts.strict and e.fan_in_exact == 0 and e.fan_out_exact == 0) continue;
+        if (shown >= limit) break;
+        if (shown != 0) try w.writeByte(',');
+        shown += 1;
         const sym = idx.graph.symbols[e.id];
         try nodeHead(w, idx, sym);
         try w.writeAll(",\"sig\":");
         try writeCollapsedString(w, sym.signature(idx.graph.files[sym.file].text), max_sig_len);
-        try w.print(",\"fan_in\":{d},\"fan_out\":{d}}}", .{ e.fan_in, e.fan_out });
+        try w.print(",\"fan_in\":{d},\"fan_in_exact\":{d},\"fan_out\":{d},\"fan_out_exact\":{d}}}", .{
+            e.fan_in, e.fan_in_exact, e.fan_out, e.fan_out_exact,
+        });
     }
     try w.writeAll("]\n");
 }
@@ -313,10 +321,12 @@ fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
 
 /// Unused: a JSON array of zero-caller function/method symbols.
 pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    var ref_names = try query.buildReferencedNames(idx);
+    defer ref_names.deinit();
     var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
-        if (!query.isDeadCandidate(idx, sym, filter)) continue;
+        if (!query.isDeadCandidate(idx, sym, filter, &ref_names)) continue;
         if (shown != 0) try w.writeByte(',');
         try symbolObject(w, idx, sym, opts.verbosity);
         shown += 1;

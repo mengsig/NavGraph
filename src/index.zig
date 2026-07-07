@@ -378,7 +378,12 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     // like a local `const candidates = ...` pointing at a global `fn candidates`).
     if (isLocalBinding(from, ref.name)) return;
     const candidates = idx.by_name.get(ref.name) orelse return;
-    const choice = chooseTarget(idx, from, candidates);
+    // A bare identifier never denotes a class member: a method/field is always
+    // reached through a receiver (`self.x`, `obj.m()`, `Type.m()`). Binding a
+    // bare name to a member manufactures false edges — e.g. an untyped local
+    // `name` mis-resolving to a class field `RouteContext.name` and inflating
+    // that member's fan-in. Restrict bare resolution to top-level definitions.
+    const choice = chooseTarget(idx, from, candidates, false);
     ref.target = choice.id;
     ref.exact = choice.confident;
 }
@@ -395,13 +400,53 @@ fn isLocalBinding(from: model.Symbol, name: []const u8) bool {
 fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
     if (receiverType(idx, from, ref.qualifier)) |type_name| {
         ref.target = memberOf(idx, type_name, ref.name);
-        ref.exact = ref.target != invalid;
-        return;
-    }
-    if (importTarget(idx, from.file, ref.qualifier)) |file_id| {
+        if (ref.target != invalid) {
+            ref.exact = true;
+            return;
+        }
+        // Known receiver but no such member here (an inherited/mixin method, or
+        // an external type): fall through to the heuristic call match below.
+    } else if (importTarget(idx, from.file, ref.qualifier)) |file_id| {
         ref.target = topLevelIn(idx, file_id, ref.name);
-        ref.exact = ref.target != invalid;
+        if (ref.target != invalid) {
+            ref.exact = true;
+            return;
+        }
     }
+    // Heuristic fallback: a *call* whose receiver type we can't infer
+    // (`svc.create_run()`, `self.planning_service.create_run()`, `Foo.bar()` on
+    // an untracked value). Bind it by method name so instance/static dispatch is
+    // visible to callers/unused/path. Marked non-exact (`?`) — the receiver is a
+    // guess, so `--strict` drops it. Only calls, never member *reads* (a `.name`
+    // read must not re-inflate a same-named field's fan-in).
+    if (ref.kind == .call) {
+        ref.target = heuristicMethodTarget(idx, from, ref.name);
+        ref.exact = false;
+    }
+}
+
+/// Best method/function named `name` for an unresolved member *call*: a member
+/// of any type (dispatch on an unknown receiver), preferring a same-file and a
+/// method definition. Always a guess — the caller marks the edge heuristic.
+fn heuristicMethodTarget(idx: *const Index, from: model.Symbol, name: []const u8) SymbolId {
+    const candidates = idx.by_name.get(name) orelse return invalid;
+    const from_lang = idx.graph.files[from.file].language.family();
+    var best: SymbolId = invalid;
+    var best_score: i32 = -1;
+    for (candidates) |cid| {
+        if (cid == from.id) continue;
+        const cand = idx.graph.symbols[cid];
+        if (cand.kind != .function and cand.kind != .method) continue;
+        if (idx.graph.files[cand.file].language.family() != from_lang) continue;
+        var score: i32 = 0;
+        if (cand.kind == .method) score += 2; // `recv.x()` most likely hits a method
+        if (cand.file == from.file) score += 1;
+        if (score > best_score) {
+            best_score = score;
+            best = cid;
+        }
+    }
+    return best;
 }
 
 /// The file an imported module `binding` refers to inside `file`, if any.
@@ -480,7 +525,7 @@ const Choice = struct { id: SymbolId, confident: bool };
 /// Pick the best definition for a bare reference: prefer same file, then same
 /// language family, then a callable over a value. `confident` is set when the
 /// pick is unambiguous (same file, or the only candidate).
-fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const SymbolId) Choice {
+fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const SymbolId, allow_members: bool) Choice {
     std.debug.assert(candidates.len > 0);
     const from_lang = idx.graph.files[from.file].language.family();
     var best: SymbolId = invalid;
@@ -489,6 +534,10 @@ fn chooseTarget(idx: *const Index, from: model.Symbol, candidates: []const Symbo
     for (candidates) |cid| {
         if (cid == from.id) continue;
         const cand = idx.graph.symbols[cid];
+        // A bare reference resolves only to a top-level definition, never a class
+        // member (which needs a receiver). Skip members unless the caller asks
+        // for them (the qualified-call heuristic does).
+        if (!allow_members and cand.parent != invalid) continue;
         // Never bind a bare reference across language families: a Python `Ship`
         // and a TSX component `Ship` share a name but not a namespace. The only
         // intended cross-language edge (client call → route) is a route_call,
@@ -762,7 +811,7 @@ fn routeId(idx: *const Index) ?SymbolId {
     return null;
 }
 
-test "member calls resolve by receiver type, not global name" {
+test "member calls: typed receiver is exact; unknown receiver is a heuristic guess" {
     const testing = std.testing;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -799,11 +848,39 @@ test "member calls resolve by receiver type, not global name" {
             try testing.expect(ref.exact);
             checked = true;
         } else if (std.mem.eql(u8, ref.qualifier, "g")) {
-            // Unknown receiver type: left external, not guessed globally.
-            try testing.expectEqual(invalid, ref.target);
+            // Unknown receiver type: a *call* is bound to a same-named method by
+            // the dispatch heuristic so it stays visible, but never as an exact
+            // edge (`--strict` drops it) — the receiver is only a guess.
+            try testing.expect(ref.target == foo_stop or ref.target == bar_stop);
+            try testing.expect(!ref.exact);
         }
     }
     try testing.expect(checked);
+}
+
+test "a bare identifier never binds to a same-named class member" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A class field `name` and a free function with a bare local `name`. The
+    // bare `name` must not resolve to `Ctx.name` — that false edge is what
+    // inflated a property's fan-in across a real repo.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\class Ctx:
+        \\    name: str = ""
+        \\
+        \\def build(x):
+        \\    name = x + "!"
+        \\    return name
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const field = qualifiedId(&idx, "Ctx", "name").?;
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(field).len);
 }
 
 fn qualifiedId(idx: *const Index, parent: []const u8, child: []const u8) ?SymbolId {
@@ -933,6 +1010,34 @@ test "an inline-arrow route gets no phantom handler; an identifier arg is linked
     // forward `function` scan must not bind the unrelated `listItems`/`del`).
     const del_route = idx.graph.symbols[routeByName(&idx, "DELETE /items/:id").?];
     for (del_route.refs) |r| try testing.expect(r.kind != .call);
+}
+
+test "FastAPI decorator kwargs (response_model) don't hijack the handler" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The decorator's `response_model=` kwarg sits exactly where an Express
+    // identifier handler would — the route must still bind the following `def`.
+    try tmp.dir.writeFile(io, .{ .sub_path = "dash.py", .data =
+        \\router = APIRouter(prefix="/ops")
+        \\@router.get("/dashboard", response_model=DashboardResponse)
+        \\def get_operations_dashboard():
+        \\    return {}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const route = idx.graph.symbols[routeByName(&idx, "GET /ops/dashboard").?];
+    var handler: SymbolId = invalid;
+    for (route.refs) |r| if (r.kind == .call and r.target != invalid) {
+        handler = r.target;
+    };
+    try testing.expectEqual(idx.lookup("get_operations_dashboard")[0], handler);
 }
 
 test "python relative imports resolve to package files" {
