@@ -57,6 +57,18 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+    // Fingerprint NavGraph's own source so the on-disk parse cache
+    // (`.navgraph/cache`) is invalidated whenever the indexer/parser logic
+    // changes — even when the serialized layout is byte-identical. Without this,
+    // a cache written by an older binary can silently survive a logic fix and
+    // keep serving stale (buggy) results. The key is content-addressed: the same
+    // source always yields the same key, so switching git branches reuses each
+    // branch's matching cache instead of thrashing it.
+    const build_opts = b.addOptions();
+    build_opts.addOption(u64, "cache_key", srcFingerprint(b));
+    const build_opts_mod = build_opts.createModule();
+    mod.addImport("build_options", build_opts_mod);
+
     const exe = b.addExecutable(.{
         .name = "navgraph",
         .root_module = b.createModule(.{
@@ -79,6 +91,7 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "NavGraph", .module = mod },
+                .{ .name = "build_options", .module = build_opts_mod },
             },
         }),
     });
@@ -153,4 +166,38 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// A content hash of every `src/**.zig` file, used as the parse-cache version
+/// key. Any edit to the indexer/parser changes this value, so a cache produced
+/// by a different build is transparently ignored (a safe rebuild). Best-effort:
+/// if the tree can't be read for any reason we return 0 — the cache still works,
+/// it just falls back to the coarser layout-magic guard.
+fn srcFingerprint(b: *std.Build) u64 {
+    const io = b.graph.io;
+    var dir = b.build_root.handle.openDir(io, "src", .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+
+    // Collect paths first and sort them, so the hash is independent of the
+    // filesystem's directory-iteration order (which is not stable across runs).
+    var walker = dir.walk(b.allocator) catch return 0;
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(io) catch return 0) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        paths.append(b.allocator, b.allocator.dupe(u8, entry.path) catch return 0) catch return 0;
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lt(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lt);
+
+    var hasher = std.hash.Wyhash.init(0);
+    for (paths.items) |p| {
+        hasher.update(p); // path renames must also change the key
+        const data = dir.readFileAlloc(io, p, b.allocator, .unlimited) catch return 0;
+        hasher.update(data);
+    }
+    return hasher.final();
 }

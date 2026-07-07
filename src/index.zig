@@ -210,7 +210,7 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
 /// vanished between directory iteration and here).
 fn statOf(b: *Builder, rel_path: []const u8) ?cache.FileStat {
     const st = b.root_dir.statFile(b.io, rel_path, .{}) catch return null;
-    return .{ .mtime_ns = st.mtime.nanoseconds, .size = st.size };
+    return .{ .mtime_ns = st.mtime.nanoseconds, .ctime_ns = st.ctime.nanoseconds, .size = st.size };
 }
 
 fn parseFile(b: *Builder, text: []const u8, lang: language.Language) ![]parser.ParsedSymbol {

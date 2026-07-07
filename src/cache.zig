@@ -12,6 +12,7 @@
 //! whole cache be ignored (a safe rebuild), never a crash.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const language = @import("language.zig");
 const model = @import("model.zig");
 const parser = @import("parser.zig");
@@ -22,13 +23,28 @@ const Reference = model.Reference;
 const Binding = model.Binding;
 const invalid_local: u32 = std.math.maxInt(u32);
 
-/// Bump the trailing digit whenever the on-disk layout changes.
-const magic = "NGCACHE3";
+/// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
+/// (parser/indexer) are guarded separately by `build_key` below, so you only
+/// touch this when the byte format itself moves.
+const magic = "NGCACHE4";
+
+/// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
+/// written into every cache header and checked on load: a cache produced by a
+/// binary with different indexer logic is ignored (a safe rebuild) even when the
+/// serialized layout is unchanged. This is what stops a stale cache from
+/// silently masking a parser fix — the failure mode that made an older NavGraph
+/// serve wrong `imports`/`routes` results after its own bugs were fixed.
+const build_key: u64 = build_options.cache_key;
 const cache_dir = ".navgraph";
 const cache_path = ".navgraph/cache";
 const max_cache_bytes: usize = 256 * 1024 * 1024;
 
-pub const FileStat = struct { mtime_ns: i128, size: u64 };
+/// The stat fields that key a cached parse. `ctime_ns` (inode status-change
+/// time) is included alongside `mtime_ns` because tools like `tar -x`, `cp -p`,
+/// and `rsync --times` preserve mtime but cannot backdate ctime — so a
+/// same-size restore that keeps mtime still busts the entry. All three are pure
+/// `stat` fields: matching stays read-free (no hashing file contents).
+pub const FileStat = struct { mtime_ns: i128, ctime_ns: i128, size: u64 };
 
 /// A restored file: its exact source text plus parsed symbols, both owned by the
 /// caller-provided arena so they can be spliced straight into the graph.
@@ -62,7 +78,8 @@ pub const Store = struct {
     /// entry for `path`; otherwise null (caller re-parses).
     pub fn restore(self: *const Store, arena: std.mem.Allocator, path: []const u8, stat: FileStat) ?Restored {
         const e = self.entries.get(path) orelse return null;
-        if (e.stat.mtime_ns != stat.mtime_ns or e.stat.size != stat.size) return null;
+        if (e.stat.mtime_ns != stat.mtime_ns or e.stat.ctime_ns != stat.ctime_ns or
+            e.stat.size != stat.size) return null;
         return materialize(arena, e.blob) catch null;
     }
 };
@@ -84,10 +101,15 @@ fn indexEntries(store: *Store) !void {
     var cur = Cursor{ .bytes = store.bytes };
     const head = try cur.take(magic.len);
     if (!std.mem.eql(u8, head, magic)) return error.BadMagic;
+    if ((try cur.getU64()) != build_key) return error.StaleBuild;
     const count = try cur.getU32();
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        const stat = FileStat{ .mtime_ns = try cur.getI128(), .size = try cur.getU64() };
+        const stat = FileStat{
+            .mtime_ns = try cur.getI128(),
+            .ctime_ns = try cur.getI128(),
+            .size = try cur.getU64(),
+        };
         const path = try cur.getStr();
         const lang = try cur.getLang();
         const blob = try readBlob(&cur);
@@ -215,6 +237,7 @@ pub fn write(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     try buf.appendSlice(gpa, magic);
+    try putU64(gpa, &buf, build_key);
     try putU32(gpa, &buf, @intCast(files.len));
     for (files, stats) |file, stat| try writeFile(gpa, &buf, file, stat, symbols);
 
@@ -233,6 +256,7 @@ fn writeFile(
     std.debug.assert(file.sym_end <= symbols.len);
     std.debug.assert(stat.size == file.text.len);
     try putI128(gpa, buf, stat.mtime_ns);
+    try putI128(gpa, buf, stat.ctime_ns);
     try putU64(gpa, buf, stat.size);
     try putStr(gpa, buf, file.path);
     try buf.append(gpa, @intFromEnum(file.language));
@@ -382,7 +406,7 @@ test "cache round-trips a file's parsed symbols" {
         .sym_start = 0,
         .sym_end = @intCast(syms.items.len),
     }};
-    const stats = [_]FileStat{.{ .mtime_ns = 123, .size = source.len }};
+    const stats = [_]FileStat{.{ .mtime_ns = 123, .ctime_ns = 456, .size = source.len }};
 
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -394,9 +418,33 @@ test "cache round-trips a file's parsed symbols" {
     try testing.expectEqualStrings(source, hit.text);
     try testing.expectEqual(parsed.items.len, hit.symbols.len);
     try testing.expectEqualStrings(parsed.items[0].name, hit.symbols[0].name);
-    // A changed mtime misses; an absent path misses.
-    try testing.expect(store.restore(arena, "m.zig", .{ .mtime_ns = 999, .size = source.len }) == null);
+    // A changed mtime misses; a changed ctime misses; an absent path misses.
+    try testing.expect(store.restore(arena, "m.zig", .{ .mtime_ns = 999, .ctime_ns = 456, .size = source.len }) == null);
+    try testing.expect(store.restore(arena, "m.zig", .{ .mtime_ns = 123, .ctime_ns = 999, .size = source.len }) == null);
     try testing.expect(store.restore(arena, "other.zig", stats[0]) == null);
+}
+
+test "a cache stamped with a different build key is ignored" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Write a minimal valid cache (zero files is enough — we only exercise the
+    // header check), then flip a byte inside the build-key field on disk to
+    // simulate a cache produced by a binary with different indexer logic.
+    const empty_files = [_]model.SourceFile{};
+    const empty_stats = [_]FileStat{};
+    try write(testing.allocator, testing.io, tmp.dir, &empty_files, &empty_stats, &.{});
+
+    const raw = try tmp.dir.readFileAlloc(testing.io, cache_path, testing.allocator, .unlimited);
+    defer testing.allocator.free(raw);
+    // The build key is the u64 immediately after the magic; a matching cache
+    // loads, a tampered one must not.
+    var loaded = load(testing.allocator, testing.io, tmp.dir);
+    if (loaded) |*store| store.deinit() else return error.ValidCacheRejected;
+    raw[magic.len] +%= 1;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = cache_path, .data = raw });
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
 }
 
 fn promote(p: ParsedSymbol, id: u32) model.Symbol {
