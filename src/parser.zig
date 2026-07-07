@@ -58,6 +58,9 @@ const Ctx = struct {
     /// close bracket; `sentinel` otherwise.
     close: []u32,
     out: *std.ArrayList(ParsedSymbol),
+    /// Keyword set used by the C-family scanners (C/C++ vs C#) to skip control
+    /// keywords when reading references and detecting member functions.
+    ckw: KeywordSet = c_keywords,
 
     fn ch(self: *const Ctx, i: u32) u8 {
         const t = self.toks[i];
@@ -105,11 +108,12 @@ pub fn parse(
         .toks = toks.items,
         .close = close,
         .out = out,
+        .ckw = if (lang == .csharp) cs_keywords else c_keywords,
     };
     const n: u32 = @intCast(toks.items.len - 1); // exclude eof from scans
     switch (lang.family()) {
         .zig => try parseZigScope(&ctx, 0, n, null),
-        .c => try parseCScope(&ctx, 0, n, null),
+        .c, .csharp => try parseCScope(&ctx, 0, n, null),
         .js => try parseJsScope(&ctx, 0, n, null),
         .python => try parsePython(&ctx),
         .other => {},
@@ -901,6 +905,23 @@ const c_keywords = KeywordSet.initComptime(.{
     .{"volatile"}, .{"class"}, .{"public"}, .{"private"}, .{"namespace"}, .{"template"},
 });
 
+/// C# control/type/modifier keywords — kept apart from `c_keywords` so the shared
+/// C-family scanners skip C#-specific keywords when reading a body's references
+/// and detecting member functions.
+const cs_keywords = KeywordSet.initComptime(.{
+    .{"if"},      .{"else"},    .{"for"},      .{"foreach"}, .{"while"},   .{"do"},
+    .{"return"},  .{"switch"},  .{"case"},     .{"break"},   .{"continue"}, .{"goto"},
+    .{"using"},   .{"namespace"}, .{"class"},  .{"struct"},  .{"interface"}, .{"enum"},
+    .{"record"},  .{"public"},  .{"private"},  .{"protected"}, .{"internal"}, .{"static"},
+    .{"readonly"}, .{"const"},  .{"virtual"},  .{"override"}, .{"abstract"}, .{"sealed"},
+    .{"async"},   .{"await"},   .{"new"},      .{"this"},    .{"base"},    .{"var"},
+    .{"void"},    .{"int"},     .{"string"},   .{"bool"},    .{"double"},  .{"float"},
+    .{"long"},    .{"short"},   .{"byte"},     .{"char"},    .{"object"},  .{"decimal"},
+    .{"true"},    .{"false"},   .{"null"},     .{"is"},      .{"as"},      .{"typeof"},
+    .{"try"},     .{"catch"},   .{"finally"},  .{"throw"},   .{"yield"},   .{"ref"},
+    .{"out"},     .{"in"},      .{"where"},    .{"get"},     .{"set"},     .{"partial"},
+});
+
 fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
     var stmt_start = lo;
     var i = lo;
@@ -915,6 +936,16 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
             stmt_start = i;
             continue;
         }
+        if (ctx.cfg.language == .csharp) {
+            // `using X;` / `global using X;` directives are C#'s imports.
+            var u = i;
+            if (ctx.identEql(u, "global")) u += 1;
+            if (ctx.identEql(u, "using") and !ctx.isPunct(u + 1, '(')) {
+                i = try parseCsUsing(ctx, u, hi);
+                stmt_start = i;
+                continue;
+            }
+        }
         if (ctx.identEql(i, "namespace")) {
             const adv = try parseCppNamespace(ctx, i, hi, parent);
             if (adv > i) {
@@ -924,7 +955,8 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
             }
         }
         if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
-            ctx.identEql(i, "union") or ctx.identEql(i, "class"))
+            ctx.identEql(i, "union") or ctx.identEql(i, "class") or
+            ctx.identEql(i, "interface"))
         {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
@@ -975,6 +1007,31 @@ fn parseCPreproc(ctx: *Ctx, hash_i: u32, hi: u32) !u32 {
     return i;
 }
 
+/// A C# `using` directive: `using System;`, `using System.Text;`, `using static
+/// System.Math;`, or an alias `using Json = System.Text.Json;`. Emits an import
+/// symbol whose `import_path` is the referenced namespace/type and whose binding
+/// is the alias name (empty for a plain directive). `kw_i` is the `using` token.
+fn parseCsUsing(ctx: *Ctx, kw_i: u32, hi: u32) AllocError!u32 {
+    const line = ctx.toks[kw_i].line;
+    var start = kw_i + 1;
+    if (ctx.identEql(start, "static")) start += 1;
+    // Scan to the terminating `;` (staying on the same line as a safety bound).
+    var semi = start;
+    while (semi < hi and !ctx.isPunct(semi, ';') and ctx.toks[semi].line == line) semi += 1;
+    if (semi <= start) return semi + 1;
+    var alias: []const u8 = "";
+    var path_start = start;
+    if (ctx.toks[start].kind == .identifier and start + 1 < semi and ctx.isPunct(start + 1, '=')) {
+        alias = ctx.textOf(start);
+        path_start = start + 2;
+    }
+    if (path_start < semi and ctx.toks[path_start].kind == .identifier) {
+        const path = ctx.source[ctx.toks[path_start].start..ctx.toks[semi - 1].end];
+        _ = try emit(ctx, importSymbol(alias, path, line, lineStartOffset(ctx, kw_i), ctx.toks[semi - 1].end));
+    }
+    return if (semi < hi) semi + 1 else semi;
+}
+
 /// `namespace [A::B] { ... }` — recurse transparently so members stay top-level,
 /// and emit the (last-named) namespace as a module symbol for outline visibility.
 /// Returns `kw_i` (no advance) for `using namespace X;` and other non-block forms.
@@ -985,13 +1042,38 @@ fn parseCppNamespace(ctx: *Ctx, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32
         name_i = open;
         open += 1;
     }
-    // `namespace A::B { ... }`
-    while (open + 1 < hi and ctx.isPunct(open, ':') and ctx.isPunct(open + 1, ':')) {
-        open += 2;
+    // Qualified name: C++ `namespace A::B { ... }` or C# `namespace A.B { ... }`.
+    while (open < hi) {
+        const sep: u32 = if (open + 1 < hi and ctx.isPunct(open, ':') and ctx.isPunct(open + 1, ':'))
+            2
+        else if (ctx.cfg.language == .csharp and ctx.isPunct(open, '.'))
+            1
+        else
+            break;
+        open += sep;
         if (open < hi and ctx.toks[open].kind == .identifier) {
             name_i = open;
             open += 1;
         }
+    }
+    // C# file-scoped namespace: `namespace App.Web;` — emit a module symbol and
+    // let the remaining top-level declarations parse as its (transparent) members.
+    if (ctx.cfg.language == .csharp and open < hi and ctx.isPunct(open, ';')) {
+        if (name_i) |ni| {
+            _ = try emit(ctx, .{
+                .name = ctx.textOf(ni),
+                .kind = .module,
+                .line = ctx.toks[ni].line,
+                .span_start = lineStartOffset(ctx, kw_i),
+                .span_end = ctx.toks[open].end,
+                .sig_end = ctx.toks[open].start,
+                .doc = collectDoc(ctx, kw_i),
+                .exported = true,
+                .parent_local = parent,
+                .refs = &.{},
+            });
+        }
+        return open + 1;
     }
     if (open >= hi or !ctx.isPunct(open, '{')) return kw_i;
     const close = ctx.close[open];
@@ -1031,6 +1113,8 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         .@"enum"
     else if (ctx.identEql(kw_i, "class"))
         .class
+    else if (ctx.identEql(kw_i, "interface"))
+        .interface
     else
         .@"struct";
     const my_idx = try emit(ctx, .{
@@ -1045,8 +1129,10 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         .parent_local = parent,
         .refs = &.{},
     });
-    // C++ class/struct bodies hold methods; parse them as members (enums do not).
-    if (ctx.cfg.language == .cpp and kind != .@"enum") {
+    // C++ class/struct bodies hold methods; C# class/struct/interface bodies do
+    // too. Parse them as members (enums do not hold methods).
+    const parses_members = ctx.cfg.language == .cpp or ctx.cfg.language == .csharp;
+    if (parses_members and kind != .@"enum") {
         try parseCppMembers(ctx, open + 1, close, my_idx);
     }
     return close + 1;
@@ -1064,7 +1150,8 @@ fn parseCppMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
             continue;
         }
         if (ctx.identEql(i, "struct") or ctx.identEql(i, "class") or
-            ctx.identEql(i, "enum") or ctx.identEql(i, "union"))
+            ctx.identEql(i, "enum") or ctx.identEql(i, "union") or
+            ctx.identEql(i, "interface"))
         {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
@@ -1076,7 +1163,7 @@ fn parseCppMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
         // A member function: `NAME ( ... )` where NAME is not a keyword and there
         // is no `=` since the member-statement start (a field initializer
         // `int x = f();` must not be read as a method named `f`).
-        if (ctx.toks[i].kind == .identifier and !c_keywords.has(ctx.textOf(i)) and
+        if (ctx.toks[i].kind == .identifier and !ctx.ckw.has(ctx.textOf(i)) and
             i + 1 < hi and ctx.isPunct(i + 1, '(') and !hasAssignBetween(ctx, stmt_start, i))
         {
             const adv = try tryCppMethod(ctx, i, hi, parent);
@@ -1112,7 +1199,7 @@ fn tryCppMethod(ctx: *Ctx, name_i: u32, hi: u32, parent: u32) AllocError!u32 {
     if (body_open != sentinel) {
         const body_close = ctx.close[body_open];
         if (body_close == sentinel) return name_i;
-        const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), c_keywords);
+        const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), ctx.ckw);
         _ = try emit(ctx, .{
             .name = ctx.textOf(name_i),
             .kind = .method,
@@ -1158,10 +1245,12 @@ fn cBodyOpen(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
         guard += 1;
     }) {
         if (ctx.isPunct(j, '{')) return j;
-        // Constructor init list `C(...) : field(x), other(y) { ... }`: the body is
-        // the next top-level `{` (bracket-aware, so `field(x)` is skipped). This
-        // stops the init-list members being mis-read as their own functions.
-        if (ctx.cfg.language == .cpp and ctx.isPunct(j, ':') and !ctx.isPunct(j + 1, ':')) {
+        // Constructor init list `C(...) : field(x) { ... }` (C++) or a C# member
+        // initializer / generic constraint `M<T>(...) where T : X { ... }`: the
+        // body is the next top-level `{` (bracket-aware, so `field(x)` is skipped).
+        if ((ctx.cfg.language == .cpp or ctx.cfg.language == .csharp) and
+            ctx.isPunct(j, ':') and !ctx.isPunct(j + 1, ':'))
+        {
             return findNext(ctx, j + 1, hi, '{');
         }
         if (ctx.toks[j].kind == .identifier) continue; // const / noexcept / override / final
@@ -1193,14 +1282,14 @@ fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) 
     const params_close = ctx.close[params_open];
     if (params_close == sentinel) return name_i;
     // Guard: the token before the name must not itself be a call keyword.
-    if (c_keywords.has(ctx.textOf(name_i))) return name_i;
+    if (ctx.ckw.has(ctx.textOf(name_i))) return name_i;
     // A definition has `{` right after the parameter list (allowing C++ trailing
     // qualifiers); otherwise it is a declaration or a call, which we ignore here.
     const body_open = cBodyOpen(ctx, params_close, hi);
     if (body_open == sentinel) return name_i;
     const body_close = ctx.close[body_open];
     if (body_close == sentinel) return name_i;
-    const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), c_keywords);
+    const body = try collectRefs(ctx, params_open, body_open + 1, body_close, ctx.textOf(name_i), ctx.ckw);
     _ = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = if (parent != null) .method else .function,
@@ -2552,6 +2641,79 @@ test "python: relative imports keep their leading dots in the module path" {
     try testing.expect(rel2);
     try testing.expect(rel1);
     try testing.expect(dot_only);
+}
+
+test "c#: namespace, class, interface, enum, methods and constructor" {
+    const src =
+        \\using System;
+        \\using System.Collections.Generic;
+        \\
+        \\namespace Shop.Domain;
+        \\
+        \\public interface IRepository
+        \\{
+        \\    void Save(int id);
+        \\}
+        \\
+        \\public enum Status { Pending, Shipped }
+        \\
+        \\public class Order
+        \\{
+        \\    public Order(int id) { Id = id; }
+        \\    public void AddItem(int sku) { this.Recount(); }
+        \\    private int Recount() { return 0; }
+        \\}
+    ;
+    var out = try parseForTest(src, .csharp);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.module, findSym(out.items, "Domain").?.kind);
+    try testing.expectEqual(SymbolKind.interface, findSym(out.items, "IRepository").?.kind);
+    try testing.expectEqual(SymbolKind.@"enum", findSym(out.items, "Status").?.kind);
+    try testing.expectEqual(SymbolKind.class, findSym(out.items, "Order").?.kind);
+    // Constructor, interface method and class methods are all captured as methods.
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "Save").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "AddItem").?.kind);
+    const recount = findSym(out.items, "Recount").?;
+    try testing.expectEqual(SymbolKind.method, recount.kind);
+
+    // `this.Recount()` is a qualified member call: the receiver is captured so
+    // resolution can bind it to the sibling method.
+    const add = findSym(out.items, "AddItem").?;
+    var saw = false;
+    for (add.refs) |r| {
+        if (std.mem.eql(u8, r.name, "Recount")) {
+            try testing.expectEqualStrings("this", r.qualifier);
+            saw = true;
+        }
+    }
+    try testing.expect(saw);
+}
+
+test "c#: using directives (plain, static, alias) become imports" {
+    const src =
+        \\using System;
+        \\using static System.Math;
+        \\using Json = System.Text.Json;
+        \\namespace App;
+        \\class C { void M() {} }
+    ;
+    var out = try parseForTest(src, .csharp);
+    defer freeRefs(&out);
+    var plain = false;
+    var static_ns = false;
+    var alias = false;
+    for (out.items) |s| {
+        if (s.kind != .import) continue;
+        if (std.mem.eql(u8, s.import_path, "System")) plain = true;
+        if (std.mem.eql(u8, s.import_path, "System.Math")) static_ns = true;
+        if (std.mem.eql(u8, s.import_path, "System.Text.Json")) {
+            alias = true;
+            try testing.expectEqualStrings("Json", s.name);
+        }
+    }
+    try testing.expect(plain);
+    try testing.expect(static_ns);
+    try testing.expect(alias);
 }
 
 fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {

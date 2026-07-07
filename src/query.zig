@@ -11,6 +11,8 @@ const render = @import("render.zig");
 const json_out = @import("json_out.zig");
 const lexer = @import("lexer.zig");
 const language = @import("language.zig");
+const events_mod = @import("events.zig");
+const gitdiff = @import("gitdiff.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -19,6 +21,19 @@ const invalid = model.invalid_symbol;
 
 /// Output encoding: compact text for agents, or JSON for tooling/MCP.
 pub const OutputFormat = enum { text, json };
+
+/// `files` ordering: `path` (discovery order, the default) or `symbols`
+/// (descending symbol count — biggest files first, the "where's the bulk" view).
+pub const FileSort = enum {
+    path,
+    symbols,
+
+    pub fn parse(s: []const u8) ?FileSort {
+        if (std.mem.eql(u8, s, "path") or std.mem.eql(u8, s, "name")) return .path;
+        if (std.mem.eql(u8, s, "symbols") or std.mem.eql(u8, s, "size")) return .symbols;
+        return null;
+    }
+};
 
 /// Default result cap (also a sentinel: `limit == default_limit` means "the user
 /// did not pass -l", which `hot` uses to pick its own shorter default).
@@ -49,6 +64,8 @@ pub const Options = struct {
     /// tests). Passing both `unused_skip_*` flags leaves only the symbols
     /// referenced nowhere: the "actually unused" set.
     unused_skip_test_only: bool = false,
+    /// `files`: result ordering (discovery order or descending symbol count).
+    file_sort: FileSort = .path,
 };
 
 /// Whether `kind` passes the (comma-separated) `--kind` filter. Empty filter
@@ -236,6 +253,7 @@ pub fn matchesFilter(path: []const u8, filter: []const u8) bool {
 /// "not found" from another verb can be diagnosed instead of trusted blindly.
 pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.listFiles(w, idx, filter, opts);
+    if (opts.file_sort == .symbols) return listFilesBySymbols(w, idx, filter, opts);
     var any = false;
     var shown: u32 = 0;
     for (idx.graph.files) |file| {
@@ -251,6 +269,40 @@ pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Option
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+}
+
+/// `files --sort symbols`: list in-scope files ranked by symbol count
+/// (descending, ties broken by path) so the biggest files surface first.
+fn listFilesBySymbols(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    var ranked: std.ArrayList(RankedFile) = .empty;
+    defer ranked.deinit(idx.gpa);
+    for (idx.graph.files) |file| {
+        if (!matchesFilter(file.path, filter)) continue;
+        try ranked.append(idx.gpa, .{ .id = file.id, .count = fileSymbolCount(idx, file) });
+    }
+    if (ranked.items.len == 0) {
+        try w.print("(no indexed files under '{s}')\n", .{filter});
+        try skippedNote(w, idx);
+        return;
+    }
+    std.mem.sort(RankedFile, ranked.items, idx, rankedFileLessThan);
+    var shown: u32 = 0;
+    for (ranked.items) |rf| {
+        const file = idx.graph.files[rf.id];
+        const n = rf.count;
+        try w.print("{s}  ({s}, {d} symbol{s})\n", .{ file.path, file.language.tag(), n, if (n == 1) "" else "s" });
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    try truncationNote(w, opts, shown);
+}
+
+const RankedFile = struct { id: model.FileId, count: u32 };
+
+/// Descending symbol count, then ascending path for a stable, readable order.
+fn rankedFileLessThan(idx: *const Index, a: RankedFile, b: RankedFile) bool {
+    if (a.count != b.count) return a.count > b.count;
+    return std.mem.lessThan(u8, idx.graph.files[a.id].path, idx.graph.files[b.id].path);
 }
 
 /// Count non-import symbols in a file (its outline size).
@@ -608,15 +660,47 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     try truncationNote(w, opts, shown);
 }
 
+/// A `search --refs` query. A bare `name` substring-matches any reference; a
+/// dotted `recv.name` pins member-access reads (`self.rows`, `Table.rows`) by
+/// exact name on the given receiver, and a leading-dot `.name` matches that
+/// attribute on *any* receiver — the way to enumerate every read of a field.
+pub const RefPattern = struct {
+    /// Receiver to match: null when the pattern has no dot (bare name);
+    /// "" matches any receiver (leading-dot form); else an exact receiver.
+    qualifier: ?[]const u8,
+    name: []const u8,
+
+    pub fn parse(pattern: []const u8) RefPattern {
+        if (std.mem.lastIndexOfScalar(u8, pattern, '.')) |dot| {
+            return .{ .qualifier = pattern[0..dot], .name = pattern[dot + 1 ..] };
+        }
+        return .{ .qualifier = null, .name = pattern };
+    }
+
+    /// Whether `ref` matches. Bare patterns substring-match the name; qualified
+    /// patterns require a member access (non-empty `ref.qualifier`), an exact
+    /// receiver match when one was given, and an exact name (empty name matches
+    /// every attribute of that receiver).
+    pub fn matches(self: RefPattern, ref: model.Reference) bool {
+        const q = self.qualifier orelse
+            return std.mem.indexOf(u8, ref.name, self.name) != null;
+        if (ref.qualifier.len == 0) return false;
+        if (q.len != 0 and !std.mem.eql(u8, ref.qualifier, q)) return false;
+        return self.name.len == 0 or std.mem.eql(u8, ref.name, self.name);
+    }
+};
+
 /// List every reference (use site) whose name contains `pattern`, grouped by the
 /// enclosing symbol, with the call-site line and whether it resolved. This is the
 /// "find usages" verb — structured, comment/string-free, resolution-aware.
+/// `Recv.field`/`.field` patterns pin instance-attribute reads.
 fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.searchRefs(w, idx, pattern, opts);
+    const pat = RefPattern.parse(pattern);
     var shown: u32 = 0;
     outer: for (idx.graph.symbols) |sym| {
         for (sym.refs) |ref| {
-            if (std.mem.indexOf(u8, ref.name, pattern) == null) continue;
+            if (!pat.matches(ref)) continue;
             // One row per *distinct* use-site line. A name referenced on several
             // lines within one caller is deduped into a single ref carrying a
             // `lines` list — expand it so every site is listed, not just the
@@ -708,7 +792,9 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !vo
 
 /// Fan-in/out suffix for a `hot` row. Default surfaces the heuristic share as a
 /// `(N ?)` qualifier so an inflated count is never shown bare; `--strict` prints
-/// the exact-only counts.
+/// the exact-only counts. A `⟨N test⟩` note splits out test-only callers so a
+/// symbol that is load-bearing only in the test harness isn't mistaken for a
+/// production hub.
 fn printHotCounts(w: *Writer, e: HotEntry, strict: bool) !void {
     if (strict) {
         try w.print("    ←{d} callers  →{d} callees\n", .{ e.fan_in_exact, e.fan_out_exact });
@@ -716,15 +802,37 @@ fn printHotCounts(w: *Writer, e: HotEntry, strict: bool) !void {
     }
     try w.print("    ←{d} callers", .{e.fan_in});
     if (e.fan_in > e.fan_in_exact) try w.print(" ({d} ?)", .{e.fan_in - e.fan_in_exact});
+    try printTestShare(w, e.fan_in, e.fan_in_test);
     try w.print("  →{d} callees", .{e.fan_out});
     if (e.fan_out > e.fan_out_exact) try w.print(" ({d} ?)", .{e.fan_out - e.fan_out_exact});
     try w.writeByte('\n');
+}
+
+/// Append ` [N prod / M test]` when some callers are tests, so an agent can tell
+/// production load-bearing from test-only exercise at a glance. `fan_in` is the
+/// caller total the split applies to (clamped so prod can't go negative).
+fn printTestShare(w: *Writer, fan_in: u32, fan_in_test: u32) !void {
+    if (fan_in_test == 0 or fan_in == 0) return;
+    const test_share = @min(fan_in_test, fan_in);
+    try w.print(" [{d} prod / {d} test]", .{ fan_in - test_share, test_share });
+}
+
+/// Number of a symbol's incoming edges whose caller lives in a test/fixture file.
+fn testCallerCount(idx: *const Index, id: SymbolId) u32 {
+    var n: u32 = 0;
+    for (idx.callersOf(id)) |cid| {
+        if (isTestPath(idx.graph.files[idx.graph.symbols[cid].file].path)) n += 1;
+    }
+    return n;
 }
 
 pub const HotEntry = struct {
     id: SymbolId,
     fan_in: u32,
     fan_in_exact: u32,
+    /// Incoming edges whose caller lives in a test/fixture file. A high test
+    /// share means a symbol is exercised, not load-bearing in production.
+    fan_in_test: u32,
     fan_out: u32,
     fan_out_exact: u32,
 };
@@ -755,6 +863,7 @@ pub fn collectHot(idx: *const Index, filter: []const u8) ![]HotEntry {
             .id = sym.id,
             .fan_in = fan_in,
             .fan_in_exact = exact_in[sym.id],
+            .fan_in_test = testCallerCount(idx, sym.id),
             .fan_out = fan_out,
             .fan_out_exact = fanOutExact(sym),
         });
@@ -813,6 +922,271 @@ fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
     }
 }
 
+/// A single event-dispatch site tied to its file (path + enclosing-symbol lookup).
+pub const EventSite = struct {
+    file: model.FileId,
+    ref: events_mod.EventRef,
+};
+
+/// Collect every string-keyed dispatch site across the repo (gpa-owned). Each
+/// site's `key`/`verb` slices point into the owning file's text (alive for the
+/// graph). Caller frees the slice.
+pub fn collectEvents(idx: *const Index, filter: []const u8) ![]EventSite {
+    var sites: std.ArrayList(EventSite) = .empty;
+    errdefer sites.deinit(idx.gpa);
+    var toks: std.ArrayList(lexer.Token) = .empty;
+    defer toks.deinit(idx.gpa);
+    var refs: std.ArrayList(events_mod.EventRef) = .empty;
+    defer refs.deinit(idx.gpa);
+    for (idx.graph.files) |file| {
+        toks.clearRetainingCapacity();
+        refs.clearRetainingCapacity();
+        lexer.tokenize(idx.gpa, file.text, language.configFor(file.language), &toks) catch continue;
+        try events_mod.collect(toks.items, file.text, &refs, idx.gpa);
+        for (refs.items) |r| {
+            if (filter.len != 0 and std.mem.indexOf(u8, r.key, filter) == null) continue;
+            try sites.append(idx.gpa, .{ .file = file.id, .ref = r });
+        }
+    }
+    const items = try sites.toOwnedSlice(idx.gpa);
+    std.mem.sort(EventSite, items, idx, eventSiteLessThan);
+    return items;
+}
+
+/// Order sites so paired keys (a handler *and* an emitter) come first — the real
+/// dispatch pairs an agent wants — then by key, role (handler before emitter),
+/// file and line for a stable read.
+fn eventSiteLessThan(idx: *const Index, a: EventSite, b: EventSite) bool {
+    if (!std.mem.eql(u8, a.ref.key, b.ref.key)) {
+        return std.mem.lessThan(u8, a.ref.key, b.ref.key);
+    }
+    if (a.ref.role != b.ref.role) return a.ref.role == .handler;
+    const pa = idx.graph.files[a.file].path;
+    const pb = idx.graph.files[b.file].path;
+    if (!std.mem.eql(u8, pa, pb)) return std.mem.lessThan(u8, pa, pb);
+    return a.ref.line < b.ref.line;
+}
+
+/// Whether the key at `start` has both a handler and an emitter site in the
+/// contiguous run of same-key sites beginning there (the list is key-sorted).
+fn keyIsPaired(sites: []const EventSite, start: usize) bool {
+    var saw_handler = false;
+    var saw_emitter = false;
+    var i = start;
+    while (i < sites.len and std.mem.eql(u8, sites[i].ref.key, sites[start].ref.key)) : (i += 1) {
+        switch (sites[i].ref.role) {
+            .handler => saw_handler = true,
+            .emitter => saw_emitter = true,
+        }
+    }
+    return saw_handler and saw_emitter;
+}
+
+/// The name of the innermost symbol in `file` whose span covers byte `offset`,
+/// or "" when the site sits at module scope (e.g. a decorator above a def whose
+/// span starts at `def`).
+pub fn enclosingSymbolName(idx: *const Index, file: model.SourceFile, offset: u32) []const u8 {
+    var best: ?model.Symbol = null;
+    var i = file.sym_start;
+    while (i < file.sym_end) : (i += 1) {
+        const sym = idx.graph.symbols[i];
+        if (sym.kind == .import) continue;
+        if (offset < sym.span_start or offset >= sym.span_end) continue;
+        if (best == null or sym.span_start > best.?.span_start) best = sym;
+    }
+    if (best) |s| return s.name;
+    // A decorator registration (`@register("x")` above a `def`) sits just before
+    // the symbol it decorates, so its offset falls outside every span. Bind it to
+    // that immediately-following definition.
+    if (lineStartsWithAt(file.text, offset)) {
+        if (nextSymbolAfter(idx, file, offset)) |s| return s.name;
+    }
+    return "";
+}
+
+/// Whether the source line containing byte `offset` begins (after leading
+/// whitespace) with a decorator `@`.
+fn lineStartsWithAt(text: []const u8, offset: u32) bool {
+    if (offset > text.len) return false;
+    var ls = offset;
+    while (ls > 0 and text[ls - 1] != '\n') ls -= 1;
+    var p = ls;
+    while (p < text.len and (text[p] == ' ' or text[p] == '\t')) p += 1;
+    return p < text.len and text[p] == '@';
+}
+
+/// The file's non-import symbol whose span begins first at/after `offset` — the
+/// definition a decorator above `offset` applies to.
+fn nextSymbolAfter(idx: *const Index, file: model.SourceFile, offset: u32) ?model.Symbol {
+    var best: ?model.Symbol = null;
+    var i = file.sym_start;
+    while (i < file.sym_end) : (i += 1) {
+        const sym = idx.graph.symbols[i];
+        if (sym.kind == .import or sym.span_start < offset) continue;
+        if (best == null or sym.span_start < best.?.span_start) best = sym;
+    }
+    return best;
+}
+
+/// List string-keyed message-bus dispatch: each event key with its handler
+/// registrations and emitter sites, paired by the shared key. The event-bus
+/// analogue of `routes` (which only sees HTTP). Heuristic and token-based.
+pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.events(w, idx, filter, opts);
+    const sites = try collectEvents(idx, filter);
+    defer idx.gpa.free(sites);
+    if (sites.len == 0) {
+        if (filter.len != 0) {
+            try w.print("(no event dispatch matching '{s}')\n", .{filter});
+        } else {
+            try w.writeAll("(no string-keyed event dispatch found)\n");
+        }
+        try skippedNote(w, idx);
+        return;
+    }
+    try emitEventGroups(w, idx, sites, opts);
+}
+
+/// Render key-sorted sites as `event "key"` groups, paired keys first. Stops once
+/// `opts.limit` keys have printed.
+fn emitEventGroups(w: *Writer, idx: *const Index, sites: []const EventSite, opts: Options) !void {
+    var shown_keys: u32 = 0;
+    var i: usize = 0;
+    while (i < sites.len) {
+        const key = sites[i].ref.key;
+        const paired = keyIsPaired(sites, i);
+        try w.print("event \"{s}\"{s}\n", .{ key, if (paired) "" else "  (unpaired)" });
+        while (i < sites.len and std.mem.eql(u8, sites[i].ref.key, key)) : (i += 1) {
+            try printEventSite(w, idx, sites[i]);
+        }
+        shown_keys += 1;
+        if (shown_keys >= opts.limit) break;
+    }
+    if (i < sites.len) try w.print("… (more; raise -l to see them)\n", .{});
+}
+
+/// One dispatch-site row: `⊕ register  path:line  in owner` (handler) or
+/// `→ send  path:line  in owner` (emitter).
+fn printEventSite(w: *Writer, idx: *const Index, site: EventSite) !void {
+    const file = idx.graph.files[site.file];
+    const marker = if (site.ref.role == .handler) "⊕" else "→";
+    try w.print("  {s} {s}  {s}:{d}", .{ marker, site.ref.verb, file.path, site.ref.line });
+    const owner = enclosingSymbolName(idx, file, site.ref.offset);
+    if (owner.len != 0) try w.print("  in {s}", .{owner});
+    try w.writeByte('\n');
+}
+
+/// Show the symbols touched by changes since `ref` (default `HEAD`, i.e. the
+/// working tree) and, under each, its direct callers — the blast radius of a
+/// change. Runs `git diff` and maps each hunk to the symbol whose span it
+/// overlaps, turning a line-oriented diff into a symbol-oriented review.
+pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []const u8, opts: Options) !void {
+    const spec = if (ref.len != 0) ref else "HEAD";
+    const result = runGitDiff(idx.gpa, io, root, spec) catch |err| {
+        try w.print("navgraph: could not run git diff ({s})\n", .{@errorName(err)});
+        return;
+    };
+    defer idx.gpa.free(result.stdout);
+    defer idx.gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        try w.print("navgraph: git diff {s} failed: {s}\n", .{ spec, std.mem.trim(u8, result.stderr, " \n\r\t") });
+        return;
+    }
+    const changes = try gitdiff.parse(idx.gpa, result.stdout);
+    defer gitdiff.freeChanges(idx.gpa, changes);
+    if (opts.format == .json) return json_out.diff(w, idx, changes, opts);
+    try renderDiff(w, idx, changes, opts);
+}
+
+/// Run `git -C <root> diff --unified=0 --no-color <ref>` and return its result
+/// (caller frees stdout/stderr). `--unified=0` keeps hunks tight so a ripple in
+/// one function isn't attributed to its neighbor via shared context lines.
+fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const u8) !std.process.RunResult {
+    const argv = [_][]const u8{ "git", "diff", "--unified=0", "--no-color", ref };
+    return std.process.run(gpa, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = root },
+        .stdout_limit = std.Io.Limit.limited(16 * 1024 * 1024),
+    });
+}
+
+/// Render each changed file, its touched symbols, and their direct callers.
+pub fn renderDiff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !void {
+    var any_symbol = false;
+    var shown: u32 = 0;
+    for (changes) |change| {
+        const file = findDiffFile(idx, change.path) orelse continue;
+        var printed_header = false;
+        var i = file.sym_start;
+        while (i < file.sym_end and shown < opts.limit) : (i += 1) {
+            const sym = idx.graph.symbols[i];
+            if (sym.kind == .import) continue;
+            if (!symbolTouched(sym, idx.graph.files[sym.file].text, change.ranges)) continue;
+            if (!printed_header) {
+                try w.print("# {s}\n", .{change.path});
+                printed_header = true;
+            }
+            any_symbol = true;
+            try w.writeAll("~ ");
+            try render.symbol(w, idx, sym, headerVerbosity(opts.verbosity), 0, true);
+            try renderBlastRadius(w, idx, sym.id);
+            shown += 1;
+        }
+    }
+    if (!any_symbol) {
+        try w.writeAll("(no changed symbols — the diff is empty or touches only non-symbol lines)\n");
+        return;
+    }
+    try truncationNote(w, opts, shown);
+}
+
+/// Print the deduplicated direct callers of a changed symbol (its blast radius),
+/// or a leaf note when nothing calls it.
+fn renderBlastRadius(w: *Writer, idx: *const Index, id: SymbolId) !void {
+    var seen: std.AutoHashMap(SymbolId, void) = .init(idx.gpa);
+    defer seen.deinit();
+    var count: u32 = 0;
+    for (idx.callersOf(id)) |cid| {
+        const gop = try seen.getOrPut(cid);
+        if (gop.found_existing) continue;
+        try render.symbol(w, idx, idx.graph.symbols[cid], .sig, 1, true);
+        count += 1;
+    }
+    if (count == 0) try indentLine(w, 1, "(no callers — leaf or entry point)\n");
+}
+
+/// Whether `sym`'s definition span overlaps any changed range (1-based lines).
+pub fn symbolTouched(sym: model.Symbol, source: []const u8, ranges: []const gitdiff.Range) bool {
+    const lo = sym.line;
+    const hi = sym.endLine(source);
+    for (ranges) |r| {
+        if (r.lo <= hi and r.hi >= lo) return true;
+    }
+    return false;
+}
+
+/// The indexed file matching a diff path: exact root-relative match first, else a
+/// path-suffix match (navgraph indexed a subdirectory of the repo, or vice
+/// versa). Null when the changed file isn't indexed (non-source, ignored, …).
+pub fn findDiffFile(idx: *const Index, diff_path: []const u8) ?model.SourceFile {
+    for (idx.graph.files) |file| {
+        if (std.mem.eql(u8, file.path, diff_path)) return file;
+    }
+    for (idx.graph.files) |file| {
+        if (pathSuffixMatch(file.path, diff_path)) return file;
+    }
+    return null;
+}
+
+/// Whether `a` and `b` name the same file via a component-aligned suffix
+/// (`src/foo.zig` matches `pkg/src/foo.zig`), guarding against `bar.zig` matching
+/// `foobar.zig` by requiring the boundary to fall on a `/`.
+fn pathSuffixMatch(a: []const u8, b: []const u8) bool {
+    if (std.mem.endsWith(u8, a, b)) return a.len == b.len or a[a.len - b.len - 1] == '/';
+    if (std.mem.endsWith(u8, b, a)) return b.len == a.len or b[b.len - a.len - 1] == '/';
+    return false;
+}
+
 /// Show `name`'s callees and callers together (each one level deep) — a quick
 /// "what's around this symbol" view without choosing a direction.
 pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
@@ -867,9 +1241,21 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     var refs = try buildReferencedNames(idx);
     defer refs.deinit();
     var shown: u32 = 0;
+    var hidden_test: u32 = 0;
+    var hidden_exported: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (!isDeadCandidate(idx, sym, filter, &refs)) continue;
-        if (!deadCandidateShown(sym, opts, &refs)) continue;
+        if (!deadCandidateShown(sym, opts, &refs)) {
+            // Attribute the suppression to the flag that hid it (test-only takes
+            // precedence, matching deadCandidateShown's order) so the note below
+            // can nudge a re-run without that flag.
+            if (opts.unused_skip_test_only and refs.tests.contains(sym.name)) {
+                hidden_test += 1;
+            } else if (opts.unused_skip_exported and sym.exported) {
+                hidden_exported += 1;
+            }
+            continue;
+        }
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         // A name reached only from tests is a genuine cleanup target (no
         // application caller) — flag it as such; otherwise note public API.
@@ -886,6 +1272,12 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     if (shown == 0) {
         try w.print("(no unused functions under '{s}')\n", .{filter});
         try skippedNote(w, idx);
+    }
+    if (hidden_exported > 0) {
+        try w.print("  ({d} exported symbol(s) hidden by --no-public — re-run without it to audit public API)\n", .{hidden_exported});
+    }
+    if (hidden_test > 0) {
+        try w.print("  ({d} test-only symbol(s) hidden by --no-test)\n", .{hidden_test});
     }
     try truncationNote(w, opts, shown);
 }
@@ -1046,10 +1438,23 @@ fn tallyUses(
             i = try scanPyStmt(toks, text, i, bucket);
             continue;
         }
-        const name = t.text(text);
+        // A decorator application lexes as one `@name` token (the lexer treats
+        // `@` as an identifier byte for Zig builtins). For decorator languages
+        // strip it so `@websocket_handler` counts as a use of `websocket_handler`
+        // — otherwise a live decorator function reads as dead.
+        const name = decoratorName(t.text(text), zig);
         if (name.len >= 2) try bumpOccurrence(bucket, name);
         i += 1;
     }
+}
+
+/// The effective identifier a token references. For non-Zig languages a leading
+/// `@` is a decorator/attribute sigil (`@handler`, C# `@class`), not part of the
+/// name, so it is stripped. Zig keeps `@` — `@import`/`@fieldParentPtr` are
+/// builtins whose whole spelling is the token.
+fn decoratorName(tok: []const u8, zig: bool) []const u8 {
+    if (zig or tok.len < 2 or tok[0] != '@') return tok;
+    return tok[1..];
 }
 
 /// True when token `i` begins a Zig `test {}` block: the `test` keyword, an
@@ -1198,17 +1603,31 @@ fn addTemplateIdents(text: []const u8, occ: *std.StringHashMap(u32)) !void {
     }
 }
 
-/// A symbol worth reporting as possibly-unused: a callable, in-scope of the
-/// filter, not an obvious entry point, and not used by any *production* code.
-/// A test-only-used function still qualifies (it's a real cleanup target) — the
-/// caller distinguishes it via `refs.tests`. `refs` is `buildReferencedNames`.
+/// Kinds `unused` will report as possible dead code: callables plus type-like
+/// definitions (a class/struct/enum/interface/type never referenced anywhere is
+/// dead too — instantiation, inheritance and type annotations all count as uses
+/// in `buildReferencedNames`, so a truly-unreferenced type is a safe report).
+/// Deliberately excludes fields/variables/constants/imports/modules: those are
+/// noisier and usually not what a dead-code audit targets.
+fn isReportableDeadKind(kind: model.SymbolKind) bool {
+    return switch (kind) {
+        .function, .method, .class, .@"struct", .@"enum", .interface, .type => true,
+        else => false,
+    };
+}
+
+/// A symbol worth reporting as possibly-unused: a callable or type-like
+/// definition, in-scope of the filter, not an obvious entry point, and not used
+/// by any *production* code. A test-only-used symbol still qualifies (it's a real
+/// cleanup target) — the caller distinguishes it via `refs.tests`. `refs` is
+/// `buildReferencedNames`.
 pub fn isDeadCandidate(
     idx: *const Index,
     sym: model.Symbol,
     filter: []const u8,
     refs: *const RefSets,
 ) bool {
-    if (sym.kind != .function and sym.kind != .method) return false;
+    if (!isReportableDeadKind(sym.kind)) return false;
     if (std.mem.eql(u8, sym.name, "main")) return false;
     // Framework/entry-point callables are invoked implicitly, never by name, so
     // they always look "dead": dunder methods (`__init__`, `__call__`), a JS/TS
@@ -1236,7 +1655,7 @@ pub fn isDeadCandidate(
 /// (possible public API). With both set, only symbols referenced nowhere survive
 /// — the "actually unused" set. `refs` is `buildReferencedNames`.
 pub fn deadCandidateShown(sym: model.Symbol, opts: Options, refs: *const RefSets) bool {
-    std.debug.assert(sym.kind == .function or sym.kind == .method);
+    std.debug.assert(isReportableDeadKind(sym.kind));
     std.debug.assert(sym.name.len != 0);
     if (opts.unused_skip_test_only and refs.tests.contains(sym.name)) return false;
     if (opts.unused_skip_exported and sym.exported) return false;
@@ -1248,23 +1667,44 @@ fn isDunder(name: []const u8) bool {
     return name.len >= 4 and std.mem.startsWith(u8, name, "__") and std.mem.endsWith(u8, name, "__");
 }
 
-/// True when the line immediately above `sym`'s definition is a decorator
-/// (`@…`) — a cheap signal that the symbol is framework-invoked rather than
-/// called by name. Handles the common single-line decorator; a decorator whose
-/// closing `)` sits on its own line just above the def is not detected.
+/// Max non-blank lines scanned above a definition when looking for a decorator —
+/// enough for a multi-line decorator's argument list without runaway cost.
+const decorator_scan_lines = 24;
+
+/// True when a decorator (`@…`) sits just above `sym`'s definition — a cheap
+/// signal that the symbol is framework-invoked (a route/handler/fixture) rather
+/// than called by name. Scans the contiguous block of non-blank lines
+/// immediately above the def, so it catches both the single-line form
+/// (`@app.get("/x")`) and a multi-line decorator whose closing `)` sits on its
+/// own line above the def. A blank line ends the block (decorators are adjacent
+/// to what they decorate), bounding the scan and avoiding a stray `@` far above.
 fn precededByDecorator(idx: *const Index, sym: model.Symbol) bool {
     const text = idx.graph.files[sym.file].text;
     if (sym.span_start == 0 or sym.span_start > text.len) return false;
     // Start of the definition's own line.
     var ls = sym.span_start;
     while (ls > 0 and text[ls - 1] != '\n') ls -= 1;
-    if (ls == 0) return false;
-    // The previous line is text[ps .. ls-1] (ls-1 is its terminating '\n').
-    var ps = ls - 1;
-    while (ps > 0 and text[ps - 1] != '\n') ps -= 1;
-    var i = ps;
-    while (i + 1 < ls and (text[i] == ' ' or text[i] == '\t')) i += 1;
-    return i < ls and text[i] == '@';
+    var scanned: u32 = 0;
+    while (ls > 0 and scanned < decorator_scan_lines) : (scanned += 1) {
+        // The previous line's terminating '\n' is at ls-1; its content is
+        // text[ps .. ls-1].
+        var ps = ls - 1;
+        while (ps > 0 and text[ps - 1] != '\n') ps -= 1;
+        const line = text[ps .. ls - 1];
+        // A blank line ends the contiguous block directly above the def.
+        if (isBlankLine(line)) return false;
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len != 0 and trimmed[0] == '@') return true;
+        if (ps == 0) return false;
+        ls = ps;
+    }
+    return false;
+}
+
+/// A line containing only whitespace.
+fn isBlankLine(line: []const u8) bool {
+    for (line) |c| if (c != ' ' and c != '\t' and c != '\r') return false;
+    return true;
 }
 
 /// Whether `path` is a test/fixture module: its functions are invoked by the
@@ -1828,6 +2268,126 @@ test "unused: a helper used only via a template literal or past JSX prose is not
     try testing.expect(std.mem.indexOf(u8, out, "tmpl") == null);
 }
 
+test "unused: a class never instantiated is dead; an instantiated one is live" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "models.py", .data =
+        \\class UsedThing:
+        \\    pass
+        \\
+        \\class DeadThing:
+        \\    pass
+        \\
+        \\def make():
+        \\    return UsedThing()
+        \\
+        \\print(make())
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "DeadThing") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "UsedThing") == null);
+}
+
+test "unused: a multi-line decorator suppresses a framework-wired handler" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `ws_handler` is never called by name; its multi-line decorator wires it in.
+    // `plain_dead` has no decorator and must still surface.
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.py", .data =
+        \\@app.websocket(
+        \\    "/ws",
+        \\)
+        \\async def ws_handler():
+        \\    return 1
+        \\
+        \\def plain_dead():
+        \\    return 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "ws_handler") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "plain_dead") != null);
+}
+
+test "unused: a decorator function applied as @name is live, not dead" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `register` is applied as `@register` — a use the token `@register` must
+    // credit to `register`, not read as a separate name. `orphan` is truly dead.
+    try tmp.dir.writeFile(io, .{ .sub_path = "bus.py", .data =
+        \\def register(fn):
+        \\    return fn
+        \\
+        \\@register
+        \\def handler():
+        \\    return 1
+        \\
+        \\def orphan():
+        \\    return 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "register") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "orphan") != null);
+}
+
+test "unused: --no-public reports how many exported symbols it hid" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.ts", .data =
+        \\export function deadPublic(): number { return 1; }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{ .unused_skip_exported = true });
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "deadPublic") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "hidden by --no-public") != null);
+}
+
 test "unused: a name only re-exported/imported is dead; called or aliased-and-used is live" {
     const testing = std.testing;
     const io = testing.io;
@@ -2085,6 +2645,39 @@ test "files lists indexed files with their symbol counts" {
     try testing.expect(std.mem.indexOf(u8, out, "2 symbols") != null);
 }
 
+test "files --sort symbols ranks the file with more symbols first" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "small.py", .data =
+        \\def only():
+        \\    return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.py", .data =
+        \\def a():
+        \\    return 1
+        \\def b():
+        \\    return 2
+        \\def c():
+        \\    return 3
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try listFiles(&aw.writer, &idx, "", .{ .file_sort = .symbols });
+    const out = aw.written();
+    const big = std.mem.indexOf(u8, out, "big.py") orelse return error.TestUnexpectedResult;
+    const small = std.mem.indexOf(u8, out, "small.py") orelse return error.TestUnexpectedResult;
+    try testing.expect(big < small);
+}
+
 test "end line is correct despite a leading comment or template prefix" {
     const testing = std.testing;
     const io = testing.io;
@@ -2120,6 +2713,109 @@ test "end line is correct despite a leading comment or template prefix" {
     try testing.expectEqual(@as(u32, 9), max_of.endLine(idx.graph.files[max_of.file].text));
 }
 
+test "events pairs a decorator handler with an emitter across files" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "bus.py", .data =
+        \\@register("start")
+        \\def handle_start(msg):
+        \\    return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function go() {
+        \\    socket.send("start");
+        \\    log("a plain message with spaces");
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try events(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // The key groups both sites; the decorator handler binds to its function; the
+    // spaced prose message is not treated as an event key.
+    try testing.expect(std.mem.indexOf(u8, out, "event \"start\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "in handle_start") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "client.ts:2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "plain message") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "unpaired") == null);
+}
+
+test "diff maps a changed hunk to its symbol and lists the blast radius" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn helper() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn run() u32 {
+        \\    return helper();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // A synthetic hunk touching helper's body (line 2) — bypasses git so the test
+    // has no external dependency; the git-output parser is covered in gitdiff.zig.
+    var ranges = [_]gitdiff.Range{.{ .lo = 2, .hi = 2 }};
+    var changes = [_]gitdiff.FileChange{.{ .path = "m.zig", .ranges = &ranges }};
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try renderDiff(&aw.writer, &idx, &changes, .{});
+    const out = aw.written();
+    // helper is the changed symbol; run is its caller (the blast radius).
+    try testing.expect(std.mem.indexOf(u8, out, "~ ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "run") != null);
+    // `run` itself (lines 4-6) is not touched, so it is not a top-level `~` entry.
+    try testing.expect(std.mem.indexOf(u8, out, "~ pub fn run") == null and
+        std.mem.indexOf(u8, out, "~ fn run") == null);
+}
+
+test "events marks a key with only one side unpaired and honors the filter" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.js", .data =
+        \\function f() {
+        \\    emitter.emit("only_emitted");
+        \\    bus.on("paired");
+        \\    bus.emit("paired");
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try events(&aw.writer, &idx, "only", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "only_emitted") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "unpaired") != null);
+    // The filter excludes the paired key.
+    try testing.expect(std.mem.indexOf(u8, out, "paired\"") == null);
+}
+
 test "hot ranks the most-called function first" {
     const testing = std.testing;
     const io = testing.io;
@@ -2153,6 +2849,40 @@ test "hot ranks the most-called function first" {
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "shared") != null);
     try testing.expect(std.mem.indexOf(u8, out, "←3 callers") != null);
+}
+
+test "hot splits test callers from production callers" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `shared` is called from one production file and one test file: the split
+    // must read `[1 prod / 1 test]` so a test-only hub isn't mistaken for load-bearing.
+    try tmp.dir.writeFile(io, .{ .sub_path = "core.zig", .data =
+        \\pub fn shared() void {}
+        \\pub fn prodCaller() void { shared(); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "core_test.zig", .data =
+        \\const core = @import("core.zig");
+        \\pub fn testCaller() void { core.shared(); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const ranked = try collectHot(&idx, "");
+    defer idx.gpa.free(ranked);
+    try testing.expectEqualStrings("shared", idx.graph.symbols[ranked[0].id].name);
+    try testing.expectEqual(@as(u32, 1), ranked[0].fan_in_test);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try hot(&aw.writer, &idx, "", .{});
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "[1 prod / 1 test]") != null);
 }
 
 test "line range renders end line for a multi-line definition" {
@@ -2299,6 +3029,47 @@ test "search --refs lists every distinct use-site line of a name" {
     try testing.expect(std.mem.indexOf(u8, out, "m.zig:5") != null);
     try testing.expect(std.mem.indexOf(u8, out, "m.zig:6") != null);
     try testing.expect(std.mem.indexOf(u8, out, "m.zig:7") != null);
+}
+
+test "search --refs pins instance-attribute reads by receiver" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Two same-named fields on different receivers: `self.rows` must pin only the
+    // instance reads, not `df.rows` — the attribute-tracking gap a trial hit.
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.py", .data =
+        \\class Table:
+        \\    def first(self):
+        \\        return self.rows[0]
+        \\    def count(self):
+        \\        return len(self.rows)
+        \\def external(df):
+        \\    return df.rows
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try search(&aw.writer, &idx, "self.rows", .{ .refs = true });
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "t.py:3") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "t.py:5") != null);
+    // `external`'s `df.rows` read (line 7) must be excluded by the receiver pin.
+    try testing.expect(std.mem.indexOf(u8, out, "in external") == null);
+
+    // The leading-dot form matches the attribute on any receiver.
+    var buf2: std.ArrayList(u8) = .empty;
+    defer buf2.deinit(testing.allocator);
+    var aw2: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf2);
+    defer aw2.deinit();
+    try search(&aw2.writer, &idx, ".rows", .{ .refs = true });
+    try testing.expect(std.mem.indexOf(u8, aw2.written(), "in external") != null);
 }
 
 test "def -v full includes leading decorators and multi-line python literals" {

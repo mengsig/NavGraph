@@ -62,12 +62,14 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .callers => try query.walk(out, idx, parsed.arg, true, parsed.options),
         .search => try query.search(out, idx, parsed.arg, parsed.options),
         .routes => try query.listRoutes(out, idx, parsed.arg, parsed.options),
+        .events => try query.events(out, idx, parsed.arg, parsed.options),
         .neighbors => try query.neighbors(out, idx, parsed.arg, parsed.options),
         .unused => try query.unused(out, idx, parsed.arg, parsed.options),
         .imports => try query.listImports(out, idx, parsed.arg, parsed.options),
         .importers => try query.listImporters(out, idx, parsed.arg, parsed.options),
         .path => try query.shortestPath(out, idx, parsed.arg, parsed.arg2, parsed.options),
         .hot => try query.hot(out, idx, parsed.arg, parsed.options),
+        .diff => try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .help => unreachable,
     }
 }

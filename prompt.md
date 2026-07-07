@@ -18,7 +18,7 @@ respected), so the index tracks what git tracks. Run `navgraph files` to see
 exactly what got indexed, and if a query comes back empty check there first — an
 empty result plus a `(not indexed — skipped: …)` note means the code lives in a
 pruned subtree, not that it's absent.
-Languages: Zig, C/C++, Python, JavaScript, TypeScript, TSX.
+Languages: Zig, C/C++, C#, Python, JavaScript, TypeScript, TSX.
 
 ## Edit without reading first
 

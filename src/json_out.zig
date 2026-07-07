@@ -13,6 +13,7 @@ const render = @import("render.zig");
 const query = @import("query.zig");
 const lexer = @import("lexer.zig");
 const language = @import("language.zig");
+const gitdiff = @import("gitdiff.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -90,11 +91,12 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 /// reference objects (use sites), mirroring the text usages listing.
 pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
     std.debug.assert(pattern.len > 0);
+    const pat = query.RefPattern.parse(pattern);
     var shown: u32 = 0;
     try w.writeByte('[');
     outer: for (idx.graph.symbols) |sym| {
         for (sym.refs) |ref| {
-            if (std.mem.indexOf(u8, ref.name, pattern) == null) continue;
+            if (!pat.matches(ref)) continue;
             // One object per distinct use-site line (mirrors the text renderer).
             if (ref.lines.len > 1) {
                 for (ref.lines) |ln| {
@@ -281,9 +283,10 @@ fn walkCallers(
     try w.writeByte(']');
 }
 
-/// Hot: array of `{...symbol, fan_in, fan_in_exact, fan_out, fan_out_exact}`
-/// ranked by connectivity. `*_exact` exclude heuristic `?` edges; `--strict`
-/// drops entries whose connectivity is entirely heuristic.
+/// Hot: array of `{...symbol, fan_in, fan_in_exact, fan_in_test, fan_out, fan_out_exact}`
+/// ranked by connectivity. `*_exact` exclude heuristic `?` edges; `fan_in_test`
+/// is the share of callers in test files; `--strict` drops entries whose
+/// connectivity is entirely heuristic.
 pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     const ranked = try query.collectHot(idx, filter);
     defer idx.gpa.free(ranked);
@@ -299,8 +302,8 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !vo
         try nodeHead(w, idx, sym);
         try w.writeAll(",\"sig\":");
         try writeCollapsedString(w, sym.signature(idx.graph.files[sym.file].text), max_sig_len);
-        try w.print(",\"fan_in\":{d},\"fan_in_exact\":{d},\"fan_out\":{d},\"fan_out_exact\":{d}}}", .{
-            e.fan_in, e.fan_in_exact, e.fan_out, e.fan_out_exact,
+        try w.print(",\"fan_in\":{d},\"fan_in_exact\":{d},\"fan_in_test\":{d},\"fan_out\":{d},\"fan_out_exact\":{d}}}", .{
+            e.fan_in, e.fan_in_exact, e.fan_in_test, e.fan_out, e.fan_out_exact,
         });
     }
     try w.writeAll("]\n");
@@ -342,6 +345,86 @@ fn routeObject(w: *Writer, idx: *const Index, route: Symbol) !void {
         try symbolObject(w, idx, idx.graph.symbols[cid], .names);
     }
     try w.writeAll("]}");
+}
+
+/// Diff: array of `{file, symbols:[{...symbol, callers:[...]}]}` — changed symbols
+/// and their direct callers (blast radius) per file.
+pub fn diff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !void {
+    _ = opts;
+    try w.writeByte('[');
+    var first_file = true;
+    for (changes) |change| {
+        const file = query.findDiffFile(idx, change.path) orelse continue;
+        var opened = false;
+        var i = file.sym_start;
+        while (i < file.sym_end) : (i += 1) {
+            const sym = idx.graph.symbols[i];
+            if (sym.kind == .import) continue;
+            if (!query.symbolTouched(sym, idx.graph.files[sym.file].text, change.ranges)) continue;
+            if (!opened) {
+                if (!first_file) try w.writeByte(',');
+                first_file = false;
+                try w.writeAll("{\"file\":");
+                try writeString(w, change.path);
+                try w.writeAll(",\"symbols\":[");
+                opened = true;
+            } else {
+                try w.writeByte(',');
+            }
+            try nodeHead(w, idx, sym);
+            try w.writeAll(",\"callers\":[");
+            for (idx.callersOf(sym.id), 0..) |cid, k| {
+                if (k != 0) try w.writeByte(',');
+                try symbolObject(w, idx, idx.graph.symbols[cid], .names);
+            }
+            try w.writeAll("]}");
+        }
+        if (opened) try w.writeAll("]}");
+    }
+    try w.writeAll("]\n");
+}
+
+/// Events: array of `{key, sites:[{role, verb, file, line, in}]}` grouped by key.
+pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    const sites = try query.collectEvents(idx, filter);
+    defer idx.gpa.free(sites);
+    try w.writeByte('[');
+    var shown_keys: u32 = 0;
+    var i: usize = 0;
+    while (i < sites.len) {
+        const key = sites[i].ref.key;
+        if (shown_keys != 0) try w.writeByte(',');
+        try w.writeAll("{\"key\":");
+        try writeString(w, key);
+        try w.writeAll(",\"sites\":[");
+        var first = true;
+        while (i < sites.len and std.mem.eql(u8, sites[i].ref.key, key)) : (i += 1) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try eventSiteObject(w, idx, sites[i]);
+        }
+        try w.writeAll("]}");
+        shown_keys += 1;
+        if (shown_keys >= opts.limit) break;
+    }
+    try w.writeAll("]\n");
+}
+
+fn eventSiteObject(w: *Writer, idx: *const Index, site: query.EventSite) !void {
+    const file = idx.graph.files[site.file];
+    try w.writeAll("{\"role\":");
+    try writeString(w, if (site.ref.role == .handler) "handler" else "emitter");
+    try w.writeAll(",\"verb\":");
+    try writeString(w, site.ref.verb);
+    try w.writeAll(",\"file\":");
+    try writeString(w, file.path);
+    try w.print(",\"line\":{d}", .{site.ref.line});
+    const owner = query.enclosingSymbolName(idx, file, site.ref.offset);
+    if (owner.len != 0) {
+        try w.writeAll(",\"in\":");
+        try writeString(w, owner);
+    }
+    try w.writeByte('}');
 }
 
 /// Neighbors: `{symbol, callees:[...], callers:[...]}` per resolved id.

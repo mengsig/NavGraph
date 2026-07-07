@@ -11,6 +11,7 @@ pub const Language = enum {
     zig,
     c,
     cpp,
+    csharp,
     python,
     javascript,
     typescript,
@@ -23,6 +24,7 @@ pub const Language = enum {
             .zig => "zig",
             .c => "c",
             .cpp => "cpp",
+            .csharp => "cs",
             .python => "py",
             .javascript => "js",
             .typescript => "ts",
@@ -36,6 +38,7 @@ pub const Language = enum {
         return switch (self) {
             .zig => .zig,
             .c, .cpp => .c,
+            .csharp => .csharp,
             .python => .python,
             .javascript, .typescript, .tsx => .js,
             .unknown => .other,
@@ -43,7 +46,7 @@ pub const Language = enum {
     }
 };
 
-pub const Family = enum { zig, c, python, js, other };
+pub const Family = enum { zig, c, csharp, python, js, other };
 
 /// Doc-comment extraction style differs enough between languages to name it.
 pub const DocStyle = enum {
@@ -88,7 +91,7 @@ pub fn configFor(language: Language) Config {
             .doc_style = .zig_slashes,
             .brace_scoped = true,
         },
-        .c, .cpp => .{
+        .c, .cpp, .csharp => .{
             .language = language,
             .line_comment = "//",
             .block_open = "/*",
@@ -144,6 +147,7 @@ pub fn detect(path: []const u8) Language {
         .{ ".cxx", Language.cpp },
         .{ ".hpp", Language.cpp },
         .{ ".hh", Language.cpp },
+        .{ ".cs", Language.csharp },
         .{ ".py", Language.python },
         .{ ".pyi", Language.python },
         .{ ".js", Language.javascript },
@@ -175,6 +179,7 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.zig, detect("src/main.zig"));
     try std.testing.expectEqual(Language.python, detect("app/server.py"));
     try std.testing.expectEqual(Language.tsx, detect("web/App.tsx"));
+    try std.testing.expectEqual(Language.csharp, detect("Shop/Order.cs"));
     try std.testing.expectEqual(Language.unknown, detect("README.md"));
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
 }

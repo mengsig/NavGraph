@@ -85,8 +85,8 @@ not fully captured as edges.
 8. **New query verbs.** ✅ *Done.*
    - `path <A> <B>` — shortest call path between two symbols (BFS). ✅
    - `neighbors <name>` — callees + callers in one view. ✅
-   - `unused [filter]` — functions/methods with no callers (candidate dead
-     code; exported symbols are marked, not hidden). ✅
+   - `unused [filter]` — functions/methods *and types* nothing references
+     (candidate dead code; exported symbols are marked, not hidden). ✅
    - `imports [filter]` / `importers <file>` — local module dependency graph,
      built from the resolved import table. ✅
    - *Still open:* `changed <gitrev>` — symbols touched since a revision + their

@@ -6,8 +6,8 @@ const query = @import("query.zig");
 const render = @import("render.zig");
 
 pub const Command = enum {
-    outline, def, calls, callers, search, routes,
-    neighbors, unused, imports, importers, path, hot,
+    outline, def, calls, callers, search, routes, events,
+    neighbors, unused, imports, importers, path, hot, diff,
     files, read, strings, help,
 };
 
@@ -37,16 +37,20 @@ const usage_text =
     \\  def <name>         Show a definition (supports Parent.name, name@path)
     \\  calls <name>       Symbols that <name> calls/uses (callees), as a tree
     \\  callers <name>     Symbols that call/use <name> (callers), as a tree
-    \\  search <pattern>   Find symbols by name (or use sites with --refs)
+    \\  search <pattern>   Find symbols by name (or use sites with --refs;
+    \\                     Recv.field / .field pins instance-attribute reads)
     \\  routes [filter]    List HTTP routes and the client calls that hit them
+    \\  events [filter]    Link message-bus handlers (register/on) to emitters (send/emit)
     \\  neighbors <name>   Callees and callers of <name> in one view
-    \\  unused [filter]    Functions/methods with no callers (possible dead code);
+    \\  unused [filter]    Functions/methods & types nothing references (dead code);
     \\                     add --no-public and/or --no-test to narrow it
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
+    \\  diff [ref]         Symbols changed since <ref> (default HEAD) + their callers
     \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
-    \\  files [filter]     List every indexed file + its symbol count (index coverage)
+    \\  files [filter]     List every indexed file + its symbol count (index coverage);
+    \\                     add --sort symbols to rank biggest-first
     \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
     \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
     \\  help               Show this help
@@ -57,6 +61,7 @@ const usage_text =
     \\  -C, --root <path>                      Project root to index (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
+    \\  --sort <path|symbols>                  files: order by path (default) or symbol count
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
@@ -128,10 +133,13 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "callers", Command.callers }, .{ "uses", Command.callers },
         .{ "search", Command.search },   .{ "grep", Command.search },
         .{ "routes", Command.routes },   .{ "api", Command.routes },
+        .{ "events", Command.events },   .{ "dispatch", Command.events },
+        .{ "bus", Command.events },
         .{ "neighbors", Command.neighbors }, .{ "near", Command.neighbors },
         .{ "unused", Command.unused },   .{ "dead", Command.unused },
         .{ "imports", Command.imports }, .{ "importers", Command.importers },
         .{ "path", Command.path },
+        .{ "diff", Command.diff },       .{ "changed", Command.diff },
         .{ "hot", Command.hot },         .{ "central", Command.hot },
         .{ "files", Command.files },     .{ "manifest", Command.files },
         .{ "read", Command.read },       .{ "cat", Command.read },
@@ -146,10 +154,11 @@ fn parseCommand(s: []const u8) ?Command {
 }
 
 /// Whether `command` has the positional arguments it requires. `outline`,
-/// `routes`, `unused` and `imports` accept an optional filter; `path` needs two.
+/// `routes`, `events`, `unused` and `imports` accept an optional filter; `path`
+/// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .unused, .imports, .hot, .files => true,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff => true,
         .path => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
@@ -181,6 +190,10 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (eqAny(f.name, &.{ "-k", "--kind" })) {
         out.options.kinds = try f.value(args, i);
+        return f.next(i);
+    }
+    if (eqAny(f.name, &.{ "--sort" })) {
+        out.options.file_sort = query.FileSort.parse(try f.value(args, i)) orelse return error.BadValue;
         return f.next(i);
     }
     // Boolean flags: an attached `=value` is a usage error.
@@ -323,4 +336,31 @@ test "new flags: --refs, --kind" {
 
     const d = try parse(&.{ "outline", "-kfn" });
     try std.testing.expectEqualStrings("fn", d.options.kinds);
+}
+
+test "events and diff commands parse with optional args and aliases" {
+    const a = try parse(&.{"events"});
+    try std.testing.expectEqual(Command.events, a.command);
+
+    const b = try parse(&.{ "dispatch", "start" });
+    try std.testing.expectEqual(Command.events, b.command);
+    try std.testing.expectEqualStrings("start", b.arg);
+
+    const c = try parse(&.{"diff"});
+    try std.testing.expectEqual(Command.diff, c.command);
+    try std.testing.expectEqualStrings("", c.arg);
+
+    const d = try parse(&.{ "changed", "HEAD~3" });
+    try std.testing.expectEqual(Command.diff, d.command);
+    try std.testing.expectEqualStrings("HEAD~3", d.arg);
+}
+
+test "files --sort accepts path/symbols and rejects garbage" {
+    const a = try parse(&.{ "files", "--sort", "symbols" });
+    try std.testing.expectEqual(query.FileSort.symbols, a.options.file_sort);
+
+    const b = try parse(&.{ "files", "--sort=path" });
+    try std.testing.expectEqual(query.FileSort.path, b.options.file_sort);
+
+    try std.testing.expectError(error.BadValue, parse(&.{ "files", "--sort", "nope" }));
 }

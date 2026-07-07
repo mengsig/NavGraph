@@ -11,7 +11,7 @@ Ask precise questions ("what does `foo()` call, 2 levels deep?", "who calls
 `bar`?", "outline this file at signature detail") and get exactly the
 information needed — nothing more.
 
-- **Language-agnostic core.** Ships with Zig, C/C++, Python, JavaScript,
+- **Language-agnostic core.** Ships with Zig, C/C++, C#, Python, JavaScript,
   TypeScript and TSX.
 - **Depth control.** Walk the call graph outward (callees) or inward (callers)
   to a bounded depth.
