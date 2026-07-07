@@ -116,6 +116,7 @@ pub fn parse(
         .c, .csharp => try parseCScope(&ctx, 0, n, null),
         .js => try parseJsScope(&ctx, 0, n, null),
         .python => try parsePython(&ctx),
+        .lua => try parseLuaScope(&ctx, 0, n, null),
         .other => {},
     }
     try detectApi(&ctx, n);
@@ -2111,6 +2112,246 @@ fn lineStartTrimEnd(ctx: *const Ctx, term: u32) u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Lua
+// ---------------------------------------------------------------------------
+
+const lua_keywords = KeywordSet.initComptime(.{
+    .{"and"},   .{"break"}, .{"do"},    .{"else"},   .{"elseif"}, .{"end"},
+    .{"false"}, .{"for"},   .{"function"}, .{"goto"}, .{"if"},    .{"in"},
+    .{"local"}, .{"nil"},   .{"not"},   .{"or"},     .{"repeat"}, .{"return"},
+    .{"then"},  .{"true"},  .{"until"}, .{"while"},  .{"self"},
+});
+
+/// The name a Lua function definition binds: `function a.b:c(...)` yields the
+/// last segment `c`, whether the final separator was a `:` (implicit `self`),
+/// whether any receiver preceded it, and the params `(` index.
+const LuaName = struct { name_i: u32, is_member: bool, is_method: bool, open_i: u32 };
+
+fn luaFuncName(ctx: *const Ctx, start: u32, hi: u32) ?LuaName {
+    if (start >= hi or ctx.toks[start].kind != .identifier) return null;
+    var last = start;
+    var is_member = false;
+    var is_method = false;
+    while (ctx.isPunct(last + 1, '.') or ctx.isPunct(last + 1, ':')) {
+        if (last + 2 >= hi or ctx.toks[last + 2].kind != .identifier) break;
+        is_method = ctx.isPunct(last + 1, ':');
+        is_member = true;
+        last += 2;
+        if (is_method) break; // `:` is only valid as the final separator
+    }
+    const open = if (ctx.isPunct(last + 1, '(')) last + 1 else sentinel;
+    return .{ .name_i = last, .is_member = is_member, .is_method = is_method, .open_i = open };
+}
+
+/// Keywords that open an `end`/`until`-terminated Lua block. `for`/`while`
+/// headers are excluded: their trailing `do` opens the block and is counted
+/// once here, avoiding a double count.
+fn luaOpensBlock(ctx: *const Ctx, i: u32) bool {
+    return ctx.identEql(i, "function") or ctx.identEql(i, "if") or
+        ctx.identEql(i, "do") or ctx.identEql(i, "repeat");
+}
+
+/// Index of the `end`/`until` closing the block whose opener sits just before
+/// `from`; caller passes the token after the opener's header (depth starts 1).
+fn luaBlockEnd(ctx: *const Ctx, from: u32, hi: u32) u32 {
+    std.debug.assert(from <= hi);
+    var depth: u32 = 1;
+    var i = from;
+    while (i < hi) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier) continue;
+        if (luaOpensBlock(ctx, i)) {
+            depth += 1;
+        } else if (ctx.identEql(i, "end") or ctx.identEql(i, "until")) {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return hi;
+}
+
+/// The module string of a `require("mod")` / `require "mod"` initializer at
+/// `rhs`, or null when the RHS is not a require call.
+fn luaRequirePath(ctx: *const Ctx, rhs: u32, hi: u32) ?[]const u8 {
+    if (rhs >= hi or !ctx.identEql(rhs, "require")) return null;
+    if (ctx.isPunct(rhs + 1, '(') and rhs + 2 < hi and ctx.toks[rhs + 2].kind == .string)
+        return stripQuotes(ctx.textOf(rhs + 2));
+    if (rhs + 1 < hi and ctx.toks[rhs + 1].kind == .string)
+        return stripQuotes(ctx.textOf(rhs + 1));
+    return null;
+}
+
+fn parseLuaScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
+    var i = lo;
+    while (i < hi) {
+        const t = ctx.toks[i];
+        if (t.kind != .identifier or !isLineStart(ctx, i)) {
+            i += 1;
+            continue;
+        }
+        const adv = try parseLuaStmt(ctx, i, hi, parent);
+        i = if (adv > i) adv else i + 1;
+    }
+}
+
+/// Dispatch a Lua statement whose first token (`i`) starts a line. Returns the
+/// token index just past a recognised definition, or `i` when none matched.
+fn parseLuaStmt(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !u32 {
+    if (ctx.identEql(i, "function")) return parseLuaFunction(ctx, i, i, hi, parent, false);
+    if (ctx.identEql(i, "local")) {
+        if (i + 1 < hi and ctx.identEql(i + 1, "function"))
+            return parseLuaFunction(ctx, i, i + 1, hi, parent, true);
+        return parseLuaAssign(ctx, i, i + 1, hi, parent, true);
+    }
+    if (lua_keywords.has(ctx.textOf(i))) return i;
+    return parseLuaAssign(ctx, i, i, hi, parent, false);
+}
+
+fn parseLuaFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, is_local: bool) !u32 {
+    const nm = luaFuncName(ctx, fn_i + 1, hi) orelse return start_i;
+    if (nm.open_i == sentinel or ctx.close[nm.open_i] == sentinel) return start_i;
+    const params_close = ctx.close[nm.open_i];
+    const end_i = luaBlockEnd(ctx, params_close + 1, hi);
+    const name = ctx.textOf(nm.name_i);
+    const span_end = if (end_i < hi) ctx.toks[end_i].end else @as(u32, @intCast(ctx.source.len));
+    const body = try collectRefs(ctx, nm.open_i, params_close + 1, end_i, name, lua_keywords);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = if (nm.is_member) .method else .function,
+        .line = ctx.toks[nm.name_i].line,
+        .span_start = lineStartOffset(ctx, start_i),
+        .span_end = span_end,
+        .sig_end = ctx.toks[params_close].end,
+        .doc = collectDoc(ctx, start_i),
+        .exported = !is_local,
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return if (end_i < hi) end_i + 1 else hi;
+}
+
+/// Parse `[local] NAME[.field|:method]* = RHS`. `ns` is the first target token
+/// (after `local` when present). Handles require-imports, function-expression
+/// values, and plain variable/table bindings.
+fn parseLuaAssign(ctx: *Ctx, start_i: u32, ns: u32, hi: u32, parent: ?u32, is_local: bool) !u32 {
+    if (ns >= hi or ctx.toks[ns].kind != .identifier) return start_i;
+    var name_i = ns;
+    var is_member = false;
+    while (ctx.isPunct(name_i + 1, '.') or ctx.isPunct(name_i + 1, ':')) {
+        if (name_i + 2 >= hi or ctx.toks[name_i + 2].kind != .identifier) break;
+        is_member = true;
+        name_i += 2;
+    }
+    // Only a simple binding: the `=` must directly follow the lvalue name chain.
+    // A call/index lvalue (`f(x).y =`, `t[k] =`) or a comparison (`==`, `~=`,
+    // `<=`, `>=` — whose `=` sits inside an expression) is not a definition.
+    if (!ctx.isPunct(name_i + 1, '=') or ctx.isPunct(name_i + 2, '=')) return start_i;
+    const rhs = name_i + 2;
+    if (!is_member) {
+        if (luaRequirePath(ctx, rhs, hi)) |path| return emitLuaImport(ctx, start_i, name_i, path, hi);
+    }
+    if (rhs < hi and ctx.identEql(rhs, "function"))
+        return parseLuaFuncExpr(ctx, start_i, name_i, rhs, hi, parent, is_local, is_member);
+    return parseLuaVar(ctx, start_i, name_i, rhs, hi, parent, is_local, is_member);
+}
+
+fn emitLuaImport(ctx: *Ctx, start_i: u32, name_i: u32, path: []const u8, hi: u32) !u32 {
+    const span_end = lineEndOffset(ctx, ctx.toks[start_i].start);
+    _ = try emit(ctx, importSymbol(ctx.textOf(name_i), path, ctx.toks[name_i].line, lineStartOffset(ctx, start_i), span_end));
+    return tokenAfterOffset(ctx, span_end, hi);
+}
+
+fn parseLuaFuncExpr(ctx: *Ctx, start_i: u32, name_i: u32, fn_kw: u32, hi: u32, parent: ?u32, is_local: bool, is_member: bool) !u32 {
+    const open = if (ctx.isPunct(fn_kw + 1, '(')) fn_kw + 1 else sentinel;
+    if (open == sentinel or ctx.close[open] == sentinel) return start_i;
+    const params_close = ctx.close[open];
+    const end_i = luaBlockEnd(ctx, params_close + 1, hi);
+    const name = ctx.textOf(name_i);
+    const span_end = if (end_i < hi) ctx.toks[end_i].end else @as(u32, @intCast(ctx.source.len));
+    const body = try collectRefs(ctx, open, params_close + 1, end_i, name, lua_keywords);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = if (is_member) .method else .function,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, start_i),
+        .span_end = span_end,
+        .sig_end = ctx.toks[params_close].end,
+        .doc = collectDoc(ctx, start_i),
+        .exported = !is_local,
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return if (end_i < hi) end_i + 1 else hi;
+}
+
+fn parseLuaVar(ctx: *Ctx, start_i: u32, name_i: u32, rhs: u32, hi: u32, parent: ?u32, is_local: bool, is_member: bool) !u32 {
+    const first_line_end = lineEndOffset(ctx, ctx.toks[start_i].start);
+    const line = ctx.toks[name_i].line;
+    var span_end = first_line_end;
+    // A direct table literal `= { ... }` has its function fields extracted below.
+    const table_open: u32 = if (rhs < hi and ctx.isPunct(rhs, '{') and ctx.close[rhs] != sentinel) rhs else sentinel;
+    // Extend the span across any bracketed value that continues onto later lines
+    // (`= f({ ... })`, `= {\n ... \n}`), so the multi-line body is not rescanned
+    // as if it were top-level statements (the source of phantom symbols).
+    var j = rhs;
+    while (j < hi and ctx.toks[j].line == line) {
+        const opener = ctx.isPunct(j, '(') or ctx.isPunct(j, '{') or ctx.isPunct(j, '[');
+        if (opener and ctx.close[j] != sentinel) {
+            span_end = @max(span_end, ctx.toks[ctx.close[j]].end);
+            j = ctx.close[j] + 1;
+        } else j += 1;
+    }
+    const idx = try emit(ctx, .{
+        .name = ctx.textOf(name_i),
+        .kind = if (is_member) .field else .variable,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, start_i),
+        .span_end = span_end,
+        .sig_end = first_line_end,
+        .doc = collectDoc(ctx, start_i),
+        .exported = !is_local,
+        .parent_local = parent,
+        .refs = &.{},
+    });
+    if (table_open != sentinel) try parseLuaTableFields(ctx, table_open, ctx.close[table_open], idx);
+    return tokenAfterOffset(ctx, span_end, hi);
+}
+
+/// Emit a `method` for each `NAME = function(...) ... end` field of the table
+/// constructor `(open, close)` — the module-table pattern `local M = { f = ... }`.
+fn parseLuaTableFields(ctx: *Ctx, open: u32, close: u32, parent: u32) !void {
+    std.debug.assert(open < close);
+    var i = open + 1;
+    while (i < close) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier) continue;
+        if (!ctx.isPunct(i + 1, '=') or !ctx.identEql(i + 2, "function")) continue;
+        const fn_kw = i + 2;
+        const p_open = if (ctx.isPunct(fn_kw + 1, '(')) fn_kw + 1 else sentinel;
+        if (p_open == sentinel or ctx.close[p_open] == sentinel) continue;
+        const p_close = ctx.close[p_open];
+        const end_i = luaBlockEnd(ctx, p_close + 1, close);
+        const name = ctx.textOf(i);
+        const span_end = if (end_i < close) ctx.toks[end_i].end else ctx.toks[p_close].end;
+        const body = try collectRefs(ctx, p_open, p_close + 1, end_i, name, lua_keywords);
+        _ = try emit(ctx, .{
+            .name = name,
+            .kind = .method,
+            .line = ctx.toks[i].line,
+            .span_start = lineStartOffset(ctx, i),
+            .span_end = span_end,
+            .sig_end = ctx.toks[p_close].end,
+            .doc = collectDoc(ctx, i),
+            .exported = true,
+            .parent_local = parent,
+            .refs = body.refs,
+            .bindings = body.bindings,
+        });
+        i = end_i;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2714,6 +2955,82 @@ test "c#: using directives (plain, static, alias) become imports" {
     try testing.expect(plain);
     try testing.expect(static_ns);
     try testing.expect(alias);
+}
+
+test "lua: local/global functions, table methods, refs and export flags" {
+    const src =
+        \\local M = {}
+        \\
+        \\--- Adds two numbers.
+        \\local function addPrivate(a, b)
+        \\  return a + b
+        \\end
+        \\
+        \\function M.publicAdd(a, b)
+        \\  return addPrivate(a, b)
+        \\end
+        \\
+        \\function M:method(x)
+        \\  return self.value + x
+        \\end
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    const priv = findSym(out.items, "addPrivate").?;
+    try testing.expectEqual(SymbolKind.function, priv.kind);
+    try testing.expect(!priv.exported); // `local` → file-private
+    try testing.expect(std.mem.indexOf(u8, priv.doc, "Adds two numbers") != null);
+    const pub_add = findSym(out.items, "publicAdd").?;
+    try testing.expectEqual(SymbolKind.method, pub_add.kind);
+    try testing.expect(pub_add.exported); // table function → public
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "method").?.kind);
+    var found = false;
+    for (pub_add.refs) |r| {
+        if (std.mem.eql(u8, r.name, "addPrivate")) {
+            found = true;
+            try testing.expectEqual(RefKind.call, r.kind);
+        }
+    }
+    try testing.expect(found);
+}
+
+test "lua: require() emits an import; a block comment hides code inside it" {
+    const src =
+        \\local util = require("lib.util")
+        \\--[[ a multiline comment
+        \\function ghost() return 1 end
+        \\]]
+        \\local function real() return util.clamp(1) end
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    const imp = findSym(out.items, "util").?;
+    try testing.expectEqual(SymbolKind.import, imp.kind);
+    try testing.expectEqualStrings("lib.util", imp.import_path);
+    // Code inside `--[[ ]]` must not surface as a symbol.
+    try testing.expect(findSym(out.items, "ghost") == null);
+    try testing.expect(findSym(out.items, "real") != null);
+}
+
+test "lua: function fields of a table constructor become methods" {
+    const src =
+        \\local T = {
+        \\  run = function(self, n)
+        \\    return n + 1
+        \\  end,
+        \\  dead = function()
+        \\    return 42
+        \\  end,
+        \\}
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    const t = findSym(out.items, "T").?;
+    try testing.expectEqual(SymbolKind.variable, t.kind);
+    const run = findSym(out.items, "run").?;
+    try testing.expectEqual(SymbolKind.method, run.kind);
+    try testing.expect(run.parent_local != null);
+    try testing.expect(findSym(out.items, "dead") != null);
 }
 
 fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {

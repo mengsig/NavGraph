@@ -21,9 +21,11 @@ navgraph-supported languages (by extension):
 - **Zig** — `.zig`
 - **C** — `.c .h`
 - **C++** — `.cpp .hpp .cc .cxx .hh`
+- **C#** — `.cs`
+- **Lua** — `.lua`
 
 For any of the above, navgraph is mandatory. For anything else (Go, Rust, Java,
-Ruby, C#, Kotlin, Swift, Lua, Elixir, shell, config, markdown, plain text), fall
+Ruby, Kotlin, Swift, Elixir, shell, config, markdown, plain text), fall
 back to grep/read — see "Escape hatches".
 
 ### Before you act, obey this order
@@ -76,8 +78,8 @@ substitute for navgraph on supported code.
 
 These are exhaustive. If none applies to a supported file, navgraph is required.
 
-1. **Unsupported language / filetype** (Go, Rust, Java, Ruby, C#, Kotlin, Swift,
-   Lua, Elixir, shell, HTML/CSS, JSON/YAML/TOML, Markdown, plain text) — use
+1. **Unsupported language / filetype** (Go, Rust, Java, Ruby, Kotlin, Swift,
+   Elixir, shell, HTML/CSS, JSON/YAML/TOML, Markdown, plain text) — use
    grep/read.
 2. **Non-symbol content** — comments, config values, docs, prose, license text,
    commit messages. (For strings *inside* supported source, still prefer

@@ -29,8 +29,31 @@ pub fn candidates(
         .zig => try zigCandidates(arena, importer_path, module),
         .js => try jsCandidates(arena, importer_path, module),
         .python => try pyCandidates(arena, importer_path, module),
+        .lua => try luaCandidates(arena, importer_path, module),
         else => &.{},
     };
+}
+
+/// Lua `require "a.b.c"` maps the dotted module to `a/b/c.lua` or the package
+/// form `a/b/c/init.lua`. Candidates are emitted both repo-root-relative (LÖVE,
+/// plain Lua) and under a `lua/` prefix (the Neovim runtimepath convention,
+/// where `require("advantage.util")` resolves to `lua/advantage/util.lua`). A
+/// leading `.` (relative require) resolves from the importer's directory.
+fn luaCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+    const dots = leadingDots(module);
+    const base_dir = if (dots > 0) dirOf(importer) else "";
+    const slashed = try dotsToSlashes(arena, module[dots..]);
+    const stem = try joinNormalize(arena, base_dir, slashed);
+    if (stem.len == 0) return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.append(arena, try concat(arena, stem, ".lua"));
+    try list.append(arena, try concat(arena, stem, "/init.lua"));
+    if (dots == 0) { // Neovim `lua/`-rooted modules
+        const nvim = try joinNormalize(arena, "lua", stem);
+        try list.append(arena, try concat(arena, nvim, ".lua"));
+        try list.append(arena, try concat(arena, nvim, "/init.lua"));
+    }
+    return list.toOwnedSlice(arena);
 }
 
 fn zigCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
@@ -191,4 +214,17 @@ test "python dotted and relative imports map to files" {
 
     const rel = try candidates(arena, "app/main.py", "..lib.util", .python);
     try std.testing.expectEqualStrings("lib/util.py", rel[0]);
+}
+
+test "lua require maps dotted modules to file and package init paths" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const c = try candidates(arena, "src/main.lua", "lib.util", .lua);
+    try std.testing.expectEqualStrings("lib/util.lua", c[0]);
+    try std.testing.expectEqualStrings("lib/util/init.lua", c[1]);
+    // Neovim `lua/`-rooted convention: require("advantage.util") → lua/advantage/util.lua
+    try std.testing.expectEqualStrings("lua/lib/util.lua", c[2]);
+    try std.testing.expectEqualStrings("lua/lib/util/init.lua", c[3]);
 }

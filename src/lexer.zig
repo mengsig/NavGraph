@@ -285,12 +285,15 @@ fn isStringDelim(cfg: language.Config, c: u8) bool {
 
 fn lexComment(lx: *Lexer, out: *std.ArrayList(Token)) !bool {
     const cfg = lx.cfg;
-    if (cfg.line_comment.len != 0 and lx.matches(cfg.line_comment)) {
-        try lexLineComment(lx, out);
-        return true;
-    }
+    // Block opener is checked first: when the line-comment marker is a prefix of
+    // the block opener (Lua's `--` vs `--[[`), a `--[[` must not be mis-lexed as
+    // a one-line comment. For languages with disjoint markers order is moot.
     if (cfg.block_open.len != 0 and lx.matches(cfg.block_open)) {
         try lexBlockComment(lx, out);
+        return true;
+    }
+    if (cfg.line_comment.len != 0 and lx.matches(cfg.line_comment)) {
+        try lexLineComment(lx, out);
         return true;
     }
     return false;

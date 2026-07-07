@@ -16,6 +16,7 @@ pub const Language = enum {
     javascript,
     typescript,
     tsx,
+    lua,
     unknown,
 
     /// Human-readable short tag used in compressed output.
@@ -29,6 +30,7 @@ pub const Language = enum {
             .javascript => "js",
             .typescript => "ts",
             .tsx => "tsx",
+            .lua => "lua",
             .unknown => "?",
         };
     }
@@ -41,12 +43,13 @@ pub const Language = enum {
             .csharp => .csharp,
             .python => .python,
             .javascript, .typescript, .tsx => .js,
+            .lua => .lua,
             .unknown => .other,
         };
     }
 };
 
-pub const Family = enum { zig, c, csharp, python, js, other };
+pub const Family = enum { zig, c, csharp, python, js, lua, other };
 
 /// Doc-comment extraction style differs enough between languages to name it.
 pub const DocStyle = enum {
@@ -121,6 +124,16 @@ pub fn configFor(language: Language) Config {
             .doc_style = .block_star,
             .brace_scoped = true,
         },
+        .lua => .{
+            .language = .lua,
+            .line_comment = "--",
+            .block_open = "--[[",
+            .block_close = "]]",
+            .string_delims = "\"'",
+            .template_strings = false,
+            .doc_style = .none,
+            .brace_scoped = false,
+        },
         .unknown => .{
             .language = .unknown,
             .line_comment = "",
@@ -157,6 +170,7 @@ pub fn detect(path: []const u8) Language {
         .{ ".ts", Language.typescript },
         .{ ".mts", Language.typescript },
         .{ ".tsx", Language.tsx },
+        .{ ".lua", Language.lua },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, ext, entry[0])) return entry[1];
@@ -180,6 +194,7 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.python, detect("app/server.py"));
     try std.testing.expectEqual(Language.tsx, detect("web/App.tsx"));
     try std.testing.expectEqual(Language.csharp, detect("Shop/Order.cs"));
+    try std.testing.expectEqual(Language.lua, detect("config/init.lua"));
     try std.testing.expectEqual(Language.unknown, detect("README.md"));
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
 }
