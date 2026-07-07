@@ -150,53 +150,81 @@ a name-collision false edge (a local `const candidates = …` binding to a globa
 `fn candidates`); a bare reference that names a local variable/parameter is no
 longer bound to a same-named global.
 
-## Output / UX gaps to address next (ranked)
+## Agent-ergonomics round — "the tool I'd want for myself"
 
-### 1. Module-qualified calls don't resolve — ✅ FIXED (Phase 4)
-`callers`/`calls` used to miss every call made through an imported module
-(`render.symbol`, `api.methodsMatch`, `cache.load` reported zero callers).
-Import-aware resolution (`src/imports.zig` + `index.buildImportTable`) now binds
-`mod.func()` to the imported file's `func` across Zig/JS/TS/Python, so these
-resolve. A related `collectRefs` bug that dropped a qualified call sharing the
-enclosing function's name was fixed too. *Remaining:* calls on values whose type
-isn't tracked (enum methods like `x.tag()`) still fall through to external.
+Dogfooding NavGraph as *the agent that consumes it* (not just correctness
+testing) exposed that the graph already stored the data I most wanted — it just
+wasn't surfaced. Every gap below is now closed; +8 regression tests (51 total).
+The through-line: **close the loop from "find a symbol" to "act on it"** — a
+query should hand me an exact line range to read and the exact line where an edge
+happens, not send me back to grep.
 
-### 2. `callers`/`calls` don't show the call-site line — too little info
-Each caller is printed at *its own definition* line (`parseZigFn … :566`), not
-the line where the call actually happens. The `Reference.line` field already
-holds the call-site line; it just isn't rendered. Showing `→ used at L620`
-would let an agent jump straight to the usage instead of re-searching the body.
+### Line ranges everywhere — ✅ built
+Locations render as `path:start-end` (`src/index.zig:373-384`), computed from the
+symbol's byte span (`model.Symbol.endLine`). A single-line symbol stays a bare
+line. This is the highest-leverage change: I can now `Read` exactly the
+definition instead of guessing an offset. JSON gains a `line_end` field.
 
-### 3. Attached flag values are rejected
-`-d2` and `--depth=2` fail with "unknown flag" (now at least a clear error).
-Agents frequently write these. Supporting `-d2` and `--flag=value` would remove
-a common, silent-until-now footgun.
+An adversarial verification pass (4 agents refuting each feature against
+ground-truth source across 7 languages) caught a real bug here: for C/C++,
+`endLine` overshot the closing brace — sometimes past EOF — because it was
+measured as an offset from the *name* line, but a C span can legitimately begin
+earlier (a leading doc comment, or a `template <…>` / multi-line-return prefix).
+Fixed two ways: `endLine` now computes the end line *absolutely* (the line of the
+last real byte, prefix-independent), and the C parser no longer folds a leading
+doc comment into a definition's span (so `def -v full` stops duplicating the doc
+too). Re-verified: 0 findings. Regression test in `query.zig`.
 
-### 4. Large `const` initializers are dumped in `sig` view — too much info
-`outline -v sig` prints ~160 chars of a comptime map's value
-(`router_receivers`, keyword sets, etc.), which is noise when you only wanted
-the shape. For container/collection constants, showing just the type
-(`std.StaticStringMap(void)`) or the first entry would be cleaner. Verbosity
-`names` already avoids this, but `sig` is the default.
+### Call-site lines on every edge — ✅ built (was gap 2)
+`callers`/`calls`/`neighbors`/`routes` annotate each edge with `↳:N`, the line
+where the call actually happens (from `Reference.line`), rather than only the
+caller's own definition line. In a callers tree N is in this row's file; in a
+callees tree N is in the parent's file — i.e. always the caller side of the edge.
+JSON gains a `site` field on tree nodes. Now a `callers` result is directly
+jump-to-usage.
 
-### 5. `search` matches definition names only — occasional confusion
-Searching for something that's only *used* (e.g. `fetch`) returns "no symbol
-matching", which reads like the identifier is absent. A one-line hint, or an
-opt-in `--refs` mode that also searches reference names, would help.
+### `hot` — relevance ranking — ✅ built (new verb)
+`navgraph hot [path]` ranks functions/methods by fan-in (callers) then fan-out
+(callees) and lists the busiest with `←N callers →M callees`. On first contact
+with an unknown repo this is the orientation view: it surfaces the load-bearing
+symbols to read first and shows where a change will ripple widest. Defaults to a
+short top-25 (raise `-l`); honors a path filter; has a JSON form (`fan_in`/
+`fan_out`). Alias: `central`.
 
-### 6. Ambiguity handling for same-named free functions
-`Parent.name` disambiguates methods, but two same-named top-level functions in
-different files (the two `build`s) can only both be shown. A `file:name` or
-`path#name` selector would let a query target one precisely.
+### `search --refs` — find-usages — ✅ built (was gap 5)
+`search <pat> --refs` lists every *use site* (reference) matching the pattern —
+`file:line  name (on receiver)  in <enclosing symbol>  → <target file|~ext>` —
+a resolution-aware grep that name-only search couldn't do. It's structural
+(no comment/string false hits) and shows what each use resolves to.
+
+### `name@path` disambiguation — ✅ built (was gap 6)
+Any name argument accepts a trailing `@<path-substring>` selector
+(`build@build.zig`, `parse@parser`) that keeps only matches whose file path
+contains the substring — the way to target one of several same-named symbols.
+Composes with `Parent.name`.
+
+### Attached flag values — ✅ built (was gap 3)
+`-d2`, `-l50`, `-kfn`, `--depth=2`, `-Csub/dir` all parse now (value attached or
+as the next token). Boolean flags reject an attached `=value`. Removes a common
+silent footgun.
+
+### `--kind` filter — ✅ built (new)
+`outline`/`search` accept `-k/--kind fn,struct,…` to restrict output to given
+kinds (with `function`/`func` aliases). `outline --kind fn` is the "just the
+functions" view.
+
+### Collapsed `const` initializers in `sig` view — ✅ built (was gap 4)
+Const/var values now cap at 60 chars (vs 160 for signatures), so a big comptime
+map collapses to its type/constructor head
+(`std.StaticStringMap(void).initComptime(.{ .{".git"}, .{"node…`) instead of
+dumping the literal. `outline -v full` still shows the whole definition.
 
 ---
 
-## Suggested priority
+## Still open (deliberately not built)
 
-1. ~~Import-aware module resolution~~ — ✅ done (Phase 4); `callers`/`calls`/
-   `unused`/`imports` are now trustworthy across files.
-2. **Call-site lines in caller/callee trees** (gap 2) — small, high utility, now
-   the top open item.
-3. **Attached flag values** (gap 3) — small, removes a real friction point.
-4. Then the output-tuning items (4–6) as polish, plus **relevance ranking**
-   (fan-in/out counts) to surface important symbols first.
+- **Module-qualified calls on untracked-type values** (`x.tag()` where `x`'s type
+  isn't inferred) still fall through to `~ext` — a resolution-depth limit, not an
+  output gap.
+- **Raw-text grep** (matching strings/comments) is intentionally left to `grep`;
+  `search --refs` covers the structural "where is this used" need.

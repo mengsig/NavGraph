@@ -7,7 +7,7 @@ const render = @import("render.zig");
 
 pub const Command = enum {
     outline, def, calls, callers, search, routes,
-    neighbors, unused, imports, importers, path, help,
+    neighbors, unused, imports, importers, path, hot, help,
 };
 
 pub const Parsed = struct {
@@ -33,16 +33,17 @@ const usage_text =
     \\
     \\COMMANDS:
     \\  outline [path]     Outline symbols in a file/dir (default: whole project)
-    \\  def <name>         Show a definition (supports Parent.name)
+    \\  def <name>         Show a definition (supports Parent.name, name@path)
     \\  calls <name>       Symbols that <name> calls/uses (callees), as a tree
     \\  callers <name>     Symbols that call/use <name> (callers), as a tree
-    \\  search <pattern>   Find symbols whose name contains <pattern>
+    \\  search <pattern>   Find symbols by name (or use sites with --refs)
     \\  routes [filter]    List HTTP routes and the client calls that hit them
     \\  neighbors <name>   Callees and callers of <name> in one view
     \\  unused [filter]    Functions/methods with no callers (possible dead code)
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
+    \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -50,17 +51,22 @@ const usage_text =
     \\  -d, --depth <N>                        Graph depth for calls/callers (default: 1)
     \\  -C, --root <path>                      Project root to index (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
+    \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
+    \\  -r, --refs                             search: match use sites, not just names
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\
+    \\  Locations are `path:line-endLine`; call trees annotate each edge with its
+    \\  call-site line as `↳:N`. Flag values may be attached (`-d2`, `--depth=2`).
+    \\
     \\EXAMPLES:
-    \\  navgraph outline src/parser.zig
+    \\  navgraph outline src/parser.zig --kind fn
     \\  navgraph def parseZigScope -v full
-    \\  navgraph calls build -d 2
+    \\  navgraph calls build@build.zig -d 2
     \\  navgraph callers collectRefs
+    \\  navgraph search resolve --refs
     \\  navgraph neighbors resolveOne
-    \\  navgraph imports src/main.zig
     \\  navgraph path parse emit
     \\
 ;
@@ -74,7 +80,7 @@ pub fn reason(err: ParseError) []const u8 {
     return switch (err) {
         error.Usage => "expected a command and (for most commands) an argument",
         error.UnknownFlag => "unknown flag",
-        error.MissingValue => "a flag is missing its value (use `-d 2`, not `-d2`)",
+        error.MissingValue => "a flag is missing its value (e.g. `-d 2`, `-d2`, or `--depth=2`)",
         error.BadValue => "invalid flag value (expected a number or a known keyword)",
     };
 }
@@ -115,6 +121,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "unused", Command.unused },   .{ "dead", Command.unused },
         .{ "imports", Command.imports }, .{ "importers", Command.importers },
         .{ "path", Command.path },
+        .{ "hot", Command.hot },         .{ "central", Command.hot },
+
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },
     };
@@ -126,50 +134,96 @@ fn parseCommand(s: []const u8) ?Command {
 /// `routes`, `unused` and `imports` accept an optional filter; `path` needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .unused, .imports => true,
+        .outline, .routes, .unused, .imports, .hot => true,
         .path => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
 }
 
 /// Parse a flag at index `i`, returning the index of the last token consumed.
+/// Value-taking flags accept the value attached (`-d2`, `--depth=2`) or as the
+/// next token (`-d 2`). Boolean flags reject an attached value.
 fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usize {
-    const flag = args[i];
-    if (eqAny(flag, &.{ "-v", "--verbosity" })) {
-        const val = try value(args, i);
+    const raw = args[i];
+    const f = splitFlag(raw);
+
+    if (eqAny(f.name, &.{ "-v", "--verbosity" })) {
+        const val = try f.value(args, i);
         out.options.verbosity = render.Verbosity.parse(val) orelse return error.BadValue;
-        return i + 1;
+        return f.next(i);
     }
-    if (eqAny(flag, &.{ "-d", "--depth" })) {
-        out.options.depth = try parseUint(try value(args, i));
-        return i + 1;
+    if (eqAny(f.name, &.{ "-d", "--depth" })) {
+        out.options.depth = try parseUint(try f.value(args, i));
+        return f.next(i);
     }
-    if (eqAny(flag, &.{ "-l", "--limit" })) {
-        out.options.limit = try parseUint(try value(args, i));
-        return i + 1;
+    if (eqAny(f.name, &.{ "-l", "--limit" })) {
+        out.options.limit = try parseUint(try f.value(args, i));
+        return f.next(i);
     }
-    if (eqAny(flag, &.{ "-C", "--root" })) {
-        out.root = try value(args, i);
-        return i + 1;
+    if (eqAny(f.name, &.{ "-C", "--root" })) {
+        out.root = try f.value(args, i);
+        return f.next(i);
     }
-    if (eqAny(flag, &.{ "-s", "--strict" })) {
+    if (eqAny(f.name, &.{ "-k", "--kind" })) {
+        out.options.kinds = try f.value(args, i);
+        return f.next(i);
+    }
+    // Boolean flags: an attached `=value` is a usage error.
+    if (f.inline_val != null) return error.BadValue;
+    if (eqAny(f.name, &.{ "-s", "--strict" })) {
         out.options.strict = true;
         return i;
     }
-    if (eqAny(flag, &.{ "-j", "--json" })) {
+    if (eqAny(f.name, &.{ "-j", "--json" })) {
         out.options.format = .json;
         return i;
     }
-    if (eqAny(flag, &.{"--no-cache"})) {
+    if (eqAny(f.name, &.{ "-r", "--refs" })) {
+        out.options.refs = true;
+        return i;
+    }
+    if (eqAny(f.name, &.{"--no-cache"})) {
         out.use_cache = false;
         return i;
     }
     return error.UnknownFlag;
 }
 
-fn value(args: []const [:0]const u8, i: usize) ParseError![]const u8 {
-    if (i + 1 >= args.len) return error.MissingValue;
-    return args[i + 1];
+/// A flag token split into its name and an optional attached value. Handles both
+/// `--long=value` and short `-dVALUE` (name is the first two chars, `-d`).
+const SplitFlag = struct {
+    name: []const u8,
+    inline_val: ?[]const u8,
+
+    /// The flag's value: the attached one if present, else the next token.
+    fn value(self: SplitFlag, args: []const [:0]const u8, i: usize) ParseError![]const u8 {
+        if (self.inline_val) |v| {
+            if (v.len == 0) return error.MissingValue;
+            return v;
+        }
+        if (i + 1 >= args.len) return error.MissingValue;
+        return args[i + 1];
+    }
+
+    /// Index of the last consumed token: `i` when the value was attached, else
+    /// `i + 1` (the separate value token).
+    fn next(self: SplitFlag, i: usize) usize {
+        return if (self.inline_val != null) i else i + 1;
+    }
+};
+
+fn splitFlag(raw: []const u8) SplitFlag {
+    if (std.mem.startsWith(u8, raw, "--")) {
+        if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+            return .{ .name = raw[0..eq], .inline_val = raw[eq + 1 ..] };
+        }
+        return .{ .name = raw, .inline_val = null };
+    }
+    // Short flag with an attached value: `-d2`, `-lC` etc. (name = first 2 chars).
+    if (raw.len > 2 and raw[0] == '-') {
+        return .{ .name = raw[0..2], .inline_val = raw[2..] };
+    }
+    return .{ .name = raw, .inline_val = null };
 }
 
 fn parseUint(s: []const u8) ParseError!u32 {
@@ -197,4 +251,39 @@ test "parse basic commands and flags" {
 
     try std.testing.expectError(error.Usage, parse(&.{"def"}));
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "def", "x", "--nope" }));
+}
+
+test "attached flag values: -d2, --depth=2, -l50" {
+    const a = try parse(&.{ "calls", "x", "-d2" });
+    try std.testing.expectEqual(@as(u32, 2), a.options.depth);
+
+    const b = try parse(&.{ "calls", "x", "--depth=3" });
+    try std.testing.expectEqual(@as(u32, 3), b.options.depth);
+
+    const c = try parse(&.{ "outline", "-l50", "-vnames" });
+    try std.testing.expectEqual(@as(u32, 50), c.options.limit);
+    try std.testing.expectEqual(render.Verbosity.names, c.options.verbosity);
+
+    // `-C` still works both attached and separate.
+    const d = try parse(&.{ "outline", "-Csub/dir" });
+    try std.testing.expectEqualStrings("sub/dir", d.root);
+
+    // A boolean flag rejects an attached value.
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "--json=1" }));
+    // An attached-but-empty value is a missing value.
+    try std.testing.expectError(error.MissingValue, parse(&.{ "calls", "x", "--depth=" }));
+}
+
+test "new flags: --refs, --kind" {
+    const a = try parse(&.{ "search", "foo", "--refs" });
+    try std.testing.expect(a.options.refs);
+
+    const b = try parse(&.{ "search", "foo", "-r" });
+    try std.testing.expect(b.options.refs);
+
+    const c = try parse(&.{ "outline", "--kind", "fn,struct" });
+    try std.testing.expectEqualStrings("fn,struct", c.options.kinds);
+
+    const d = try parse(&.{ "outline", "-kfn" });
+    try std.testing.expectEqualStrings("fn", d.options.kinds);
 }

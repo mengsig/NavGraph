@@ -349,6 +349,17 @@ fn lineStartOffset(ctx: *const Ctx, i: u32) u32 {
     return t.start - t.col;
 }
 
+/// The first non-comment token at or after `i`. A statement's `stmt_start` can
+/// point at a leading doc comment (kept so `collectDoc` can find it); using this
+/// for `span_start` excludes that comment from the definition's span, so the span
+/// begins on the definition's own line (keeping `line`..`endLine` accurate and
+/// not duplicating the doc in `-v full`).
+fn firstCodeToken(ctx: *const Ctx, i: u32) u32 {
+    var j = i;
+    while (j < ctx.toks.len and ctx.toks[j].kind == .comment) j += 1;
+    return j;
+}
+
 const KeywordSet = std.StaticStringMap(void);
 
 /// Collect deduplicated references from the token range [lo, hi).
@@ -960,7 +971,7 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         .name = ctx.textOf(name_i),
         .kind = kind,
         .line = ctx.toks[name_i].line,
-        .span_start = lineStartOffset(ctx, stmt_start),
+        .span_start = lineStartOffset(ctx, firstCodeToken(ctx, stmt_start)),
         .span_end = ctx.toks[close].end,
         .sig_end = ctx.toks[open].start,
         .doc = collectDoc(ctx, stmt_start),
@@ -1128,7 +1139,7 @@ fn tryCFunction(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: ?u32) 
         .name = ctx.textOf(name_i),
         .kind = if (parent != null) .method else .function,
         .line = ctx.toks[name_i].line,
-        .span_start = lineStartOffset(ctx, stmt_start),
+        .span_start = lineStartOffset(ctx, firstCodeToken(ctx, stmt_start)),
         .span_end = ctx.toks[body_close].end,
         .sig_end = ctx.toks[body_open].start,
         .doc = collectDoc(ctx, stmt_start),
