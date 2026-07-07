@@ -268,13 +268,15 @@ const max_read_bytes = 8 * 1024 * 1024;
 pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !void {
     _ = opts;
     var path = spec;
-    var lo: usize = 1;
-    var hi: usize = std.math.maxInt(usize);
+    // Empty `ranges` means the whole file; one or more means `file:A-B,C-D` — a
+    // batched read that pulls several disjoint slices in one call (a symbol and
+    // its neighbours, a definition and its use, etc.) instead of N invocations.
+    var ranges_buf: [16]LineRange = undefined;
+    var ranges: []const LineRange = &.{};
     if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
-        if (parseLineRange(spec[c + 1 ..])) |r| {
+        if (parseRanges(spec[c + 1 ..], &ranges_buf)) |rs| {
             path = spec[0..c];
-            lo = r.lo;
-            hi = r.hi;
+            ranges = rs;
         }
     }
     var owned: ?[]u8 = null;
@@ -292,7 +294,7 @@ pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, sp
         owned = bytes;
         break :blk bytes;
     };
-    try printNumbered(w, path, text, lo, hi);
+    try printNumbered(w, path, text, ranges);
 }
 
 /// The in-memory text of an indexed file matching `path` (exact, else a unique
@@ -332,26 +334,34 @@ fn parseLineRange(s: []const u8) ?LineRange {
     return .{ .lo = only, .hi = only };
 }
 
-/// Emit `text`'s lines in `[lo, hi]` as `N\t<line>`, with a header naming the
-/// file and its line count. Handles a trailing newline (not counted as a line).
-fn printNumbered(w: *Writer, path: []const u8, text: []const u8, lo: usize, hi: usize) !void {
-    var total: usize = 0;
-    if (text.len != 0) {
-        total = 1;
-        for (text) |ch| {
-            if (ch == '\n') total += 1;
-        }
-        if (text[text.len - 1] == '\n') total -= 1;
+/// Parse a comma-separated list of ranges (`A-B,C-D,E`) into `buf`. Returns null
+/// if empty, over-long, or any part is unparseable — so a lone `:` in a path (or
+/// a non-range suffix) leaves the whole spec treated as a path.
+fn parseRanges(s: []const u8, buf: []LineRange) ?[]const LineRange {
+    if (s.len == 0) return null;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |part| {
+        if (n >= buf.len) return null;
+        buf[n] = parseLineRange(part) orelse return null;
+        n += 1;
     }
-    if (hi == std.math.maxInt(usize)) {
-        try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
-    } else {
-        try w.print("# {s} (lines {d}-{d} of {d})\n", .{ path, lo, @min(hi, total), total });
+    return if (n == 0) null else buf[0..n];
+}
+
+/// The number of lines in `text` (a trailing newline is not counted as a line).
+fn lineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var total: usize = 1;
+    for (text) |ch| {
+        if (ch == '\n') total += 1;
     }
-    if (lo > total) {
-        try w.print("(no such line: {d}; file has {d})\n", .{ lo, total });
-        return;
-    }
+    if (text[text.len - 1] == '\n') total -= 1;
+    return total;
+}
+
+/// Emit `text`'s lines in `[lo, hi]` as `N\t<line>` (single pass from the top).
+fn emitRange(w: *Writer, text: []const u8, lo: usize, hi: usize) !void {
     var start: usize = 0;
     var line_no: usize = 1;
     while (start < text.len) {
@@ -361,6 +371,68 @@ fn printNumbered(w: *Writer, path: []const u8, text: []const u8, lo: usize, hi: 
         start = nl + 1;
         line_no += 1;
     }
+}
+
+/// Emit `text` for `ranges` (empty = whole file) as numbered lines under a header
+/// naming the file and line count. Disjoint ranges are separated by a `⋯` gap
+/// marker so it's clear lines were skipped between them.
+fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const LineRange) !void {
+    const total = lineCount(text);
+    if (ranges.len == 0) {
+        try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
+        try emitRange(w, text, 1, std.math.maxInt(usize));
+        return;
+    }
+    if (ranges.len == 1 and ranges[0].hi != std.math.maxInt(usize)) {
+        const r = ranges[0];
+        try w.print("# {s} (lines {d}-{d} of {d})\n", .{ path, r.lo, @min(r.hi, total), total });
+    } else {
+        try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
+    }
+    var prev_hi: usize = 0;
+    for (ranges) |r| {
+        if (r.lo > total) {
+            try w.print("(no such line: {d}; file has {d})\n", .{ r.lo, total });
+            continue;
+        }
+        if (prev_hi != 0 and r.lo > prev_hi + 1) try w.writeAll("  ⋯\n");
+        try emitRange(w, text, r.lo, r.hi);
+        prev_hi = @min(r.hi, total);
+    }
+}
+
+/// Search the *contents of string literals* across every indexed file for
+/// `pattern` (substring), printing `path:line: <literal>`. The escape hatch the
+/// symbol graph can't cover: URL/route literals, log and error messages, regex
+/// sources, config keys, feature-flag names — the text a trial kept dropping to
+/// `read`/grep for. Language-agnostic: it re-lexes each file with the shared
+/// tokenizer and matches only `.string` tokens, so a hit is never an identifier
+/// that merely shares the text (stricter than a raw grep).
+pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+    std.debug.assert(pattern.len > 0);
+    if (opts.format == .json) return json_out.strings(w, idx, pattern, opts);
+    var toks: std.ArrayList(lexer.Token) = .empty;
+    defer toks.deinit(idx.gpa);
+    var shown: u32 = 0;
+    outer: for (idx.graph.files) |file| {
+        toks.clearRetainingCapacity();
+        lexer.tokenize(idx.gpa, file.text, language.configFor(file.language), &toks) catch continue;
+        for (toks.items) |t| {
+            if (t.kind != .string) continue;
+            const s = t.text(file.text);
+            if (std.mem.indexOf(u8, s, pattern) == null) continue;
+            try w.print("{s}:{d}: ", .{ file.path, t.line });
+            try render.writeCollapsed(w, s, 200);
+            try w.writeByte('\n');
+            shown += 1;
+            if (shown >= opts.limit) break :outer;
+        }
+    }
+    if (shown == 0) {
+        try w.print("(no string literal matching '{s}')\n", .{pattern});
+        try skippedNote(w, idx);
+    }
+    try truncationNote(w, opts, shown);
 }
 
 /// Show the definition(s) of `name` (supports `Parent.name`).
@@ -536,28 +608,44 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.searchRefs(w, idx, pattern, opts);
     var shown: u32 = 0;
-    for (idx.graph.symbols) |sym| {
+    outer: for (idx.graph.symbols) |sym| {
         for (sym.refs) |ref| {
             if (std.mem.indexOf(u8, ref.name, pattern) == null) continue;
-            try w.print("{s}:{d}  {s}", .{ idx.graph.files[sym.file].path, ref.line, ref.name });
-            if (ref.qualifier.len != 0) try w.print(" (on {s})", .{ref.qualifier});
-            try w.print("  in {s}", .{sym.name});
-            if (ref.target != invalid) {
-                try w.print("  → {s}", .{idx.graph.files[idx.graph.symbols[ref.target].file].path});
-            } else if (ref.kind == .call or ref.kind == .route_call) {
-                try w.writeAll("  → ~ext");
+            // One row per *distinct* use-site line. A name referenced on several
+            // lines within one caller is deduped into a single ref carrying a
+            // `lines` list — expand it so every site is listed, not just the
+            // first (the "found only one of its reads" recall gap a trial hit).
+            if (ref.lines.len > 1) {
+                for (ref.lines) |ln| {
+                    try printRefRow(w, idx, sym, ref, ln);
+                    shown += 1;
+                    if (shown >= opts.limit) break :outer;
+                }
+            } else {
+                try printRefRow(w, idx, sym, ref, ref.line);
+                shown += 1;
+                if (shown >= opts.limit) break :outer;
             }
-            try w.writeByte('\n');
-            shown += 1;
-            if (shown >= opts.limit) break;
         }
-        if (shown >= opts.limit) break;
     }
     if (shown == 0) {
         try w.print("(no reference matching '{s}')\n", .{pattern});
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+}
+
+/// Print one `search --refs` row: `path:line  name [(on recv)]  in owner [→ …]`.
+fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Reference, line: u32) !void {
+    try w.print("{s}:{d}  {s}", .{ idx.graph.files[sym.file].path, line, ref.name });
+    if (ref.qualifier.len != 0) try w.print(" (on {s})", .{ref.qualifier});
+    try w.print("  in {s}", .{sym.name});
+    if (ref.target != invalid) {
+        try w.print("  → {s}", .{idx.graph.files[idx.graph.symbols[ref.target].file].path});
+    } else if (ref.kind == .call or ref.kind == .route_call) {
+        try w.writeAll("  → ~ext");
+    }
+    try w.writeByte('\n');
 }
 
 /// The number of distinct resolved callees (outgoing edges) of `sym`.
@@ -1159,15 +1247,37 @@ fn precededByDecorator(idx: *const Index, sym: model.Symbol) bool {
     return i < ls and text[i] == '@';
 }
 
-/// Whether `path` is a test/fixture module (pytest, jest): its functions are
-/// invoked by the framework, not referenced by name.
+/// Whether `path` is a test/fixture module: its functions are invoked by the
+/// framework/harness, not referenced by name, so `unused` treats a symbol used
+/// only from here as "used only by tests" rather than production-live.
+///
+/// Recognized across every language — the file conventions (pytest `test_*.py`,
+/// jest/vitest `*.test.ts`/`*.spec.tsx`, Zig/C/C++ `*_test.zig`/`*_test.cc`) and
+/// the directory conventions (`tests/`, `test/`, `__tests__/`, `spec/`, `e2e/`).
+/// The directory check is what stops a test *helper* file with a plain name
+/// (`tests/util.py`, `__tests__/render.tsx`) from reading as production and
+/// under-reporting the dead code that only its siblings use.
 fn isTestPath(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |comp| if (isTestDirName(comp)) return true;
     const slash = std.mem.lastIndexOfScalar(u8, path, '/');
     const base = if (slash) |s| path[s + 1 ..] else path;
     if (std.mem.eql(u8, base, "conftest.py")) return true;
     if (std.mem.startsWith(u8, base, "test_")) return true;
-    inline for (.{ "_test.py", ".test.ts", ".test.tsx", ".test.js", ".spec.ts", ".spec.tsx", ".spec.js" }) |suf| {
-        if (std.mem.endsWith(u8, base, suf)) return true;
+    // Suffix conventions, keyed on the stem so any code extension counts:
+    // `foo_test.<ext>`, `foo_spec.<ext>`, `foo.test.<ext>`, `foo.spec.<ext>`.
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
+    const stem = base[0..dot];
+    inline for (.{ "_test", "_spec", ".test", ".spec" }) |suf| {
+        if (std.mem.endsWith(u8, stem, suf)) return true;
+    }
+    return false;
+}
+
+/// A path component that conventionally holds tests/fixtures in any ecosystem.
+fn isTestDirName(comp: []const u8) bool {
+    inline for (.{ "tests", "test", "__tests__", "__mocks__", "spec", "e2e" }) |d| {
+        if (std.mem.eql(u8, comp, d)) return true;
     }
     return false;
 }
@@ -2059,6 +2169,234 @@ test "line range renders end line for a multi-line definition" {
     try testing.expect(std.mem.indexOf(u8, out, "L5-") == null);
 }
 
+test "render surfaces accessor/async modifiers in the kind field" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.ts", .data =
+        \\export class Store {
+        \\  get value() { return 1; }
+        \\  async load() { return 2; }
+        \\}
+        \\export async function boot() { return 3; }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // A getter reads as `get Store.value`, not a bare `method` (the false bug).
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "value", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "get Store.value") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "method Store.value") == null);
+    }
+    { // `async` prefixes the tag for both a method and a free function.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "load", .{});
+        try showDef(&aw.writer, &idx, "boot", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "async method Store.load") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "async fn boot") != null);
+    }
+}
+
+test "strings finds text inside string literals, never bare identifiers" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data =
+        \\LOG_MSG = "gp data has not updated"
+        \\def ping():
+        \\    return "/api/health"
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\const URL = "/api/health";
+        \\function log() { return "boot ok"; }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // The URL literal is found in both languages, with file:line.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try strings(&aw.writer, &idx, "/api/health", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "svc.py:3") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "client.ts:1") != null);
+    }
+    { // `LOG_MSG` is an identifier, not a literal — no match (stricter than grep).
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try strings(&aw.writer, &idx, "LOG_MSG", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no string literal") != null);
+    }
+}
+
+test "search --refs lists every distinct use-site line of a name" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `helper` is used on three distinct lines inside one caller; all three sites
+    // must be listed, not collapsed to the first (the recall gap a trial hit).
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn helper() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn run() u32 {
+        \\    const a = helper();
+        \\    const b = helper();
+        \\    return a + b + helper();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try search(&aw.writer, &idx, "helper", .{ .refs = true });
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "m.zig:5") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "m.zig:6") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "m.zig:7") != null);
+}
+
+test "def -v full includes leading decorators and multi-line python literals" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\import functools
+        \\GP_GROUPS = [
+        \\    "stations",
+        \\    "visual",
+        \\]
+        \\@functools.lru_cache
+        \\@app.get("/x")
+        \\def handler():
+        \\    return GP_GROUPS
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // The handler's decorators are part of its `-v full` (a paste-ready target).
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "handler", .{ .verbosity = .full });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "@functools.lru_cache") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "@app.get(\"/x\")") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "def handler") != null);
+    }
+    { // The list literal's contents are shown, not truncated at line 1.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "GP_GROUPS", .{ .verbosity = .full });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "stations") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "visual") != null);
+    }
+}
+
+test "read: multiple comma-separated ranges with a gap marker" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\def a():
+        \\    x = 1
+        \\    y = 2
+        \\    z = 3
+        \\    w = 4
+        \\    return x
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try readLines(&aw.writer, io, &idx, root, "m.py:1,4-5", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "1\tdef a():") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "4\t    z = 3") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "5\t    w = 4") != null);
+    // Lines outside the requested ranges are absent, and the gap is marked.
+    try testing.expect(std.mem.indexOf(u8, out, "y = 2") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "⋯") != null);
+}
+
+test "unused: a prod fn used only from a tests/ directory is test-only (dir scope)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.py", .data =
+        \\def prod_fn():
+        \\    return 1
+        \\def helper_target():
+        \\    return 2
+        \\def entry():
+        \\    return prod_fn()
+    });
+    // A test *helper* with a plain filename, recognized as test scope only via
+    // its `tests/` directory — before dir-based scope this would have counted as
+    // production and hidden `helper_target` from the dead-code report.
+    try tmp.dir.createDirPath(io, "tests");
+    try tmp.dir.writeFile(io, .{ .sub_path = "tests/support.py", .data =
+        \\from lib import helper_target
+        \\def exercise():
+        \\    return helper_target()
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // Used only from a tests/ helper → reported and flagged.
+    try testing.expect(std.mem.indexOf(u8, out, "helper_target") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "only used by tests") != null);
+    // Used by production → not reported.
+    try testing.expect(std.mem.indexOf(u8, out, "prod_fn") == null);
+}
+
 test "dead-code filter skips dunders, tests and fixtures" {
     try std.testing.expect(isDunder("__init__"));
     try std.testing.expect(isDunder("__call__"));
@@ -2072,4 +2410,15 @@ test "dead-code filter skips dunders, tests and fixtures" {
     try std.testing.expect(isTestPath("web/App.test.tsx"));
     try std.testing.expect(!isTestPath("src/ship.py"));
     try std.testing.expect(!isTestPath("src/latest.py"));
+    // Directory-based test layouts (any language), even with a plain filename.
+    try std.testing.expect(isTestPath("tests/util.py"));
+    try std.testing.expect(isTestPath("web/__tests__/render.tsx"));
+    try std.testing.expect(isTestPath("app/e2e/flow.ts"));
+    try std.testing.expect(isTestPath("pkg/spec/parser.js"));
+    // More suffix conventions across languages.
+    try std.testing.expect(isTestPath("src/parser_test.zig"));
+    try std.testing.expect(isTestPath("core/widget_test.cc"));
+    // A prod dir/name that merely contains "test" is not a test path.
+    try std.testing.expect(!isTestPath("src/test_utils/format.py"));
+    try std.testing.expect(!isTestPath("src/contest.py"));
 }

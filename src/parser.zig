@@ -18,6 +18,7 @@ const SymbolKind = model.SymbolKind;
 const Reference = model.Reference;
 const RefKind = model.RefKind;
 const Binding = model.Binding;
+const Mods = model.Mods;
 
 /// A symbol as discovered within a single file, before global ids are assigned.
 pub const ParsedSymbol = struct {
@@ -29,6 +30,8 @@ pub const ParsedSymbol = struct {
     sig_end: u32,
     doc: []const u8,
     exported: bool,
+    /// Accessor/dispatch/async modifiers (see `model.Mods`).
+    modifiers: model.Mods = .{},
     /// Index (into the per-file parse output) of the enclosing symbol, if any.
     parent_local: ?u32,
     refs: []Reference,
@@ -1361,8 +1364,9 @@ fn parseJsDecl(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !u32 {
 
     if (ctx.identEql(k, "class")) return parseJsClass(ctx, i, k, hi, parent, exported);
     if (ctx.identEql(k, "function") or (ctx.identEql(k, "async") and ctx.identEql(k + 1, "function"))) {
-        const fn_i = if (ctx.identEql(k, "async")) k + 1 else k;
-        return parseJsFunction(ctx, i, fn_i, hi, parent, exported);
+        const is_async = ctx.identEql(k, "async");
+        const fn_i = if (is_async) k + 1 else k;
+        return parseJsFunction(ctx, i, fn_i, hi, parent, exported, .{ .is_async = is_async });
     }
     if (ctx.identEql(k, "const") or ctx.identEql(k, "let") or ctx.identEql(k, "var")) {
         return parseJsBinding(ctx, i, k, hi, parent, exported);
@@ -1478,7 +1482,7 @@ fn jsBodyOpen(ctx: *const Ctx, pclose: u32, hi: u32) u32 {
     return sentinel;
 }
 
-fn parseJsFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
+fn parseJsFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exported: bool, mods: Mods) !u32 {
     if (fn_i + 1 >= hi or ctx.toks[fn_i + 1].kind != .identifier) return start_i;
     const name_i = fn_i + 1;
     const popen = jsSkipGenerics(ctx, name_i + 1, hi);
@@ -1498,6 +1502,7 @@ fn parseJsFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, ex
         .sig_end = ctx.toks[body_open].start,
         .doc = collectDoc(ctx, start_i),
         .exported = exported,
+        .modifiers = mods,
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
@@ -1556,15 +1561,17 @@ fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exp
         _ = try emit(ctx, importSymbol(ctx.textOf(name_i), mod, ctx.toks[name_i].line, lineStartOffset(ctx, start_i), span_end));
         return tokenAfterOffset(ctx, span_end, hi);
     }
+    // `const f = async () => …` / `const f = async x => …`: the arrow is async.
+    const arrow_mods = Mods{ .is_async = eq_i != sentinel and eq_i + 1 < hi and ctx.identEql(eq_i + 1, "async") };
     const arrow_body = detectJsArrow(ctx, eq_i, hi, semi_i);
     if (arrow_body.open != sentinel) {
-        return emitJsArrow(ctx, start_i, name_i, arrow_body, parent, exported, hi);
+        return emitJsArrow(ctx, start_i, name_i, arrow_body, parent, exported, arrow_mods, hi);
     }
     // Expression-bodied arrow: `const C = () => (<JSX>…)`, `const f = x => g(x)`.
     // These carry real call sites (a React component's whole render is here), so
     // treat them as functions and collect refs — not as an opaque variable.
     if (arrow_body.is_fn and arrow_body.arrow_i != sentinel) {
-        return emitJsArrowExpr(ctx, start_i, name_i, arrow_body.arrow_i, parent, exported, hi);
+        return emitJsArrowExpr(ctx, start_i, name_i, arrow_body.arrow_i, parent, exported, arrow_mods, hi);
     }
     const end_i = if (semi_i != sentinel) semi_i else name_i;
     _ = try emit(ctx, .{
@@ -1614,7 +1621,7 @@ fn detectJsArrow(ctx: *const Ctx, eq_i: u32, hi: u32, semi_i: u32) JsArrow {
     return .{ .open = sentinel, .arrow_i = arrow_i, .is_fn = saw_arrow };
 }
 
-fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u32, exported: bool, hi: u32) !u32 {
+fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u32, exported: bool, mods: Mods, hi: u32) !u32 {
     const close = ctx.close[arrow.open];
     if (close == sentinel) return start_i + 1;
     const popen = findNext(ctx, name_i + 1, arrow.open, '(');
@@ -1630,6 +1637,7 @@ fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u3
         .sig_end = ctx.toks[arrow.open].start,
         .doc = collectDoc(ctx, start_i),
         .exported = exported,
+        .modifiers = mods,
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
@@ -1640,7 +1648,7 @@ fn emitJsArrow(ctx: *Ctx, start_i: u32, name_i: u32, arrow: JsArrow, parent: ?u3
 
 /// Emit an expression-bodied arrow `const NAME = (params) => EXPR` as a function
 /// and collect the call/read refs in EXPR. `arrow_i` is the `=>`'s `=` token.
-fn emitJsArrowExpr(ctx: *Ctx, start_i: u32, name_i: u32, arrow_i: u32, parent: ?u32, exported: bool, hi: u32) !u32 {
+fn emitJsArrowExpr(ctx: *Ctx, start_i: u32, name_i: u32, arrow_i: u32, parent: ?u32, exported: bool, mods: Mods, hi: u32) !u32 {
     const body_start = arrow_i + 2; // skip `=` and `>`
     if (body_start >= hi) return start_i;
     const end = arrowExprEnd(ctx, body_start, hi);
@@ -1660,6 +1668,7 @@ fn emitJsArrowExpr(ctx: *Ctx, start_i: u32, name_i: u32, arrow_i: u32, parent: ?
         .sig_end = ctx.toks[body_start].start,
         .doc = collectDoc(ctx, start_i),
         .exported = exported,
+        .modifiers = mods,
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
@@ -1691,11 +1700,20 @@ fn arrowExprEnd(ctx: *const Ctx, start: u32, hi: u32) u32 {
 /// Class members: methods `name(...) { }` and accessors.
 fn parseJsMember(ctx: *Ctx, start_i: u32, k: u32, hi: u32, parent: u32) !u32 {
     var m = k;
+    var mods = Mods{};
     // Skip method modifiers, but only when they prefix a name — `get x()` is an
     // accessor, whereas `get()`/`get<T>()` is a method literally named `get`.
+    // Capture them so a getter renders as `get x`, not a bare `method x` (which
+    // reads as a bug), and a `static`/`async` member is labelled as such.
     while (m + 1 < hi and ctx.toks[m + 1].kind == .identifier and
         (ctx.identEql(m, "static") or ctx.identEql(m, "async") or
-            ctx.identEql(m, "get") or ctx.identEql(m, "set") or ctx.identEql(m, "readonly"))) m += 1;
+            ctx.identEql(m, "get") or ctx.identEql(m, "set") or ctx.identEql(m, "readonly"))) : (m += 1)
+    {
+        if (ctx.identEql(m, "static")) mods.is_static = true;
+        if (ctx.identEql(m, "async")) mods.is_async = true;
+        if (ctx.identEql(m, "get")) mods.getter = true;
+        if (ctx.identEql(m, "set")) mods.setter = true;
+    }
     if (m >= hi or ctx.toks[m].kind != .identifier) return start_i;
     const popen = jsSkipGenerics(ctx, m + 1, hi);
     if (!ctx.isPunct(popen, '(')) return start_i;
@@ -1715,6 +1733,7 @@ fn parseJsMember(ctx: *Ctx, start_i: u32, k: u32, hi: u32, parent: u32) !u32 {
         .sig_end = ctx.toks[body_open].start,
         .doc = collectDoc(ctx, start_i),
         .exported = false,
+        .modifiers = mods,
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
@@ -1752,9 +1771,20 @@ fn parsePython(ctx: *Ctx) !void {
     const hi: u32 = @intCast(ctx.toks.len - 1);
     var stack: std.ArrayList(PyScope) = .empty;
     defer stack.deinit(ctx.gpa);
+    // Modifiers accrued from `@decorator` lines pending the next `def` — cleared
+    // by any non-decorator statement so a decorator never leaks past its target.
+    var pending = Mods{};
     var i: u32 = 0;
     while (i < hi) : (i += 1) {
         if (!isLineStart(ctx, i) or ctx.toks[i].kind != .identifier) continue;
+        // A decorator line (`@property`, `@app.get("/x")`, `@x.setter`): the `@`
+        // is glued to the first identifier by the lexer. Record any modifier it
+        // implies and keep it pending for the following def.
+        const txt = ctx.textOf(i);
+        if (txt.len != 0 and txt[0] == '@') {
+            applyPyDecorator(ctx, i, &pending);
+            continue;
+        }
         const indent = ctx.toks[i].col;
         popPyScopes(&stack, indent);
         const enclosing: ?PyScope = if (stack.items.len != 0) stack.items[stack.items.len - 1] else null;
@@ -1762,18 +1792,54 @@ fn parsePython(ctx: *Ctx) !void {
         if (ctx.identEql(i, "def") or (ctx.identEql(i, "async") and i + 1 < hi and ctx.identEql(i + 1, "def"))) {
             const def_i = if (ctx.identEql(i, "async")) i + 1 else i;
             const is_method = if (enclosing) |e| e.is_class else false;
-            const idx = try parsePyDef(ctx, i, def_i, hi, if (is_method) parent else null, is_method);
+            var mods = pending;
+            mods.is_async = ctx.identEql(i, "async");
+            const idx = try parsePyDef(ctx, i, def_i, hi, if (is_method) parent else null, is_method, mods);
             if (idx != sentinel) try stack.append(ctx.gpa, .{ .indent = indent, .local_idx = idx, .is_class = false });
+            pending = .{};
         } else if (ctx.identEql(i, "class")) {
             const idx = try parsePyClass(ctx, i, hi, parent);
             if (idx != sentinel) try stack.append(ctx.gpa, .{ .indent = indent, .local_idx = idx, .is_class = true });
+            pending = .{};
         } else if (ctx.identEql(i, "import") or ctx.identEql(i, "from")) {
             try parsePyImport(ctx, i, hi);
+            pending = .{};
         } else if (isPyKeyword(ctx, i)) {
+            pending = .{};
             continue;
         } else {
+            pending = .{};
             const in_func = if (enclosing) |e| !e.is_class else false;
             if (!in_func) try tryPyAssign(ctx, i, hi, parent);
+        }
+    }
+}
+
+/// Fold the modifier a Python `@decorator` at token `i` implies into `pending`.
+/// Recognizes the accessor/dispatch decorators (`@property`, `@staticmethod`,
+/// `@classmethod`, `@abstractmethod`) in both bare (`@property`) and dotted
+/// (`@abc.abstractmethod`, `@value.setter`, `@functools.cached_property`) forms;
+/// unrecognized decorators (framework/route) leave `pending` untouched.
+fn applyPyDecorator(ctx: *const Ctx, i: u32, pending: *Mods) void {
+    const txt = ctx.textOf(i);
+    std.debug.assert(txt.len >= 1 and txt[0] == '@');
+    const head = txt[1..];
+    if (std.mem.eql(u8, head, "property") or std.mem.eql(u8, head, "cached_property")) {
+        pending.getter = true;
+    } else if (std.mem.eql(u8, head, "staticmethod")) {
+        pending.is_static = true;
+    } else if (std.mem.eql(u8, head, "classmethod")) {
+        pending.classmethod = true;
+    } else if (std.mem.eql(u8, head, "abstractmethod")) {
+        pending.abstract = true;
+    } else if (ctx.isPunct(i + 1, '.') and i + 2 < ctx.toks.len and ctx.toks[i + 2].kind == .identifier) {
+        const tail = ctx.textOf(i + 2);
+        if (std.mem.eql(u8, tail, "abstractmethod")) {
+            pending.abstract = true;
+        } else if (std.mem.eql(u8, tail, "setter")) {
+            pending.setter = true;
+        } else if (std.mem.eql(u8, tail, "cached_property") or std.mem.eql(u8, tail, "property")) {
+            pending.getter = true;
         }
     }
 }
@@ -1861,7 +1927,7 @@ fn pyBlockEnd(ctx: *const Ctx, def_i: u32, indent: u32, hi: u32) u32 {
     return hi;
 }
 
-fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_method: bool) !u32 {
+fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_method: bool, mods: Mods) !u32 {
     if (def_i + 1 >= hi or ctx.toks[def_i + 1].kind != .identifier) return sentinel;
     const name_i = def_i + 1;
     const indent = ctx.toks[start_i].col;
@@ -1885,6 +1951,7 @@ fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_met
         .sig_end = sig_end,
         .doc = collectDoc(ctx, start_i),
         .exported = ctx.source[ctx.toks[name_i].start] != '_',
+        .modifiers = mods,
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
@@ -1923,13 +1990,24 @@ fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
     }
     if (j >= hi or !ctx.isPunct(j, '=')) return;
     if (j + 1 < hi and ctx.isPunct(j + 1, '=')) return; // comparison ==
+    const first_line_end = lineEndOffset(ctx, ctx.toks[i].start);
+    // A bracketed multi-line initializer (`NAME = [ … ]` / `{ … }` / `( … )`)
+    // spans past line 1: capture the whole literal so `def NAME -v full` shows
+    // its contents (the value-resolution gap a trial hit on `GP_GROUPS`). The
+    // signature stays the first line, so the `sig` view still collapses to the
+    // head. Only a *direct* bracket literal extends — `NAME = f([…])` does not.
+    var span_end = first_line_end;
+    if (j + 1 < hi and (ctx.isPunct(j + 1, '[') or ctx.isPunct(j + 1, '{') or ctx.isPunct(j + 1, '('))) {
+        const close = ctx.close[j + 1];
+        if (close != sentinel and close < hi) span_end = @max(span_end, ctx.toks[close].end);
+    }
     _ = try emit(ctx, .{
         .name = ctx.textOf(i),
         .kind = if (parent != null) .field else .variable,
         .line = ctx.toks[i].line,
         .span_start = lineStartOffset(ctx, i),
-        .span_end = lineEndOffset(ctx, ctx.toks[i].start),
-        .sig_end = lineEndOffset(ctx, ctx.toks[i].start),
+        .span_end = span_end,
+        .sig_end = first_line_end,
         .doc = "",
         .exported = ctx.source[ctx.toks[i].start] != '_',
         .parent_local = parent,
@@ -2113,6 +2191,95 @@ test "js: expression-body arrow is a function and captures its calls" {
     try testing.expect(saw_status);
     // A call-free expression-body arrow is still recognized as a function.
     try testing.expectEqual(SymbolKind.function, findSym(out.items, "label").?.kind);
+}
+
+test "js: accessor and dispatch modifiers are captured (get/set/static/async)" {
+    const src =
+        \\class Store {
+        \\  get value() { return this._v; }
+        \\  set value(x) { this._v = x; }
+        \\  static make() { return new Store(); }
+        \\  async load() { return this.value; }
+        \\  plain() { return 1; }
+        \\}
+        \\async function boot() { return 1; }
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    // Two methods named `value` (getter + setter) share a name; distinguish by mod.
+    var saw_get = false;
+    var saw_set = false;
+    for (out.items) |s| {
+        if (!std.mem.eql(u8, s.name, "value")) continue;
+        if (s.modifiers.getter) saw_get = true;
+        if (s.modifiers.setter) saw_set = true;
+    }
+    try testing.expect(saw_get);
+    try testing.expect(saw_set);
+    try testing.expect(findSym(out.items, "make").?.modifiers.is_static);
+    try testing.expect(findSym(out.items, "load").?.modifiers.is_async);
+    try testing.expect(!findSym(out.items, "plain").?.modifiers.any());
+    try testing.expect(findSym(out.items, "boot").?.modifiers.is_async);
+}
+
+test "python: @property/@staticmethod/@classmethod/@x.setter/async def modifiers" {
+    const src =
+        \\class Api:
+        \\    @property
+        \\    def value(self):
+        \\        return self._v
+        \\    @value.setter
+        \\    def value(self, x):
+        \\        self._v = x
+        \\    @staticmethod
+        \\    def make():
+        \\        return 1
+        \\    @classmethod
+        \\    def build(cls):
+        \\        return 2
+        \\    async def load(self):
+        \\        return 3
+        \\    def plain(self):
+        \\        return 4
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    var saw_get = false;
+    var saw_set = false;
+    for (out.items) |s| {
+        if (!std.mem.eql(u8, s.name, "value")) continue;
+        if (s.modifiers.getter) saw_get = true;
+        if (s.modifiers.setter) saw_set = true;
+    }
+    try testing.expect(saw_get);
+    try testing.expect(saw_set);
+    try testing.expect(findSym(out.items, "make").?.modifiers.is_static);
+    try testing.expect(findSym(out.items, "build").?.modifiers.classmethod);
+    try testing.expect(findSym(out.items, "load").?.modifiers.is_async);
+    // A plain method carries no modifiers, and an unrecognized decorator does not
+    // leak onto the next def.
+    try testing.expect(!findSym(out.items, "plain").?.modifiers.any());
+}
+
+test "python: a multi-line list/dict initializer spans the whole literal" {
+    const src =
+        \\GP_GROUPS = [
+        \\    "stations",
+        \\    "visual",
+        \\]
+        \\def use():
+        \\    return GP_GROUPS
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const gp = findSym(out.items, "GP_GROUPS").?;
+    // The full definition body reaches the closing bracket (line 4), so `-v full`
+    // shows the literal's contents rather than truncating at line 1.
+    const body = src[gp.span_start..gp.span_end];
+    try testing.expect(std.mem.indexOf(u8, body, "stations") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "visual") != null);
+    // The signature stays the first line (so the collapsed `sig` view is short).
+    try testing.expect(std.mem.indexOf(u8, src[gp.span_start..gp.sig_end], "stations") == null);
 }
 
 test "python: f-string interpolation exposes the calls inside it" {

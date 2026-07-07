@@ -11,6 +11,8 @@ const model = @import("model.zig");
 const index_mod = @import("index.zig");
 const render = @import("render.zig");
 const query = @import("query.zig");
+const lexer = @import("lexer.zig");
+const language = @import("language.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -93,21 +95,62 @@ pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Opti
     outer: for (idx.graph.symbols) |sym| {
         for (sym.refs) |ref| {
             if (std.mem.indexOf(u8, ref.name, pattern) == null) continue;
+            // One object per distinct use-site line (mirrors the text renderer).
+            if (ref.lines.len > 1) {
+                for (ref.lines) |ln| {
+                    if (shown != 0) try w.writeByte(',');
+                    try refObject(w, idx, sym, ref, ln);
+                    shown += 1;
+                    if (shown >= opts.limit) break :outer;
+                }
+            } else {
+                if (shown != 0) try w.writeByte(',');
+                try refObject(w, idx, sym, ref, ref.line);
+                shown += 1;
+                if (shown >= opts.limit) break :outer;
+            }
+        }
+    }
+    try w.writeAll("]\n");
+}
+
+fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, line: u32) !void {
+    try w.writeAll("{\"name\":");
+    try writeString(w, ref.name);
+    try w.writeAll(",\"file\":");
+    try writeString(w, idx.graph.files[sym.file].path);
+    try w.print(",\"line\":{d},\"in\":", .{line});
+    try writeString(w, sym.name);
+    if (ref.qualifier.len != 0) {
+        try w.writeAll(",\"qualifier\":");
+        try writeString(w, ref.qualifier);
+    }
+    if (ref.target != invalid) {
+        try w.writeAll(",\"target\":");
+        try writeString(w, idx.graph.files[idx.graph.symbols[ref.target].file].path);
+    }
+    try w.writeByte('}');
+}
+
+/// `strings --json`: array of `{file, line, text}` string-literal matches.
+pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+    std.debug.assert(pattern.len > 0);
+    var toks: std.ArrayList(lexer.Token) = .empty;
+    defer toks.deinit(idx.gpa);
+    var shown: u32 = 0;
+    try w.writeByte('[');
+    outer: for (idx.graph.files) |file| {
+        toks.clearRetainingCapacity();
+        lexer.tokenize(idx.gpa, file.text, language.configFor(file.language), &toks) catch continue;
+        for (toks.items) |t| {
+            if (t.kind != .string) continue;
+            const s = t.text(file.text);
+            if (std.mem.indexOf(u8, s, pattern) == null) continue;
             if (shown != 0) try w.writeByte(',');
-            try w.writeAll("{\"name\":");
-            try writeString(w, ref.name);
-            try w.writeAll(",\"file\":");
-            try writeString(w, idx.graph.files[sym.file].path);
-            try w.print(",\"line\":{d},\"in\":", .{ref.line});
-            try writeString(w, sym.name);
-            if (ref.qualifier.len != 0) {
-                try w.writeAll(",\"qualifier\":");
-                try writeString(w, ref.qualifier);
-            }
-            if (ref.target != invalid) {
-                try w.writeAll(",\"target\":");
-                try writeString(w, idx.graph.files[idx.graph.symbols[ref.target].file].path);
-            }
+            try w.writeAll("{\"file\":");
+            try writeString(w, file.path);
+            try w.print(",\"line\":{d},\"text\":", .{t.line});
+            try writeCollapsedString(w, s, 200);
             try w.writeByte('}');
             shown += 1;
             if (shown >= opts.limit) break :outer;
@@ -467,6 +510,31 @@ fn nodeHead(w: *Writer, idx: *const Index, sym: Symbol) !void {
     try writeString(w, idx.graph.files[sym.file].path);
     const source = idx.graph.files[sym.file].text;
     try w.print(",\"line\":{d},\"line_end\":{d}", .{ sym.line, sym.endLine(source) });
+    try writeModifiers(w, sym);
+}
+
+/// Emit `,"modifiers":[...]` (accessor/dispatch/async) when any are set; the
+/// `kind` field stays the base kind so consumers can rely on it.
+fn writeModifiers(w: *Writer, sym: Symbol) !void {
+    const m = sym.modifiers;
+    if (!m.any()) return;
+    try w.writeAll(",\"modifiers\":[");
+    var first = true;
+    if (m.is_static) try modItem(w, &first, "static");
+    if (m.is_async) try modItem(w, &first, "async");
+    if (m.getter) try modItem(w, &first, "getter");
+    if (m.setter) try modItem(w, &first, "setter");
+    if (m.classmethod) try modItem(w, &first, "classmethod");
+    if (m.abstract) try modItem(w, &first, "abstract");
+    try w.writeByte(']');
+}
+
+fn modItem(w: *Writer, first: *bool, name: []const u8) !void {
+    if (!first.*) try w.writeByte(',');
+    first.* = false;
+    try w.writeByte('"');
+    try w.writeAll(name);
+    try w.writeByte('"');
 }
 
 /// A full symbol object; fields grow with verbosity (sig, then doc, then body).
@@ -593,6 +661,46 @@ test "json output is well-formed and escapes control characters" {
     const def_out = daw.written();
     try testing.expect(std.mem.indexOf(u8, def_out, "\\\"safely\\\"") != null);
     try testing.expect(balancedBrackets(def_out));
+}
+
+test "json carries modifiers and the strings verb is well-formed" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.ts", .data =
+        \\export class Store {
+        \\  get value(): number { return 1; }
+        \\  async load() { return fetch("/api/health"); }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // `def value -j`: kind stays "method"; modifiers carries "getter".
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "value", .{ .format = .json });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"method\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"modifiers\":[\"getter\"]") != null);
+        try testing.expect(balancedBrackets(out));
+    }
+    { // `strings /api -j`: a `{file,line,text}` array.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try strings(&aw.writer, &idx, "/api/health", .{ .format = .json });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "\"text\":\"\\\"/api/health\\\"\"") != null);
+        try testing.expect(balancedBrackets(out));
+    }
 }
 
 /// Cheap structural check: every `[`/`{` is closed, ignoring string contents.

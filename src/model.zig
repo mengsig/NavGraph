@@ -66,6 +66,29 @@ pub const RefKind = enum {
     route_call,
 };
 
+/// Definition modifiers that refine a symbol without changing its `kind`:
+/// accessor role (getter/setter), dispatch (static/classmethod), async-ness and
+/// abstractness. Deliberately language-agnostic — JS/TS `get`/`set`/`static`/
+/// `async`, Python `@property`/`@staticmethod`/`@classmethod`/`@abstractmethod`
+/// and `async def`, C++ `static`/`virtual`. Rendered as words before the kind
+/// tag (`async fn run`, `static get x`) so an agent isn't misled into reading a
+/// getter as a plain method; the `kind` itself is untouched, so `-k` filtering
+/// and graph semantics are unaffected. Serialized as a single byte.
+pub const Mods = packed struct(u8) {
+    is_static: bool = false,
+    is_async: bool = false,
+    getter: bool = false,
+    setter: bool = false,
+    classmethod: bool = false,
+    abstract: bool = false,
+    _pad: u2 = 0,
+
+    /// Whether any modifier is set (nothing to render otherwise).
+    pub fn any(self: Mods) bool {
+        return @as(u8, @bitCast(self)) != 0;
+    }
+};
+
 /// A use of some name inside a symbol's body. `target` is filled during
 /// resolution (`invalid_symbol` when unresolved / external).
 pub const Reference = struct {
@@ -116,6 +139,9 @@ pub const Symbol = struct {
     parent: SymbolId,
     /// True when the definition is exported/public.
     exported: bool,
+    /// Accessor/dispatch/async modifiers (see `Mods`). Refines how the symbol is
+    /// displayed without altering `kind`.
+    modifiers: Mods = .{},
     /// Outgoing references collected from the body.
     refs: []Reference,
     /// Local variable -> type-name bindings discovered in the body.

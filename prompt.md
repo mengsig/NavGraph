@@ -26,8 +26,13 @@ directly from its output — no `Read` step.
 - **Change a function/method/class:**
   `navgraph def <name> -v full` → copy the exact snippet you want to change into
   `Edit`'s `old_string` → write `new_string`. The body is verbatim, so the match
-  is reliable. (Ignore the one-line `kind name  path:line` header and any
-  trailing blank line — your `old_string` is a snippet from inside the body.)
+  is reliable. **Leading decorators/attributes are included** (a Python
+  `@property`/FastAPI handler shows its decorators, a TS `@Component` its
+  annotation), so the snippet is a complete, paste-ready target. A `const`/`var`
+  bound to a multi-line array/dict/object literal shows the **whole literal**, so
+  `def GP_GROUPS -v full` resolves its contents. (Ignore the one-line `kind name
+  path:line` header and any trailing blank line — your `old_string` is a snippet
+  from inside the body.)
 
 - **Change how/where something is called** (edit each call site):
   `navgraph callers <name>` lists every **enclosing function** that calls it,
@@ -42,10 +47,18 @@ directly from its output — no `Read` step.
 
 When you genuinely need raw text NavGraph can't attribute to a symbol (module
 top-level statements, config, comments, a specific arbitrary line), use
-`navgraph read <file>` — it prints numbered source lines, and `read <file:A-B>`
-prints just that range. It works on **any** file, including config and files in
-skipped dirs (it falls back to a disk read), so you can stay in NavGraph instead
-of switching to `Read` for non-symbol text. See **Blind spots** below.
+`navgraph read <file>` — it prints numbered source lines. `read <file:A-B>`
+prints one range, and `read <file:A-B,C-D>` **several disjoint ranges** in one
+call (a `⋯` marks each gap). It works on **any** file, including config and
+files in skipped dirs (it falls back to a disk read), so you can stay in
+NavGraph instead of switching to `Read` for non-symbol text.
+
+To find **text inside string literals** — a URL/route, a log or error message, a
+regex source, a config key, a feature-flag name — use `navgraph strings
+<pattern>`. It matches only inside string tokens across every language (so a hit
+is never an identifier that merely shares the text), printing `path:line: <the
+literal>`. This is the verb for the content the symbol graph can't index. See
+**Blind spots** below.
 
 ## Reading locations
 
@@ -71,6 +84,15 @@ Three trust tiers, so you know when to double-check:
 `exact` (unmarked) → trust · `?` → verify or `-s` · `~ ext:` → NavGraph can't
 see it, use `grep`/`Read`.
 
+**Modifiers.** A symbol's kind field carries accessor/dispatch/async modifiers so
+you don't misread it: a getter renders as `get x` and a setter as `set x` (not a
+bare `method x`), and `static`/`async`/`classmethod`/`abstract` prefix the tag
+(`async fn boot`, `static get make`, `classmethod method build`). These come from
+JS/TS `get`/`set`/`static`/`async`, Python `@property`/`@staticmethod`/
+`@classmethod`/`@abstractmethod` and `async def`. The underlying `kind` is
+unchanged, so `-k method` still matches a getter and the JSON `kind` is stable
+(modifiers appear in a separate JSON `modifiers` array).
+
 When a `calls`/`callers` tree contains any `?` edges it ends with a one-line
 footer telling you how many and reminding you to re-run with `-s` to drop them —
 so you never have to eyeball a large tree to decide whether it's fully trusted.
@@ -88,10 +110,13 @@ Two views are built to be trustworthy at repo scale:
   JSX, module scope, or a partially-parsed body still keeps a symbol off the
   list; a name only in an `import`/`export`/`module.exports` list is a *mention*,
   not a use (a re-exported-but-uncalled function IS reported; an `X as Y` rename
-  counts as a use of `X`). A symbol reached **only from tests** — a separate
-  test file, **or (in Zig) an inline `test {}` block in the same production
-  file** — is reported and annotated `(only used by tests)`, the real cleanup
-  target, separately from truly-unreferenced code. Decorated definitions,
+  counts as a use of `X`). A symbol reached **only from tests** is reported and
+  annotated `(only used by tests)`, the real cleanup target, separately from
+  truly-unreferenced code. Test scope is recognized across languages by file
+  convention (`test_*.py`, `*.test.ts`, `*_test.zig`, `*_test.cc`, …), by
+  **directory** (`tests/`, `__tests__/`, `spec/`, `e2e/` — so a plainly-named
+  helper under a test dir counts too), and — in Zig — by an inline `test {}`
+  block in the same production file. Decorated definitions,
   dunder/`constructor` methods, and `main` are treated as invoked.
   It won't flag production-live code; the cost is recall (a dead name colliding
   with a live one is skipped). Framework entry points reached only by reflection
@@ -110,13 +135,14 @@ Two views are built to be trustworthy at repo scale:
 | Callees **and** callers of X in one view            | `navgraph neighbors <name>` |
 | The load-bearing symbols (rank by fan-in/out)       | `navgraph hot [path]` |
 | Find a symbol by name fragment                      | `navgraph search <fragment>` |
-| Find **use sites** of a name (structural grep)      | `navgraph search <fragment> --refs` |
+| Find **use sites** of a name (every site, structural)| `navgraph search <fragment> --refs` |
+| Find text **inside string literals** (URLs, logs, regexes) | `navgraph strings <pattern>` |
 | The HTTP API surface + who calls each endpoint      | `navgraph routes [filter]` |
 | Possible dead code (functions with no callers)      | `navgraph unused [filter]` |
 | What a file imports / who imports a file            | `navgraph imports [filter]` · `navgraph importers <file>` |
 | Shortest call path from A to B                      | `navgraph path <A> <B>` |
 | **Every indexed file + its symbol count** (coverage)| `navgraph files [filter]` |
-| **Raw source lines** of any file (non-symbol text)  | `navgraph read <file[:A-B]>` |
+| **Raw source lines** of any file (non-symbol text)  | `navgraph read <file[:A-B[,C-D]]>` |
 
 ## Flags
 
@@ -128,8 +154,10 @@ Flags come **after** the command (`navgraph outline src -v full`, not
 - `-d N` — call-graph depth for `calls`/`callers` (default `1`).
 - `-k, --kind k1,k2` — restrict `outline`/`search` to kinds (`fn`, `method`,
   `class`, `struct`, `route`, …).
-- `-r, --refs` — for `search`, match **use sites**, not just definition names;
-  for `calls`/`neighbors`, **also include data reads** (a `var`/`const`/`field`
+- `-r, --refs` — for `search`, match **use sites** (every distinct use-site
+  line, not just definition names — a name used on several lines in one caller
+  lists each site); for `calls`/`neighbors`, **also include data reads** (a
+  `var`/`const`/`field`
   the symbol reads). By default the callee view shows only calls and type
   dependencies — a `const LIMIT` or module `var` a function merely reads is
   hidden as dependency noise. Use `--refs` when you want those data edges too.
@@ -201,10 +229,13 @@ should be gitignored (`.navgraph/`).
 
 NavGraph is honest about what it can't see; reach for `grep`/`Read` for:
 
-- **Non-symbol text:** string literals, config, comments, TODOs, log messages.
+- **String-literal content** (URLs, log/error text, regexes) is searchable with
+  `navgraph strings <pattern>`; for **comments, TODOs and config** use `navgraph
+  read`/`grep`.
 - **Module top-level statements:** references made outside any function body
-  (e.g. a TS `const client = new ApiClient()` at module scope) are not attributed
-  to a caller, so `callers`/`search --refs` can miss them.
+  (e.g. a TS `const client = new ApiClient()` at module scope, or a
+  `for (const url of urls) fetch(url)` loop) are not attributed to a caller, so
+  `callers`/`search --refs` can miss them — `grep`/`Read` for those.
 - **Barrel / re-export chains:** `export { X } from './x'` indirection is not
   followed transitively, so `importers`/edges can under-report consumers that
   import through an `index.ts` barrel.

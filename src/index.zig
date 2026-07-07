@@ -311,6 +311,7 @@ fn appendFile(
             .doc = p.doc,
             .parent = parent,
             .exported = p.exported,
+            .modifiers = p.modifiers,
             .refs = p.refs,
             .bindings = p.bindings,
             .import_path = p.import_path,

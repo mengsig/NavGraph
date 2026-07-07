@@ -8,7 +8,7 @@ const render = @import("render.zig");
 pub const Command = enum {
     outline, def, calls, callers, search, routes,
     neighbors, unused, imports, importers, path, hot,
-    files, read, help,
+    files, read, strings, help,
 };
 
 pub const Parsed = struct {
@@ -46,7 +46,8 @@ const usage_text =
     \\  path <A> <B>       Shortest call path from <A> to <B>
     \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
     \\  files [filter]     List every indexed file + its symbol count (index coverage)
-    \\  read <file[:A-B]>  Print raw source lines (numbered) — non-symbol text escape hatch
+    \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
+    \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -129,6 +130,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "hot", Command.hot },         .{ "central", Command.hot },
         .{ "files", Command.files },     .{ "manifest", Command.files },
         .{ "read", Command.read },       .{ "cat", Command.read },
+        .{ "strings", Command.strings }, .{ "str", Command.strings },
+        .{ "literals", Command.strings },
 
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },

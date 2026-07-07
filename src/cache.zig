@@ -133,6 +133,7 @@ fn skipSymbol(cur: *Cursor) !void {
     var f: u32 = 0;
     while (f < 5) : (f += 1) _ = try cur.getU32(); // line, span_start, span_end, sig_end, parent_local
     _ = try cur.getU8(); // exported
+    _ = try cur.getU8(); // modifiers
     _ = try cur.getStr(); // doc
     _ = try cur.getStr(); // import_path
     const ref_count = try cur.getU32();
@@ -178,6 +179,7 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
     const sig_end = try cur.getU32();
     const parent_raw = try cur.getU32();
     const exported = (try cur.getU8()) != 0;
+    const modifiers: model.Mods = @bitCast(try cur.getU8());
     const doc = try arena.dupe(u8, try cur.getStr());
     const import_path = try arena.dupe(u8, try cur.getStr());
     std.debug.assert(span_start <= sig_end and sig_end <= span_end);
@@ -190,6 +192,7 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
         .sig_end = sig_end,
         .doc = doc,
         .exported = exported,
+        .modifiers = modifiers,
         .parent_local = if (parent_raw == invalid_local) null else parent_raw,
         .refs = try readRefs(arena, cur),
         .bindings = try readBindings(arena, cur),
@@ -289,6 +292,7 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
     try putU32(gpa, buf, sym.sig_end);
     try putU32(gpa, buf, localParent(sym, base));
     try buf.append(gpa, @intFromBool(sym.exported));
+    try buf.append(gpa, @as(u8, @bitCast(sym.modifiers)));
     try putStr(gpa, buf, sym.doc);
     try putStr(gpa, buf, sym.import_path);
     try putU32(gpa, buf, @intCast(sym.refs.len));
@@ -476,6 +480,7 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
         .doc = p.doc,
         .parent = if (p.parent_local) |pl| pl else model.invalid_symbol,
         .exported = p.exported,
+        .modifiers = p.modifiers,
         .refs = p.refs,
         .bindings = p.bindings,
     };

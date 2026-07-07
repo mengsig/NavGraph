@@ -76,8 +76,7 @@ pub fn symbolSite(
     exact: bool,
 ) !void {
     try writeIndent(w, indent);
-    try w.writeAll(sym.kind.tag());
-    try w.writeByte(' ');
+    try writeKind(w, sym);
     try writeQualifiedName(w, idx, sym);
 
     const source = idx.graph.files[sym.file].text;
@@ -122,6 +121,28 @@ fn writeSiteLines(w: *Writer, lines: []const u32) !void {
 fn writeIndent(w: *Writer, indent: usize) !void {
     var i: usize = 0;
     while (i < indent) : (i += 1) try w.writeAll("  ");
+}
+
+/// Write the leading `[modifiers ]<tag> ` field for a symbol. Modifiers surface
+/// accessor/dispatch/async-ness (`async fn run`, `static get x`, `classmethod
+/// method of`) so an agent isn't misled into reading a getter as a plain method
+/// — the false-bug-report a trial hit on `_field`. Accessors replace the tag
+/// with `get`/`set`; other modifiers prefix it. `kind` is untouched, so `-k`
+/// filtering and the JSON `kind` stay stable.
+fn writeKind(w: *Writer, sym: Symbol) !void {
+    const m = sym.modifiers;
+    if (m.is_static) try w.writeAll("static ");
+    if (m.classmethod) try w.writeAll("classmethod ");
+    if (m.abstract) try w.writeAll("abstract ");
+    if (m.is_async) try w.writeAll("async ");
+    if (m.getter) {
+        try w.writeAll("get");
+    } else if (m.setter) {
+        try w.writeAll("set");
+    } else {
+        try w.writeAll(sym.kind.tag());
+    }
+    try w.writeByte(' ');
 }
 
 fn writeQualifiedName(w: *Writer, idx: *const Index, sym: Symbol) !void {
@@ -220,8 +241,32 @@ fn writeDocLine(w: *Writer, sym: Symbol, indent: usize) !void {
 
 fn writeFullBody(w: *Writer, sym: Symbol, source: []const u8, indent: usize) !void {
     _ = indent;
-    try w.writeAll(sym.body(source));
+    // Include any leading `@decorator` / attribute lines so `-v full` is a
+    // complete, paste-ready Edit target — a Python `@property`/FastAPI handler
+    // carries its decorators, a TS `@Component` its annotation. The parser
+    // deliberately excludes these from the span (to keep `line`/`endLine` on the
+    // definition itself), so widen the printed slice here.
+    const start = decoratorStart(source, sym.span_start);
+    try w.writeAll(source[start..sym.span_end]);
     try w.writeByte('\n');
+}
+
+/// Walk upward from `span_start` over a contiguous run of decorator/attribute
+/// lines (a line whose first non-blank byte is `@`), returning the offset where
+/// the definition-with-decorators begins. A blank or non-decorator line stops
+/// the run.
+fn decoratorStart(source: []const u8, span_start: u32) u32 {
+    var start = span_start;
+    while (start > 0 and source[start - 1] != '\n') start -= 1; // start of span's own line
+    while (start > 0) {
+        const prev_nl = start - 1; // the '\n' terminating the previous line
+        var ls = prev_nl;
+        while (ls > 0 and source[ls - 1] != '\n') ls -= 1; // start of previous line
+        var i = ls;
+        while (i < prev_nl and (source[i] == ' ' or source[i] == '\t')) i += 1;
+        if (i < prev_nl and source[i] == '@') start = ls else break;
+    }
+    return start;
 }
 
 /// Strip leading comment/docstring markers from a raw doc slice.
