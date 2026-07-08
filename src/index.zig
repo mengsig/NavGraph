@@ -1253,3 +1253,200 @@ test "a bare read of a local variable is not bound to a same-named global" {
     const cand_fn = idx.lookup("candidates")[0];
     try testing.expectEqual(@as(usize, 0), idx.callersOf(cand_fn).len);
 }
+
+test "go: a call resolves across files within the Go family" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "store.go", .data = 
+        \\package app
+        \\func Save(x int) int { return x }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "handler.go", .data = 
+        \\package app
+        \\func Handle() int { return Save(1) }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const save = idx.lookup("Save")[0];
+    const handle = idx.lookup("Handle")[0];
+    // The cross-file `Save(1)` call resolves and shows Handle as a caller.
+    try testing.expectEqual(handle, idx.callersOf(save)[0]);
+}
+
+test "rust: a call resolves by name across files within the Rust family" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.rs", .data = 
+        \\pub fn parse(s: &str) -> u32 { 0 }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.rs", .data = 
+        \\mod util;
+        \\pub fn run() -> u32 { parse("x") }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const parse = idx.lookup("parse")[0];
+    const run = idx.lookup("run")[0];
+    try testing.expectEqual(run, idx.callersOf(parse)[0]);
+    // `mod util;` resolved to util.rs as an import dependency.
+    const main_file = idx.graph.symbols[run].file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+}
+
+test "ruby: require_relative resolves and a cross-file call links within the Ruby family" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.rb", .data = 
+        \\def helper(x)
+        \\  x + 1
+        \\end
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.rb", .data = 
+        \\require_relative "util"
+        \\def run
+        \\  helper(1)
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const helper = idx.lookup("helper")[0];
+    const run = idx.lookup("run")[0];
+    // The `helper(1)` call resolves to util.rb's top-level def.
+    try testing.expectEqual(run, idx.callersOf(helper)[0]);
+    // require_relative bound main.rb → util.rb as an import.
+    const main_file = idx.graph.symbols[run].file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+}
+
+test "cross-language: a Go and a Python function sharing a name stay isolated" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.go", .data = 
+        \\package app
+        \\func Process() int { return 1 }
+        \\func Run() int { return Process() }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data = 
+        \\def Process():
+        \\    return 2
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Both `Process` definitions exist under one name.
+    try testing.expectEqual(@as(usize, 2), idx.lookup("Process").len);
+    const go_process = qualifiedFileSym(&idx, "svc.go", "Process").?;
+    const py_process = qualifiedFileSym(&idx, "svc.py", "Process").?;
+    const run = idx.lookup("Run")[0];
+
+    // The Go `Run` links only to the Go `Process`; the Python one has no callers.
+    try testing.expectEqual(run, idx.callersOf(go_process)[0]);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(py_process).len);
+}
+
+test "cross-language: Rust and Go definitions with the same name do not cross-link" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.rs", .data = 
+        \\pub fn encode() -> u32 { helper() }
+        \\pub fn helper() -> u32 { 1 }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "enc.go", .data = 
+        \\package app
+        \\func helper() int { return 2 }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const rs_helper = qualifiedFileSym(&idx, "lib.rs", "helper").?;
+    const go_helper = qualifiedFileSym(&idx, "enc.go", "helper").?;
+    const encode = idx.lookup("encode")[0];
+    // The Rust `encode` calls the Rust `helper`, never the Go one.
+    try testing.expectEqual(encode, idx.callersOf(rs_helper)[0]);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(go_helper).len);
+}
+
+test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within families" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Each language defines and calls its own `compute`; none may bleed.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.go", .data = 
+        \\package app
+        \\func compute() int { return 1 }
+        \\func GoRun() int { return compute() }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.rs", .data = 
+        \\fn compute() -> u32 { 1 }
+        \\pub fn rs_run() -> u32 { compute() }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.rb", .data = 
+        \\def compute
+        \\  1
+        \\end
+        \\def rb_run
+        \\  compute()
+        \\end
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.py", .data = 
+        \\def compute():
+        \\    return 1
+        \\def py_run():
+        \\    return compute()
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Four distinct `compute` definitions, each with exactly one caller from its
+    // own language.
+    try testing.expectEqual(@as(usize, 4), idx.lookup("compute").len);
+    inline for (.{
+        .{ "a.go", "GoRun" },
+        .{ "b.rs", "rs_run" },
+        .{ "c.rb", "rb_run" },
+        .{ "d.py", "py_run" },
+    }) |c| {
+        const compute = qualifiedFileSym(&idx, c[0], "compute").?;
+        const callers = idx.callersOf(compute);
+        try testing.expectEqual(@as(usize, 1), callers.len);
+        try testing.expectEqualStrings(c[1], idx.graph.symbols[callers[0]].name);
+    }
+}
