@@ -81,12 +81,10 @@ pub const Options = struct {
     /// Restrict `outline`/`search` to symbols whose kind tag is in this
     /// comma-separated set (e.g. "fn,method"). Empty means all kinds.
     kinds: []const u8 = "",
-    /// `unused`: drop exported symbols (they may be public API, not dead code).
+    /// `unused --no-public`: drop exported symbols (they may be public API, not
+    /// dead code). The test axis (whether test usage counts / test code is in
+    /// scope) is the unified `tests` selector above, not a separate flag.
     unused_skip_exported: bool = false,
-    /// `unused`: drop symbols referenced only from tests (they are used — by
-    /// tests). Passing both `unused_skip_*` flags leaves only the symbols
-    /// referenced nowhere: the "actually unused" set.
-    unused_skip_test_only: bool = false,
     /// `unused`: disambiguate same-named symbols by import reachability instead of
     /// the (safe) family-wide name tally. Surfaces dead code masked by a used
     /// same-name twin in another package, at the cost of depending on import
@@ -1370,24 +1368,16 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     defer refs.deinit();
     if (opts.unused_follow_imports) refs.scope = try buildCollisionScope(idx);
     var shown: u32 = 0;
-    var hidden_test: u32 = 0;
     var hidden_exported: u32 = 0;
     for (idx.graph.symbols) |sym| {
-        if (!try isDeadCandidate(idx, sym, filter, &refs)) continue;
+        if (!try isDeadCandidateScoped(idx, sym, filter, &refs, opts.tests)) continue;
         if (!deadCandidateShown(idx, sym, opts, &refs)) {
-            // Attribute the suppression to the flag that hid it (test-only takes
-            // precedence, matching deadCandidateShown's order) so the note below
-            // can nudge a re-run without that flag.
-            if (opts.unused_skip_test_only and refs.testsContains(familyOf(idx, sym), sym.name)) {
-                hidden_test += 1;
-            } else if (opts.unused_skip_exported and sym.exported) {
-                hidden_exported += 1;
-            }
+            hidden_exported += 1; // only `--no-public` hides a candidate now
             continue;
         }
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
-        // A name reached only from tests is a genuine cleanup target (no
-        // application caller) — flag it as such; otherwise note public API.
+        // Under `--no-tests` a name reached only from tests is a genuine cleanup
+        // target with no application caller — flag it; otherwise note public API.
         if (refs.testsContains(familyOf(idx, sym), sym.name)) {
             try w.writeAll("  (only used by tests)\n");
         } else if (sym.exported) {
@@ -1404,9 +1394,6 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     }
     if (hidden_exported > 0) {
         try w.print("  ({d} exported symbol(s) hidden by --no-public — re-run without it to audit public API)\n", .{hidden_exported});
-    }
-    if (hidden_test > 0) {
-        try w.print("  ({d} test-only symbol(s) hidden by --no-test)\n", .{hidden_test});
     }
     try truncationNote(w, opts, shown);
 }
@@ -1948,40 +1935,63 @@ fn isReportableDeadKind(kind: model.SymbolKind) bool {
     };
 }
 
-/// A symbol worth reporting as possibly-unused: a callable or type-like
-/// definition, in-scope of the filter, not an obvious entry point, and not used
-/// by any *production* code. A test-only-used symbol still qualifies (it's a real
-/// cleanup target) — the caller distinguishes it via `refs.tests`. `refs` is
-/// `buildReferencedNames`.
-pub fn isDeadCandidate(
+/// A symbol worth reporting as possibly-unused under the given test `scope`:
+///   `with`    — dead in the whole graph (used by neither production nor tests);
+///               test code itself is never a candidate (its blocks are entry
+///               points). This is `unused`'s default: "what is truly dead".
+///   `without` — dead in production only (test usage ignored, so a test-only-used
+///               symbol surfaces — annotated by the caller); test code is not a
+///               candidate.
+///   `only`    — a dead *test helper*: a symbol in test code that nothing calls
+///               (test entry points — `test` blocks and `test_*` — are excluded).
+/// Always excludes obvious entry points (`main`, dunders, `constructor`, pytest
+/// `test_*`, decorated functions/methods). `refs` is `buildReferencedNames`.
+pub fn isDeadCandidateScoped(
     idx: *const Index,
     sym: model.Symbol,
     filter: []const u8,
     refs: *const RefSets,
+    scope: TestScope,
 ) !bool {
     if (!isReportableDeadKind(sym.kind)) return false;
     if (std.mem.eql(u8, sym.name, "main")) return false;
-    // Framework/entry-point callables are invoked implicitly, never by name, so
-    // they always look "dead": dunder methods (`__init__`, `__call__`), a JS/TS
-    // `constructor` (invoked by `new`), pytest test functions, and everything in
-    // test/conftest files (tests + fixtures).
+    // Framework/entry-point callables are invoked implicitly, never by name:
+    // dunder methods (`__init__`), a JS/TS `constructor` (`new`), pytest `test_*`.
     if (isDunder(sym.name)) return false;
     if (std.mem.eql(u8, sym.name, "constructor")) return false;
     if (std.mem.startsWith(u8, sym.name, "test_")) return false;
     // A decorated *function/method* is wired in by the decorator, not called by
-    // name (`@field_validator`, `@app.on_event`, `@pytest.fixture`,
-    // `@abstractmethod`) — treat it like a route handler: invoked, just not at a
-    // visible call site. A decorated *class* (`@dataclass`, `@final`) is NOT
-    // framework-invoked — it's still referenced by name when used — so a dead one
-    // (e.g. an unused dataclass) should still be reported.
+    // name (`@app.on_event`, `@pytest.fixture`) — treat it like a route handler.
+    // A decorated *class* (`@dataclass`) IS referenced by name, so a dead one is
+    // still reported.
     if ((sym.kind == .function or sym.kind == .method) and precededByDecorator(idx, sym)) return false;
-    // Used somewhere → live. Reporting a live symbol as dead is the false positive
-    // that costs trust. A name used *only* from tests is NOT excluded here — it
-    // surfaces as a cleanup candidate, annotated.
-    if (try symbolUsed(idx, sym, refs)) return false;
-    const path = idx.graph.files[sym.file].path;
-    if (isTestPath(path)) return false;
-    return matchesFilter(path, filter);
+    const is_test = isTestSymbol(idx, sym);
+    if (scope == .only) {
+        // Dead *test* code: a test-scope symbol (helper) that nothing references.
+        // Uses the resolved graph — which now counts `test` blocks as callers —
+        // rather than the name-tally, whose test bucket includes a symbol's own
+        // definition (test-file defs are not subtracted).
+        if (!is_test) return false;
+        if (idx.callersOf(sym.id).len != 0) return false;
+        return matchesFilter(idx.graph.files[sym.file].path, filter);
+    }
+    // with/without: only production code is a candidate.
+    if (is_test) return false;
+    // Usage via the safe name-tally: `without` ignores test usage; `with` counts
+    // it (a symbol a test uses is not dead). A false "dead" report costs trust.
+    const used = switch (scope) {
+        .without => try symbolUsed(idx, sym, refs),
+        .with => (try symbolUsed(idx, sym, refs)) or refs.testsContains(familyOf(idx, sym), sym.name),
+        .only => unreachable,
+    };
+    if (used) return false;
+    return matchesFilter(idx.graph.files[sym.file].path, filter);
+}
+
+/// `isDeadCandidateScoped` with the production-focused (`without`) scope — the
+/// stable 4-arg form used by callers/tests that predate the `--tests` selector.
+pub fn isDeadCandidate(idx: *const Index, sym: model.Symbol, filter: []const u8, refs: *const RefSets) !bool {
+    return isDeadCandidateScoped(idx, sym, filter, refs, .without);
 }
 
 /// Whether `sym` counts as used. By default this is the safe family-wide name
@@ -1996,17 +2006,17 @@ fn symbolUsed(idx: *const Index, sym: model.Symbol, refs: *const RefSets) !bool 
     return refs.prodContains(fam, sym.name);
 }
 
-/// Apply the `unused` visibility filters to a symbol already known to be a dead
-/// candidate. `unused_skip_test_only` drops names referenced only from tests (a
-/// real use, just not production); `unused_skip_exported` drops exported symbols
-/// (possible public API). With both set, only symbols referenced nowhere survive
-/// — the "actually unused" set. `refs` is `buildReferencedNames`.
+/// Apply the `unused` visibility filter to a symbol already known to be a dead
+/// candidate: `--no-public` (`unused_skip_exported`) drops exported symbols, which
+/// may be public API rather than dead. The test axis is handled upstream by the
+/// `--tests` scope in `isDeadCandidateScoped`. `refs` is unused here (kept for a
+/// stable signature).
 pub fn deadCandidateShown(idx: *const Index, sym: model.Symbol, opts: Options, refs: *const RefSets) bool {
+    _ = idx;
+    _ = refs;
     std.debug.assert(isReportableDeadKind(sym.kind));
     std.debug.assert(sym.name.len != 0);
-    if (opts.unused_skip_test_only and refs.testsContains(familyOf(idx, sym), sym.name)) return false;
-    if (opts.unused_skip_exported and sym.exported) return false;
-    return true;
+    return !(opts.unused_skip_exported and sym.exported);
 }
 
 /// A `__dunder__` name (implicitly invoked by the language/runtime).
@@ -2883,7 +2893,9 @@ test "unused: used-only-from-tests is flagged and annotated; production use is n
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    // `--no-tests` is the production-focused view: test usage does not count, so a
+    // test-only-used symbol surfaces, annotated.
+    try unused(&aw.writer, &idx, "", .{ .tests = .without });
     const out = aw.written();
     // Used in production → not reported.
     try testing.expect(std.mem.indexOf(u8, out, "prod_used") == null);
@@ -2892,6 +2904,53 @@ test "unused: used-only-from-tests is flagged and annotated; production use is n
     try testing.expect(std.mem.indexOf(u8, out, "only used by tests") != null);
     // Referenced nowhere → reported (plainly, no test annotation of its own).
     try testing.expect(std.mem.indexOf(u8, out, "truly_dead") != null);
+}
+
+test "unused: default (--tests with) treats test usage as real; --tests-only finds dead test code" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.py", .data =
+        \\def helper_tested_only():
+        \\    return 2
+        \\def truly_dead():
+        \\    return 3
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "test_lib.py", .data =
+        \\from lib import helper_tested_only
+        \\def dead_test_helper():
+        \\    return 9
+        \\def test_it():
+        \\    assert helper_tested_only() == 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Default `--tests with`: a symbol used by a test is NOT dead; only truly-dead.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try unused(&aw.writer, &idx, "", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "helper_tested_only") == null); // used by a test
+        try testing.expect(std.mem.indexOf(u8, out, "truly_dead") != null); // used nowhere
+    }
+    // `--tests-only`: report dead code *in test files* (a helper no test calls).
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try unused(&aw.writer, &idx, "", .{ .tests = .only });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "dead_test_helper") != null); // dead test helper
+        try testing.expect(std.mem.indexOf(u8, out, "truly_dead") == null); // production, out of test scope
+    }
 }
 
 test "unused: a Zig fn used only inside an inline test {} block is test-only, not live" {
@@ -2928,7 +2987,7 @@ test "unused: a Zig fn used only inside an inline test {} block is test-only, no
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    try unused(&aw.writer, &idx, "", .{ .tests = .without });
     const out = aw.written();
     // Called from a production body → live.
     try testing.expect(std.mem.indexOf(u8, out, "prod_used") == null);
@@ -3606,7 +3665,7 @@ test "unused: a prod fn used only from a tests/ directory is test-only (dir scop
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    try unused(&aw.writer, &idx, "", .{ .tests = .without });
     const out = aw.written();
     // Used only from a tests/ helper → reported and flagged.
     try testing.expect(std.mem.indexOf(u8, out, "helper_target") != null);

@@ -56,10 +56,14 @@ to provide: `navgraph coverage [path]` → per-file % of fn/method reachable fro
 test + the unreached list. Conservative vs. line coverage, zero instrumentation,
 works on every language NavGraph parses.
 
-### A3. `unused --no-test` from real edges, not filename heuristics  **[nice]**
-Because tests aren't in the graph (A1), `--no-test` narrowing keys off
-path/name patterns (`test_*`, `conftest.py`, `*.spec.*`). With real test-edge
-data it could mean "used only from `test` blocks" precisely.
+### A3. Unify the test axis into one `--tests` selector  **[✅ shipped]**
+*Shipped:* the confusing `--no-test` (unused-only) is gone; every verb —
+`outline`/`search`/`callers`/`hot`/`unused` — takes the same
+`--tests <with|without|only>` (aliases `--no-tests`/`--tests-only`), default
+`with`. For `unused`: `with` = truly dead (used by neither production nor
+tests), `--no-tests` = dead in production (test-only-used surfaces, annotated),
+`--tests-only` = dead test code (via the resolved graph, which now includes
+`test`-block callers). `--no-public` stays — it's the orthogonal visibility axis.
 
 ---
 

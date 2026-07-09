@@ -471,7 +471,7 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
-        if (!try query.isDeadCandidate(idx, sym, filter, &refs)) continue;
+        if (!try query.isDeadCandidateScoped(idx, sym, filter, &refs, opts.tests)) continue;
         if (!query.deadCandidateShown(idx, sym, opts, &refs)) continue;
         if (shown != 0) try w.writeByte(',');
         // A name used only from tests is a real cleanup target — flag it so JSON
@@ -1681,7 +1681,9 @@ test "unused json flags a test-only symbol with test_only:true" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{ .format = .json });
+    // `--no-tests` is the production-focused view where a test-only-used symbol
+    // surfaces (and carries test_only:true).
+    try unused(&aw.writer, &idx, "", .{ .format = .json, .tests = .without });
     var p = try tjParse(aw.written());
     defer p.deinit();
     var test_only_flagged = false;

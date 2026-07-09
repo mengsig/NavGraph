@@ -42,8 +42,10 @@ const usage_text =
     \\  routes [filter]    List HTTP routes and the client calls that hit them
     \\  events [filter]    Link message-bus handlers (register/on) to emitters (send/emit)
     \\  neighbors <name>   Callees and callers of <name> in one view
-    \\  unused [filter]    Functions/methods & types nothing references (dead code);
-    \\                     add --no-public and/or --no-test to narrow it
+    \\  unused [filter]    Dead code (fns/methods & types nothing references). Default:
+    \\                     truly dead; --no-tests = dead in production (test-only-used
+    \\                     shown), --tests-only = dead test code, --no-public drops
+    \\                     exported (maybe public API)
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
@@ -65,18 +67,15 @@ const usage_text =
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  --sort <path|symbols>                  files: order by path (default) or symbol count
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
-    \\  -t, --tests <with|without|only>        Test-scope for outline/search/callers/hot:
-    \\                                         with (default) | without | only. A test is
-    \\                                         a Zig `test` block, a test_* fn, or a
-    \\                                         file under a test dir.
+    \\  -t, --tests <with|without|only>        Unified test-scope for outline/search/
+    \\                                         callers/hot/unused: with (default) |
+    \\                                         without | only. A test is a Zig `test`
+    \\                                         block, a test_* fn, or a test-dir file.
     \\  --no-tests, --tests-only               Shortcuts for --tests without / --tests only.
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\  --no-public                            unused: drop exported symbols (possible public API)
-    \\  --no-test                              unused only: drop symbols used solely by
-    \\                                         tests (distinct from --no-tests above;
-    \\                                         pass with --no-public for the fully-dead set)
     \\  --follow-imports                       unused: disambiguate same-name symbols by
     \\                                         import reachability (finds dead code masked
     \\                                         by a used twin; relies on import resolution)
@@ -93,7 +92,8 @@ const usage_text =
     \\  navgraph callers collectRefs
     \\  navgraph search resolve --refs
     \\  navgraph neighbors resolveOne
-    \\  navgraph unused --no-public --no-test
+    \\  navgraph unused                            # truly-dead code
+    \\  navgraph unused --tests-only --no-public   # dead private test helpers
     \\  navgraph callers parse --tests-only        # which tests exercise parse
     \\  navgraph outline src --no-tests            # production structure only
     \\  navgraph coverage src                      # test reach per file
@@ -241,10 +241,6 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.use_cache = false;
         return i;
     }
-    if (eqAny(f.name, &.{"--no-test"})) {
-        out.options.unused_skip_test_only = true;
-        return i;
-    }
     if (eqAny(f.name, &.{"--no-public"})) {
         out.options.unused_skip_exported = true;
         return i;
@@ -341,18 +337,21 @@ test "attached flag values: -d2, --depth=2, -l50" {
     try std.testing.expectError(error.MissingValue, parse(&.{ "calls", "x", "--depth=" }));
 }
 
-test "unused narrowing flags: --no-public, --no-test" {
+test "unused flags: --no-public and the unified --tests scope (no --no-test)" {
     const a = try parse(&.{ "unused", "--no-public" });
     try std.testing.expect(a.options.unused_skip_exported);
-    try std.testing.expect(!a.options.unused_skip_test_only);
+    try std.testing.expectEqual(query.TestScope.with, a.options.tests); // default
 
-    const b = try parse(&.{ "unused", "src", "--no-test", "--no-public" });
+    const b = try parse(&.{ "unused", "src", "--no-tests", "--no-public" });
     try std.testing.expect(b.options.unused_skip_exported);
-    try std.testing.expect(b.options.unused_skip_test_only);
+    try std.testing.expectEqual(query.TestScope.without, b.options.tests);
     try std.testing.expectEqualStrings("src", b.arg);
 
-    // Boolean flags reject an attached value.
+    try std.testing.expectEqual(query.TestScope.only, (try parse(&.{ "unused", "--tests-only" })).options.tests);
+
+    // --no-public rejects an attached value; the retired --no-test is now unknown.
     try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-public=1" }));
+    try std.testing.expectError(error.UnknownFlag, parse(&.{ "unused", "--no-test" }));
 
     const c = try parse(&.{ "unused", "--follow-imports" });
     try std.testing.expect(c.options.unused_follow_imports);
@@ -502,7 +501,7 @@ test "parse: default option values on a bare command" {
     try std.testing.expect(!p.options.refs);
     try std.testing.expectEqualStrings("", p.options.kinds);
     try std.testing.expect(!p.options.unused_skip_exported);
-    try std.testing.expect(!p.options.unused_skip_test_only);
+    try std.testing.expectEqual(query.TestScope.with, p.options.tests);
     try std.testing.expect(!p.options.unused_follow_imports);
     try std.testing.expectEqual(query.FileSort.path, p.options.file_sort);
     try std.testing.expect(p.use_cache);
@@ -676,7 +675,7 @@ test "boolean flags set their fields (short and long)" {
     try std.testing.expect((try parse(&.{ "search", "x", "-r" })).options.refs);
     try std.testing.expect((try parse(&.{ "search", "x", "--refs" })).options.refs);
     try std.testing.expect(!(try parse(&.{ "outline", "--no-cache" })).use_cache);
-    try std.testing.expect((try parse(&.{ "unused", "--no-test" })).options.unused_skip_test_only);
+    try std.testing.expectEqual(query.TestScope.without, (try parse(&.{ "unused", "--no-tests" })).options.tests);
     try std.testing.expect((try parse(&.{ "unused", "--no-public" })).options.unused_skip_exported);
     try std.testing.expect((try parse(&.{ "unused", "--follow-imports" })).options.unused_follow_imports);
 }
@@ -689,7 +688,7 @@ test "boolean flags reject an attached value (BadValue)" {
     try std.testing.expectError(error.BadValue, parse(&.{ "search", "x", "--refs=yes" }));
     try std.testing.expectError(error.BadValue, parse(&.{ "search", "x", "-r1" }));
     try std.testing.expectError(error.BadValue, parse(&.{ "outline", "--no-cache=0" }));
-    try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-test=1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-tests=1" }));
     try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-public=1" }));
     try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--follow-imports=1" }));
 }
@@ -739,7 +738,7 @@ test "usage documents every command and test-scope flag (drift guard)" {
         try testing.expect(std.mem.indexOf(u8, out, f.name) != null);
     }
     // The unified test-scope flag and its aliases are documented.
-    for ([_][]const u8{ "--tests", "--no-tests", "--tests-only", "--no-test", "--no-public" }) |flag| {
+    for ([_][]const u8{ "--tests", "--no-tests", "--tests-only", "--no-public" }) |flag| {
         try testing.expect(std.mem.indexOf(u8, out, flag) != null);
     }
 }

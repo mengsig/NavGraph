@@ -60,7 +60,7 @@ navgraph <command> [arg] [flags]
 | `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
 | `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
-| `unused [filter]`  | Dead-code candidates; `--no-public`/`--no-test` narrow it, `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
+| `unused [filter]`  | Dead code. Default: truly dead (used by neither production nor tests). `--no-tests` = dead in production (test-only-used shown, annotated); `--tests-only` = dead test code; `--no-public` drops exported (maybe public API); `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `help`             | Show help.                                                    |
 
@@ -72,7 +72,7 @@ navgraph <command> [arg] [flags]
 | `-d, --depth <N>`             | Graph depth for `calls`/`callers` (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
 | `-l, --limit <N>`             | Max results (default `300`).               |
-| `-t, --tests <with\|without\|only>` | Test-scope for `outline`/`search`/`callers`/`hot`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
+| `-t, --tests <with\|without\|only>` | Unified test-scope for `outline`/`search`/`callers`/`hot`/`unused`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
 
 ## Examples
 
