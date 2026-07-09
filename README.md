@@ -60,7 +60,7 @@ navgraph <command> [arg] [flags]
 | `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
 | `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
-| `unused [filter]`  | Dead code. Default: truly dead (used by neither production nor tests). `--no-tests` = dead in production (test-only-used shown, annotated); `--tests-only` = dead test code; `--no-public` drops exported (maybe public API); `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
+| `unused [filter]`  | Unreferenced definitions (fns/methods & types) — removal candidates nothing calls or uses (**not** "broken" code). Default: truly unused (no caller in app or test code). `--no-tests` also lists code used only by tests (annotated); `--tests-only` lists unused test helpers; `--no-public` drops exported (maybe public API); `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `help`             | Show help.                                                    |
 

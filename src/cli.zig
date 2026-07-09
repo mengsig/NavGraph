@@ -42,10 +42,12 @@ const usage_text =
     \\  routes [filter]    List HTTP routes and the client calls that hit them
     \\  events [filter]    Link message-bus handlers (register/on) to emitters (send/emit)
     \\  neighbors <name>   Callees and callers of <name> in one view
-    \\  unused [filter]    Dead code (fns/methods & types nothing references). Default:
-    \\                     truly dead; --no-tests = dead in production (test-only-used
-    \\                     shown), --tests-only = dead test code, --no-public drops
-    \\                     exported (maybe public API)
+    \\  unused [filter]    Unreferenced definitions (fns/methods & types) nothing calls
+    \\                     or uses — i.e. removal candidates, NOT broken code. Default
+    \\                     lists the truly unused (no caller in app OR test code);
+    \\                     --no-tests also lists code used only by tests (annotated);
+    \\                     --tests-only lists unused test helpers; --no-public drops
+    \\                     exported symbols (may be public API)
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
@@ -77,8 +79,8 @@ const usage_text =
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\  --no-public                            unused: drop exported symbols (possible public API)
     \\  --follow-imports                       unused: disambiguate same-name symbols by
-    \\                                         import reachability (finds dead code masked
-    \\                                         by a used twin; relies on import resolution)
+    \\                                         import reachability (finds unused code masked
+    \\                                         by a used same-name twin; needs import resolution)
     \\
     \\  Locations are `path:line-endLine`; call trees annotate each edge with its
     \\  call-site line as `↳:N`, and a trailing `?` marks a heuristic (ambiguous
@@ -92,8 +94,8 @@ const usage_text =
     \\  navgraph callers collectRefs
     \\  navgraph search resolve --refs
     \\  navgraph neighbors resolveOne
-    \\  navgraph unused                            # truly-dead code
-    \\  navgraph unused --tests-only --no-public   # dead private test helpers
+    \\  navgraph unused                            # truly-unused code (removal candidates)
+    \\  navgraph unused --tests-only --no-public   # unused private test helpers
     \\  navgraph callers parse --tests-only        # which tests exercise parse
     \\  navgraph outline src --no-tests            # production structure only
     \\  navgraph coverage src                      # test reach per file
