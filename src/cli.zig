@@ -89,6 +89,15 @@ const usage_text =
     \\  name-match) edge — verify those or use `-s` to drop them. Flag values may
     \\  be attached (`-d2`, `--depth=2`).
     \\
+    \\  PATTERNS: a name/filter containing `*` is a glob (`def Ba*`, `search *_handler`,
+    \\  `callers Matcher.is*`). Globs anchor on the whole name; without `*`, names
+    \\  substring-match and defs match exactly. Path filters glob gitignore-style:
+    \\  `files *_test.py` (basename, any depth), `outline src/**/*.ts` (full path).
+    \\
+    \\  IGNORES: `.gitignore` is respected everywhere; a `.navgraphignore` (same
+    \\  syntax, per-directory) adds navgraph-only rules, and its `!dir/` re-includes
+    \\  a directory the built-in skip set (node_modules, vendor, venv, …) prunes.
+    \\
     \\EXAMPLES:
     \\  navgraph outline src/parser.zig --kind fn
     \\  navgraph def parseZigScope -v full

@@ -47,6 +47,8 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
         const sym = idx.graph.symbols[i];
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
+        if (!query.kindAllowed(sym.kind, opts.kinds)) continue;
         if (!wrote_any) {
             if (sep) try w.writeByte(',');
             try w.print("{{\"path\":", .{});
@@ -78,7 +80,8 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
         if (!query.kindAllowed(sym.kind, opts.kinds)) continue;
-        if (std.mem.indexOf(u8, sym.name, pattern) == null) continue;
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
+        if (!query.matchesName(pattern, sym.name)) continue;
         if (shown != 0) try w.writeByte(',');
         try symbolObject(w, idx, sym, opts.verbosity);
         shown += 1;
@@ -139,6 +142,9 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
     std.debug.assert(pattern.len > 0);
     var toks: std.ArrayList(lexer.Token) = .empty;
     defer toks.deinit(idx.gpa);
+    const is_glob = query.isGlobPattern(pattern);
+    const pat = try query.wrapStringPattern(idx.gpa, pattern);
+    defer if (is_glob) idx.gpa.free(pat);
     var shown: u32 = 0;
     try w.writeByte('[');
     outer: for (idx.graph.files) |file| {
@@ -147,7 +153,7 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
         for (toks.items) |t| {
             if (t.kind != .string) continue;
             const s = t.text(file.text);
-            if (std.mem.indexOf(u8, s, pattern) == null) continue;
+            if (!query.matchesString(pat, is_glob, s)) continue;
             if (shown != 0) try w.writeByte(',');
             try w.writeAll("{\"file\":");
             try writeString(w, file.path);
@@ -275,6 +281,7 @@ fn walkCallers(
     defer lines.deinit(idx.gpa);
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
         if (wrote != 0) try w.writeByte(',');
         try query.callSiteLines(idx, cid, id, &lines);
         try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), visited);
@@ -315,7 +322,7 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
         if (sym.kind != .route) continue;
-        if (filter.len != 0 and std.mem.indexOf(u8, sym.name, filter) == null) continue;
+        if (!query.matchesName(filter, sym.name)) continue;
         if (shown != 0) try w.writeByte(',');
         try routeObject(w, idx, sym);
         shown += 1;

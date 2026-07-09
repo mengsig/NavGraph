@@ -209,6 +209,51 @@ test "dispatch def shows a definition signature" {
     try std.testing.expect(has(out, "app.zig"));
 }
 
+test "dispatch def and search resolve glob patterns" {
+    const io = std.testing.io;
+    var fx = try sampleFixture(io);
+    defer fx.deinit();
+
+    // `def` with a prefix glob lists every match (issue #3's `def Ba*` shape).
+    const defs = try dispatchOwned(std.testing.allocator, io, &fx.idx, .{ .command = .def, .arg = "m*" });
+    defer std.testing.allocator.free(defs);
+    try std.testing.expect(has(defs, "mid"));
+    try std.testing.expect(!has(defs, "leaf"));
+
+    // `search` with a glob anchors on the whole name: `r*n` hits `run` only.
+    const found = try dispatchOwned(std.testing.allocator, io, &fx.idx, .{ .command = .search, .arg = "r*n" });
+    defer std.testing.allocator.free(found);
+    try std.testing.expect(has(found, "run"));
+    try std.testing.expect(!has(found, "orphan")); // substring would hit it; glob must not
+}
+
+test "index honors .navgraphignore: prune a source dir, re-include a built-in skip" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".navgraphignore", .data = "junk/\n!node_modules/\n" });
+    try tmp.dir.createDir(io, "junk", .default_dir);
+    try tmp.dir.createDir(io, "node_modules", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.py", .data = "def real():\n    pass\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk/j.py", .data = "def scratch():\n    pass\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/v.py", .data = "def vendored():\n    pass\n" });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(std.testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var saw_app = false;
+    var saw_vendored = false;
+    for (idx.graph.files) |f| {
+        try std.testing.expect(!std.mem.startsWith(u8, f.path, "junk/")); // pruned
+        if (std.mem.eql(u8, f.path, "app.py")) saw_app = true;
+        if (std.mem.eql(u8, f.path, "node_modules/v.py")) saw_vendored = true;
+    }
+    try std.testing.expect(saw_app);
+    try std.testing.expect(saw_vendored); // `!node_modules/` overrode the built-in skip
+}
+
 test "dispatch def on an unknown name reports not found without crashing" {
     const io = std.testing.io;
     var fx = try sampleFixture(io);

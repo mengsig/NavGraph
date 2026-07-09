@@ -119,6 +119,18 @@ navgraph <command> [arg] [flags]
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
 | `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
 
+**Patterns.** A name or filter containing `*` is a glob: `def 'Ba*'` lists
+`Bays` and `Bananas`, `search '*_handler'` anchors on the whole name,
+`callers 'Matcher.is*'` walks every matching member. Path filters glob
+gitignore-style — `files '*_test.py'` matches basenames at any depth,
+`outline 'src/**/*.ts'` the full path. Without a `*`, names substring-match
+(and `def` matches exactly), as before.
+
+**Ignores.** `.gitignore` is respected everywhere. A `.navgraphignore`
+(same syntax, per-directory) adds navgraph-only rules — scratch dirs, vendored
+code, fixtures — without touching git; a negated rule (`!vendor/`) re-includes
+a directory the built-in skip set would prune.
+
 ## Examples
 
 Outline a file at signature detail:
@@ -181,8 +193,11 @@ method Server.start (self):  app/server.py:15
 ## How it works
 
 1. **Walk** the project tree, skipping vendored/build dirs (`node_modules`,
-   `.git`, `zig-out`, `__pycache__`, `dist`, …) and any file or directory
-   matched by a `.gitignore` (per-directory files, negation, and `*`/`**` globs).
+   `.git`, `zig-out`, `__pycache__`, `dist`, `site-packages`, …) and any file or
+   directory matched by a `.gitignore` (per-directory files, negation, and
+   `*`/`**` globs). A **`.navgraphignore`** (same syntax, per-directory) adds
+   navgraph-only rules on top — and a negated `!vendor/` rule there re-includes
+   a directory the built-in skip set would prune.
 2. **Tokenize** each file with a shared, language-configured lexer that
    correctly skips strings/comments.
 3. **Extract** definitions and their in-body references with per-language

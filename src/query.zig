@@ -13,6 +13,7 @@ const lexer = @import("lexer.zig");
 const language = @import("language.zig");
 const events_mod = @import("events.zig");
 const gitdiff = @import("gitdiff.zig");
+const gitignore = @import("gitignore.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -110,7 +111,7 @@ pub fn isTestSymbol(idx: *const Index, sym: model.Symbol) bool {
 }
 
 /// Apply the `--tests` scope selector to a symbol's test-ness.
-fn inTestScope(scope: TestScope, is_test: bool) bool {
+pub fn inTestScope(scope: TestScope, is_test: bool) bool {
     return switch (scope) {
         .with => true,
         .without => !is_test,
@@ -290,7 +291,50 @@ fn parentDepth(idx: *const Index, sym: model.Symbol) usize {
 
 pub fn matchesFilter(path: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;
+    if (isGlobPattern(filter)) {
+        // Gitignore-style: a pattern with a `/` globs against the whole
+        // relative path (`src/*.py`, `**/api/*.ts`); one without globs against
+        // the basename (`*_test.py` matches at any depth).
+        if (std.mem.indexOfScalar(u8, filter, '/') != null) return gitignore.glob(filter, path);
+        const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+        return gitignore.glob(filter, base);
+    }
     return std.mem.startsWith(u8, path, filter) or std.mem.indexOf(u8, path, filter) != null;
+}
+
+/// Whether `pattern` opts into glob matching. Only `*` triggers glob mode — a
+/// lone `?` stays literal because Ruby method names legitimately end in `?`.
+pub fn isGlobPattern(pattern: []const u8) bool {
+    return std.mem.indexOfScalar(u8, pattern, '*') != null;
+}
+
+/// Symbol-name match: whole-name glob when the pattern contains `*`
+/// (`Ba*` → `Bays`, `Bananas`; `*_handler` → suffix), else substring.
+pub fn matchesName(pattern: []const u8, name: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (isGlobPattern(pattern)) return gitignore.glob(pattern, name);
+    return std.mem.indexOf(u8, name, pattern) != null;
+}
+
+/// Exact match, or whole-text glob when the pattern carries a `*`.
+fn exactOrGlob(pattern: []const u8, text: []const u8) bool {
+    if (isGlobPattern(pattern)) return gitignore.glob(pattern, text);
+    return std.mem.eql(u8, pattern, text);
+}
+
+/// Match inside a string literal: substring normally; a `*` pattern globs
+/// *unanchored* (wrapped in `**` so it can hit mid-literal and cross `/`).
+/// `wrapStringPattern` builds the wrapped form once per query.
+pub fn matchesString(wrapped_or_plain: []const u8, is_glob: bool, s: []const u8) bool {
+    if (is_glob) return gitignore.glob(wrapped_or_plain, s);
+    return std.mem.indexOf(u8, s, wrapped_or_plain) != null;
+}
+
+/// For a glob `pattern`, return `**pattern**` (gpa-owned); else the pattern
+/// itself (borrowed). Pair with `matchesString`.
+pub fn wrapStringPattern(gpa: std.mem.Allocator, pattern: []const u8) ![]const u8 {
+    if (!isGlobPattern(pattern)) return pattern;
+    return std.fmt.allocPrint(gpa, "**{s}**", .{pattern});
 }
 
 /// The index's coverage manifest: every indexed file with its language and
@@ -517,6 +561,9 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
     if (opts.format == .json) return json_out.strings(w, idx, pattern, opts);
     var toks: std.ArrayList(lexer.Token) = .empty;
     defer toks.deinit(idx.gpa);
+    const is_glob = isGlobPattern(pattern);
+    const pat = try wrapStringPattern(idx.gpa, pattern);
+    defer if (is_glob) idx.gpa.free(pat);
     var shown: u32 = 0;
     outer: for (idx.graph.files) |file| {
         toks.clearRetainingCapacity();
@@ -524,7 +571,7 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
         for (toks.items) |t| {
             if (t.kind != .string) continue;
             const s = t.text(file.text);
-            if (std.mem.indexOf(u8, s, pattern) == null) continue;
+            if (!matchesString(pat, is_glob, s)) continue;
             try w.print("{s}:{d}: ", .{ file.path, t.line });
             try render.writeCollapsed(w, s, 200);
             try w.writeByte('\n');
@@ -698,7 +745,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         if (sym.kind == .import) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
-        if (std.mem.indexOf(u8, sym.name, pattern) == null) continue;
+        if (!matchesName(pattern, sym.name)) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         shown += 1;
         if (shown >= opts.limit) break;
@@ -727,17 +774,20 @@ pub const RefPattern = struct {
         return .{ .qualifier = null, .name = pattern };
     }
 
-    /// Whether `ref` matches. Bare patterns substring-match the name; qualified
-    /// patterns require a member access (non-empty `ref.qualifier`), an exact
-    /// receiver match when one was given, and an exact name (empty name matches
-    /// every attribute of that receiver).
+    /// Whether `ref` matches. Bare patterns substring-match the name (glob when
+    /// they carry a `*`); qualified patterns require a member access (non-empty
+    /// `ref.qualifier`), an exact-or-glob receiver match when one was given, and
+    /// an exact-or-glob name (empty name matches every attribute of that
+    /// receiver).
     pub fn matches(self: RefPattern, ref: model.Reference) bool {
         const q = self.qualifier orelse
-            return std.mem.indexOf(u8, ref.name, self.name) != null;
+            return matchesName(self.name, ref.name);
         if (ref.qualifier.len == 0) return false;
-        if (q.len != 0 and !std.mem.eql(u8, ref.qualifier, q)) return false;
-        return self.name.len == 0 or std.mem.eql(u8, ref.name, self.name);
+        if (q.len != 0 and !partMatches(q, ref.qualifier)) return false;
+        return self.name.len == 0 or partMatches(self.name, ref.name);
     }
+
+    const partMatches = exactOrGlob;
 };
 
 /// List every reference (use site) whose name contains `pattern`, grouped by the
@@ -1018,7 +1068,7 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (sym.kind != .route) continue;
-        if (filter.len != 0 and std.mem.indexOf(u8, sym.name, filter) == null) continue;
+        if (!matchesName(filter, sym.name)) continue;
         any = true;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         try routeRelations(w, idx, sym);
@@ -2271,6 +2321,7 @@ pub fn resolveIds(idx: *const Index, name: []const u8, buf: []SymbolId) []const 
 
 /// Resolve `name` (optionally `Parent.child`) without a path selector.
 fn resolveBare(idx: *const Index, name: []const u8, buf: []SymbolId) []const SymbolId {
+    if (isGlobPattern(name)) return resolveGlob(idx, name, buf);
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
         const parent = name[0..dot];
         const child = name[dot + 1 ..];
@@ -2279,6 +2330,31 @@ fn resolveBare(idx: *const Index, name: []const u8, buf: []SymbolId) []const Sym
     const ids = idx.lookup(name);
     const n = @min(ids.len, buf.len);
     @memcpy(buf[0..n], ids[0..n]);
+    return buf[0..n];
+}
+
+/// Resolve a glob name (`Ba*`, `parse*Scope`, `Matcher.is*`) by scanning every
+/// definition. A dotted glob matches the parent part against the enclosing
+/// symbol's name and the child part against the member's own name.
+fn resolveGlob(idx: *const Index, pattern: []const u8, buf: []SymbolId) []const SymbolId {
+    var parent_pat: ?[]const u8 = null;
+    var name_pat = pattern;
+    if (std.mem.lastIndexOfScalar(u8, pattern, '.')) |dot| {
+        parent_pat = pattern[0..dot];
+        name_pat = pattern[dot + 1 ..];
+    }
+    var n: usize = 0;
+    for (idx.graph.symbols) |sym| {
+        if (n == buf.len) break;
+        if (sym.kind == .import) continue;
+        if (!exactOrGlob(name_pat, sym.name)) continue;
+        if (parent_pat) |pp| {
+            if (sym.parent == invalid) continue;
+            if (!exactOrGlob(pp, idx.graph.symbols[sym.parent].name)) continue;
+        }
+        buf[n] = sym.id;
+        n += 1;
+    }
     return buf[0..n];
 }
 
@@ -3715,6 +3791,29 @@ test "matchesFilter: empty matches all, prefix and substring hit, mismatch misse
     try std.testing.expect(matchesFilter("src/api.zig", ".zig")); // suffix (as substring)
     try std.testing.expect(!matchesFilter("src/api.zig", "queue")); // absent
     try std.testing.expect(!matchesFilter("a", "abc")); // filter longer than path
+}
+
+test "matchesFilter: glob patterns — basename without slash, whole path with slash" {
+    // No `/` in the pattern → glob against the basename, at any depth.
+    try std.testing.expect(matchesFilter("src/api_test.zig", "*_test.zig"));
+    try std.testing.expect(matchesFilter("deep/nested/api_test.zig", "*_test.zig"));
+    try std.testing.expect(!matchesFilter("src/api.zig", "*_test.zig"));
+    // A `/` in the pattern → glob against the whole relative path.
+    try std.testing.expect(matchesFilter("src/api.zig", "src/*.zig"));
+    try std.testing.expect(!matchesFilter("src/sub/api.zig", "src/*.zig")); // `*` stays in one segment
+    try std.testing.expect(matchesFilter("src/sub/api.zig", "src/**/*.zig")); // `**` crosses
+    try std.testing.expect(!matchesFilter("lib/api.zig", "src/*.zig"));
+}
+
+test "matchesName: substring without star, whole-name glob with star" {
+    try std.testing.expect(matchesName("solve", "resolveIds")); // substring
+    try std.testing.expect(!matchesName("resolve*", "chooseTarget"));
+    try std.testing.expect(matchesName("resolve*", "resolveIds")); // prefix glob
+    try std.testing.expect(matchesName("*Ids", "resolveIds")); // suffix glob
+    try std.testing.expect(matchesName("re*Ids", "resolveIds")); // interior glob
+    try std.testing.expect(!matchesName("solve*", "resolveIds")); // glob is anchored
+    try std.testing.expect(matchesName("empty?", "empty?")); // lone `?` stays literal (Ruby)
+    try std.testing.expect(!matchesName("empty?", "emptyX"));
 }
 
 test "parseLineRange: single, A-B, open-ended A-, and rejected forms" {

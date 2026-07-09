@@ -184,12 +184,12 @@ fn persistCache(b: *const Builder, idx: *const Index) void {
 }
 
 const ignored_dirs = std.StaticStringMap(void).initComptime(.{
-    .{".git"},        .{"node_modules"}, .{"zig-out"},   .{".zig-cache"},
-    .{"zig-cache"},   .{"__pycache__"},  .{".venv"},     .{"venv"},
-    .{"dist"},        .{"build"},        .{".next"},     .{"target"},
-    .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},   .{".advantage"},
-    .{".nvime"},      .{".idea"},        .{".vscode"},   .{"coverage"},
-    .{".navgraph"},   .{"testenv"},
+    .{".git"},        .{"node_modules"},  .{"zig-out"},       .{".zig-cache"},
+    .{"zig-cache"},   .{"__pycache__"},   .{".venv"},         .{"venv"},
+    .{"dist"},        .{"build"},         .{".next"},         .{"target"},
+    .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},        .{".advantage"},
+    .{".nvime"},      .{".idea"},         .{".vscode"},       .{"coverage"},
+    .{".navgraph"},   .{"site-packages"}, .{".tox"},          .{".ruff_cache"},
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
@@ -210,16 +210,25 @@ fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerr
     path_buf.shrinkRetainingCapacity(base_len);
 }
 
-/// Load `dir`'s `.gitignore` (if any) into the matcher, tagged with `base` (the
-/// directory's path relative to the root). Rule text and base are duped into the
-/// arena so they outlive this call. Absent/unreadable files are simply skipped.
+/// Load `dir`'s `.gitignore` and `.navgraphignore` (if any) into the matcher,
+/// tagged with `base` (the directory's path relative to the root). Rule text and
+/// base are duped into the arena so they outlive this call. Absent/unreadable
+/// files are simply skipped. `.navgraphignore` uses the same syntax and is added
+/// after `.gitignore`, so (last-match-wins) it can both add ignores git doesn't
+/// have and re-include (`!pattern`) something `.gitignore` — or the built-in
+/// skip set — prunes.
 fn loadGitignore(b: *Builder, dir: std.Io.Dir, base: []const u8) !void {
-    const text = dir.readFileAlloc(b.io, ".gitignore", b.arena, .limited(max_gitignore_bytes)) catch return;
-    try b.ignore.addFile(try b.arena.dupe(u8, base), text);
+    inline for (.{ ".gitignore", ".navgraphignore" }) |ignore_file| {
+        if (dir.readFileAlloc(b.io, ignore_file, b.arena, .limited(max_gitignore_bytes))) |text| {
+            try b.ignore.addFile(try b.arena.dupe(u8, base), text);
+        } else |_| {}
+    }
 }
 
 fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.ArrayList(u8)) !void {
-    if (ignored_dirs.has(name)) {
+    // An explicit `!pattern` re-include (from a `.navgraphignore`) overrides the
+    // built-in skip set — the user's way to force-index e.g. `vendor/`.
+    if (ignored_dirs.has(name) and !b.ignore.isReincluded(path_buf.items, true)) {
         // A build-output-conventional name (`coverage`, `build`, `dist`, `target`)
         // is a *real source directory* when it sits under a source tree
         // (`frontend/src/coverage/`) — a domain dir (satellite coverage, a build
@@ -265,14 +274,15 @@ fn underSourceRoot(path: []const u8) bool {
 
 /// Directories whose skip is universally expected (VCS, dependency, build, cache
 /// and editor dirs) — never worth surfacing. Anything else in `ignored_dirs`
-/// (e.g. `vendor`, `testenv`) can plausibly hold real source, so its skip is
-/// reported to avoid the silent-failure trap.
+/// (e.g. `vendor`) can plausibly hold real source, so its skip is reported to
+/// avoid the silent-failure trap.
 const silent_skip = std.StaticStringMap(void).initComptime(.{
-    .{".git"},        .{"node_modules"}, .{"zig-out"},    .{".zig-cache"},
-    .{"zig-cache"},   .{"__pycache__"},  .{".venv"},      .{"venv"},
-    .{"dist"},        .{"build"},        .{".next"},      .{"target"},
-    .{".mypy_cache"}, .{".pytest_cache"}, .{".idea"},     .{".vscode"},
-    .{"coverage"},    .{".navgraph"},    .{".advantage"}, .{".nvime"},
+    .{".git"},        .{"node_modules"},  .{"zig-out"},    .{".zig-cache"},
+    .{"zig-cache"},   .{"__pycache__"},   .{".venv"},      .{"venv"},
+    .{"dist"},        .{"build"},         .{".next"},      .{"target"},
+    .{".mypy_cache"}, .{".pytest_cache"}, .{".idea"},      .{".vscode"},
+    .{"coverage"},    .{".navgraph"},     .{".advantage"}, .{".nvime"},
+    .{"site-packages"}, .{".tox"},        .{".ruff_cache"},
 });
 
 /// Record a pruned, potentially-source directory's name once (deduped) for the

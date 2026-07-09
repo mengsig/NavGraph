@@ -1,0 +1,3 @@
+# NavGraph's own index scope: the testenv/ trees are fixture repos for the
+# test suite, not part of this codebase.
+testenv/

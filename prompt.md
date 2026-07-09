@@ -145,8 +145,14 @@ backend handler with the TypeScript frontend call that hits it.
 ### Gotchas
 
 - **navgraph respects `.gitignore`** (all commands) plus a fixed skip set
-  (`node_modules .git dist build target vendor .venv __pycache__ .next zig-out coverage`).
+  (`node_modules .git dist build target vendor .venv __pycache__ .next zig-out coverage site-packages`).
   If something you expect is missing from results, check it isn't gitignored.
+  A **`.navgraphignore`** (same syntax) adds navgraph-only ignores, and a
+  negated `!vendor/` rule in it re-includes a built-in-skipped directory.
+- **`*` patterns are globs**: `def 'Ba*'`, `search '*_handler'`,
+  `callers 'Matcher.is*'`, `files '*_test.py'`, `outline 'src/**/*.ts'`.
+  Globs anchor on the whole name; without `*`, names substring-match. Quote
+  them so the shell doesn't expand.
 - `path A B` printing "no call path" is a real answer (A genuinely doesn't reach
   B), not a failure.
 - Don't gauge "is X indexed?" with `navgraph search X | wc -l`: the not-found
