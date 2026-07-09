@@ -1861,6 +1861,11 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     if (opts.tests != .with and !indexHasTests(idx)) {
         try w.writeAll("  (note: no test files detected in this index — test-scope flags have nothing to exclude)\n");
     }
+    // `-C one-file.go` builds a one-file index: every cross-file caller is out
+    // of view, so widely-used symbols read as dead. Say so (a trial was misled).
+    if (shown > 0 and idx.graph.files.len == 1) {
+        try w.writeAll("  (note: single-file index — callers in other files aren't visible; scope -C to the project to confirm)\n");
+    }
     if (shown == 0) {
         try w.print("(no unused functions under '{s}')\n", .{filter});
         // The default (`--tests with`) reports only code used *nowhere*, which is
