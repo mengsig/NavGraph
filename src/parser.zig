@@ -440,6 +440,9 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // Skip only a *bare* self-reference (recursion noise). A qualified call
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
+        // A JS/TS object-literal property key (`{ count: ... }`) names a field,
+        // not a reference to a same-named binding — don't emit an edge for it.
+        if (qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
         try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call);
     }
@@ -473,6 +476,18 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
         if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
     }
     return "";
+}
+
+/// Whether token `i` is a JS/TS object-literal property key: an identifier
+/// preceded by `{` or `,` and followed by `:` (`{ key: v }`, `, key: v`). Such a
+/// key names a field, not a reference to a same-named binding, so it must not
+/// become a call/read edge. Gated to the JS family: in Python `{name: v}` the key
+/// `name` *is* a variable reference and must stay an edge.
+fn isJsObjectKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    if (ctx.cfg.language.family() != .js) return false;
+    if (i <= lo or i + 1 >= hi) return false;
+    if (!ctx.isPunct(i + 1, ':')) return false;
+    return ctx.isPunct(i - 1, '{') or ctx.isPunct(i - 1, ',');
 }
 
 fn recordRef(
@@ -548,10 +563,16 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
             i += 1;
             continue;
         }
-        if (expect_name and ctx.toks[i].kind == .identifier and ctx.isPunct(i + 1, ':')) {
-            if (typeFromChain(ctx, i + 2, close)) |ty| {
-                try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
+        if (expect_name and ctx.toks[i].kind == .identifier) {
+            // Record every parameter name so a bare reference to it in the body
+            // is treated as a local, not a same-named global. Capture the
+            // annotated type (`name: T`) when present for receiver resolution;
+            // an untyped param still shadows the global (empty type).
+            var ty: []const u8 = "";
+            if (ctx.isPunct(i + 1, ':')) {
+                if (typeFromChain(ctx, i + 2, close)) |t| ty = t;
             }
+            try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
         }
         expect_name = false;
         i += 1;
@@ -564,7 +585,10 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
     const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
     if (is_decl) {
         if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
-        const ty = inferDeclType(ctx, i + 1, hi) orelse return null;
+        // Capture the name even when no type can be inferred: an untyped local
+        // (`const x = f()`) still shadows a same-named global for bare-reference
+        // resolution (empty type just means "no receiver type known").
+        const ty = inferDeclType(ctx, i + 1, hi) orelse "";
         return .{ .name = ctx.textOf(i + 1), .type_name = ty };
     }
     // Bare assignment at line start: `name = Type(...)` (python/js).
@@ -5042,4 +5066,42 @@ test "ruby: a method with default-valued params keeps its body refs" {
     try testing.expectEqual(SymbolKind.method, fetch.kind);
     try testing.expect(hasCallRef(fetch, "build"));
     try testing.expect(hasCallRef(fetch, "paginate"));
+}
+
+test "scope: JS/TS object-literal keys and untyped params are not global references" {
+    // Reproduces the js_express scope-blindness bug. `count:` is a property key
+    // and `count` is a parameter — neither is a reference to a top-level `count`.
+    const src =
+        \\function count() { return 0; }
+        \\export function statsHandler(req, res) {
+        \\    res.json({ count: size() });
+        \\}
+        \\export function formatStatus(count) {
+        \\    return count > 0;
+        \\}
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    const stats = findSym(out.items, "statsHandler").?;
+    try testing.expect(!hasRef(stats, "count")); // object-literal key: not an edge
+    try testing.expect(hasCallRef(stats, "size")); // a real call: still an edge
+    // The untyped parameter is captured as a (typeless) binding, so a bare
+    // `count` use in the body won't bind to the global `count`.
+    const fmt = findSym(out.items, "formatStatus").?;
+    try testing.expect(bindingType(fmt.bindings, "count") != null);
+}
+
+test "scope: Python dict keys ARE references (object-key suppression is JS-only)" {
+    // In Python `{item: 2}` the key `item` is a variable read, so it must stay an
+    // edge — the object-key suppression is gated to the JS family.
+    const src =
+        \\def item():
+        \\    return 1
+        \\def build():
+        \\    return {item: 2}
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const build = findSym(out.items, "build").?;
+    try testing.expect(hasRef(build, "item"));
 }

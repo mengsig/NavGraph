@@ -587,8 +587,11 @@ fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[
         if (from.parent == invalid) return null;
         return idx.graph.symbols[from.parent].name;
     }
+    // Return only a *typed* binding: bindings now also carry untyped locals and
+    // parameters (name-only, empty type) to shadow same-named globals in bare
+    // resolution, but those give no receiver type to scope a member access by.
     for (from.bindings) |b| {
-        if (std.mem.eql(u8, b.name, qualifier)) return b.type_name;
+        if (std.mem.eql(u8, b.name, qualifier) and b.type_name.len > 0) return b.type_name;
     }
     return null;
 }
@@ -2081,4 +2084,30 @@ test "no-cache builds are deterministic and agree with a cached build" {
     // The cross-module edge survives in all three.
     try testing.expectEqual(b.lookup("run")[0], b.callersOf(b.lookup("helper")[0])[0]);
     try testing.expectEqual(c.lookup("run")[0], c.callersOf(c.lookup("helper")[0])[0]);
+}
+
+test "scope-blind refs: JS object key and param do not create false caller edges" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "db.js", .data =
+        \\function count() { return 0; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "use.js", .data =
+        \\function statsHandler(req, res) {
+        \\    res.json({ count: size() });
+        \\}
+        \\function formatStatus(count) {
+        \\    return count > 0;
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    // The dead global count() must have no callers: the `{ count: ... }` object
+    // key and the `count` parameter are not references to it.
+    const count = qualifiedFileSym(&idx, "db.js", "count").?;
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(count).len);
 }
