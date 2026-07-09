@@ -15,7 +15,7 @@ for a symbol as your way of understanding supported code.**
 
 navgraph-supported languages (by extension):
 
-- **Python** — `.py`
+- **Python** — `.py .pyi`
 - **JavaScript** — `.js .jsx .mjs .cjs`
 - **TypeScript** — `.ts .tsx .mts`
 - **Zig** — `.zig`
@@ -49,7 +49,9 @@ supported code, and each has a required replacement:
 | Manually tracing how A reaches B | `navgraph path <A> <B>` |
 | Guessing which code matters | `navgraph hot [path]` |
 | Reviewing/scoping what a branch changed | `navgraph diff [ref]` (changed symbols since `ref`, default `HEAD`, + their callers) |
-| Hunting for dead code (functions/methods **and types**) | `navgraph unused [filter]` — add `--no-public --no-test` for the actually-dead set |
+| Hunting for unused code (functions/methods **and types**) | `navgraph unused [filter]` — default is *truly unused* (no app or test caller = removal candidate, not "broken"); `--no-public` hides exported/public API |
+| Finding which tests exercise a symbol | `navgraph callers <name> --tests-only` (Zig `test` blocks & `test_*` fns are indexed) |
+| Measuring test reach / coverage | `navgraph coverage [path]` (% of fn/method reachable from a test; `-j` for JSON) |
 | Reading routers + client to map an endpoint | `navgraph routes [filter]` (cross-language) |
 | Reading handler + caller to trace a message-bus / WS event | `navgraph events [filter]` (pairs `register`/`on` handlers with `send`/`emit` emitters, cross-language) |
 | Reading imports at the top of files | `navgraph imports [filter]` / `importers <file>` |
@@ -81,9 +83,9 @@ substitute for navgraph on supported code.
 
 These are exhaustive. If none applies to a supported file, navgraph is required.
 
-1. **Unsupported language / filetype** (Go, Rust, Java, Ruby, Kotlin, Swift,
-   Elixir, shell, HTML/CSS, JSON/YAML/TOML, Markdown, plain text) — use
-   grep/read.
+1. **Unsupported language / filetype** (Java, Kotlin, Swift, Elixir, shell,
+   HTML/CSS, JSON/YAML/TOML, Markdown, plain text) — use grep/read. (Go, Rust,
+   Ruby, C#, and Lua **are** supported — see the list above; use navgraph.)
 2. **Non-symbol content** — comments, config values, docs, prose, license text,
    commit messages. (For strings *inside* supported source, still prefer
    `navgraph strings`.)
@@ -106,23 +108,33 @@ applies. "It was faster to just read it" is not a valid hatch.
 - `-l N` / `--limit N` — cap results (default 300).
 - `-r` / `--refs` — `search`: match use sites; `calls`/`neighbors`: include
   var/const/field reads.
-- `-C <path>` — index root; scope to a subtree.
+- `-t` / `--tests <with|without|only>` — unified test scope for
+  `outline`/`search`/`callers`/`hot`/`unused` (aliases `--no-tests`,
+  `--tests-only`); default `with`. A *test* = a Zig `test` block, a `test_*`
+  function, or a file under a test dir. E.g. `callers foo --tests-only` = which
+  tests exercise `foo`; `outline --no-tests` = production structure only.
+- `-C <path>` — index root; scope to a subtree, or point at a **single file** to
+  scope to just that file.
 - `-j` / `--json` — stable JSON for tooling/`jq`.
 - `--sort path|symbols` — `files`: order by path (default) or symbol count.
 - `--no-cache` — rebuild (cache lives in `.navgraph/cache`). Run after updating
   navgraph itself, or after large refactors/deletions, so the index reflects
   current source.
-- `unused` narrowing: `--no-public` drops exported symbols (possible public
-  API), `--no-test` drops symbols used only by tests. Pass **both** for the
-  actually-unused set; the output notes how many were hidden.
+- `unused` scope (the `--tests` selector, above): default lists *truly unused*
+  code (no caller in app or test code); `--no-tests` also lists code used only by
+  tests (annotated); `--tests-only` lists unused test helpers; `--no-public`
+  drops exported symbols (possible public API). "Unused" = unreferenced, i.e. a
+  removal candidate — not broken/unusable.
+- `coverage [path]` — per-file % of `fn`/`method` reachable from a test in the
+  call graph; a dependency-free stand-in for line coverage (`-j` for JSON).
 
 ### Cross-package & cross-language resolution
 
 navgraph resolves edges **across packages in a monorepo** (import-resolved, not
 name-matched), so `unused`/`callers`/`path` are trustworthy across an
 `apps/*` + `packages/*` split — a symbol defined in one package and used in
-another is correctly seen as live, and `unused` won't mask a dead symbol just
-because its name is reused elsewhere. `routes` (HTTP) and `events` (message
+another is correctly seen as live, and `unused` won't mask an unreferenced symbol
+just because its name is reused elsewhere. `routes` (HTTP) and `events` (message
 bus / WS) additionally bridge **across languages**, pairing e.g. a Python
 backend handler with the TypeScript frontend call that hits it.
 
@@ -136,4 +148,8 @@ backend handler with the TypeScript frontend call that hits it.
 - Don't gauge "is X indexed?" with `navgraph search X | wc -l`: the not-found
   message is itself one line, so `wc -l` reads 1 whether X was found or not.
   Inspect the actual output.
+- `outline`/`search`/`callers`/`hot` include **test code by default** — Zig
+  `test` blocks (rendered as kind `test`), `test_*` functions, and files under a
+  test dir. Add `--no-tests` for a production-only view, or `--tests-only` to
+  focus on tests (e.g. "which tests hit this function").
 
