@@ -99,6 +99,26 @@ These are exhaustive. If none applies to a supported file, navgraph is required.
 If you skip navgraph on a supported file, you must be able to name which hatch
 applies. "It was faster to just read it" is not a valid hatch.
 
+### Spend calls well (measured against grep-agents in trials)
+
+- **`outline` already gives file:line for every symbol — don't follow it with
+  `def X` just to locate X.** `def` is for reading a *body* (`-v full`), not
+  for finding things you already see.
+- **Start container questions with `outline <file> -k class`** (or
+  `-k struct,iface`), not an unfiltered outline of a 3k-line file. Container
+  lines include the inheritance clause (`class Group (Command)`), so the
+  hierarchy usually needs zero further calls.
+- **On a hub function, reach for `-s` early.** Heuristic `?` edges on a
+  popular name are noise you'd otherwise verify by hand.
+- **`path A B` beats `calls A -d3`** when the question is "how does A reach
+  B" — one chain, no scanning.
+- **Trust the JSON `parent` field** for "which class is this method on"
+  (`hot -j`, `search -j`, …).
+- **Go**: package-qualified calls (`caddy.Load(...)`) resolve exactly, and
+  methods are pinnable as `Type.method` (`callers 'Metrics.Provision'`). A
+  name shared by many implementations (`Provision`) prints an
+  N-definitions banner — pin it rather than scanning.
+
 ### Flags worth knowing
 
 - `-v names|sig|doc|full` — detail level (default `sig`).

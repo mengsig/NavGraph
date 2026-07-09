@@ -39,6 +39,10 @@ pub const Index = struct {
     /// from `ignored_dirs`). Surfaced on empty results so a skipped subtree reads
     /// as "not indexed" rather than "absent". Arena-owned.
     skipped_dirs: []const []const u8 = &.{},
+    /// Go package name → files declaring it (`package caddy` in caddy.go,
+    /// logging.go, …). Lets a package-qualified call (`caddy.Load(...)`) resolve
+    /// to the package's top-level definitions. Arena-owned.
+    go_packages: std.StringHashMapUnmanaged([]const FileId) = .empty,
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -156,6 +160,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     };
     try buildNameIndex(&idx);
     try buildImportTable(&idx);
+    try buildGoPackageTable(&idx);
     resolveReferences(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
@@ -497,6 +502,47 @@ fn uniqueSuffixMatch(idx: *const Index, cand: []const u8) ?FileId {
     return if (count == 1) found else null;
 }
 
+/// Collect `package X` declarations (Go `.module` symbols) into
+/// `Index.go_packages`. All allocations go through the arena, so the table
+/// dies with the index.
+fn buildGoPackageTable(idx: *Index) !void {
+    const arena = idx.arena.allocator();
+    var lists: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(FileId)) = .empty;
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind != .module) continue;
+        if (idx.graph.files[sym.file].language != .go) continue;
+        const slot = try lists.getOrPut(arena, sym.name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(arena, sym.file);
+    }
+    var it = lists.iterator();
+    while (it.next()) |e| {
+        try idx.go_packages.put(arena, e.key_ptr.*, e.value_ptr.items);
+    }
+}
+
+/// Resolve a Go package-qualified call (`caddy.Load(...)`) to a top-level
+/// definition in one of the files declaring `package <qualifier>`. Exact when
+/// exactly one package file defines the name; a cross-package name collision
+/// binds the first hit as heuristic.
+fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference) bool {
+    if (idx.graph.files[from.file].language != .go) return false;
+    const files = idx.go_packages.get(ref.qualifier) orelse return false;
+    var found: SymbolId = invalid;
+    var hits: u32 = 0;
+    for (files) |fid| {
+        if (fid == from.file) continue; // own package is never name-qualified
+        const t = topLevelIn(idx, fid, ref.name);
+        if (t == invalid) continue;
+        hits += 1;
+        if (found == invalid) found = t;
+    }
+    if (found == invalid) return false;
+    ref.target = found;
+    ref.exact = hits == 1;
+    return true;
+}
+
 fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
@@ -554,6 +600,8 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.exact = true;
             return;
         }
+    } else if (goPackageTarget(idx, from, ref)) {
+        return;
     }
     // Heuristic fallback: a *call* whose receiver type we can't infer
     // (`svc.create_run()`, `self.planning_service.create_run()`, `Foo.bar()` on

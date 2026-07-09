@@ -222,6 +222,8 @@ pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Opt
     }
     if (!any) {
         try w.print("(no source symbols under '{s}')\n", .{path_filter});
+        try kindHint(w, idx, path_filter, opts);
+        try outlinePathHint(w, idx, path_filter);
         try skippedNote(w, idx);
     }
     if (shown >= opts.limit) {
@@ -669,13 +671,18 @@ fn suggestNear(w: *Writer, idx: *const Index, name: []const u8) !void {
     if (std.mem.lastIndexOfScalar(u8, nm, '.')) |dot| nm = nm[dot + 1 ..];
     if (nm.len < 2 or isGlobPattern(nm)) return;
 
+    // Rank: ci-equal > ci-prefix > ci-substring > edit-distance≤2, and within a
+    // tier a SHORTER name wins — `Contex` must suggest `Context`, not the four
+    // longest names that happen to contain "contex" (a trial hit exactly that).
     var names: [4][]const u8 = undefined;
-    var scores: [4]u8 = .{ 0, 0, 0, 0 }; // 3 = ci-equal, 2 = ci-substring, 1 = edit≤2
+    var scores: [4]u8 = .{ 0, 0, 0, 0 };
     for (idx.graph.symbols) |sym| {
         // Imports aren't definitions; test blocks have prose names ("outline
         // lists …") that read as garbage in a did-you-mean list.
         if (sym.kind == .import or sym.kind == .test_case) continue;
         const score: u8 = if (std.ascii.eqlIgnoreCase(sym.name, nm))
+            4
+        else if (std.ascii.startsWithIgnoreCase(sym.name, nm))
             3
         else if (std.ascii.indexOfIgnoreCase(sym.name, nm) != null)
             2
@@ -683,7 +690,7 @@ fn suggestNear(w: *Writer, idx: *const Index, name: []const u8) !void {
             1
         else
             continue;
-        // Insert if it beats the weakest slot; dedupe by name.
+        // Replace the weakest slot when this hit outranks it; dedupe by name.
         var weakest: usize = 0;
         var dup = false;
         for (0..names.len) |i| {
@@ -691,25 +698,42 @@ fn suggestNear(w: *Writer, idx: *const Index, name: []const u8) !void {
                 dup = true;
                 break;
             }
-            if (scores[i] < scores[weakest]) weakest = i;
+            if (better(scores[weakest], if (scores[weakest] == 0) 0 else names[weakest].len, scores[i], if (scores[i] == 0) 0 else names[i].len))
+                weakest = i;
         }
-        if (dup or scores[weakest] >= score) continue;
-        names[weakest] = sym.name;
-        scores[weakest] = score;
+        if (dup) continue;
+        if (better(score, sym.name.len, scores[weakest], if (scores[weakest] == 0) 0 else names[weakest].len)) {
+            names[weakest] = sym.name;
+            scores[weakest] = score;
+        }
+    }
+    // Emit best-first: tier 4 down to 1, shorter names first within a tier
+    // (selection sort over 4 slots).
+    for (0..names.len) |i| {
+        var best = i;
+        for (i + 1..names.len) |j| {
+            if (better(scores[j], if (scores[j] == 0) 0 else names[j].len, scores[best], if (scores[best] == 0) 0 else names[best].len))
+                best = j;
+        }
+        std.mem.swap(u8, &scores[i], &scores[best]);
+        std.mem.swap([]const u8, &names[i], &names[best]);
     }
     var wrote = false;
-    // Emit best-first (score 3, then 2, then 1).
-    var want: u8 = 3;
-    while (want >= 1) : (want -= 1) {
-        for (0..names.len) |i| {
-            if (scores[i] != want) continue;
-            try w.writeAll(if (wrote) ", " else "  (did you mean: ");
-            try w.print("{s}", .{names[i]});
-            wrote = true;
-        }
-        if (want == 1) break;
+    for (0..names.len) |i| {
+        if (scores[i] == 0) continue;
+        try w.writeAll(if (wrote) ", " else "  (did you mean: ");
+        try w.print("{s}", .{names[i]});
+        wrote = true;
     }
     if (wrote) try w.writeAll("?)\n");
+}
+
+/// Suggestion ordering: higher tier wins; within a tier a shorter name wins
+/// (closer to what was typed). An empty slot (score 0) always loses.
+fn better(score_a: u8, len_a: usize, score_b: u8, len_b: usize) bool {
+    if (score_a != score_b) return score_a > score_b;
+    if (score_a == 0) return false;
+    return len_a < len_b;
 }
 
 /// Bounded Levenshtein: true when `a` and `b` are within edit distance 2.
@@ -908,10 +932,48 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     if (shown == 0) {
         try w.print("(no symbol matching '{s}')\n", .{pattern});
         try suggestNear(w, idx, pattern);
+        try kindHint(w, idx, "", opts);
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
     return shown > 0;
+}
+
+/// When a `-k` filter produced zero results, list the kinds that DO exist in
+/// scope — so `-k struct` on a Python repo says "kinds here: class, fn,
+/// method…" instead of a bare miss (a trial burned a call on exactly that).
+fn kindHint(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
+    if (opts.kinds.len == 0) return;
+    var present = std.StaticBitSet(@typeInfo(model.SymbolKind).@"enum".fields.len).initEmpty();
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import or sym.kind == .unknown) continue;
+        if (!matchesFilter(idx.graph.files[sym.file].path, path_filter)) continue;
+        present.set(@intFromEnum(sym.kind));
+    }
+    if (present.count() == 0) return;
+    try w.print("  (no '{s}' here — kinds present: ", .{opts.kinds});
+    var first = true;
+    inline for (@typeInfo(model.SymbolKind).@"enum".fields) |f| {
+        const k: model.SymbolKind = @enumFromInt(f.value);
+        if (present.isSet(f.value)) {
+            if (!first) try w.writeAll(", ");
+            try w.writeAll(k.tag());
+            first = false;
+        }
+    }
+    try w.writeAll(")\n");
+}
+
+/// When `outline <arg>` matches no file but `<arg>` names a symbol, say where
+/// it lives — the "outline takes a path" trap costs a call otherwise.
+fn outlinePathHint(w: *Writer, idx: *const Index, path_filter: []const u8) !void {
+    if (path_filter.len == 0 or isGlobPattern(path_filter)) return;
+    const ids = idx.lookup(path_filter);
+    if (ids.len == 0) return;
+    const sym = idx.graph.symbols[ids[0]];
+    try w.print("  (outline takes a path; '{s}' is a symbol — try `def {s}` or `outline {s}`)\n", .{
+        path_filter, path_filter, idx.graph.files[sym.file].path,
+    });
 }
 
 /// A `search --refs` query. A bare `name` substring-matches any reference; a
@@ -994,6 +1056,10 @@ fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Refe
     try w.print("  in {s}", .{sym.name});
     if (ref.target != invalid) {
         try w.print("  → {s}", .{idx.graph.files[idx.graph.symbols[ref.target].file].path});
+        // A heuristic binding (a bare name matched cross-file by name alone) is
+        // marked like call-tree edges are, so the arrow can't be misread as a
+        // verified cross-file dependency.
+        if (!ref.exact) try w.writeAll(" ?");
     } else if (ref.kind == .call or ref.kind == .route_call) {
         try w.writeAll("  → ~ext");
     }
@@ -1100,6 +1166,74 @@ fn testCallerCount(idx: *const Index, id: SymbolId) u32 {
     return n;
 }
 
+/// For a method whose enclosing class inherits from a type not defined in this
+/// repo, the first such external base name — e.g. `RawIOBase` for a class
+/// declared `class _WindowsConsoleReader(io.RawIOBase)`. Such methods are
+/// routinely invoked by the external framework, so "no in-repo caller" is not
+/// evidence of death. Returns null when every base is local (or none).
+fn externalBaseOf(idx: *const Index, sym: model.Symbol) ?[]const u8 {
+    if (sym.kind != .method or sym.parent == invalid) return null;
+    return externalBaseOfClass(idx, idx.graph.symbols[sym.parent], 3);
+}
+
+/// The first base of `class_sym` (transitively, up to `depth` levels) that has
+/// no in-repo definition. A base defined locally is walked into — a class two
+/// hops from `io.RawIOBase` is still framework-driven.
+fn externalBaseOfClass(idx: *const Index, class_sym: model.Symbol, depth: u32) ?[]const u8 {
+    if (depth == 0) return null;
+    switch (class_sym.kind) {
+        .class, .@"struct", .interface => {},
+        else => return null,
+    }
+    const sig = class_sym.signature(idx.graph.files[class_sym.file].text);
+    const n = std.mem.indexOf(u8, sig, class_sym.name) orelse return null;
+    const clause = sig[n + class_sym.name.len ..];
+    // Walk identifiers in the base clause; a dotted chain's LAST segment is the
+    // type. Skip clause keywords and `kwarg=` labels (Python metaclass=…).
+    var i: usize = 0;
+    while (i < clause.len) {
+        if (!isIdentStart(clause[i])) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < clause.len and isIdentChar(clause[i])) i += 1;
+        const word = clause[start..i];
+        if (i < clause.len and (clause[i] == '=' or clause[i] == '.')) {
+            // kwarg label, or a qualifier segment (`io` of `io.RawIOBase`).
+            if (clause[i] == '=') { // skip the kwarg's value expression
+                while (i < clause.len and clause[i] != ',' and clause[i] != ')') i += 1;
+            }
+            continue;
+        }
+        inline for (.{ "extends", "implements", "public", "private", "protected", "virtual", "final", "abstract", "object" }) |kw| {
+            if (std.mem.eql(u8, word, kw)) break;
+        } else {
+            // A local definition that is really the class itself (click's
+            // `class TextWrapper(textwrap.TextWrapper)`) does not count as a
+            // local base; a genuinely local base is walked transitively.
+            var local: ?model.Symbol = null;
+            for (idx.lookup(word)) |cid| {
+                if (cid != class_sym.id) {
+                    local = idx.graph.symbols[cid];
+                    break;
+                }
+            }
+            const base = local orelse return word;
+            if (externalBaseOfClass(idx, base, depth - 1)) |ext| return ext;
+        }
+    }
+    return null;
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+
+fn isIdentChar(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
 /// Whether `sym`'s body issues at least one HTTP client call (a `route_call`
 /// reference) — an `unused` hint that the symbol is a client leg of a
 /// `routes` pairing rather than plain dead code.
@@ -1133,6 +1267,14 @@ fn interfaceDispatchHint(idx: *const Index, sym: model.Symbol) ?[]const u8 {
     if (idx.graph.files[sym.file].language == .go and go_interface_names.has(sym.name)) {
         return "commonly satisfies a stdlib interface in Go";
     }
+    // Python file/stream protocol methods are duck-typed: an in-repo class can
+    // satisfy `io`-style consumers with no inheritance at all, so "no caller"
+    // means nothing for these names.
+    if (sym.kind == .method and idx.graph.files[sym.file].language.family() == .python and
+        py_protocol_names.has(sym.name))
+    {
+        return "a Python file/stream protocol method (duck-typed)";
+    }
     var callables: u32 = 0;
     for (idx.lookup(sym.name)) |cid| {
         const c = idx.graph.symbols[cid];
@@ -1141,6 +1283,13 @@ fn interfaceDispatchHint(idx: *const Index, sym: model.Symbol) ?[]const u8 {
     if (callables > 4) return "many same-named defs — possible interface dispatch";
     return null;
 }
+
+const py_protocol_names = std.StaticStringMap(void).initComptime(.{
+    .{"read"},     .{"write"},    .{"readinto"},  .{"readline"}, .{"readlines"},
+    .{"writelines"}, .{"seek"},   .{"tell"},      .{"flush"},    .{"close"},
+    .{"fileno"},   .{"isatty"},   .{"readable"},  .{"writable"}, .{"seekable"},
+    .{"truncate"}, .{"detach"},
+});
 
 const go_interface_names = std.StaticStringMap(void).initComptime(.{
     .{"MarshalJSON"},   .{"UnmarshalJSON"}, .{"MarshalText"},  .{"UnmarshalText"},
@@ -1692,6 +1841,11 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
             }
         } else if (interfaceDispatchHint(idx, sym)) |hint| {
             try w.print("  ({s} — verify before removing)\n", .{hint});
+        } else if (externalBaseOf(idx, sym)) |base| {
+            // `_WindowsConsoleReader(io.RawIOBase).readinto` has no in-repo
+            // caller because the *stdlib* calls it. Say so instead of letting
+            // it read as plain dead code (4 of 5 hits in a Python trial).
+            try w.print("  (method of a class extending external '{s}' — may be framework-invoked)\n", .{base});
         } else if (callsRoutes(sym)) {
             // Caller-less but issues HTTP calls: likely a UI/event entry point
             // the in-repo call graph can't see (a trial misread one as dead).

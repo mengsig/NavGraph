@@ -678,6 +678,12 @@ fn symbolArray(w: *Writer, idx: *const Index, ids: []const SymbolId, v: render.V
 fn nodeHead(w: *Writer, idx: *const Index, sym: Symbol) !void {
     try w.print("{{\"id\":{d},\"kind\":\"{s}\",\"name\":", .{ sym.id, sym.kind.tag() });
     try writeString(w, sym.name);
+    // The enclosing symbol's name (a method's class / a Go method's receiver
+    // type), so class-scoped analysis never needs line-range bookkeeping.
+    if (sym.parent != invalid) {
+        try w.writeAll(",\"parent\":");
+        try writeString(w, idx.graph.symbols[sym.parent].name);
+    }
     try w.print(",\"file\":", .{});
     try writeString(w, idx.graph.files[sym.file].path);
     const source = idx.graph.files[sym.file].text;
@@ -715,11 +721,7 @@ fn symbolObject(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity)
 }
 
 fn symbolObjectExtra(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity, test_only: bool) !void {
-    try nodeHead(w, idx, sym);
-    if (sym.parent != invalid) {
-        try w.writeAll(",\"parent\":");
-        try writeString(w, idx.graph.symbols[sym.parent].name);
-    }
+    try nodeHead(w, idx, sym); // includes "parent" when the symbol has one
     try w.print(",\"exported\":{}", .{sym.exported});
     const source = idx.graph.files[sym.file].text;
     if (v != .names) {

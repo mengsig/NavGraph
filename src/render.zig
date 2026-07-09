@@ -158,7 +158,11 @@ fn writeQualifiedName(w: *Writer, idx: *const Index, sym: Symbol) !void {
 fn writeSigSuffix(w: *Writer, sym: Symbol, source: []const u8) !void {
     const is_value = switch (sym.kind) {
         .function, .method => false,
-        .class, .@"struct", .@"enum", .interface, .import, .macro, .module, .test_case => return,
+        // Containers show their inheritance clause (`class Group(Command)`,
+        // `class Foo extends Bar`, `struct X : Y`) — the one hierarchy fact an
+        // "explain these classes" task otherwise needs a read per class for.
+        .class, .@"struct", .interface => return writeBaseClause(w, sym, source),
+        .@"enum", .import, .macro, .module, .test_case => return,
         else => true,
     };
     const suffix = if (is_value)
@@ -173,6 +177,32 @@ fn writeSigSuffix(w: *Writer, sym: Symbol, source: []const u8) !void {
     // whole literal. `outline -v full` still shows the complete definition.
     const cap: usize = if (is_value) max_value_len else max_sig_len;
     try writeCollapsed(w, suffix, cap);
+}
+
+/// Print a container's inheritance clause: the signature text after the name,
+/// minus declaration punctuation (`{`, `:` line-end) and bodyless noise. Yields
+/// `(Command)` for Python, `extends Bar implements Baz` for JS/TS, `: IBar`
+/// for C++/C#, `< Base` for Ruby — and nothing for a bare `struct {`.
+fn writeBaseClause(w: *Writer, sym: Symbol, source: []const u8) !void {
+    const sig = sym.signature(source);
+    const n = std.mem.indexOf(u8, sig, sym.name) orelse return;
+    var rest = sig[n + sym.name.len ..];
+    // Generic params belong to the name, not the base clause: `class Foo<T> …`.
+    if (rest.len != 0 and (rest[0] == '<' or rest[0] == '[')) {
+        const closer: u8 = if (rest[0] == '<') '>' else ']';
+        if (std.mem.indexOfScalar(u8, rest, closer)) |c| rest = rest[c + 1 ..];
+    }
+    rest = std.mem.trim(u8, rest, " \t\r\n");
+    while (rest.len != 0 and (rest[rest.len - 1] == '{' or rest[rest.len - 1] == ':')) {
+        rest = std.mem.trimEnd(u8, rest[0 .. rest.len - 1], " \t\r\n");
+    }
+    // Nothing left, or only the declaration keyword (`= struct`, `interface`):
+    // no base clause to show.
+    inline for (.{ "", "=", "= struct", "= enum", "= union", "= opaque", "struct", "interface", "class", "object" }) |noise| {
+        if (std.mem.eql(u8, rest, noise)) return;
+    }
+    try w.writeByte(' ');
+    try writeCollapsed(w, rest, 80);
 }
 
 /// The parameter/return portion of a function signature (from the first `(`).

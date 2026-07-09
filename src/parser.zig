@@ -38,6 +38,11 @@ pub const ParsedSymbol = struct {
     bindings: []const Binding = &.{},
     /// For an `import` symbol: the raw module string (see `model.Symbol`).
     import_path: []const u8 = "",
+    /// Transient (never cached): a Go method's receiver type name
+    /// (`func (m *Metrics) Provision(…)` → "Metrics"). The Go post-pass
+    /// (`attachGoReceivers`) resolves it to `parent_local` when the type is
+    /// declared in the same file, then it is dead weight.
+    receiver: []const u8 = "",
 };
 
 /// References plus local bindings collected from one symbol body.
@@ -123,7 +128,10 @@ pub fn parse(
         .js => try parseJsScope(&ctx, 0, n, null),
         .python => try parsePython(&ctx),
         .lua => try parseLuaScope(&ctx, 0, n, null),
-        .go => try parseGoScope(&ctx, 0, n, null),
+        .go => {
+            try parseGoScope(&ctx, 0, n, null);
+            attachGoReceivers(&ctx);
+        },
         .rust => try parseRustScope(&ctx, 0, n, null, false),
         .ruby => try parseRubyScope(&ctx, 0, n, null),
         .other => {},
@@ -443,6 +451,15 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // A JS/TS object-literal property key (`{ count: ... }`) names a field,
         // not a reference to a same-named binding — don't emit an edge for it.
         if (qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
+        // A Python identifier directly before `=` (and not `==`) is a keyword-
+        // argument label (`f(envvar="X")`) or an assignment target — a name
+        // being *bound*, not read. Emitting it as a ref let kwargs bind
+        // cross-file to any same-named global (a trial's false-arrow report).
+        if (qualifier.len == 0 and ctx.cfg.language.family() == .python and
+            ctx.isPunct(i + 1, '=') and !ctx.isPunct(i + 2, '='))
+        {
+            continue;
+        }
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
         try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call);
     }
@@ -591,10 +608,31 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
         const ty = inferDeclType(ctx, i + 1, hi) orelse "";
         return .{ .name = ctx.textOf(i + 1), .type_name = ty };
     }
-    // Bare assignment at line start: `name = Type(...)` (python/js).
+    // Python `for NAME in …`, `with … as NAME`, `except … as NAME`: loop and
+    // context variables are locals; an unrecorded one used to leak as a bare
+    // ref and bind cross-file to any same-named global (a trial's
+    // `for envvar in self.envvar:` pointed at an unrelated example script's
+    // `envvar`). Python-gated: `as` is an expression operator in C# and an
+    // import alias elsewhere.
+    if (ctx.cfg.language.family() == .python and
+        (ctx.identEql(i, "for") or ctx.identEql(i, "as")))
+    {
+        if (i + 1 < hi and ctx.toks[i + 1].kind == .identifier) {
+            return .{ .name = ctx.textOf(i + 1), .type_name = "" };
+        }
+        return null;
+    }
     const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
-    if (!first_on_line or !ctx.isPunct(i + 1, '=') or ctx.isPunct(i + 2, '=')) return null;
-    const ty = typeFromRhs(ctx, i + 2, hi) orelse return null;
+    if (!first_on_line) return null;
+    // Go short declaration `name := …` (tokens `:` `=`).
+    if (ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, '=')) {
+        return .{ .name = ctx.textOf(i), .type_name = typeFromRhs(ctx, i + 3, hi) orelse "" };
+    }
+    // Bare assignment at line start: `name = RHS` (python/js). Typed when the
+    // RHS constructs a known type; still recorded untyped otherwise so the
+    // local shadows same-named globals.
+    if (!ctx.isPunct(i + 1, '=') or ctx.isPunct(i + 2, '=')) return null;
+    const ty = typeFromRhs(ctx, i + 2, hi) orelse "";
     return .{ .name = ctx.textOf(i), .type_name = ty };
 }
 
@@ -2511,6 +2549,26 @@ fn lastPathSegment(path: []const u8) []const u8 {
 fn parseGoScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
     var i = lo;
     while (i < hi) {
+        // `package caddy` — emitted as a `.module` symbol so package-qualified
+        // calls (`caddy.Load(...)`) can resolve to this file's top-level defs.
+        if (parent == null and ctx.identEql(i, "package") and isLineStart(ctx, i) and
+            i + 1 < hi and ctx.toks[i + 1].kind == .identifier)
+        {
+            _ = try emit(ctx, .{
+                .name = ctx.textOf(i + 1),
+                .kind = .module,
+                .line = ctx.toks[i].line,
+                .span_start = lineStartOffset(ctx, i),
+                .span_end = ctx.toks[i + 1].end,
+                .sig_end = ctx.toks[i + 1].end,
+                .doc = "",
+                .exported = true,
+                .parent_local = null,
+                .refs = &.{},
+            });
+            i += 2;
+            continue;
+        }
         if (ctx.identEql(i, "func")) {
             const adv = try parseGoFunc(ctx, i, hi, parent);
             if (adv > i) {
@@ -2614,10 +2672,12 @@ fn emitGoValue(ctx: *Ctx, name_i: u32, kind: SymbolKind, parent: ?u32) AllocErro
 fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     var j = func_i + 1;
     var is_method = false;
+    var receiver: []const u8 = "";
     // Optional receiver: `func (r T) Name(...)`.
     if (j < hi and ctx.isPunct(j, '(')) {
         const rc = ctx.close[j];
         if (rc == sentinel) return func_i;
+        receiver = goReceiverType(ctx, j, rc);
         j = rc + 1;
         is_method = true;
     }
@@ -2650,8 +2710,57 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         .parent_local = parent,
         .refs = body.refs,
         .bindings = body.bindings,
+        .receiver = receiver,
     });
     return body_close + 1;
+}
+
+/// A Go-modules major-version import segment: `v2`, `v10`, ….
+fn isGoVersionSegment(s: []const u8) bool {
+    if (s.len < 2 or s[0] != 'v') return false;
+    for (s[1..]) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// The receiver *type* name of a Go method: in `(m *Metrics)` the second
+/// identifier ("Metrics"); in the nameless form `(Metrics)` the only one.
+/// Generic receivers `(m *Metrics[T])` still yield "Metrics" (the type
+/// parameter comes after and is ignored).
+fn goReceiverType(ctx: *const Ctx, open: u32, close: u32) []const u8 {
+    var first: []const u8 = "";
+    var k = open + 1;
+    while (k < close) : (k += 1) {
+        if (ctx.isPunct(k, '[')) break; // type params — done
+        if (ctx.toks[k].kind != .identifier) continue;
+        if (first.len == 0) {
+            first = ctx.textOf(k);
+        } else {
+            return ctx.textOf(k); // `name *Type` — the second identifier
+        }
+    }
+    return first;
+}
+
+/// Go post-pass: attach each method to its receiver type when that type is
+/// declared in the same file (`func (m *Metrics) Provision` → parent = the
+/// `Metrics` symbol), regardless of declaration order. Makes the
+/// `Metrics.Provision` pin, qualified rendering, and type-scoped queries work
+/// for Go the way they do for class languages.
+fn attachGoReceivers(ctx: *Ctx) void {
+    for (ctx.out.items, 0..) |*sym, i| {
+        if (sym.kind != .method or sym.receiver.len == 0 or sym.parent_local != null) continue;
+        for (ctx.out.items, 0..) |cand, ci| {
+            if (ci == i) continue;
+            switch (cand.kind) {
+                .@"struct", .class, .interface, .type, .@"enum" => {},
+                else => continue,
+            }
+            if (std.mem.eql(u8, cand.name, sym.receiver)) {
+                sym.parent_local = @intCast(ci);
+                break;
+            }
+        }
+    }
 }
 
 /// The `{` opening a Go function body after its parameter list closes at
@@ -2772,11 +2881,16 @@ fn parseGoImport(ctx: *Ctx, import_i: u32, hi: u32) AllocError!u32 {
 }
 
 /// Emit an import for the path string at `str_i`, binding it to the preceding
-/// alias identifier when one sits on the same line, else the path's last segment.
+/// alias identifier when one sits on the same line, else the path's last
+/// segment — skipping a Go-modules major-version suffix (`…/caddy/v2` binds as
+/// `caddy`, the real package name, not `v2`).
 fn emitGoImport(ctx: *Ctx, str_i: u32) AllocError!void {
     const path = stripQuotes(ctx.textOf(str_i));
     if (path.len == 0) return;
     var binding = lastPathSegment(path);
+    if (isGoVersionSegment(binding) and path.len > binding.len + 1) {
+        binding = lastPathSegment(path[0 .. path.len - binding.len - 1]);
+    }
     var span_start_tok = str_i;
     // A preceding same-line identifier is an import alias (`alias "path"`) — but
     // NOT the `import` keyword itself of a single, ungrouped `import "fmt"`, which
@@ -5406,4 +5520,84 @@ test "go: grouped const/var skips multi-line initializers (no phantom symbols)" 
     try testing.expect(findSym(out.items, "config") == null);
     try testing.expect(findSym(out.items, "timeout") == null);
     try testing.expect(findSym(out.items, "suffix") == null);
+}
+
+test "go: package decl is a module symbol; methods parent to their same-file receiver type" {
+    const src =
+        \\package metrics
+        \\
+        \\func (m *Metrics) Provision(x int) error {
+        \\    return nil
+        \\}
+        \\
+        \\type Metrics struct {
+        \\    n int
+        \\}
+        \\
+        \\func (Metrics) Nameless() {}
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+
+    const pkg = findSym(out.items, "metrics").?;
+    try testing.expectEqual(SymbolKind.module, pkg.kind);
+
+    // Method declared BEFORE its type still gets parented (post-pass).
+    const typ_idx: u32 = blk: {
+        for (out.items, 0..) |s, i| {
+            if (s.kind == .@"struct" and std.mem.eql(u8, s.name, "Metrics")) break :blk @intCast(i);
+        }
+        unreachable;
+    };
+    const prov = findSym(out.items, "Provision").?;
+    try testing.expectEqual(typ_idx, prov.parent_local.?);
+    // Nameless-receiver form `func (Metrics) X()` parents too.
+    const nameless = findSym(out.items, "Nameless").?;
+    try testing.expectEqual(typ_idx, nameless.parent_local.?);
+}
+
+test "go: a /vN module import binds the real package name, not the version segment" {
+    const src =
+        \\package main
+        \\
+        \\import (
+        \\    "github.com/caddyserver/caddy/v2"
+        \\    "example.com/single/v10"
+        \\)
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "caddy") != null);
+    try testing.expect(findSym(out.items, "single") != null);
+    try testing.expect(findSym(out.items, "v2") == null);
+}
+
+test "python: kwarg labels and loop/context variables are not references" {
+    const src =
+        \\def use(envvar, done):
+        \\    configure(envvar="PATH")
+        \\    for envvar in items:
+        \\        touch(envvar)
+        \\    with open("f") as handle:
+        \\        handle.close()
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const use = findSym(out.items, "use").?;
+    // The kwarg label on line 2 is skipped at collection; the only remaining
+    // `envvar` mentions are the loop sites, and the loop variable is a recorded
+    // local binding — so resolution will never bind them cross-file.
+    for (use.refs) |r| {
+        if (std.mem.eql(u8, r.name, "envvar")) {
+            try testing.expect(r.line != 2); // never the kwarg site
+        }
+    }
+    var saw_envvar = false;
+    var saw_handle = false;
+    for (use.bindings) |b| {
+        if (std.mem.eql(u8, b.name, "envvar")) saw_envvar = true;
+        if (std.mem.eql(u8, b.name, "handle")) saw_handle = true;
+    }
+    try testing.expect(saw_envvar); // `for envvar in …`
+    try testing.expect(saw_handle); // `with … as handle`
 }
