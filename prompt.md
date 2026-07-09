@@ -56,7 +56,7 @@ supported code, and each has a required replacement:
 | Reading handler + caller to trace a message-bus / WS event | `navgraph events [filter]` (pairs `register`/`on` handlers with `send`/`emit` emitters, cross-language) |
 | Reading imports at the top of files | `navgraph imports [filter]` / `importers <file>` |
 | `grep` inside string literals (URLs, logs, regexes) | `navgraph strings <pattern>` |
-| Listing indexed files / gauging coverage | `navgraph files [filter]` (add `--sort symbols` to rank biggest-first) |
+| Listing indexed files / gauging index coverage | `navgraph files [filter]` (add `--sort symbols` to rank biggest-first) |
 
 Only after navgraph has pointed you at specific lines may you `read` those exact
 lines (or use `navgraph read file:A-B`) — never a whole supported file "to get
@@ -127,6 +127,9 @@ applies. "It was faster to just read it" is not a valid hatch.
   removal candidate — not broken/unusable.
 - `coverage [path]` — per-file % of `fn`/`method` reachable from a test in the
   call graph; a dependency-free stand-in for line coverage (`-j` for JSON).
+- `--follow-imports` — `unused` only: disambiguate same-name symbols by import
+  reachability, surfacing unused code a used same-name twin would otherwise mask
+  (needs import resolution).
 
 ### Cross-package & cross-language resolution
 
@@ -152,4 +155,9 @@ backend handler with the TypeScript frontend call that hits it.
   `test` blocks (rendered as kind `test`), `test_*` functions, and files under a
   test dir. Add `--no-tests` for a production-only view, or `--tests-only` to
   focus on tests (e.g. "which tests hit this function").
+- **Inline non-Zig tests aren't detected.** Test detection is Zig `test` blocks +
+  a name/path heuristic (`test_*`, `*_test.*`/`*.spec.*`, files under a test dir).
+  Tests written *inline in a production file* in other languages — notably Rust
+  `#[cfg(test)] mod tests { … }` — are treated as production code, so
+  `--tests-only`/`coverage` won't count them.
 

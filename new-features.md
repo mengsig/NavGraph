@@ -12,7 +12,8 @@ a ROADMAP item, the *specific, reproducible* finding below is still new and
 actionable.
 
 Legend: **[bug]** wrong output · **[gap]** a construct/verb it should handle but
-doesn't · **[nice]** an ergonomic win for the consuming agent.
+doesn't · **[nice]** an ergonomic win for the consuming agent · **[✅ shipped]**
+landed this session (verified against the current binary).
 
 Evidence: every item was observed either by running the current `navgraph`
 against a fixture under `testenv/` (67 findings — 14 bugs, 33 gaps, 20
@@ -22,17 +23,43 @@ sections below curate them by theme.
 
 ---
 
+## ✅ Shipped in this pass
+
+Backlog items that landed this session (details in the sections below; verified
+against the current `navgraph` binary):
+
+- **§A1 / A2 / A3** — Zig `test` blocks are indexed as `test`-kind symbols, so
+  `callers foo --tests-only` shows the tests exercising `foo`; new `coverage`
+  verb (text + JSON); one unified `--tests with|without|only` selector across
+  `outline`/`search`/`callers`/`hot`/`unused` (the old `--no-test` was removed).
+- **§C** — scope-aware reference resolution: JS/TS object-literal keys and
+  untyped params/locals no longer create false `callers`/`calls`/`hot`/`path`
+  edges (the `unused` token-tally now also skips object keys).
+- **§E** — `unused` trustworthiness: C# `private`/`protected`/`internal` are
+  respected by `--no-public`; a dead `@dataclass` class is now reported.
+- **§D** — Go package-level `const`/`var` and C# expression-bodied methods indexed.
+- **§K** — Rust `impl<'a> Type<'a>` methods nest under the type; Go single-line
+  `import "fmt"` binds `fmt`; `-C <file>` scopes to a single file.
+
+Still open: everything below not marked ✅ — largest being import-graph
+resolution for C/C++/C#/Go (§F), `def -v doc` docstrings (§H), the Zig
+generic-container idiom and C# properties/fields (§D), and non-Zig inline-test
+detection (§A4).
+
+---
+
 ## A. Test-awareness — the biggest missing capability
 
 Measuring this very task's coverage hit a wall that turned into the single
 highest-value idea here.
 
 ### A1. Index `test` blocks as first-class symbols  **[✅ shipped]**
-*Shipped:* Zig `test "…" {}` blocks are now `.test_case` symbols with body
-edges, so `callers foo` shows the tests that exercise `foo`.
-`navgraph outline src/gitdiff.zig` lists the functions but **none of the `test`
-blocks**, though the file has several. Zig `test "name" { ... }` are executable
-units with a call graph, but NavGraph drops them. Consequences I hit directly:
+*Shipped:* Zig `test "…" {}` blocks are now `test`-kind symbols with body edges,
+so `callers foo --tests-only` shows the tests that exercise `foo`.
+*(Original finding:)* `navgraph outline src/gitdiff.zig` used to list the
+functions but **none of the `test` blocks**, though the file had several. Zig
+`test "name" { ... }` are executable units with a call graph, but NavGraph
+dropped them. Consequences that motivated the fix:
 - A function exercised **only** by a test has no non-test caller, so `callers`
   shows nothing and `unused` would flag it as dead — a false positive that
   punishes well-tested private helpers.
@@ -101,9 +128,10 @@ internally for changed symbols; exposing the general op would generalize it.
 false call/read edges — `callers`/`calls`/`hot`/`path` are clean. (The `unused`
 token-tally's scope-blindness is tracked with §E.)
 
-Name-based reference matching still leaks across scopes, producing **both false
-callers and hidden dead code**. ROADMAP Tier 1 fixed type-scoped *member* calls,
-but *bareword* references remain scope-blind. Seen in 3 languages independently:
+Name-based reference matching *used to* leak across scopes, producing **both
+false callers and hidden dead code**. The graph edges (`callers`/`calls`/`hot`/
+`path`) are now scope-aware; the residual leak is the `unused` token-tally's
+param-shadow case (§E). Original findings, seen in 3 languages independently:
 
 - **[bug] Object-literal property keys count as calls.** (JS `js_express`, TS
   `ts_frontend`.) `res.json({ count: store.size() })` makes `count:` resolve to a
@@ -116,10 +144,11 @@ but *bareword* references remain scope-blind. Seen in 3 languages independently:
   `get_item` (route handler vs `db.get_item`); an unresolved `db.get_item(...)`
   name-matches the wrong one, polluting `neighbors`/`callers`.
 
-Fix direction: an object-literal-key context check and local-binding/param
-shadowing check in reference resolution (the local-variable case already exists
-per `improvements.md`; extend it to object keys and params). This single class
-would improve `callers`, `calls`, `hot`, and `unused` precision at once.
+*Shipped:* object-literal-key suppression and untyped param/local binding capture
+in reference resolution (extending the existing local-variable case to object
+keys and params) cleaned `callers`/`calls`/`hot`/`path` at once, and the `unused`
+tally now skips object keys too. *Still open:* the tally's param-shadow case
+(§E) and the Python cross-file collision (depends on the import fix, §F).
 
 ---
 
@@ -137,13 +166,13 @@ union labeling.
 Whole categories of real symbols are invisible or wrong. Each makes `outline`,
 `def`, `search`, and `unused` incomplete for that language.
 
-**C# (weakest support overall — 8 findings):**
+**C# (weakest support — 3 gaps open; expression-bodied methods shipped):**
 - **[gap]** Properties (auto `{get;set;}`, get-only, expression-bodied, static)
   are unindexed — `def PriceDollars` → "no definition".
 - **[gap]** Fields (incl. `public static int NextOrderId`) unindexed.
 - **[gap]** Generic methods `Foo<T>(...)` dropped even when block-bodied (side
   effect: their class is falsely reported fully dead by `unused`).
-- **[gap]** Expression-bodied methods `IsEmpty() => …;` dropped.
+- **[✅ shipped]** Expression-bodied methods `IsEmpty() => …;` are now indexed.
 
 **C++ (`cpp_app`):**
 - **[bug]** `enum class ShapeKind` indexed with **no name** — `def ShapeKind`
@@ -163,15 +192,13 @@ type-constructor (`fn Stack(comptime T) type { return struct { … } }`) are not
 indexed, so `operands.push()` mis-resolves to an unrelated `Vm.push`; **[gap]**
 `union(enum)` rendered as `struct`; **[nice]** enum backing integer type dropped.
 
-**Go (`go_service`):** **[bug]** package-level `const`/`var` (grouped and single)
-unindexed — `search StatusActive`/`ErrNotFound` find nothing.
+**Go (`go_service`):** **[✅ shipped]** package-level `const`/`var` (grouped and
+single) are now indexed (`search StatusActive`/`ErrNotFound` resolve).
 
-**Rust (`rust_cli`):** **[bug]** `impl<'a> Lexer<'a>` (lifetime/generic-param
-impl) orphans all its methods to top level — they don't nest under `Lexer` and
-`def Lexer` shows zero methods. **Root cause identified:** `rustImplTypeName` in
-`src/parser.zig` takes the last identifier before `{`, which for
-`impl<'a> Lexer<'a>` is inside the generics, not the type. High-value, localized
-fix.
+**Rust (`rust_cli`):** **[✅ shipped, see §K]** `impl<'a> Lexer<'a>`
+(lifetime/generic-param impl) methods now nest under `Lexer`. Root cause was
+`rustImplTypeName` taking the last identifier before `{` (inside the generics,
+not the type); it now skips the impl's generic clause and each type's args.
 
 **Ruby (`ruby_app`):** **[bug]** predicate/bang names lose their trailing `?`/`!`
 — `def available?` stored as `available`, so `def 'available?'` fails; **[nice]**
@@ -306,6 +333,10 @@ in-memory graph (`idx.graph.symbols[...].refs`, `callersOf`, `findSym`).
 ---
 
 ## Appendix — all 67 findings (auto-generated)
+
+*Snapshot of the original 67 findings. Several shipped this pass — see the
+"Shipped in this pass" summary and the ✅ tags in §C/§D/§E/§K (e.g. Go const/var,
+Rust `impl<'a>`, C# expression-bodied methods, the object-key false edges).*
 
 | # | app | sev | verb | finding |
 |---|-----|-----|------|---------|

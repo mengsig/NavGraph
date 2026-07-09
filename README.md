@@ -57,10 +57,18 @@ navgraph <command> [arg] [flags]
 | `calls <name>`     | Tree of what `<name>` calls/uses (callees).                   |
 | `callers <name>`   | Tree of who calls/uses `<name>` (callers).                    |
 | `search <pattern>` | Symbols whose name contains `<pattern>` (`--refs` for use sites; `Recv.field`/`.field` pins attribute reads). |
+| `routes [filter]`  | HTTP routes + the client calls that hit them — links server handlers to client calls across languages. |
 | `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
-| `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
-| `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
+| `neighbors <name>` | Callees and callers of `<name>` in one view.                  |
 | `unused [filter]`  | Unreferenced definitions (fns/methods & types) — removal candidates nothing calls or uses (**not** "broken" code). Default: truly unused (no caller in app or test code). `--no-tests` also lists code used only by tests (annotated); `--tests-only` lists unused test helpers; `--no-public` drops exported (maybe public API); `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
+| `imports [filter]` | Modules each file imports (local dependency edges).           |
+| `importers <file>` | Files that import `<file>`.                                    |
+| `path <A> <B>`     | Shortest call path from `<A>` to `<B>`.                        |
+| `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
+| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols. |
+| `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
+| `read <file[:A-B]>`| Print raw source lines (numbered); batch ranges: `file:A-B,C-D`. |
+| `strings <pattern>`| Search inside string literals (URLs, log/error text, regexes). |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `help`             | Show help.                                                    |
 
@@ -72,7 +80,15 @@ navgraph <command> [arg] [flags]
 | `-d, --depth <N>`             | Graph depth for `calls`/`callers` (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
 | `-l, --limit <N>`             | Max results (default `300`).               |
+| `-k, --kind <k1,k2>`          | Restrict `outline`/`search` to kinds (`fn`, `struct`, …). |
 | `-t, --tests <with\|without\|only>` | Unified test-scope for `outline`/`search`/`callers`/`hot`/`unused`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
+| `-r, --refs`                  | `search`: match use sites; `calls`/`neighbors`: include var/const/field reads. |
+| `-s, --strict`                | Follow only high-confidence edges (drop heuristic `?` edges). |
+| `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
+| `--sort <path\|symbols>`      | `files`: order by path (default) or symbol count. |
+| `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild.  |
+| `--no-public`                 | `unused`: drop exported symbols (possible public API). |
+| `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
 
 ## Examples
 
@@ -152,13 +168,19 @@ Everything for one run lives in a single arena that is freed on exit.
 
 ## Limitations & roadmap
 
-- Resolution is **name-based**: a method call on a standard-library object can
-  resolve to a same-named project symbol. Ambiguity is possible; treat the
-  graph as high-recall guidance, not a compiler-grade index.
-- No persistent cache yet — each invocation re-indexes. This is sub-second for
-  typical repos; a mtime-keyed cache is a planned enhancement.
-- **Cross-language API linking** (e.g. a TS `fetch('/route')` linked to a Python
-  route handler) is on the roadmap and not yet implemented.
+- Resolution is **heuristic**, not compiler-grade. It is type-scoped (a member
+  call binds only to a member of the receiver's inferred type — `self`/`this`,
+  typed params, local `Foo{…}`/`Foo.init()` bindings) and import-aware, but a
+  call on an untracked receiver falls back to a name match, marked heuristic
+  (`?`); `--strict` drops those. Treat the graph as high-recall guidance.
+- Repeat runs are fast via an on-disk cache under `.navgraph/cache` (path +
+  mtime + size keyed); `--no-cache` forces a clean rebuild.
+- **Cross-language linking** covers HTTP routes (`navgraph routes`, e.g. a TS
+  `fetch('/route')` paired with a Python/Flask handler) and message-bus events
+  (`navgraph events`). GraphQL / DB-model / protobuf schemas, and non-Zig
+  *inline* tests (e.g. Rust `#[cfg(test)]`), are not yet handled.
+
+See `ROADMAP.md` for planned work and `new-features.md` for the current backlog.
 
 ## Library use
 
