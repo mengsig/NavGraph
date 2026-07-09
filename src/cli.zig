@@ -59,21 +59,24 @@ const usage_text =
     \\FLAGS:
     \\  -v, --verbosity <names|sig|doc|full>   Detail level (default: sig)
     \\  -d, --depth <N>                        Graph depth for calls/callers (default: 1)
-    \\  -C, --root <path>                      Project root to index (default: .)
+    \\  -C, --root <path>                      Index root: a directory, or a single
+    \\                                         file to scope to it (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  --sort <path|symbols>                  files: order by path (default) or symbol count
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
     \\  -t, --tests <with|without|only>        Test-scope for outline/search/callers/hot:
-    \\                                         include tests (default), exclude (--no-tests),
-    \\                                         or only tests (--tests-only). Test = a Zig
-    \\                                         `test` block, a test_* fn, or a test-dir file.
+    \\                                         with (default) | without | only. A test is
+    \\                                         a Zig `test` block, a test_* fn, or a
+    \\                                         file under a test dir.
+    \\  --no-tests, --tests-only               Shortcuts for --tests without / --tests only.
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\  --no-public                            unused: drop exported symbols (possible public API)
-    \\  --no-test                              unused: drop symbols used only by tests
-    \\                                         (pass both to find the actually-unused set)
+    \\  --no-test                              unused only: drop symbols used solely by
+    \\                                         tests (distinct from --no-tests above;
+    \\                                         pass with --no-public for the fully-dead set)
     \\  --follow-imports                       unused: disambiguate same-name symbols by
     \\                                         import reachability (finds dead code masked
     \\                                         by a used twin; relies on import resolution)
@@ -720,6 +723,25 @@ test "usage: writes the full help banner" {
     try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") != null);
     try testing.expect(std.mem.indexOf(u8, out, "FLAGS:") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--no-cache") != null);
+}
+
+test "usage documents every command and test-scope flag (drift guard)" {
+    const testing = std.testing;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try usage(&aw.writer);
+    const out = aw.written();
+    // Every Command's canonical name must appear in the help, so a new verb can't
+    // ship undocumented.
+    inline for (@typeInfo(Command).@"enum".fields) |f| {
+        try testing.expect(std.mem.indexOf(u8, out, f.name) != null);
+    }
+    // The unified test-scope flag and its aliases are documented.
+    for ([_][]const u8{ "--tests", "--no-tests", "--tests-only", "--no-test", "--no-public" }) |flag| {
+        try testing.expect(std.mem.indexOf(u8, out, flag) != null);
+    }
 }
 
 test "splitFlag: long flag with and without an attached value" {

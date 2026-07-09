@@ -70,7 +70,7 @@ navgraph <command> [arg] [flags]
 |-------------------------------|--------------------------------------------|
 | `-v, --verbosity <level>`     | `names` \| `sig` \| `doc` \| `full` (default `sig`). |
 | `-d, --depth <N>`             | Graph depth for `calls`/`callers` (default `1`). |
-| `-C, --root <path>`           | Project root to index (default `.`).       |
+| `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
 | `-l, --limit <N>`             | Max results (default `300`).               |
 | `-t, --tests <with\|without\|only>` | Test-scope for `outline`/`search`/`callers`/`hot`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
 
