@@ -1450,3 +1450,635 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
         try testing.expectEqualStrings(c[1], idx.graph.symbols[callers[0]].name);
     }
 }
+
+
+// ===========================================================================
+// APPENDED HARDENING TESTS (build + resolution)
+// ===========================================================================
+
+/// First reference of `sym` whose name matches, ignoring the qualifier.
+fn refByName(sym: model.Symbol, name: []const u8) ?model.Reference {
+    for (sym.refs) |ref| {
+        if (std.mem.eql(u8, ref.name, name)) return ref;
+    }
+    return null;
+}
+
+/// First reference of `sym` matching both `qualifier` and `name`.
+fn refByQual(sym: model.Symbol, qualifier: []const u8, name: []const u8) ?model.Reference {
+    for (sym.refs) |ref| {
+        if (std.mem.eql(u8, ref.qualifier, qualifier) and std.mem.eql(u8, ref.name, name)) return ref;
+    }
+    return null;
+}
+
+/// Count how many entries of `list` equal `needle`.
+fn countStr(list: []const []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    for (list) |s| if (std.mem.eql(u8, s, needle)) {
+        n += 1;
+    };
+    return n;
+}
+
+test "underSourceRoot: a source-root component anywhere makes it true" {
+    const testing = std.testing;
+    // A `source_roots` component (src/lib/app/source/sources/packages/pkg) at any
+    // depth flips it true — this is what keeps `frontend/src/coverage/` indexed.
+    try testing.expect(underSourceRoot("src"));
+    try testing.expect(underSourceRoot("frontend/src/coverage"));
+    try testing.expect(underSourceRoot("a/lib/b"));
+    try testing.expect(underSourceRoot("app/models"));
+    try testing.expect(underSourceRoot("packages/x/target"));
+    try testing.expect(underSourceRoot("some/pkg/deep"));
+    try testing.expect(underSourceRoot("source/gen"));
+    try testing.expect(underSourceRoot("a/sources/b"));
+    // No source-root component anywhere: false (a root-level build dir, an
+    // arbitrary nesting, and the empty path).
+    try testing.expect(!underSourceRoot("coverage"));
+    try testing.expect(!underSourceRoot("frontend/build"));
+    try testing.expect(!underSourceRoot("a/b/c"));
+    try testing.expect(!underSourceRoot(""));
+    // A substring that isn't a whole path component must not match.
+    try testing.expect(!underSourceRoot("libs/foo")); // "libs" != "lib"
+    try testing.expect(!underSourceRoot("srcgen/x")); // "srcgen" != "src"
+}
+
+test "lua: require binds a module edge and a qualified cross-file call resolves" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/util.lua", .data =
+        \\local M = {}
+        \\function M.clamp(x)
+        \\  return x
+        \\end
+        \\function clamp(x)
+        \\  return x
+        \\end
+        \\return M
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.lua", .data =
+        \\local util = require("lib.util")
+        \\local function run()
+        \\  return util.clamp(1)
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The Lua `require("lib.util")` binds `util` -> lib/util.lua as a module edge.
+    const main_file = idx.graph.symbols[idx.lookup("run")[0]].file;
+    const util_file = idx.graph.files[main_file];
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+    const imp = idx.importsOf(main_file)[0];
+    try testing.expectEqualStrings("util", imp.binding);
+    try testing.expect(std.mem.endsWith(u8, idx.graph.files[imp.target].path, "lib/util.lua"));
+    try testing.expect(imp.target != util_file.id);
+
+    // `util.clamp(1)` resolves through the import to the top-level `clamp` in
+    // lib/util.lua (exact, module-qualified).
+    const target = qualifiedFileSym(&idx, "lib/util.lua", "clamp").?;
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ref = refByQual(run, "util", "clamp").?;
+    try testing.expectEqual(target, ref.target);
+    try testing.expect(ref.exact);
+}
+
+test "js: a CommonJS require binds a module and a qualified member call resolves" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.js", .data =
+        \\function foo() { return 1; }
+        \\module.exports = { foo };
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.js", .data =
+        \\const util = require('./util');
+        \\function run() { return util.foo(); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const main_file = idx.graph.symbols[idx.lookup("run")[0]].file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+    try testing.expectEqualStrings("util", idx.importsOf(main_file)[0].binding);
+
+    // `util.foo()` resolves through the require binding to util.js's foo (exact).
+    const foo = idx.lookup("foo")[0];
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ref = refByQual(run, "util", "foo").?;
+    try testing.expectEqual(foo, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(run.id, idx.callersOf(foo)[0]);
+}
+
+test "python from-import records a module edge whose binding is empty" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "pkg");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/util.py", .data =
+        \\def helper():
+        \\    return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/main.py", .data =
+        \\from .util import helper
+        \\def run():
+        \\    return helper()
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const main_file = idx.graph.symbols[idx.lookup("run")[0]].file;
+    const util_file = idx.graph.symbols[idx.lookup("helper")[0]].file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+    const imp = idx.importsOf(main_file)[0];
+    // A `from X import Y` contributes a module edge but no callable binding.
+    try testing.expectEqual(@as(usize, 0), imp.binding.len);
+    try testing.expectEqual(util_file, imp.target);
+    // The bare `helper()` still resolves within the Python family.
+    try testing.expectEqual(idx.lookup("run")[0], idx.callersOf(idx.lookup("helper")[0])[0]);
+}
+
+test "a zig @import of the file's own path is ignored (no self-import edge)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "self.zig", .data =
+        \\const me = @import("self.zig");
+        \\pub fn f() u32 {
+        \\    return 1;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const file = idx.graph.symbols[idx.lookup("f")[0]].file;
+    // resolveFileImports drops `target == f.id`, so a self-import yields no edge.
+    try testing.expectEqual(@as(usize, 0), idx.importsOf(file).len);
+}
+
+test "chooseTarget: a bare call to a name defined in two files is a non-confident guess" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn shared() u32 {
+        \\    return 1;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn shared() u32 {
+        \\    return 2;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data =
+        \\pub fn go() u32 {
+        \\    return shared();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), idx.lookup("shared").len);
+    const go = idx.graph.symbols[idx.lookup("go")[0]];
+    const ref = refByName(go, "shared").?;
+    // Two equally-plausible cross-file candidates: it binds one but is not exact.
+    try testing.expect(ref.target != invalid);
+    try testing.expect(!ref.exact);
+    // The chosen target is one of the two `shared` defs and `go` is its only
+    // caller; the total caller count across both defs is exactly one.
+    var total: usize = 0;
+    for (idx.lookup("shared")) |sid| total += idx.callersOf(sid).len;
+    try testing.expectEqual(@as(usize, 1), total);
+    try testing.expectEqual(go.id, idx.callersOf(ref.target)[0]);
+}
+
+test "chooseTarget: a same-file definition wins and is exact over a same-named other-file def" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn dup() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn caller() u32 {
+        \\    return dup();
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn dup() u32 {
+        \\    return 2;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const a_dup = qualifiedFileSym(&idx, "a.zig", "dup").?;
+    const b_dup = qualifiedFileSym(&idx, "b.zig", "dup").?;
+    const caller = idx.graph.symbols[idx.lookup("caller")[0]];
+    const ref = refByName(caller, "dup").?;
+    // Same-file scores highest (>= 4) so the pick is confident/exact.
+    try testing.expectEqual(a_dup, ref.target);
+    try testing.expect(ref.exact);
+    // The other file's identically-named def is never linked.
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(b_dup).len);
+    try testing.expectEqual(caller.id, idx.callersOf(a_dup)[0]);
+}
+
+test "member call: a self receiver resolves exactly to a sibling method (zig)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data =
+        \\pub const T = struct {
+        \\    pub fn first(self: *T) u32 {
+        \\        return self.second();
+        \\    }
+        \\    pub fn second(self: *T) u32 {
+        \\        return 1;
+        \\    }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const first = qualifiedId(&idx, "T", "first").?;
+    const second = qualifiedId(&idx, "T", "second").?;
+    const first_sym = idx.graph.symbols[first];
+    const ref = refByQual(first_sym, "self", "second").?;
+    // `self.second()` resolves to the enclosing type's member, exactly.
+    try testing.expectEqual(second, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(first, idx.callersOf(second)[0]);
+}
+
+test "member call: a this receiver resolves exactly to a sibling method (js class)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.js", .data =
+        \\class Svc {
+        \\  first() { return this.second(); }
+        \\  second() { return 1; }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const first = qualifiedId(&idx, "Svc", "first").?;
+    const second = qualifiedId(&idx, "Svc", "second").?;
+    const ref = refByQual(idx.graph.symbols[first], "this", "second").?;
+    try testing.expectEqual(second, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(first, idx.callersOf(second)[0]);
+}
+
+test "unknown receiver: a member call is a heuristic guess, a member read stays unbound" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\class Ctx:
+        \\    value: int = 0
+        \\    def compute(self):
+        \\        return 1
+        \\
+        \\def build():
+        \\    obj = make()
+        \\    total = obj.value
+        \\    return obj.compute()
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const value = qualifiedId(&idx, "Ctx", "value").?;
+    const compute = qualifiedId(&idx, "Ctx", "compute").?;
+    const build_sym = idx.graph.symbols[idx.lookup("build")[0]];
+
+    // `obj.compute()` on an untyped receiver is bound to the method by the
+    // dispatch heuristic, but never as an exact edge.
+    const call = refByQual(build_sym, "obj", "compute").?;
+    try testing.expectEqual(compute, call.target);
+    try testing.expect(!call.exact);
+    try testing.expectEqual(build_sym.id, idx.callersOf(compute)[0]);
+
+    // `obj.value` is a member *read*, so it must not inflate the field's fan-in.
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(value).len);
+}
+
+test "heuristic method target prefers a same-file method over a free function" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub const T = struct {
+        \\    pub fn process(self: *T) u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\pub fn run() u32 {
+        \\    return g.process();
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.zig", .data =
+        \\pub fn process() u32 {
+        \\    return 2;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const method = qualifiedId(&idx, "T", "process").?;
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ref = refByQual(run, "g", "process").?;
+    // The method (score: +2 method, +1 same-file) beats the other-file free fn.
+    try testing.expectEqual(method, ref.target);
+    try testing.expect(!ref.exact); // heuristic dispatch is never exact
+    try testing.expectEqual(run.id, idx.callersOf(method)[0]);
+}
+
+test "a qualified call to a nonexistent member of an imported module stays unresolved" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data =
+        \\pub fn helper() u32 {
+        \\    return 1;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data =
+        \\const util = @import("util.zig");
+        \\pub fn run() u32 {
+        \\    return util.ghost();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ref = refByQual(run, "util", "ghost").?;
+    // The module resolves, but it has no `ghost`, and no other file does either:
+    // the heuristic fallback also finds nothing, so the edge stays external.
+    try testing.expectEqual(invalid, ref.target);
+    // The import edge itself is still present.
+    const main_file = run.file;
+    try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+    // helper was never called.
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(idx.lookup("helper")[0]).len);
+}
+
+test "route linking: an unmatched client fetch stays external and the route has no callers" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
+        \\app = FastAPI()
+        \\@app.get("/users")
+        \\def list_users():
+        \\    return []
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function loadThing() {
+        \\  return fetch('/nonexistent');
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const loader = idx.graph.symbols[idx.lookup("loadThing")[0]];
+    var seen = false;
+    for (loader.refs) |ref| {
+        if (ref.kind != .route_call) continue;
+        // No backend route matches `/nonexistent`, so it stays unresolved.
+        try testing.expectEqual(invalid, ref.target);
+        try testing.expect(!ref.exact);
+        seen = true;
+    }
+    try testing.expect(seen);
+    // The real route exists but nobody calls it.
+    const route = routeByName(&idx, "GET /users").?;
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(route).len);
+}
+
+test "skipped_dirs: a pruned vendor tree is reported once; a build/dep dir is silent" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A potentially-source dir (`vendor`) appears twice; its skip must be
+    // recorded once (deduped). `node_modules` is a universally-expected skip and
+    // must never be surfaced.
+    try tmp.dir.createDirPath(io, "vendor");
+    try tmp.dir.createDirPath(io, "deep/vendor");
+    try tmp.dir.createDirPath(io, "node_modules");
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/a.zig", .data =
+        \\pub fn vendored() u32 { return 1; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "deep/vendor/b.zig", .data =
+        \\pub fn vendored2() u32 { return 2; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/c.zig", .data =
+        \\pub fn nodedep() u32 { return 3; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "real.zig", .data =
+        \\pub fn realfn() u32 { return 4; }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Only the top-level real source is indexed; pruned trees are absent.
+    try testing.expectEqual(@as(usize, 1), idx.lookup("realfn").len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("vendored").len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("vendored2").len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("nodedep").len);
+
+    // `vendor` is reported exactly once; `node_modules` is a silent skip.
+    try testing.expectEqual(@as(usize, 1), countStr(idx.skipped_dirs, "vendor"));
+    try testing.expectEqual(@as(usize, 0), countStr(idx.skipped_dirs, "node_modules"));
+}
+
+test "skipped_dirs is empty when nothing potentially-source is pruned" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "only.zig", .data =
+        \\pub fn only() u32 { return 1; }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), idx.lookup("only").len);
+    try testing.expectEqual(@as(usize, 0), idx.skipped_dirs.len);
+}
+
+test "a project with only unsupported files indexes nothing" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "just prose, no code\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "data.json", .data = "{\"a\":1}\n" });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    try testing.expectEqual(@as(usize, 0), idx.graph.files.len);
+    try testing.expectEqual(@as(usize, 0), idx.graph.symbols.len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("anything").len);
+    try testing.expectEqual(@as(usize, 0), idx.skipped_dirs.len);
+}
+
+test "incremental cache: a file grown between builds is re-parsed, not served stale" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data =
+        \\pub fn one() u32 {
+        \\    return 1;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // Cold build writes the cache.
+    var cold = try build(testing.allocator, io, root, true);
+    try testing.expectEqual(@as(usize, 1), cold.lookup("one").len);
+    try testing.expectEqual(@as(usize, 0), cold.lookup("two").len);
+    cold.deinit();
+
+    // Grow the file: the size differs, so the cached entry no longer matches its
+    // stat and the file must be re-parsed (not restored from disk).
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data =
+        \\pub fn one() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn two() u32 {
+        \\    return 2;
+        \\}
+    });
+
+    var warm = try build(testing.allocator, io, root, true);
+    defer warm.deinit();
+    try testing.expectEqual(@as(usize, 1), warm.lookup("one").len);
+    try testing.expectEqual(@as(usize, 1), warm.lookup("two").len); // freshly parsed
+}
+
+test "no-cache builds are deterministic and agree with a cached build" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "u.zig", .data =
+        \\pub fn helper(x: i32) i32 {
+        \\    return x;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\const u = @import("u.zig");
+        \\pub fn run() i32 {
+        \\    return u.helper(1);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var a = try build(testing.allocator, io, root, false);
+    const names_a = try dupeNames(testing.allocator, &a);
+    defer freeNames(testing.allocator, names_a);
+    a.deinit();
+
+    // A second no-cache build yields an identical symbol sequence.
+    var b = try build(testing.allocator, io, root, false);
+    defer b.deinit();
+    try testing.expectEqual(names_a.len, b.graph.symbols.len);
+    for (names_a, b.graph.symbols) |name, sym| try testing.expectEqualStrings(name, sym.name);
+
+    // And a cached build produces the same symbols too — the cache is transparent.
+    var c = try build(testing.allocator, io, root, true);
+    defer c.deinit();
+    try testing.expectEqual(names_a.len, c.graph.symbols.len);
+    for (names_a, c.graph.symbols) |name, sym| try testing.expectEqualStrings(name, sym.name);
+    // The cross-module edge survives in all three.
+    try testing.expectEqual(b.lookup("run")[0], b.callersOf(b.lookup("helper")[0])[0]);
+    try testing.expectEqual(c.lookup("run")[0], c.callersOf(c.lookup("helper")[0])[0]);
+}

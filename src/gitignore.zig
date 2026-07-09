@@ -190,3 +190,254 @@ test "nested gitignore scoped to its subtree, deeper wins" {
     try std.testing.expect(!m.isIgnored("sub/a.log", false)); // deeper negation wins
     try std.testing.expect(m.isIgnored("other/a.log", false)); // sub rule doesn't reach
 }
+
+
+// ---------------------------------------------------------------------------
+// Appended tests: parseLine, relativeTo, matchRule, glob, and Matcher.isIgnored
+// ---------------------------------------------------------------------------
+
+test "parseLine: plain name is unanchored basename rule" {
+    const r = parseLine("", "foo").?;
+    try std.testing.expectEqualStrings("", r.base);
+    try std.testing.expectEqualStrings("foo", r.pattern);
+    try std.testing.expect(!r.negated);
+    try std.testing.expect(!r.dir_only);
+    try std.testing.expect(!r.anchored);
+}
+
+test "parseLine: negation strips bang and sets negated" {
+    const r = parseLine("", "!foo.log").?;
+    try std.testing.expectEqualStrings("foo.log", r.pattern);
+    try std.testing.expect(r.negated);
+    try std.testing.expect(!r.dir_only);
+    try std.testing.expect(!r.anchored);
+}
+
+test "parseLine: directory-only strips trailing slash" {
+    const r = parseLine("", "build/").?;
+    try std.testing.expectEqualStrings("build", r.pattern);
+    try std.testing.expect(r.dir_only);
+    try std.testing.expect(!r.anchored); // no interior slash left after stripping
+    try std.testing.expect(!r.negated);
+}
+
+test "parseLine: leading slash anchors and is stripped" {
+    const r = parseLine("", "/dist").?;
+    try std.testing.expectEqualStrings("dist", r.pattern);
+    try std.testing.expect(r.anchored);
+    try std.testing.expect(!r.dir_only);
+}
+
+test "parseLine: interior slash anchors without stripping" {
+    const r = parseLine("", "src/gen.zig").?;
+    try std.testing.expectEqualStrings("src/gen.zig", r.pattern);
+    try std.testing.expect(r.anchored);
+    try std.testing.expect(!r.dir_only);
+}
+
+test "parseLine: comment and blank lines return null" {
+    try std.testing.expect(parseLine("", "# a comment") == null);
+    try std.testing.expect(parseLine("", "#") == null);
+    try std.testing.expect(parseLine("", "") == null);
+    try std.testing.expect(parseLine("", "   ") == null); // all-whitespace trims to empty
+    try std.testing.expect(parseLine("", "\t\t") == null);
+}
+
+test "parseLine: trailing spaces and tabs are trimmed" {
+    const r = parseLine("", "foo   ").?;
+    try std.testing.expectEqualStrings("foo", r.pattern);
+    const r2 = parseLine("", "bar\t \t").?;
+    try std.testing.expectEqualStrings("bar", r2.pattern);
+}
+
+test "parseLine: trailing carriage return (CRLF) is trimmed" {
+    const r = parseLine("", "foo\r").?;
+    try std.testing.expectEqualStrings("foo", r.pattern);
+    // The '/' must be recognised as dir-only even with a trailing CR.
+    const r2 = parseLine("", "build/\r").?;
+    try std.testing.expectEqualStrings("build", r2.pattern);
+    try std.testing.expect(r2.dir_only);
+}
+
+test "parseLine: escaped hash/bang become literal patterns, not comment/negation" {
+    const r = parseLine("", "\\#file").?;
+    try std.testing.expectEqualStrings("#file", r.pattern);
+    try std.testing.expect(!r.negated);
+    const r2 = parseLine("", "\\!file").?;
+    try std.testing.expectEqualStrings("!file", r2.pattern);
+    try std.testing.expect(!r2.negated);
+}
+
+test "parseLine: lone bang and lone slash reduce to null" {
+    try std.testing.expect(parseLine("", "!") == null);
+    try std.testing.expect(parseLine("", "/") == null);
+    try std.testing.expect(parseLine("", "!/") == null);
+}
+
+test "parseLine: negated directory-only keeps both flags" {
+    const r = parseLine("", "!logs/").?;
+    try std.testing.expectEqualStrings("logs", r.pattern);
+    try std.testing.expect(r.negated);
+    try std.testing.expect(r.dir_only);
+}
+
+test "parseLine: base is stored on the rule" {
+    const r = parseLine("sub/dir", "foo").?;
+    try std.testing.expectEqualStrings("sub/dir", r.base);
+}
+
+test "relativeTo: empty base returns the path unchanged" {
+    const rel = relativeTo("", "a/b/c").?;
+    try std.testing.expectEqualStrings("a/b/c", rel);
+}
+
+test "relativeTo: strips the base prefix and separating slash" {
+    const rel = relativeTo("sub", "sub/a.log").?;
+    try std.testing.expectEqualStrings("a.log", rel);
+    const rel2 = relativeTo("a/b", "a/b/c/d").?;
+    try std.testing.expectEqualStrings("c/d", rel2);
+}
+
+test "relativeTo: path outside base returns null" {
+    try std.testing.expect(relativeTo("sub", "other/a.log") == null);
+}
+
+test "relativeTo: path equal to base returns null" {
+    try std.testing.expect(relativeTo("sub", "sub") == null);
+}
+
+test "relativeTo: prefix not on a slash boundary returns null" {
+    // "subdir" starts with "sub" but the next char is not '/'.
+    try std.testing.expect(relativeTo("sub", "subdir/a") == null);
+}
+
+test "matchRule: anchored rule matches against the whole relative path" {
+    const r: Rule = .{ .base = "", .pattern = "a/b", .negated = false, .dir_only = false, .anchored = true };
+    try std.testing.expect(matchRule(r, "a/b"));
+    try std.testing.expect(!matchRule(r, "x/a/b")); // anchored: no leading segment
+    const r2: Rule = .{ .base = "", .pattern = "dist", .negated = false, .dir_only = false, .anchored = true };
+    try std.testing.expect(matchRule(r2, "dist"));
+    try std.testing.expect(!matchRule(r2, "app/dist"));
+}
+
+test "matchRule: unanchored rule matches only the final component" {
+    const r: Rule = .{ .base = "", .pattern = "foo", .negated = false, .dir_only = false, .anchored = false };
+    try std.testing.expect(matchRule(r, "foo"));
+    try std.testing.expect(matchRule(r, "a/b/foo")); // basename match at any depth
+    try std.testing.expect(!matchRule(r, "foo/bar")); // basename is "bar", not "foo"
+}
+
+test "glob: literal exact match and mismatches" {
+    try std.testing.expect(glob("foo", "foo"));
+    try std.testing.expect(!glob("foo", "bar"));
+    try std.testing.expect(!glob("foo", "fo")); // pattern longer than text
+    try std.testing.expect(!glob("foo", "food")); // text longer than pattern
+}
+
+test "glob: question mark matches exactly one non-slash char" {
+    try std.testing.expect(glob("f?o", "foo"));
+    try std.testing.expect(glob("?", "a"));
+    try std.testing.expect(!glob("f?o", "fo")); // nothing for '?' to consume
+    try std.testing.expect(!glob("f?o", "f/o")); // '?' does not match '/'
+    try std.testing.expect(!glob("?", "")); // empty text
+}
+
+test "glob: single star does not cross slash and can match empty" {
+    try std.testing.expect(glob("*.log", "a.log"));
+    try std.testing.expect(glob("*.log", ".log")); // '*' matches zero chars
+    try std.testing.expect(glob("a*", "a")); // trailing '*' matches empty
+    try std.testing.expect(!glob("*.log", "a/b.log")); // '*' stops at '/'
+    try std.testing.expect(!glob("*.log", "a.txt"));
+}
+
+test "glob: double star crosses slashes and matches zero directories" {
+    try std.testing.expect(glob("**/tmp", "a/b/tmp"));
+    try std.testing.expect(glob("**/tmp", "a/tmp"));
+    try std.testing.expect(glob("**/tmp", "tmp")); // '**/' matches zero dirs
+    try std.testing.expect(!glob("**/tmp", "a/nope"));
+    try std.testing.expect(glob("foo/**/bar", "foo/x/y/bar"));
+    try std.testing.expect(glob("foo/**/bar", "foo/bar")); // zero dirs between
+}
+
+test "glob: bracket char classes are treated literally (unsupported)" {
+    // The implementation documents that [charclass] ranges are not supported;
+    // brackets match as ordinary literal characters.
+    try std.testing.expect(glob("[abc].txt", "[abc].txt"));
+    try std.testing.expect(!glob("[abc].txt", "a.txt"));
+    try std.testing.expect(glob("[a-z]", "[a-z]"));
+    try std.testing.expect(!glob("[a-z]", "m"));
+}
+
+test "glob: empty pattern only matches empty text" {
+    try std.testing.expect(glob("", ""));
+    try std.testing.expect(!glob("", "x"));
+}
+
+test "isIgnored: an empty matcher ignores nothing" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(!m.isIgnored("anything", false));
+    try std.testing.expect(!m.isIgnored("some/dir", true));
+}
+
+test "isIgnored: last matching rule wins across negation ordering" {
+    // Negation first, then a broader re-ignore: the later rule decides.
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "!*.log\n*.log\n");
+    try std.testing.expect(m.isIgnored("a.log", false)); // *.log wins (last)
+
+    // Broad ignore first, then a targeted negation.
+    var m2 = Matcher.init(std.testing.allocator);
+    defer m2.deinit();
+    try m2.addFile("", "*.log\n!keep.log\n");
+    try std.testing.expect(!m2.isIgnored("keep.log", false));
+    try std.testing.expect(m2.isIgnored("other.log", false));
+}
+
+test "isIgnored: CRLF line endings are handled" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "*.log\r\nbuild/\r\n");
+    try std.testing.expect(m.isIgnored("a.log", false));
+    try std.testing.expect(m.isIgnored("build", true));
+    try std.testing.expect(!m.isIgnored("build", false)); // dir-only survives CRLF
+}
+
+test "isIgnored: escaped hash matches a literal file, plain hash is a comment" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "\\#note\n");
+    try std.testing.expect(m.isIgnored("#note", false));
+
+    var m2 = Matcher.init(std.testing.allocator);
+    defer m2.deinit();
+    try m2.addFile("", "#note\n"); // comment: produces no rule
+    try std.testing.expect(!m2.isIgnored("#note", false));
+}
+
+test "isIgnored: directory-only negation re-includes a directory" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "*/\n!keep/\n");
+    try std.testing.expect(m.isIgnored("foo", true)); // any dir ignored
+    try std.testing.expect(!m.isIgnored("keep", true)); // keep/ re-included
+    try std.testing.expect(!m.isIgnored("foo", false)); // dir-only: files untouched
+}
+
+test "isIgnored: bracket pattern is matched literally, not as a class" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "[abc].txt\n");
+    try std.testing.expect(m.isIgnored("[abc].txt", false));
+    try std.testing.expect(!m.isIgnored("a.txt", false));
+    try std.testing.expect(!m.isIgnored("b.txt", false));
+}
+
+test "isIgnored: anchored root rule does not match nested dirs" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "/dist\n");
+    try std.testing.expect(m.isIgnored("dist", true));
+    try std.testing.expect(!m.isIgnored("app/dist", true));
+}

@@ -3505,3 +3505,779 @@ test "dead-code filter skips dunders, tests and fixtures" {
     try std.testing.expect(!isTestPath("src/test_utils/format.py"));
     try std.testing.expect(!isTestPath("src/contest.py"));
 }
+
+
+// ============================================================================
+// APPENDED TESTS — verb coverage: pure helpers, outline/listFiles/readLines,
+// showDef/walk/search not-found + selectors, neighbors, routes, imports,
+// shortestPath, hot limits. (No overlap with the existing test blocks.)
+// ============================================================================
+
+test "matchesFilter: empty matches all, prefix and substring hit, mismatch misses" {
+    try std.testing.expect(matchesFilter("src/api.zig", "")); // empty filter → all
+    try std.testing.expect(matchesFilter("src/api.zig", "src/")); // prefix
+    try std.testing.expect(matchesFilter("src/api.zig", "api")); // interior substring
+    try std.testing.expect(matchesFilter("src/api.zig", ".zig")); // suffix (as substring)
+    try std.testing.expect(!matchesFilter("src/api.zig", "queue")); // absent
+    try std.testing.expect(!matchesFilter("a", "abc")); // filter longer than path
+}
+
+test "parseLineRange: single, A-B, open-ended A-, and rejected forms" {
+    // Single line.
+    const one = parseLineRange("7").?;
+    try std.testing.expectEqual(@as(usize, 7), one.lo);
+    try std.testing.expectEqual(@as(usize, 7), one.hi);
+    // Bounded range.
+    const rng = parseLineRange("3-9").?;
+    try std.testing.expectEqual(@as(usize, 3), rng.lo);
+    try std.testing.expectEqual(@as(usize, 9), rng.hi);
+    // Open-ended tail: A- means A to end (hi == maxInt).
+    const tail = parseLineRange("4-").?;
+    try std.testing.expectEqual(@as(usize, 4), tail.lo);
+    try std.testing.expectEqual(std.math.maxInt(usize), tail.hi);
+    // Rejections leave the token to be treated as a literal path fragment.
+    try std.testing.expect(parseLineRange("") == null); // empty
+    try std.testing.expect(parseLineRange("0") == null); // line 0 invalid
+    try std.testing.expect(parseLineRange("5-2") == null); // hi < lo
+    try std.testing.expect(parseLineRange("abc") == null); // non-numeric
+    try std.testing.expect(parseLineRange("2-x") == null); // bad hi
+    try std.testing.expect(parseLineRange("0-3") == null); // lo == 0
+}
+
+test "parseRanges: single, comma list, empty, overflow, and a bad member" {
+    var buf: [4]LineRange = undefined;
+    // Single member.
+    const single = parseRanges("5", &buf).?;
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqual(@as(usize, 5), single[0].lo);
+    // Comma-separated members, in order.
+    const list = parseRanges("1,4-6,9", &buf).?;
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+    try std.testing.expectEqual(@as(usize, 1), list[0].lo);
+    try std.testing.expectEqual(@as(usize, 4), list[1].lo);
+    try std.testing.expectEqual(@as(usize, 6), list[1].hi);
+    try std.testing.expectEqual(@as(usize, 9), list[2].lo);
+    // Empty → null (so a lone ':' in a path is not read as a range).
+    try std.testing.expect(parseRanges("", &buf) == null);
+    // Any unparseable member poisons the whole spec.
+    try std.testing.expect(parseRanges("1,bad,3", &buf) == null);
+    // More members than the buffer holds → null (spec left as a path).
+    var tiny: [2]LineRange = undefined;
+    try std.testing.expect(parseRanges("1,2,3", &tiny) == null);
+}
+
+test "hotLimit: short default only when -l was omitted (sentinel), else the given cap" {
+    // No -l: limit == default_limit sentinel → the brief hot_default.
+    try std.testing.expectEqual(hot_default, hotLimit(.{}));
+    try std.testing.expectEqual(hot_default, hotLimit(.{ .limit = default_limit }));
+    // An explicit -l overrides, even to a value below the default.
+    try std.testing.expectEqual(@as(u32, 5), hotLimit(.{ .limit = 5 }));
+    try std.testing.expectEqual(@as(u32, 1000), hotLimit(.{ .limit = 1000 }));
+}
+
+test "FileSort.parse: canonical names, aliases, and unknown rejection" {
+    try std.testing.expectEqual(FileSort.path, FileSort.parse("path").?);
+    try std.testing.expectEqual(FileSort.path, FileSort.parse("name").?); // alias
+    try std.testing.expectEqual(FileSort.symbols, FileSort.parse("symbols").?);
+    try std.testing.expectEqual(FileSort.symbols, FileSort.parse("size").?); // alias
+    try std.testing.expect(FileSort.parse("count") == null);
+    try std.testing.expect(FileSort.parse("") == null);
+}
+
+test "outline -k restricts to the requested kind, both sides of the branch" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "w.zig", .data =
+        \\pub const Widget = struct {
+        \\    x: u32,
+        \\};
+        \\pub fn build() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // No filter: both the struct and the fn appear.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "struct Widget") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "fn build") != null);
+    }
+    { // -k fn: only the function; the struct is filtered out.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{ .kinds = "fn" });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "fn build") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Widget") == null);
+    }
+    { // -k struct: only the struct; the function is filtered out.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{ .kinds = "struct" });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "struct Widget") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "build") == null);
+    }
+}
+
+test "outline -v names drops the signature that the default sig view shows" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn add(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // Default sig view carries the parameter list.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{ .verbosity = .sig });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "fn add") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "(a: u32") != null);
+    }
+    { // names view: the name is present, the signature is not.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{ .verbosity = .names });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "fn add") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "(a: u32") == null);
+    }
+}
+
+test "outline truncates per-file and names the unexpanded overflow files under -l" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Two files, each with symbols; a tiny budget forces per-file truncation and
+    // the "more file(s) named but not expanded" summary on the second file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn a1() void {}
+        \\pub fn a2() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn b1() void {}
+        \\pub fn b2() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // limit 1 across two files: first file expands one symbol, second is named-only.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{ .limit = 1 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "symbol") != null and
+            std.mem.indexOf(u8, out, "here (raise -l to list)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "more file(s) named but not expanded") != null);
+    }
+    { // A single-file scope hits the plain "stopped at -l" footer instead.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "a.zig", .{ .limit = 1 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "stopped at -l 1") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "more file(s) named") == null);
+    }
+}
+
+test "outline path filter with no match reports an explicit empty result" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "only.zig", .data =
+        \\pub fn present() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try outline(&aw.writer, &idx, "does_not_exist", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "no source symbols under 'does_not_exist'") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "present") == null);
+}
+
+test "outline --format json is well-formed and carries path/lang/symbols" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "j.zig", .data =
+        \\pub fn one() void {}
+        \\pub fn two() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try outline(&aw.writer, &idx, "", .{ .format = .json });
+    const out = aw.written();
+
+    // Parse to prove it is a valid JSON document, then assert on the schema.
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .array);
+    try testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    const file_obj = parsed.value.array.items[0];
+    try testing.expect(file_obj == .object);
+    try testing.expectEqualStrings("j.zig", file_obj.object.get("path").?.string);
+    try testing.expectEqualStrings("zig", file_obj.object.get("lang").?.string);
+    const syms = file_obj.object.get("symbols").?;
+    try testing.expect(syms == .array);
+    try testing.expectEqual(@as(usize, 2), syms.array.items.len);
+}
+
+test "listFiles: default order filters by path and reports an empty scope" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.py", .data =
+        \\def only():
+        \\    return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drop.py", .data =
+        \\def other():
+        \\    return 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // Filter narrows to the matching file only.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listFiles(&aw.writer, &idx, "keep", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "keep.py") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "drop.py") == null);
+        try testing.expect(std.mem.indexOf(u8, out, "1 symbol)") != null); // singular
+    }
+    { // No file matches → the explicit not-found note, naming the filter.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listFiles(&aw.writer, &idx, "nowhere", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no indexed files under 'nowhere'") != null);
+    }
+}
+
+test "read: out-of-range line noted; open-ended A- tail runs to EOF" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\a = 1
+        \\b = 2
+        \\c = 3
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // A range whose start is past EOF is flagged, not silently empty.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try readLines(&aw.writer, io, &idx, root, "m.py:10-20", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no such line: 10; file has 3") != null);
+    }
+    { // Open-ended `2-` emits from line 2 through the last line, dropping line 1.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try readLines(&aw.writer, io, &idx, root, "m.py:2-", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "2\tb = 2") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "3\tc = 3") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "a = 1") == null);
+    }
+}
+
+test "showDef: unknown name is reported; @path selects one of several twins" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "left.zig", .data =
+        \\pub fn dup() u32 {
+        \\    return 1;
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "right.zig", .data =
+        \\pub fn dup() u32 {
+        \\    return 2;
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // Missing name → the explicit not-found sentence.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "ghost", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no definition named 'ghost'") != null);
+    }
+    { // Bare name shows both twins (each with its own file path).
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "dup", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "left.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "right.zig") != null);
+    }
+    { // The @path selector narrows to exactly one file.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "dup@right", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "right.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "left.zig") == null);
+    }
+}
+
+test "walk: unknown symbol reported; callees followed to depth 2" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "chain.zig", .data =
+        \\pub fn leaf() void {}
+        \\pub fn mid() void {
+        \\    leaf();
+        \\}
+        \\pub fn top() void {
+        \\    mid();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // Unknown name → the (no symbol named …) note.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "absent", false, .{ .depth = 1 });
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol named 'absent'") != null);
+    }
+    { // depth 1 from top reaches mid but not the transitively-called leaf.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "top", false, .{ .depth = 1 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "mid") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "leaf") == null);
+    }
+    { // depth 2 descends one more hop and reaches leaf.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "top", false, .{ .depth = 2 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "mid") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "leaf") != null);
+    }
+}
+
+test "search: matches names, honors -k, and reports no match" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.zig", .data =
+        \\pub const Config = struct {
+        \\    n: u32,
+        \\};
+        \\pub fn configure() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // A substring pattern matches both the struct and the fn by name.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "onfig", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "Config") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "configure") != null);
+    }
+    { // -k struct narrows the same query to just the struct.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "onfig", .{ .kinds = "struct" });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "Config") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "configure") == null);
+    }
+    { // No name contains the pattern → the not-found note.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "zzzz", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol matching 'zzzz'") != null);
+    }
+}
+
+test "neighbors: shows both callees and callers, and reports a missing symbol" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "n.zig", .data =
+        \\pub fn leaf() void {}
+        \\pub fn mid() void {
+        \\    leaf();
+        \\}
+        \\pub fn top() void {
+        \\    mid();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // mid sits between top (caller) and leaf (callee): both directions listed.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try neighbors(&aw.writer, &idx, "mid", .{});
+        const out = aw.written();
+        const calls_hdr = std.mem.indexOf(u8, out, "↓ calls").?;
+        const callers_hdr = std.mem.indexOf(u8, out, "↑ callers").?;
+        try testing.expect(calls_hdr < callers_hdr); // callees section precedes callers
+        // leaf shows under callees; top shows under callers.
+        const leaf_at = std.mem.indexOf(u8, out, "leaf").?;
+        const top_at = std.mem.indexOf(u8, out, "top").?;
+        try testing.expect(leaf_at > calls_hdr and leaf_at < callers_hdr);
+        try testing.expect(top_at > callers_hdr);
+    }
+    { // Missing name → the shared not-found note.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try neighbors(&aw.writer, &idx, "nobody", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol named 'nobody'") != null);
+    }
+}
+
+test "routes: a route renders with its handler callee and its client caller" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A FastAPI-style decorator route with a handler, plus a TS client that fetches
+    // the same path — the cross-language route↔client link.
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
+        \\app = FastAPI()
+        \\@app.get("/orders")
+        \\def list_orders():
+        \\    return []
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function loadOrders() {
+        \\  return fetch("/orders");
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try listRoutes(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    // The route symbol (METHOD path), its handler callee, and the client caller.
+    try testing.expect(std.mem.indexOf(u8, out, "GET /orders") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "list_orders") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "loadOrders") != null);
+}
+
+test "routes: a filter that matches no route reports an empty scope" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
+        \\@app.get("/health")
+        \\def health():
+        \\    return 1
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // The filter matches the one route by its name substring.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listRoutes(&aw.writer, &idx, "health", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "GET /health") != null);
+    }
+    { // A non-matching filter → the not-found note.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listRoutes(&aw.writer, &idx, "billing", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no routes under 'billing'") != null);
+    }
+}
+
+test "imports: listImports shows a local import with its binding; empty scope noted" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "dep.zig", .data =
+        \\pub fn f() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "user.zig", .data =
+        \\const dep = @import("dep.zig");
+        \\pub fn g() void {
+        \\    dep.f();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // user.zig → dep.zig, bound as `dep`.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listImports(&aw.writer, &idx, "user", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "user.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "→ dep.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "(dep)") != null);
+    }
+    { // dep.zig has no local imports of its own → empty note under that scope.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listImports(&aw.writer, &idx, "dep.zig", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no local imports under 'dep.zig'") != null);
+    }
+}
+
+test "imports: listImporters lists reverse deps and reports none for a leaf" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "dep.zig", .data =
+        \\pub fn f() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "user.zig", .data =
+        \\const dep = @import("dep.zig");
+        \\pub fn g() void {
+        \\    dep.f();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // dep.zig is imported by user.zig.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listImporters(&aw.writer, &idx, "dep.zig", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "dep.zig ← imported by") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "user.zig") != null);
+    }
+    { // user.zig imports others but nobody imports it → no importers.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try listImporters(&aw.writer, &idx, "user.zig", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no importers of 'user.zig'") != null);
+    }
+}
+
+test "shortestPath renders the chain, a same-node path, and a no-path note" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p.zig", .data =
+        \\pub fn alpha() void {
+        \\    beta();
+        \\}
+        \\pub fn beta() void {
+        \\    gamma();
+        \\}
+        \\pub fn gamma() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // A reachable target renders the full alpha→beta→gamma cascade.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try shortestPath(&aw.writer, &idx, "alpha", "gamma", .{});
+        const out = aw.written();
+        const a = std.mem.indexOf(u8, out, "alpha").?;
+        const b = std.mem.indexOf(u8, out, "beta").?;
+        const g = std.mem.indexOf(u8, out, "gamma").?;
+        try testing.expect(a < b and b < g); // rendered source-first
+    }
+    { // Same node: the path is the single node, nothing else on the way.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try shortestPath(&aw.writer, &idx, "alpha", "alpha", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "alpha") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "beta") == null);
+    }
+    { // No backward edge gamma→alpha → the explicit no-path note.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try shortestPath(&aw.writer, &idx, "gamma", "alpha", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no call path from 'gamma' to 'alpha'") != null);
+    }
+}
+
+test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "core.zig", .data =
+        \\pub fn shared() void {}
+        \\pub fn a() void { shared(); }
+        \\pub fn b() void { shared(); a(); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.zig", .data =
+        \\pub fn helper() void {}
+        \\pub fn caller() void { helper(); }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    { // -l 1 shows only the top-ranked function and notes the rest.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try hot(&aw.writer, &idx, "", .{ .limit = 1 });
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "shared") != null); // rank 1
+        try testing.expect(std.mem.indexOf(u8, out, "more; raise -l to see them") != null);
+    }
+    { // The filter is a file-path scope: only core.zig functions survive.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try hot(&aw.writer, &idx, "core", .{});
+        const out = aw.written();
+        try testing.expect(std.mem.indexOf(u8, out, "shared") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "helper") == null);
+    }
+    { // A filter matching no file → the empty note naming it.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try hot(&aw.writer, &idx, "missing", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "no functions under 'missing'") != null);
+    }
+}

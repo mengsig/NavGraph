@@ -10,3 +10,8 @@ export function formatItem(item) {
 export function summarize(items) {
   return items.map(formatItem).join(', ');
 }
+
+// Render a short status line for a request result. Used by the API client.
+export function formatStatus(count) {
+  return count === 1 ? '1 item' : `${count} items`;
+}

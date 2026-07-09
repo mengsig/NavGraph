@@ -374,3 +374,435 @@ test "files --sort accepts path/symbols and rejects garbage" {
 
     try std.testing.expectError(error.BadValue, parse(&.{ "files", "--sort", "nope" }));
 }
+
+
+// ---------------------------------------------------------------------------
+// Appended hardening tests for src/cli.zig
+// ---------------------------------------------------------------------------
+
+test "parseCommand: every primary command name maps correctly" {
+    try std.testing.expectEqual(Command.outline, parseCommand("outline").?);
+    try std.testing.expectEqual(Command.def, parseCommand("def").?);
+    try std.testing.expectEqual(Command.calls, parseCommand("calls").?);
+    try std.testing.expectEqual(Command.callers, parseCommand("callers").?);
+    try std.testing.expectEqual(Command.search, parseCommand("search").?);
+    try std.testing.expectEqual(Command.routes, parseCommand("routes").?);
+    try std.testing.expectEqual(Command.events, parseCommand("events").?);
+    try std.testing.expectEqual(Command.neighbors, parseCommand("neighbors").?);
+    try std.testing.expectEqual(Command.unused, parseCommand("unused").?);
+    try std.testing.expectEqual(Command.imports, parseCommand("imports").?);
+    try std.testing.expectEqual(Command.importers, parseCommand("importers").?);
+    try std.testing.expectEqual(Command.path, parseCommand("path").?);
+    try std.testing.expectEqual(Command.diff, parseCommand("diff").?);
+    try std.testing.expectEqual(Command.hot, parseCommand("hot").?);
+    try std.testing.expectEqual(Command.files, parseCommand("files").?);
+    try std.testing.expectEqual(Command.read, parseCommand("read").?);
+    try std.testing.expectEqual(Command.strings, parseCommand("strings").?);
+    try std.testing.expectEqual(Command.help, parseCommand("help").?);
+}
+
+test "parseCommand: every alias maps to its command" {
+    try std.testing.expectEqual(Command.outline, parseCommand("o").?);
+    try std.testing.expectEqual(Command.def, parseCommand("show").?);
+    try std.testing.expectEqual(Command.calls, parseCommand("callees").?);
+    try std.testing.expectEqual(Command.callers, parseCommand("uses").?);
+    try std.testing.expectEqual(Command.search, parseCommand("grep").?);
+    try std.testing.expectEqual(Command.routes, parseCommand("api").?);
+    try std.testing.expectEqual(Command.events, parseCommand("dispatch").?);
+    try std.testing.expectEqual(Command.events, parseCommand("bus").?);
+    try std.testing.expectEqual(Command.neighbors, parseCommand("near").?);
+    try std.testing.expectEqual(Command.unused, parseCommand("dead").?);
+    try std.testing.expectEqual(Command.diff, parseCommand("changed").?);
+    try std.testing.expectEqual(Command.hot, parseCommand("central").?);
+    try std.testing.expectEqual(Command.files, parseCommand("manifest").?);
+    try std.testing.expectEqual(Command.read, parseCommand("cat").?);
+    try std.testing.expectEqual(Command.strings, parseCommand("str").?);
+    try std.testing.expectEqual(Command.strings, parseCommand("literals").?);
+    // help aliases
+    try std.testing.expectEqual(Command.help, parseCommand("--help").?);
+    try std.testing.expectEqual(Command.help, parseCommand("-h").?);
+}
+
+test "parseCommand: unknown and empty return null" {
+    try std.testing.expect(parseCommand("frobnicate") == null);
+    try std.testing.expect(parseCommand("") == null);
+    try std.testing.expect(parseCommand("Outline") == null); // case-sensitive
+    try std.testing.expect(parseCommand("defx") == null);
+}
+
+test "parse: unknown command is a usage error" {
+    try std.testing.expectError(error.Usage, parse(&.{"frobnicate"}));
+    try std.testing.expectError(error.Usage, parse(&.{ "nope", "arg" }));
+    // An unknown leading-dash token is treated as a command lookup, not a flag.
+    try std.testing.expectError(error.Usage, parse(&.{"--bogus"}));
+}
+
+test "parse: empty argv is a usage error" {
+    try std.testing.expectError(error.Usage, parse(&.{}));
+}
+
+test "parse: aliases resolve through parse to the same command" {
+    try std.testing.expectEqual(Command.outline, (try parse(&.{"o"})).command);
+    try std.testing.expectEqual(Command.callers, (try parse(&.{ "uses", "x" })).command);
+    try std.testing.expectEqual(Command.search, (try parse(&.{ "grep", "x" })).command);
+    try std.testing.expectEqual(Command.routes, (try parse(&.{"api"})).command);
+    try std.testing.expectEqual(Command.hot, (try parse(&.{"central"})).command);
+    try std.testing.expectEqual(Command.files, (try parse(&.{"manifest"})).command);
+    try std.testing.expectEqual(Command.read, (try parse(&.{ "cat", "f.zig" })).command);
+    try std.testing.expectEqual(Command.strings, (try parse(&.{ "literals", "pat" })).command);
+}
+
+test "parse: help returns immediately and ignores trailing tokens" {
+    const a = try parse(&.{"help"});
+    try std.testing.expectEqual(Command.help, a.command);
+
+    // Trailing junk (including an otherwise-unknown flag) is ignored for help.
+    const b = try parse(&.{ "help", "garbage", "--nope", "-d", "x" });
+    try std.testing.expectEqual(Command.help, b.command);
+    try std.testing.expectEqualStrings("", b.arg);
+
+    const c = try parse(&.{"--help"});
+    try std.testing.expectEqual(Command.help, c.command);
+
+    const d = try parse(&.{"-h"});
+    try std.testing.expectEqual(Command.help, d.command);
+}
+
+test "parse: default option values on a bare command" {
+    const p = try parse(&.{"outline"});
+    try std.testing.expectEqual(render.Verbosity.sig, p.options.verbosity);
+    try std.testing.expectEqual(@as(u32, 1), p.options.depth);
+    try std.testing.expectEqual(query.default_limit, p.options.limit);
+    try std.testing.expect(!p.options.strict);
+    try std.testing.expectEqual(query.OutputFormat.text, p.options.format);
+    try std.testing.expect(!p.options.refs);
+    try std.testing.expectEqualStrings("", p.options.kinds);
+    try std.testing.expect(!p.options.unused_skip_exported);
+    try std.testing.expect(!p.options.unused_skip_test_only);
+    try std.testing.expect(!p.options.unused_follow_imports);
+    try std.testing.expectEqual(query.FileSort.path, p.options.file_sort);
+    try std.testing.expect(p.use_cache);
+    try std.testing.expectEqualStrings(".", p.root);
+    try std.testing.expectEqualStrings("", p.arg);
+    try std.testing.expectEqualStrings("", p.arg2);
+}
+
+test "hasRequiredArgs: optional-arg commands accept no positional" {
+    const empty = Parsed{ .command = .outline };
+    try std.testing.expect(hasRequiredArgs(.outline, empty));
+    try std.testing.expect(hasRequiredArgs(.routes, empty));
+    try std.testing.expect(hasRequiredArgs(.events, empty));
+    try std.testing.expect(hasRequiredArgs(.unused, empty));
+    try std.testing.expect(hasRequiredArgs(.imports, empty));
+    try std.testing.expect(hasRequiredArgs(.hot, empty));
+    try std.testing.expect(hasRequiredArgs(.files, empty));
+    try std.testing.expect(hasRequiredArgs(.diff, empty));
+}
+
+test "hasRequiredArgs: single-arg commands require a positional" {
+    const empty = Parsed{ .command = .def };
+    const withArg = Parsed{ .command = .def, .arg = "foo" };
+    try std.testing.expect(!hasRequiredArgs(.def, empty));
+    try std.testing.expect(hasRequiredArgs(.def, withArg));
+    try std.testing.expect(!hasRequiredArgs(.calls, empty));
+    try std.testing.expect(!hasRequiredArgs(.callers, empty));
+    try std.testing.expect(!hasRequiredArgs(.search, empty));
+    try std.testing.expect(!hasRequiredArgs(.neighbors, empty));
+    try std.testing.expect(!hasRequiredArgs(.importers, empty));
+    try std.testing.expect(!hasRequiredArgs(.read, empty));
+    try std.testing.expect(!hasRequiredArgs(.strings, empty));
+}
+
+test "hasRequiredArgs: path needs exactly two positionals" {
+    try std.testing.expect(!hasRequiredArgs(.path, .{ .command = .path }));
+    try std.testing.expect(!hasRequiredArgs(.path, .{ .command = .path, .arg = "A" }));
+    try std.testing.expect(!hasRequiredArgs(.path, .{ .command = .path, .arg2 = "B" }));
+    try std.testing.expect(hasRequiredArgs(.path, .{ .command = .path, .arg = "A", .arg2 = "B" }));
+}
+
+test "parse: optional-arg commands succeed with no positional" {
+    try std.testing.expectEqual(Command.routes, (try parse(&.{"routes"})).command);
+    try std.testing.expectEqual(Command.events, (try parse(&.{"events"})).command);
+    try std.testing.expectEqual(Command.unused, (try parse(&.{"unused"})).command);
+    try std.testing.expectEqual(Command.imports, (try parse(&.{"imports"})).command);
+    try std.testing.expectEqual(Command.hot, (try parse(&.{"hot"})).command);
+    try std.testing.expectEqual(Command.files, (try parse(&.{"files"})).command);
+    try std.testing.expectEqual(Command.diff, (try parse(&.{"diff"})).command);
+    // ...and with an optional filter/positional.
+    try std.testing.expectEqualStrings("src", (try parse(&.{ "outline", "src" })).arg);
+    try std.testing.expectEqualStrings("HEAD~2", (try parse(&.{ "diff", "HEAD~2" })).arg);
+}
+
+test "parse: single-arg commands require their positional" {
+    try std.testing.expectError(error.Usage, parse(&.{"def"}));
+    try std.testing.expectError(error.Usage, parse(&.{"calls"}));
+    try std.testing.expectError(error.Usage, parse(&.{"callers"}));
+    try std.testing.expectError(error.Usage, parse(&.{"search"}));
+    try std.testing.expectError(error.Usage, parse(&.{"neighbors"}));
+    try std.testing.expectError(error.Usage, parse(&.{"importers"}));
+    try std.testing.expectError(error.Usage, parse(&.{"read"}));
+    try std.testing.expectError(error.Usage, parse(&.{"strings"}));
+    // Provided: fine.
+    try std.testing.expectEqualStrings("f.zig", (try parse(&.{ "importers", "f.zig" })).arg);
+    try std.testing.expectEqualStrings("x.zig:1-2", (try parse(&.{ "read", "x.zig:1-2" })).arg);
+}
+
+test "parse: path with two positionals; too few or too many is usage error" {
+    const p = try parse(&.{ "path", "A", "B" });
+    try std.testing.expectEqual(Command.path, p.command);
+    try std.testing.expectEqualStrings("A", p.arg);
+    try std.testing.expectEqualStrings("B", p.arg2);
+
+    try std.testing.expectError(error.Usage, parse(&.{"path"}));
+    try std.testing.expectError(error.Usage, parse(&.{ "path", "A" }));
+    // Third positional overflows.
+    try std.testing.expectError(error.Usage, parse(&.{ "path", "A", "B", "C" }));
+}
+
+test "parse: extra positional on a single-arg command is a usage error" {
+    try std.testing.expectError(error.Usage, parse(&.{ "def", "a", "b" }));
+    // A second positional is only accepted by `path`.
+    try std.testing.expectError(error.Usage, parse(&.{ "outline", "a", "b" }));
+}
+
+test "parse: flags may appear before and after the positional" {
+    const a = try parse(&.{ "calls", "-d2", "target", "-s" });
+    try std.testing.expectEqualStrings("target", a.arg);
+    try std.testing.expectEqual(@as(u32, 2), a.options.depth);
+    try std.testing.expect(a.options.strict);
+
+    const b = try parse(&.{ "outline", "-l50", "src", "--json" });
+    try std.testing.expectEqualStrings("src", b.arg);
+    try std.testing.expectEqual(@as(u32, 50), b.options.limit);
+    try std.testing.expectEqual(query.OutputFormat.json, b.options.format);
+}
+
+test "verbosity flag: every keyword and alias, separated and attached" {
+    try std.testing.expectEqual(render.Verbosity.names, (try parse(&.{ "def", "x", "-v", "names" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.sig, (try parse(&.{ "def", "x", "-v", "sig" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.doc, (try parse(&.{ "def", "x", "-v", "doc" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.full, (try parse(&.{ "def", "x", "-v", "full" })).options.verbosity);
+    // aliases
+    try std.testing.expectEqual(render.Verbosity.names, (try parse(&.{ "def", "x", "--verbosity", "name" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.sig, (try parse(&.{ "def", "x", "-v", "signature" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.doc, (try parse(&.{ "def", "x", "-v", "docs" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.full, (try parse(&.{ "def", "x", "-v", "body" })).options.verbosity);
+    // attached forms
+    try std.testing.expectEqual(render.Verbosity.full, (try parse(&.{ "def", "x", "-vfull" })).options.verbosity);
+    try std.testing.expectEqual(render.Verbosity.doc, (try parse(&.{ "def", "x", "--verbosity=doc" })).options.verbosity);
+}
+
+test "verbosity flag: garbage value is a BadValue error" {
+    try std.testing.expectError(error.BadValue, parse(&.{ "def", "x", "-v", "nope" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "def", "x", "--verbosity=zzz" }));
+}
+
+test "depth/limit/root/kind flags: separated and attached forms" {
+    // depth
+    try std.testing.expectEqual(@as(u32, 4), (try parse(&.{ "calls", "x", "-d", "4" })).options.depth);
+    try std.testing.expectEqual(@as(u32, 4), (try parse(&.{ "calls", "x", "-d4" })).options.depth);
+    try std.testing.expectEqual(@as(u32, 4), (try parse(&.{ "calls", "x", "--depth", "4" })).options.depth);
+    try std.testing.expectEqual(@as(u32, 4), (try parse(&.{ "calls", "x", "--depth=4" })).options.depth);
+    // limit
+    try std.testing.expectEqual(@as(u32, 7), (try parse(&.{ "outline", "-l", "7" })).options.limit);
+    try std.testing.expectEqual(@as(u32, 7), (try parse(&.{ "outline", "-l7" })).options.limit);
+    try std.testing.expectEqual(@as(u32, 7), (try parse(&.{ "outline", "--limit=7" })).options.limit);
+    // root
+    try std.testing.expectEqualStrings("sub", (try parse(&.{ "outline", "-C", "sub" })).root);
+    try std.testing.expectEqualStrings("sub", (try parse(&.{ "outline", "-Csub" })).root);
+    try std.testing.expectEqualStrings("sub", (try parse(&.{ "outline", "--root=sub" })).root);
+    // kind
+    try std.testing.expectEqualStrings("fn,struct", (try parse(&.{ "outline", "-k", "fn,struct" })).options.kinds);
+    try std.testing.expectEqualStrings("fn", (try parse(&.{ "outline", "-kfn" })).options.kinds);
+    try std.testing.expectEqualStrings("method", (try parse(&.{ "outline", "--kind=method" })).options.kinds);
+}
+
+test "value-taking flags without a value are MissingValue errors" {
+    try std.testing.expectError(error.MissingValue, parse(&.{ "calls", "x", "-d" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "outline", "-l" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "outline", "-C" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "outline", "-k" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "def", "x", "-v" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "files", "--sort" }));
+    // Attached-but-empty value is also MissingValue.
+    try std.testing.expectError(error.MissingValue, parse(&.{ "calls", "x", "--depth=" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "outline", "--kind=" }));
+}
+
+test "depth/limit reject non-numeric and overflowing values (BadValue)" {
+    try std.testing.expectError(error.BadValue, parse(&.{ "calls", "x", "-d", "abc" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "calls", "x", "-dxx" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "-l", "-5" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "calls", "x", "--depth=99999999999" }));
+}
+
+test "sort flag: keywords and aliases, plus BadValue" {
+    try std.testing.expectEqual(query.FileSort.path, (try parse(&.{ "files", "--sort", "path" })).options.file_sort);
+    try std.testing.expectEqual(query.FileSort.path, (try parse(&.{ "files", "--sort", "name" })).options.file_sort);
+    try std.testing.expectEqual(query.FileSort.symbols, (try parse(&.{ "files", "--sort=symbols" })).options.file_sort);
+    try std.testing.expectEqual(query.FileSort.symbols, (try parse(&.{ "files", "--sort=size" })).options.file_sort);
+    try std.testing.expectError(error.BadValue, parse(&.{ "files", "--sort", "zzz" }));
+}
+
+test "boolean flags set their fields (short and long)" {
+    try std.testing.expect((try parse(&.{ "calls", "x", "-s" })).options.strict);
+    try std.testing.expect((try parse(&.{ "calls", "x", "--strict" })).options.strict);
+    try std.testing.expectEqual(query.OutputFormat.json, (try parse(&.{ "outline", "-j" })).options.format);
+    try std.testing.expectEqual(query.OutputFormat.json, (try parse(&.{ "outline", "--json" })).options.format);
+    try std.testing.expect((try parse(&.{ "search", "x", "-r" })).options.refs);
+    try std.testing.expect((try parse(&.{ "search", "x", "--refs" })).options.refs);
+    try std.testing.expect(!(try parse(&.{ "outline", "--no-cache" })).use_cache);
+    try std.testing.expect((try parse(&.{ "unused", "--no-test" })).options.unused_skip_test_only);
+    try std.testing.expect((try parse(&.{ "unused", "--no-public" })).options.unused_skip_exported);
+    try std.testing.expect((try parse(&.{ "unused", "--follow-imports" })).options.unused_follow_imports);
+}
+
+test "boolean flags reject an attached value (BadValue)" {
+    try std.testing.expectError(error.BadValue, parse(&.{ "calls", "x", "--strict=1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "calls", "x", "-s1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "--json=1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "-j1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "search", "x", "--refs=yes" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "search", "x", "-r1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "--no-cache=0" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-test=1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--no-public=1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "unused", "--follow-imports=1" }));
+}
+
+test "unknown flag: bare form is UnknownFlag, attached-value form is BadValue" {
+    try std.testing.expectError(error.UnknownFlag, parse(&.{ "def", "x", "--nope" }));
+    try std.testing.expectError(error.UnknownFlag, parse(&.{ "def", "x", "-z" }));
+    // An unknown flag carrying an attached value trips the boolean-attach guard
+    // before the unknown-flag fallthrough, so it surfaces as BadValue.
+    try std.testing.expectError(error.BadValue, parse(&.{ "def", "x", "--nope=1" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "def", "x", "-z9" }));
+}
+
+test "reason: each ParseError maps to its explanation" {
+    try std.testing.expect(std.mem.indexOf(u8, reason(error.Usage), "expected a command") != null);
+    try std.testing.expectEqualStrings("unknown flag", reason(error.UnknownFlag));
+    try std.testing.expect(std.mem.indexOf(u8, reason(error.MissingValue), "missing its value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason(error.BadValue), "invalid flag value") != null);
+}
+
+test "usage: writes the full help banner" {
+    const testing = std.testing;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try usage(&aw.writer);
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "NavGraph") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "USAGE:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "FLAGS:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "--no-cache") != null);
+}
+
+test "splitFlag: long flag with and without an attached value" {
+    const a = splitFlag("--depth=2");
+    try std.testing.expectEqualStrings("--depth", a.name);
+    try std.testing.expectEqualStrings("2", a.inline_val.?);
+
+    const b = splitFlag("--strict");
+    try std.testing.expectEqualStrings("--strict", b.name);
+    try std.testing.expect(b.inline_val == null);
+
+    // Only the first `=` splits; the rest is part of the value.
+    const c = splitFlag("--kind=fn=struct");
+    try std.testing.expectEqualStrings("--kind", c.name);
+    try std.testing.expectEqualStrings("fn=struct", c.inline_val.?);
+
+    // `--sort=` yields an empty (non-null) value → value() reports MissingValue.
+    const d = splitFlag("--sort=");
+    try std.testing.expectEqualStrings("--sort", d.name);
+    try std.testing.expectEqualStrings("", d.inline_val.?);
+}
+
+test "splitFlag: short flag with and without an attached value" {
+    const a = splitFlag("-d2");
+    try std.testing.expectEqualStrings("-d", a.name);
+    try std.testing.expectEqualStrings("2", a.inline_val.?);
+
+    // A bare 2-char short flag has no attached value.
+    const b = splitFlag("-d");
+    try std.testing.expectEqualStrings("-d", b.name);
+    try std.testing.expect(b.inline_val == null);
+
+    // The name is always the first two chars for a long-ish short token.
+    const c = splitFlag("-Csub/dir");
+    try std.testing.expectEqualStrings("-C", c.name);
+    try std.testing.expectEqualStrings("sub/dir", c.inline_val.?);
+
+    // A lone dash is neither long nor an attach; passes through untouched.
+    const d = splitFlag("-");
+    try std.testing.expectEqualStrings("-", d.name);
+    try std.testing.expect(d.inline_val == null);
+}
+
+test "SplitFlag.value: attached value wins and value() ignores args" {
+    const args = [_][:0]const u8{ "--depth", "IGNORED" };
+    const sf = SplitFlag{ .name = "--depth", .inline_val = "9" };
+    try std.testing.expectEqualStrings("9", try sf.value(&args, 0));
+    try std.testing.expectEqual(@as(usize, 0), sf.next(0));
+}
+
+test "SplitFlag.value: separate value reads the next token" {
+    const args = [_][:0]const u8{ "-d", "5" };
+    const sf = SplitFlag{ .name = "-d", .inline_val = null };
+    try std.testing.expectEqualStrings("5", try sf.value(&args, 0));
+    try std.testing.expectEqual(@as(usize, 1), sf.next(0));
+}
+
+test "SplitFlag.value: empty attached value is MissingValue" {
+    const args = [_][:0]const u8{"--sort"};
+    const sf = SplitFlag{ .name = "--sort", .inline_val = "" };
+    try std.testing.expectError(error.MissingValue, sf.value(&args, 0));
+}
+
+test "SplitFlag.value: no next token is MissingValue" {
+    const args = [_][:0]const u8{"-d"};
+    const sf = SplitFlag{ .name = "-d", .inline_val = null };
+    try std.testing.expectError(error.MissingValue, sf.value(&args, 0));
+}
+
+test "parseUint: valid decimals including bounds" {
+    try std.testing.expectEqual(@as(u32, 0), try parseUint("0"));
+    try std.testing.expectEqual(@as(u32, 42), try parseUint("42"));
+    try std.testing.expectEqual(@as(u32, 7), try parseUint("007")); // leading zeros ok
+    try std.testing.expectEqual(@as(u32, 4294967295), try parseUint("4294967295")); // u32 max
+}
+
+test "parseUint: overflow, non-digit, empty and negative are BadValue" {
+    try std.testing.expectError(error.BadValue, parseUint("4294967296")); // u32 max + 1
+    try std.testing.expectError(error.BadValue, parseUint("99999999999"));
+    try std.testing.expectError(error.BadValue, parseUint("abc"));
+    try std.testing.expectError(error.BadValue, parseUint("12x"));
+    try std.testing.expectError(error.BadValue, parseUint(""));
+    try std.testing.expectError(error.BadValue, parseUint("-1"));
+    try std.testing.expectError(error.BadValue, parseUint("0x10")); // base 10 only
+    try std.testing.expectError(error.BadValue, parseUint(" 5")); // no whitespace
+}
+
+test "eqAny: membership, misses and empty option set" {
+    try std.testing.expect(eqAny("-d", &.{ "-d", "--depth" }));
+    try std.testing.expect(eqAny("--depth", &.{ "-d", "--depth" }));
+    try std.testing.expect(!eqAny("-x", &.{ "-d", "--depth" }));
+    try std.testing.expect(!eqAny("-d", &.{})); // empty set never matches
+    try std.testing.expect(eqAny("--sort", &.{"--sort"}));
+    try std.testing.expect(!eqAny("--Sort", &.{"--sort"})); // case-sensitive
+}
+
+test "parse: multiple mixed flags accumulate onto one Parsed" {
+    const p = try parse(&.{ "search", "resolve", "--refs", "-l", "10", "-C", "src", "-kfn", "-s", "--json" });
+    try std.testing.expectEqual(Command.search, p.command);
+    try std.testing.expectEqualStrings("resolve", p.arg);
+    try std.testing.expect(p.options.refs);
+    try std.testing.expectEqual(@as(u32, 10), p.options.limit);
+    try std.testing.expectEqualStrings("src", p.root);
+    try std.testing.expectEqualStrings("fn", p.options.kinds);
+    try std.testing.expect(p.options.strict);
+    try std.testing.expectEqual(query.OutputFormat.json, p.options.format);
+}

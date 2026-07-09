@@ -33,6 +33,26 @@ class UserService:
             return True
         return False
 
+    def list_all(self) -> list:
+        """Return every stored user as a domain object."""
+        return [User(uid, row["name"], row["email"]) for uid, row in _USERS.items()]
+
+    def replace(self, id: int, name: str, email: str):
+        """Overwrite a user's fields; None when the id is unknown."""
+        if id not in _USERS:
+            return None
+        clean = normalize_email(email)
+        _USERS[id] = {"name": name, "email": clean}
+        return User(id, name, clean)
+
+    def update_email(self, id: int, email: str):
+        """Patch just the email of an existing user."""
+        row = self._query(id)
+        if row is None:
+            return None
+        row["email"] = normalize_email(email)
+        return User(id, row["name"], row["email"])
+
 
 def _seed_demo_data() -> None:
     """Populate the store with fixtures for local development."""

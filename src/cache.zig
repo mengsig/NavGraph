@@ -485,3 +485,631 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
         .bindings = p.bindings,
     };
 }
+
+
+// ---------------------------------------------------------------------------
+// Appended tests: exhaustive coverage of cache serialization round-trips,
+// corruption safety, cursor bounds, and enum validation.
+// ---------------------------------------------------------------------------
+
+/// A test-only description of one serialized reference record (mirrors the
+/// on-disk ref layout so we can hand-build blobs with chosen enum bytes).
+const TestRef = struct {
+    name: []const u8 = "",
+    qualifier: []const u8 = "",
+    line: u32 = 1,
+    kind: u8 = 0,
+    count: u32 = 1,
+    lines: []const u32 = &[_]u32{},
+};
+
+/// Hand-encode one symbol record in exactly the byte layout `readSymbol`
+/// expects, letting a test inject arbitrary (possibly out-of-range) enum bytes.
+fn encSym(
+    a: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    name: []const u8,
+    kind_byte: u8,
+    parent_raw: u32,
+    exported_byte: u8,
+    mods_byte: u8,
+    doc: []const u8,
+    import_path: []const u8,
+    refs: []const TestRef,
+    binds: []const Binding,
+) !void {
+    try putStr(a, buf, name);
+    try putU8(a, buf, kind_byte);
+    try putU32(a, buf, 1); // line
+    try putU32(a, buf, 0); // span_start
+    try putU32(a, buf, 8); // span_end
+    try putU32(a, buf, 4); // sig_end
+    try putU32(a, buf, parent_raw);
+    try putU8(a, buf, exported_byte);
+    try putU8(a, buf, mods_byte);
+    try putStr(a, buf, doc);
+    try putStr(a, buf, import_path);
+    try putU32(a, buf, @intCast(refs.len));
+    for (refs) |r| {
+        try putStr(a, buf, r.name);
+        try putStr(a, buf, r.qualifier);
+        try putU32(a, buf, r.line);
+        try putU8(a, buf, r.kind);
+        try putU32(a, buf, r.count);
+        try putU32(a, buf, @intCast(r.lines.len));
+        for (r.lines) |ln| try putU32(a, buf, ln);
+    }
+    try putU32(a, buf, @intCast(binds.len));
+    for (binds) |b| {
+        try putStr(a, buf, b.name);
+        try putStr(a, buf, b.type_name);
+    }
+}
+
+/// Hand-encode a whole cache holding exactly one entry with an empty symbol
+/// list. `lang_byte` is written verbatim so a test can drive `getLang`.
+fn buildOneEntryCache(
+    a: std.mem.Allocator,
+    path: []const u8,
+    lang_byte: u8,
+    mtime: i128,
+    ctime: i128,
+    text: []const u8,
+) !std.ArrayList(u8) {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, magic);
+    try putU64(a, &buf, build_key);
+    try putU32(a, &buf, 1); // entry count
+    try putI128(a, &buf, mtime);
+    try putI128(a, &buf, ctime);
+    try putU64(a, &buf, @intCast(text.len)); // size
+    try putStr(a, &buf, path);
+    try putU8(a, &buf, lang_byte);
+    try putStr(a, &buf, text); // blob: text
+    try putU32(a, &buf, 0); // blob: sym_count
+    return buf;
+}
+
+/// Write raw bytes to the cache path under a tmp dir (creating `.navgraph`).
+fn writeRawCache(tmp: *std.testing.TmpDir, bytes: []const u8) !void {
+    try tmp.dir.createDirPath(std.testing.io, cache_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = cache_path, .data = bytes });
+}
+
+/// Assert a restored ParsedSymbol equals the originating graph Symbol across
+/// every cached field. `base` is the file's `sym_start` (parent ids are stored
+/// base-relative).
+fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
+    const t = std.testing;
+    try t.expectEqualStrings(expected.name, got.name);
+    try t.expectEqual(expected.kind, got.kind);
+    try t.expectEqual(expected.line, got.line);
+    try t.expectEqual(expected.span_start, got.span_start);
+    try t.expectEqual(expected.span_end, got.span_end);
+    try t.expectEqual(expected.sig_end, got.sig_end);
+    try t.expectEqual(expected.exported, got.exported);
+    try t.expectEqual(@as(u8, @bitCast(expected.modifiers)), @as(u8, @bitCast(got.modifiers)));
+    try t.expectEqualStrings(expected.doc, got.doc);
+    try t.expectEqualStrings(expected.import_path, got.import_path);
+    if (expected.parent == model.invalid_symbol) {
+        try t.expectEqual(@as(?u32, null), got.parent_local);
+    } else {
+        try t.expectEqual(@as(?u32, expected.parent - base), got.parent_local);
+    }
+    try t.expectEqual(expected.refs.len, got.refs.len);
+    for (expected.refs, got.refs) |er, gr| {
+        try t.expectEqualStrings(er.name, gr.name);
+        try t.expectEqualStrings(er.qualifier, gr.qualifier);
+        try t.expectEqual(er.line, gr.line);
+        try t.expectEqual(er.kind, gr.kind);
+        try t.expectEqual(er.count, gr.count);
+        try t.expectEqualSlices(u32, er.lines, gr.lines);
+    }
+    try t.expectEqual(expected.bindings.len, got.bindings.len);
+    for (expected.bindings, got.bindings) |eb, gb| {
+        try t.expectEqualStrings(eb.name, gb.name);
+        try t.expectEqualStrings(eb.type_name, gb.type_name);
+    }
+}
+
+test "full round-trip preserves every field across two files with distinct languages" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // File A (zig): a struct + a method (parent-relative), the method carrying
+    // rich refs (multi-line + qualified) and bindings, plus modifiers.
+    const textA = "pub const Container = struct { pub fn run() void {} };\n    // pad pad\n";
+    const textB = "import numpy as np\ncount = 0\n";
+
+    var no_refs = [_]Reference{};
+    var refs1 = [_]Reference{
+        .{ .name = "helper", .qualifier = "", .line = 30, .kind = .call, .count = 3, .lines = &[_]u32{ 30, 33, 40 } },
+        .{ .name = "Widget", .qualifier = "w", .line = 31, .kind = .type_use, .count = 1, .lines = &[_]u32{} },
+    };
+    const binds1 = [_]Binding{
+        .{ .name = "tmp", .type_name = "i32" },
+        .{ .name = "w", .type_name = "Widget" },
+    };
+    var refs3 = [_]Reference{
+        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .count = 2, .lines = &[_]u32{ 5, 6 } },
+    };
+
+    var syms = [_]model.Symbol{
+        .{ .id = 0, .file = 0, .name = "Container", .kind = .@"struct", .line = 1, .span_start = 0, .span_end = 20, .sig_end = 10, .doc = "/// A container", .parent = model.invalid_symbol, .exported = true, .refs = &no_refs },
+        .{ .id = 1, .file = 0, .name = "run", .kind = .method, .line = 3, .span_start = 20, .span_end = 30, .sig_end = 25, .doc = "", .parent = 0, .exported = false, .modifiers = .{ .is_async = true, .getter = true }, .refs = &refs1, .bindings = &binds1 },
+        // File B (python): an import (carries import_path) + a variable whose
+        // parent points base-relative into file B to exercise the base offset.
+        .{ .id = 2, .file = 1, .name = "np", .kind = .import, .line = 1, .span_start = 0, .span_end = 10, .sig_end = 8, .doc = "", .parent = model.invalid_symbol, .exported = false, .import_path = "numpy", .refs = &no_refs },
+        .{ .id = 3, .file = 1, .name = "count", .kind = .variable, .line = 2, .span_start = 10, .span_end = 25, .sig_end = 18, .doc = "/// counter", .parent = 2, .exported = true, .modifiers = .{ .is_static = true }, .refs = &refs3 },
+    };
+
+    const files = [_]model.SourceFile{
+        .{ .id = 0, .path = "a.zig", .language = .zig, .text = textA, .sym_start = 0, .sym_end = 2 },
+        .{ .id = 1, .path = "b.py", .language = .python, .text = textB, .sym_start = 2, .sym_end = 4 },
+    };
+    const stats = [_]FileStat{
+        .{ .mtime_ns = 1000, .ctime_ns = 2000, .size = textA.len },
+        .{ .mtime_ns = 3000, .ctime_ns = 4000, .size = textB.len },
+    };
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try write(testing.allocator, testing.io, tmp.dir, &files, &stats, &syms);
+
+    var store = load(testing.allocator, testing.io, tmp.dir).?;
+    defer store.deinit();
+    try testing.expectEqual(@as(u32, 2), store.entries.count());
+    try testing.expectEqual(Language.zig, store.entries.get("a.zig").?.lang);
+    try testing.expectEqual(Language.python, store.entries.get("b.py").?.lang);
+
+    const hitA = store.restore(arena, "a.zig", stats[0]).?;
+    try testing.expectEqualStrings(textA, hitA.text);
+    try testing.expectEqual(@as(usize, 2), hitA.symbols.len);
+    try expectSymEq(0, syms[0], hitA.symbols[0]);
+    try expectSymEq(0, syms[1], hitA.symbols[1]);
+
+    const hitB = store.restore(arena, "b.py", stats[1]).?;
+    try testing.expectEqualStrings(textB, hitB.text);
+    try testing.expectEqual(@as(usize, 2), hitB.symbols.len);
+    try expectSymEq(2, syms[2], hitB.symbols[0]);
+    try expectSymEq(2, syms[3], hitB.symbols[1]);
+
+    // A size mismatch (mtime/ctime intact) still misses.
+    try testing.expect(store.restore(arena, "a.zig", .{ .mtime_ns = 1000, .ctime_ns = 2000, .size = 99999 }) == null);
+}
+
+test "putU8 appends a single byte and cursor reads it back" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putU8(a, &buf, 0);
+    try putU8(a, &buf, 200);
+    try putU8(a, &buf, 255);
+    try testing.expectEqual(@as(usize, 3), buf.items.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 200, 255 }, buf.items);
+    var cur = Cursor{ .bytes = buf.items };
+    try testing.expectEqual(@as(u8, 0), try cur.getU8());
+    try testing.expectEqual(@as(u8, 200), try cur.getU8());
+    try testing.expectEqual(@as(u8, 255), try cur.getU8());
+    // Exhausted cursor errors rather than reading past end.
+    try testing.expectError(error.Truncated, cur.getU8());
+}
+
+test "encode helpers write little-endian bytes" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putU32(a, &buf, 0x01020304);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x04, 0x03, 0x02, 0x01 }, buf.items);
+    buf.clearRetainingCapacity();
+    try putU64(a, &buf, 0x0102030405060708);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 }, buf.items);
+    buf.clearRetainingCapacity();
+    try putStr(a, &buf, "AB");
+    try testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 0, 'A', 'B' }, buf.items);
+}
+
+test "encode/decode helpers round-trip edge values" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putU8(a, &buf, 0);
+    try putU8(a, &buf, 255);
+    try putU32(a, &buf, 0);
+    try putU32(a, &buf, std.math.maxInt(u32));
+    try putU64(a, &buf, 0);
+    try putU64(a, &buf, std.math.maxInt(u64));
+    try putI128(a, &buf, std.math.minInt(i128));
+    try putI128(a, &buf, std.math.maxInt(i128));
+    try putI128(a, &buf, -1);
+    try putStr(a, &buf, "");
+    try putStr(a, &buf, "round trip");
+    var cur = Cursor{ .bytes = buf.items };
+    try testing.expectEqual(@as(u8, 0), try cur.getU8());
+    try testing.expectEqual(@as(u8, 255), try cur.getU8());
+    try testing.expectEqual(@as(u32, 0), try cur.getU32());
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), try cur.getU32());
+    try testing.expectEqual(@as(u64, 0), try cur.getU64());
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), try cur.getU64());
+    try testing.expectEqual(@as(i128, std.math.minInt(i128)), try cur.getI128());
+    try testing.expectEqual(@as(i128, std.math.maxInt(i128)), try cur.getI128());
+    try testing.expectEqual(@as(i128, -1), try cur.getI128());
+    try testing.expectEqualStrings("", try cur.getStr());
+    try testing.expectEqualStrings("round trip", try cur.getStr());
+    try testing.expectEqual(buf.items.len, cur.pos);
+    try testing.expectError(error.Truncated, cur.getU8());
+}
+
+test "cursor take yields exact bytes and errors past the end" {
+    const testing = std.testing;
+    const data = [_]u8{ 10, 20, 30, 40 };
+    var cur = Cursor{ .bytes = &data };
+    try testing.expectEqualSlices(u8, &[_]u8{ 10, 20 }, try cur.take(2));
+    try testing.expectEqualSlices(u8, &[_]u8{ 30, 40 }, try cur.take(2));
+    try testing.expectError(error.Truncated, cur.take(1));
+    // take(0) at the exact end is a valid empty slice, not an error.
+    try testing.expectEqualSlices(u8, &[_]u8{}, try cur.take(0));
+}
+
+test "getStr with a length exceeding the buffer is Truncated" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putU32(a, &buf, 100); // claims a 100-byte payload that isn't present
+    var cur = Cursor{ .bytes = buf.items };
+    try testing.expectError(error.Truncated, cur.getStr());
+}
+
+test "fixed-width getters error on short input" {
+    const testing = std.testing;
+    {
+        var c = Cursor{ .bytes = &[_]u8{ 1, 2, 3 } };
+        try testing.expectError(error.Truncated, c.getU32());
+    }
+    {
+        var c = Cursor{ .bytes = &[_]u8{ 1, 2, 3, 4, 5, 6, 7 } };
+        try testing.expectError(error.Truncated, c.getU64());
+    }
+    {
+        var c = Cursor{ .bytes = &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 } };
+        try testing.expectError(error.Truncated, c.getI128());
+    }
+    {
+        var c = Cursor{ .bytes = &[_]u8{} };
+        try testing.expectError(error.Truncated, c.getU8());
+    }
+}
+
+test "enumFromInt accepts in-range values and rejects out-of-range" {
+    const testing = std.testing;
+    inline for (@typeInfo(Language).@"enum".fields) |f| {
+        try testing.expectEqual(@as(Language, @enumFromInt(f.value)), try enumFromInt(Language, @intCast(f.value)));
+    }
+    try testing.expectError(error.BadEnum, enumFromInt(Language, @intCast(@typeInfo(Language).@"enum".fields.len)));
+    try testing.expectError(error.BadEnum, enumFromInt(Language, 255));
+
+    inline for (@typeInfo(model.SymbolKind).@"enum".fields) |f| {
+        try testing.expectEqual(@as(model.SymbolKind, @enumFromInt(f.value)), try enumFromInt(model.SymbolKind, @intCast(f.value)));
+    }
+    try testing.expectError(error.BadEnum, enumFromInt(model.SymbolKind, @intCast(@typeInfo(model.SymbolKind).@"enum".fields.len)));
+
+    inline for (@typeInfo(model.RefKind).@"enum".fields) |f| {
+        try testing.expectEqual(@as(model.RefKind, @enumFromInt(f.value)), try enumFromInt(model.RefKind, @intCast(f.value)));
+    }
+    try testing.expectError(error.BadEnum, enumFromInt(model.RefKind, @intCast(@typeInfo(model.RefKind).@"enum".fields.len)));
+}
+
+test "cursor enum getters decode valid bytes and reject out-of-range" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putU8(a, &buf, @intFromEnum(Language.rust));
+    try putU8(a, &buf, @intFromEnum(model.SymbolKind.method));
+    try putU8(a, &buf, @intFromEnum(model.RefKind.type_use));
+    var cur = Cursor{ .bytes = buf.items };
+    try testing.expectEqual(Language.rust, try cur.getLang());
+    try testing.expectEqual(model.SymbolKind.method, try cur.getKind());
+    try testing.expectEqual(model.RefKind.type_use, try cur.getRefKind());
+
+    {
+        var c = Cursor{ .bytes = &[_]u8{200} };
+        try testing.expectError(error.BadEnum, c.getLang());
+    }
+    {
+        var c = Cursor{ .bytes = &[_]u8{200} };
+        try testing.expectError(error.BadEnum, c.getKind());
+    }
+    {
+        var c = Cursor{ .bytes = &[_]u8{200} };
+        try testing.expectError(error.BadEnum, c.getRefKind());
+    }
+    // An empty buffer truncates before it can even read the enum byte.
+    {
+        var c = Cursor{ .bytes = &[_]u8{} };
+        try testing.expectError(error.Truncated, c.getLang());
+    }
+}
+
+test "materialize reconstructs all scalar, string, ref and binding fields" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const a = testing.allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putStr(a, &buf, "the text"); // blob text
+    try putU32(a, &buf, 2); // sym_count
+
+    const mods = model.Mods{ .is_async = true, .setter = true };
+    const mods_byte = @as(u8, @bitCast(mods));
+    const refs = [_]TestRef{
+        .{ .name = "helper", .qualifier = "", .line = 30, .kind = @intFromEnum(model.RefKind.call), .count = 3, .lines = &[_]u32{ 30, 33, 40 } },
+        .{ .name = "Widget", .qualifier = "w", .line = 31, .kind = @intFromEnum(model.RefKind.type_use), .count = 1, .lines = &[_]u32{} },
+    };
+    const binds = [_]Binding{
+        .{ .name = "tmp", .type_name = "i32" },
+        .{ .name = "w", .type_name = "Widget" },
+    };
+    // sym0: parent invalid -> null; carries doc, import_path, modifiers, refs, binds.
+    try encSym(a, &buf, "run", @intFromEnum(model.SymbolKind.method), invalid_local, 1, mods_byte, "/// doc", "mod.zig", &refs, &binds);
+    // sym1: parent id 0 -> parent_local 0 (distinct from null).
+    try encSym(a, &buf, "leaf", @intFromEnum(model.SymbolKind.field), 0, 0, 0, "", "", &.{}, &.{});
+
+    const r = try materialize(arena, buf.items);
+    try testing.expectEqualStrings("the text", r.text);
+    try testing.expectEqual(@as(usize, 2), r.symbols.len);
+
+    const s0 = r.symbols[0];
+    try testing.expectEqualStrings("run", s0.name);
+    try testing.expectEqual(model.SymbolKind.method, s0.kind);
+    try testing.expect(s0.exported);
+    try testing.expectEqual(mods_byte, @as(u8, @bitCast(s0.modifiers)));
+    try testing.expectEqualStrings("/// doc", s0.doc);
+    try testing.expectEqualStrings("mod.zig", s0.import_path);
+    try testing.expectEqual(@as(?u32, null), s0.parent_local);
+    try testing.expectEqual(@as(usize, 2), s0.refs.len);
+    try testing.expectEqualStrings("helper", s0.refs[0].name);
+    try testing.expectEqualStrings("", s0.refs[0].qualifier);
+    try testing.expectEqual(@as(u32, 30), s0.refs[0].line);
+    try testing.expectEqual(model.RefKind.call, s0.refs[0].kind);
+    try testing.expectEqual(@as(u32, 3), s0.refs[0].count);
+    try testing.expectEqualSlices(u32, &[_]u32{ 30, 33, 40 }, s0.refs[0].lines);
+    try testing.expectEqualStrings("w", s0.refs[1].qualifier);
+    try testing.expectEqual(model.RefKind.type_use, s0.refs[1].kind);
+    try testing.expectEqual(@as(usize, 0), s0.refs[1].lines.len);
+    try testing.expectEqual(@as(usize, 2), s0.bindings.len);
+    try testing.expectEqualStrings("tmp", s0.bindings[0].name);
+    try testing.expectEqualStrings("i32", s0.bindings[0].type_name);
+    try testing.expectEqualStrings("Widget", s0.bindings[1].type_name);
+
+    const s1 = r.symbols[1];
+    try testing.expectEqual(@as(?u32, 0), s1.parent_local);
+    try testing.expectEqual(model.SymbolKind.field, s1.kind);
+    try testing.expect(!s1.exported);
+}
+
+test "materialize decodes every SymbolKind value" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const a = testing.allocator;
+    inline for (@typeInfo(model.SymbolKind).@"enum".fields) |f| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try putStr(a, &buf, "t");
+        try putU32(a, &buf, 1);
+        try encSym(a, &buf, "s", @intCast(f.value), invalid_local, 0, 0, "", "", &.{}, &.{});
+        const r = try materialize(arena, buf.items);
+        try testing.expectEqual(@as(model.SymbolKind, @enumFromInt(f.value)), r.symbols[0].kind);
+    }
+}
+
+test "materialize decodes every RefKind value" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const a = testing.allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putStr(a, &buf, "t");
+    try putU32(a, &buf, 1);
+    var refs: [@typeInfo(model.RefKind).@"enum".fields.len]TestRef = undefined;
+    inline for (@typeInfo(model.RefKind).@"enum".fields, 0..) |f, i| {
+        refs[i] = .{ .name = "r", .qualifier = "", .line = 1, .kind = @intCast(f.value), .count = 1, .lines = &[_]u32{} };
+    }
+    try encSym(a, &buf, "s", @intFromEnum(model.SymbolKind.function), invalid_local, 0, 0, "", "", &refs, &.{});
+    const r = try materialize(arena, buf.items);
+    inline for (@typeInfo(model.RefKind).@"enum".fields, 0..) |f, i| {
+        try testing.expectEqual(@as(model.RefKind, @enumFromInt(f.value)), r.symbols[0].refs[i].kind);
+    }
+}
+
+test "materialize rejects an out-of-range symbol kind" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putStr(a, &buf, "t");
+    try putU32(a, &buf, 1);
+    try encSym(a, &buf, "s", 250, invalid_local, 0, 0, "", "", &.{}, &.{});
+    try testing.expectError(error.BadEnum, materialize(arena, buf.items));
+}
+
+test "materialize rejects an out-of-range ref kind" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putStr(a, &buf, "t");
+    try putU32(a, &buf, 1);
+    const refs = [_]TestRef{.{ .name = "r", .kind = 250, .line = 1 }};
+    try encSym(a, &buf, "s", @intFromEnum(model.SymbolKind.function), invalid_local, 0, 0, "", "", &refs, &.{});
+    try testing.expectError(error.BadEnum, materialize(arena, buf.items));
+}
+
+test "materialize rejects a truncated blob" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try putStr(a, &buf, "text");
+    try putU32(a, &buf, 1);
+    try encSym(a, &buf, "s", @intFromEnum(model.SymbolKind.function), invalid_local, 0, 0, "", "", &.{}, &.{});
+    // Chop it down so the very first getStr (blob text) truncates.
+    try testing.expectError(error.Truncated, materialize(arena, buf.items[0..3]));
+}
+
+test "write emits the versioned magic and build key header" {
+    const testing = std.testing;
+    const empty_files = [_]model.SourceFile{};
+    const empty_stats = [_]FileStat{};
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try write(testing.allocator, testing.io, tmp.dir, &empty_files, &empty_stats, &.{});
+
+    const raw = try tmp.dir.readFileAlloc(testing.io, cache_path, testing.allocator, .unlimited);
+    defer testing.allocator.free(raw);
+    try testing.expect(std.mem.startsWith(u8, raw, magic));
+    const bk = std.mem.readInt(u64, raw[magic.len..][0..8], .little);
+    try testing.expectEqual(build_key, bk);
+    const count = std.mem.readInt(u32, raw[magic.len + 8 ..][0..4], .little);
+    try testing.expectEqual(@as(u32, 0), count);
+}
+
+test "load reads a hand-built cache and restores an empty-symbol file" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var buf = try buildOneEntryCache(testing.allocator, "f.zig", @intFromEnum(Language.zig), 11, 22, "hello");
+    defer buf.deinit(testing.allocator);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeRawCache(&tmp, buf.items);
+
+    var store = load(testing.allocator, testing.io, tmp.dir).?;
+    defer store.deinit();
+    try testing.expectEqual(@as(u32, 1), store.entries.count());
+    try testing.expectEqual(Language.zig, store.entries.get("f.zig").?.lang);
+
+    const hit = store.restore(arena, "f.zig", .{ .mtime_ns = 11, .ctime_ns = 22, .size = 5 }).?;
+    try testing.expectEqualStrings("hello", hit.text);
+    try testing.expectEqual(@as(usize, 0), hit.symbols.len);
+    // Size mismatch misses.
+    try testing.expect(store.restore(arena, "f.zig", .{ .mtime_ns = 11, .ctime_ns = 22, .size = 4 }) == null);
+}
+
+test "every language tag survives the cache header" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    inline for (@typeInfo(Language).@"enum".fields) |f| {
+        var buf = try buildOneEntryCache(testing.allocator, "f.zig", @intCast(f.value), 1, 2, "x");
+        defer buf.deinit(testing.allocator);
+        try writeRawCache(&tmp, buf.items);
+        var store = load(testing.allocator, testing.io, tmp.dir).?;
+        defer store.deinit();
+        try testing.expectEqual(@as(Language, @enumFromInt(f.value)), store.entries.get("f.zig").?.lang);
+    }
+}
+
+test "load rejects a cache header with an out-of-range language" {
+    const testing = std.testing;
+    var buf = try buildOneEntryCache(testing.allocator, "f.zig", 250, 1, 2, "x");
+    defer buf.deinit(testing.allocator);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeRawCache(&tmp, buf.items);
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+}
+
+test "load rejects a corrupt magic" {
+    const testing = std.testing;
+    var buf = try buildOneEntryCache(testing.allocator, "f.zig", @intFromEnum(Language.zig), 1, 2, "x");
+    defer buf.deinit(testing.allocator);
+    buf.items[0] +%= 1;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeRawCache(&tmp, buf.items);
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+}
+
+test "load rejects a cache whose entry count exceeds its data" {
+    const testing = std.testing;
+    var buf = try buildOneEntryCache(testing.allocator, "f.zig", @intFromEnum(Language.zig), 1, 2, "x");
+    defer buf.deinit(testing.allocator);
+    // Header claims five entries but only one is encoded -> Truncated -> null.
+    std.mem.writeInt(u32, buf.items[magic.len + 8 ..][0..4], 5, .little);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeRawCache(&tmp, buf.items);
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+}
+
+test "load rejects empty and sub-magic cache files" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeRawCache(&tmp, "");
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+    try writeRawCache(&tmp, "NG");
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+}
+
+test "load ignores a cache truncated by a single trailing byte" {
+    const testing = std.testing;
+    var no_refs = [_]Reference{};
+    const binds = [_]Binding{.{ .name = "v", .type_name = "X" }};
+    var syms = [_]model.Symbol{
+        .{ .id = 0, .file = 0, .name = "s", .kind = .function, .line = 1, .span_start = 0, .span_end = 1, .sig_end = 1, .doc = "", .parent = model.invalid_symbol, .exported = false, .refs = &no_refs, .bindings = &binds },
+    };
+    const files = [_]model.SourceFile{
+        .{ .id = 0, .path = "s.zig", .language = .zig, .text = "x", .sym_start = 0, .sym_end = 1 },
+    };
+    const stats = [_]FileStat{.{ .mtime_ns = 1, .ctime_ns = 1, .size = 1 }};
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try write(testing.allocator, testing.io, tmp.dir, &files, &stats, &syms);
+
+    const raw = try tmp.dir.readFileAlloc(testing.io, cache_path, testing.allocator, .unlimited);
+    defer testing.allocator.free(raw);
+    try testing.expect(raw.len > 1);
+    // A valid cache loads; dropping one trailing byte busts the whole thing.
+    {
+        var ok = load(testing.allocator, testing.io, tmp.dir).?;
+        ok.deinit();
+    }
+    try writeRawCache(&tmp, raw[0 .. raw.len - 1]);
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+}
+
+test "load returns null when no cache file exists" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
+}

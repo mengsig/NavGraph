@@ -814,3 +814,1041 @@ fn balancedBrackets(s: []const u8) bool {
     }
     return depth == 0 and !in_str;
 }
+
+
+// ===========================================================================
+// Appended tests: JSON rendering of every verb, escaping, and structural checks.
+// ===========================================================================
+
+/// A fresh growable JSON writer. `fromArrayList` empties the (empty) list and
+/// takes ownership, so the returned Allocating owns its own buffer.
+fn tjWriter() std.Io.Writer.Allocating {
+    var buf: std.ArrayList(u8) = .empty;
+    return std.Io.Writer.Allocating.fromArrayList(std.testing.allocator, &buf);
+}
+
+/// Build an index rooted at `tmp`'s scratch directory (non-cached).
+fn tjBuild(tmp: *std.testing.TmpDir) !Index {
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    return index_mod.build(std.testing.allocator, std.testing.io, root, false);
+}
+
+/// Parse `s` as a JSON document, proving it is well-formed. Caller must
+/// `.deinit()` the returned value.
+fn tjParse(s: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, s, .{});
+}
+
+// --- pure string escaping -------------------------------------------------
+
+test "writeString quotes and escapes specials, control chars, and passes printables" {
+    var b: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&b);
+    // quote, backslash, newline, tab, cr, control 0x01, control 0x1f, plain 'x'.
+    try writeString(&w, "a\"b\\c\nd\te\rf\x01g\x1fx");
+    const out = w.buffered();
+    try std.testing.expectEqualStrings(
+        "\"a\\\"b\\\\c\\nd\\te\\rf\\u0001g\\u001fx\"",
+        out,
+    );
+}
+
+test "writeEscaped maps each special byte and leaves printable ASCII intact" {
+    const testing = std.testing;
+    const Case = struct { in: u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .in = '"', .want = "\\\"" },
+        .{ .in = '\\', .want = "\\\\" },
+        .{ .in = '\n', .want = "\\n" },
+        .{ .in = '\r', .want = "\\r" },
+        .{ .in = '\t', .want = "\\t" },
+        .{ .in = 0, .want = "\\u0000" },
+        .{ .in = 8, .want = "\\u0008" },
+        .{ .in = 11, .want = "\\u000b" },
+        .{ .in = 12, .want = "\\u000c" },
+        .{ .in = 31, .want = "\\u001f" },
+        .{ .in = 'A', .want = "A" },
+        .{ .in = ' ', .want = " " },
+        .{ .in = '~', .want = "~" },
+    };
+    for (cases) |c| {
+        var b: [16]u8 = undefined;
+        var w = std.Io.Writer.fixed(&b);
+        try writeEscaped(&w, c.in);
+        try testing.expectEqualStrings(c.want, w.buffered());
+    }
+}
+
+test "writeCollapsedString collapses interior whitespace and trims edges" {
+    var b: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&b);
+    try writeCollapsedString(&w, "  fn   foo (a,\n\tb)  ", 200);
+    // Leading/trailing runs are dropped; interior runs collapse to one space.
+    try std.testing.expectEqualStrings("\"fn foo (a, b)\"", w.buffered());
+}
+
+test "writeCollapsedString caps the length and never emits a trailing space" {
+    var b: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&b);
+    // 8 non-space chars requested via cap; the run after is dropped, no trailing gap.
+    try writeCollapsedString(&w, "abcdefghijkl   more", 8);
+    try std.testing.expectEqualStrings("\"abcdefgh\"", w.buffered());
+}
+
+test "writeCollapsedString escapes embedded quotes" {
+    var b: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&b);
+    try writeCollapsedString(&w, "say \"hi\"", 200);
+    try std.testing.expectEqualStrings("\"say \\\"hi\\\"\"", w.buffered());
+}
+
+// --- balancedBrackets -----------------------------------------------------
+
+test "balancedBrackets accepts balanced and rejects malformed input" {
+    const testing = std.testing;
+    try testing.expect(balancedBrackets("[]"));
+    try testing.expect(balancedBrackets("{}"));
+    try testing.expect(balancedBrackets("[{\"a\":[1,2]},{}]"));
+    // Brackets inside a string literal are ignored.
+    try testing.expect(balancedBrackets("{\"k\":\"][}{\"}"));
+    // An escaped quote does not end the string early.
+    try testing.expect(balancedBrackets("{\"k\":\"a\\\"b\"}"));
+    // Extra closer, missing closer, and an unterminated string all fail.
+    try testing.expect(!balancedBrackets("[]]"));
+    try testing.expect(!balancedBrackets("[{}"));
+    try testing.expect(!balancedBrackets("{\"k\":\"unterminated}"));
+    try testing.expect(!balancedBrackets("}{"));
+}
+
+// --- outline --------------------------------------------------------------
+
+test "outline json is a well-formed array of files carrying symbol fields" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "o.zig", .data =
+        \\pub fn foo() void {}
+        \\fn bar() void {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try outline(&aw.writer, &idx, "", .{ .format = .json });
+    const out = aw.written();
+
+    var p = try tjParse(out);
+    defer p.deinit();
+    try testing.expect(p.value == .array);
+    const files = p.value.array.items;
+    try testing.expectEqual(@as(usize, 1), files.len);
+    const f0 = files[0].object;
+    try testing.expect(std.mem.endsWith(u8, f0.get("path").?.string, "o.zig"));
+    try testing.expectEqualStrings("zig", f0.get("lang").?.string);
+    const syms = f0.get("symbols").?.array.items;
+    try testing.expectEqual(@as(usize, 2), syms.len);
+    const s0 = syms[0].object;
+    try testing.expectEqualStrings("fn", s0.get("kind").?.string);
+    try testing.expectEqualStrings("foo", s0.get("name").?.string);
+    try testing.expectEqual(@as(i64, 1), s0.get("line").?.integer);
+    try testing.expect(s0.get("line_end").?.integer >= s0.get("line").?.integer);
+    try testing.expectEqual(true, s0.get("exported").?.bool);
+    // Default verbosity is `sig`, so a signature string is present.
+    try testing.expect(s0.get("sig").?.string.len > 0);
+    // `bar` is not exported.
+    try testing.expectEqual(false, syms[1].object.get("exported").?.bool);
+    try testing.expect(balancedBrackets(out));
+}
+
+test "outline json verbosity adds sig, then doc, then body" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "v.zig", .data =
+        \\/// A documented helper.
+        \\pub fn helper() u32 {
+        \\    return 42;
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    const V = struct {
+        fn field(verb: render.Verbosity, idxp: *const Index, key: []const u8) !bool {
+            var aw = tjWriter();
+            defer aw.deinit();
+            try outline(&aw.writer, idxp, "", .{ .format = .json, .verbosity = verb });
+            var p = try tjParse(aw.written());
+            defer p.deinit();
+            const sym = p.value.array.items[0].object.get("symbols").?.array.items[0].object;
+            return sym.get(key) != null;
+        }
+    };
+    // names: no sig/doc/body. sig: sig only. doc: sig+doc. full: sig+doc+body.
+    try testing.expect(!try V.field(.names, &idx, "sig"));
+    try testing.expect(try V.field(.sig, &idx, "sig"));
+    try testing.expect(!try V.field(.sig, &idx, "doc"));
+    try testing.expect(try V.field(.doc, &idx, "doc"));
+    try testing.expect(!try V.field(.doc, &idx, "body"));
+    try testing.expect(try V.field(.full, &idx, "body"));
+    try testing.expect(try V.field(.full, &idx, "doc"));
+}
+
+test "outline json empties on a non-matching filter and truncates at the limit" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn one() void {}
+        \\pub fn two() void {}
+        \\pub fn three() void {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    { // filter matches no file → empty array.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "nosuchpath", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
+    }
+    { // limit caps the total symbols shown.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try outline(&aw.writer, &idx, "", .{ .format = .json, .limit = 2 });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 2), p.value.array.items[0].object.get("symbols").?.array.items.len);
+    }
+}
+
+// --- def / search ---------------------------------------------------------
+
+test "def json returns symbol objects with parent and exported fields" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.ts", .data =
+        \\export class Box {
+        \\  open() { return 1; }
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try showDef(&aw.writer, &idx, "open", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expect(p.value == .array);
+    const obj = p.value.array.items[0].object;
+    try testing.expectEqualStrings("open", obj.get("name").?.string);
+    // The method's parent class is recorded.
+    try testing.expectEqualStrings("Box", obj.get("parent").?.string);
+    try testing.expect(obj.get("exported") != null);
+}
+
+test "def json for an unknown name is an empty array" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "e.zig", .data =
+        \\pub fn present() void {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try showDef(&aw.writer, &idx, "absent_symbol", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
+}
+
+test "search json matches substrings, honors kinds, truncates, and empties" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.zig", .data =
+        \\pub fn loadUser() void {}
+        \\pub fn loadThing() void {}
+        \\pub const LoadCount = 3;
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    { // substring "load" matches both fns (case-sensitive → not the const).
+        var aw = tjWriter();
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "load", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 2), p.value.array.items.len);
+    }
+    { // kinds filter restricted to const → only LoadCount.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "Load", .{ .format = .json, .kinds = "const" });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+        try testing.expectEqualStrings("LoadCount", p.value.array.items[0].object.get("name").?.string);
+    }
+    { // limit truncates.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "load", .{ .format = .json, .limit = 1 });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+    }
+    { // no match → empty array.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try search(&aw.writer, &idx, "zzznope", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
+    }
+}
+
+test "search --refs json emits reference objects with the resolved target" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "r.zig", .data =
+        \\pub fn add(a: i32, b: i32) i32 { return a + b; }
+        \\pub fn run() i32 { return add(1, 2); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try searchRefs(&aw.writer, &idx, "add", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expect(p.value.array.items.len >= 1);
+    // Find the use-site inside `run`.
+    var found = false;
+    for (p.value.array.items) |item| {
+        const o = item.object;
+        if (!std.mem.eql(u8, o.get("name").?.string, "add")) continue;
+        if (!std.mem.eql(u8, o.get("in").?.string, "run")) continue;
+        found = true;
+        try testing.expect(o.get("line").?.integer >= 1);
+        // The reference resolves to add's file.
+        try testing.expect(std.mem.endsWith(u8, o.get("target").?.string, "r.zig"));
+    }
+    try testing.expect(found);
+}
+
+test "strings json emits file/line/text with a collapsed, escaped literal" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data =
+        \\pub const msg = "hello    spaced   world";
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try strings(&aw.writer, &idx, "hello", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+    const o = p.value.array.items[0].object;
+    try testing.expect(std.mem.endsWith(u8, o.get("file").?.string, "t.zig"));
+    try testing.expect(o.get("line").?.integer >= 1);
+    // Interior whitespace runs collapsed to single spaces; the surrounding
+    // source quotes survive as literal characters of the token.
+    try testing.expect(std.mem.indexOf(u8, o.get("text").?.string, "hello spaced world") != null);
+}
+
+// --- calls / callers (walk) ----------------------------------------------
+
+test "calls json nests callees and marks a mutual-recursion cycle" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Mutual recursion: ping -> pong -> ping, where the third node revisits ping.
+    try tmp.dir.writeFile(io, .{ .sub_path = "rec.zig", .data =
+        \\pub fn ping() void { pong(); }
+        \\pub fn pong() void { ping(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "ping", false, .{ .format = .json, .depth = 4 });
+    const out = aw.written();
+    var p = try tjParse(out);
+    defer p.deinit();
+    const root = p.value.array.items[0].object;
+    try testing.expectEqualStrings("ping", root.get("name").?.string);
+    const callees = root.get("callees").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callees.len);
+    try testing.expectEqualStrings("pong", callees[0].object.get("name").?.string);
+    // Every callee edge carries the call-site line.
+    try testing.expect(callees[0].object.get("site").?.integer >= 1);
+    // The cycle closes when ping is revisited, marked recursion:true.
+    try testing.expect(std.mem.indexOf(u8, out, "\"recursion\":true") != null);
+}
+
+test "calls json lists unresolved calls under ext" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "x.zig", .data =
+        \\pub fn caller() void { someMissingExternal(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "caller", false, .{ .format = .json, .depth = 2 });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const root = p.value.array.items[0].object;
+    // No resolved callees, but the unresolved call surfaces in ext.
+    try testing.expectEqual(@as(usize, 0), root.get("callees").?.array.items.len);
+    const ext = root.get("ext").?.array.items;
+    try testing.expectEqual(@as(usize, 1), ext.len);
+    try testing.expectEqualStrings("someMissingExternal", ext[0].string);
+}
+
+test "calls json aggregates multiple call sites with sites and lines" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn target() void {}
+        \\pub fn multi() void {
+        \\    target();
+        \\    target();
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "multi", false, .{ .format = .json, .depth = 2 });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const callees = p.value.array.items[0].object.get("callees").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callees.len);
+    const edge = callees[0].object;
+    try testing.expectEqualStrings("target", edge.get("name").?.string);
+    // Two call sites → sites:2 and a lines array spanning both.
+    try testing.expectEqual(@as(i64, 2), edge.get("sites").?.integer);
+    const lines = edge.get("lines").?.array.items;
+    try testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expectEqual(@as(i64, 3), lines[0].integer);
+    try testing.expectEqual(@as(i64, 4), lines[1].integer);
+}
+
+test "callers json nests incoming edges with a call-site line" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.zig", .data =
+        \\pub fn leaf() void {}
+        \\pub fn mid() void { leaf(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try walk(&aw.writer, &idx, "leaf", true, .{ .format = .json, .depth = 2 });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const root = p.value.array.items[0].object;
+    try testing.expectEqualStrings("leaf", root.get("name").?.string);
+    const callers = root.get("callers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqualStrings("mid", callers[0].object.get("name").?.string);
+    try testing.expect(callers[0].object.get("site").?.integer >= 1);
+}
+
+test "calls json flags a heuristic edge with exact:false; strict drops it" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `self.planning.create_run(1)` resolves only heuristically (untyped receiver).
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data =
+        \\class PlanningService:
+        \\    def create_run(self, x):
+        \\        return x
+        \\
+        \\class Handler:
+        \\    def __init__(self):
+        \\        self.planning = PlanningService()
+        \\    def handle(self):
+        \\        return self.planning.create_run(1)
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    { // Default walk annotates the heuristic edge with exact:false.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "handle", false, .{ .format = .json, .depth = 2 });
+        const out = aw.written();
+        var p = try tjParse(out);
+        defer p.deinit();
+        try testing.expect(std.mem.indexOf(u8, out, "\"exact\":false") != null);
+    }
+    { // Strict follows only exact edges → the heuristic callee is gone.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "handle", false, .{ .format = .json, .depth = 2, .strict = true });
+        const out = aw.written();
+        var p = try tjParse(out);
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 0), p.value.array.items[0].object.get("callees").?.array.items.len);
+    }
+}
+
+// --- hot ------------------------------------------------------------------
+
+test "hot json ranks by fan-in and carries the fan counters plus a sig" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "h.zig", .data =
+        \\pub fn shared() void {}
+        \\pub fn a() void { shared(); }
+        \\pub fn b() void { shared(); }
+        \\pub fn c() void { shared(); a(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try hot(&aw.writer, &idx, "", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const items = p.value.array.items;
+    try testing.expect(items.len >= 1);
+    const top = items[0].object;
+    try testing.expectEqualStrings("shared", top.get("name").?.string);
+    try testing.expectEqual(@as(i64, 3), top.get("fan_in").?.integer);
+    try testing.expectEqual(@as(i64, 3), top.get("fan_in_exact").?.integer);
+    try testing.expectEqual(@as(i64, 0), top.get("fan_in_test").?.integer);
+    try testing.expectEqual(@as(i64, 0), top.get("fan_out").?.integer);
+    try testing.expectEqual(@as(i64, 0), top.get("fan_out_exact").?.integer);
+    try testing.expect(top.get("sig").?.string.len > 0);
+}
+
+test "hot json strict drops an entry whose connectivity is entirely heuristic" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data =
+        \\class PlanningService:
+        \\    def create_run(self, x):
+        \\        return x
+        \\
+        \\class Handler:
+        \\    def __init__(self):
+        \\        self.planning = PlanningService()
+        \\    def handle(self):
+        \\        return self.planning.create_run(1)
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try hot(&aw.writer, &idx, "", .{ .format = .json, .strict = true });
+    const out = aw.written();
+    var p = try tjParse(out);
+    defer p.deinit();
+    // create_run's only fan-in is heuristic → strict omits it entirely.
+    try testing.expect(std.mem.indexOf(u8, out, "create_run") == null);
+}
+
+// --- routes ---------------------------------------------------------------
+
+test "routes json links a handler object and null for an inline arrow" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "routes.js", .data =
+        \\const router = express.Router();
+        \\router.get('/items', listItems);
+        \\router.delete('/items/:id', (req, res) => { return del(); });
+        \\function listItems(req, res) { return 1; }
+        \\function del() { return 2; }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try listRoutes(&aw.writer, &idx, "", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    var saw_get = false;
+    var saw_delete = false;
+    for (p.value.array.items) |item| {
+        const o = item.object;
+        const route = o.get("route").?.string;
+        try testing.expect(std.mem.endsWith(u8, o.get("file").?.string, "routes.js"));
+        try testing.expect(o.get("line").?.integer >= 1);
+        try testing.expect(o.get("callers") != null);
+        if (std.mem.eql(u8, route, "GET /items")) {
+            saw_get = true;
+            // Its handler is the resolved listItems symbol object.
+            try testing.expectEqualStrings("listItems", o.get("handler").?.object.get("name").?.string);
+        } else if (std.mem.eql(u8, route, "DELETE /items/:id")) {
+            saw_delete = true;
+            // The inline arrow leaves no handler → null.
+            try testing.expect(o.get("handler").? == .null);
+        }
+    }
+    try testing.expect(saw_get and saw_delete);
+}
+
+// --- diff -----------------------------------------------------------------
+
+test "diff json reports changed symbols and their callers (blast radius)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.zig", .data =
+        \\pub fn helper() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn run() u32 {
+        \\    return helper();
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    // Synthetic hunk touching helper's body (line 2), bypassing git.
+    var ranges = [_]gitdiff.Range{.{ .lo = 2, .hi = 2 }};
+    var changes = [_]gitdiff.FileChange{.{ .path = "d.zig", .ranges = &ranges }};
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try diff(&aw.writer, &idx, &changes, .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+    const file_obj = p.value.array.items[0].object;
+    try testing.expectEqualStrings("d.zig", file_obj.get("file").?.string);
+    const syms = file_obj.get("symbols").?.array.items;
+    try testing.expectEqual(@as(usize, 1), syms.len);
+    const changed = syms[0].object;
+    try testing.expectEqualStrings("helper", changed.get("name").?.string);
+    // run calls helper → run is the caller in the blast radius.
+    const callers = changed.get("callers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqualStrings("run", callers[0].object.get("name").?.string);
+}
+
+test "diff json is an empty array when no changed file is indexed" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.zig", .data =
+        \\pub fn only() void {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var ranges = [_]gitdiff.Range{.{ .lo = 1, .hi = 1 }};
+    var changes = [_]gitdiff.FileChange{.{ .path = "not_indexed.zig", .ranges = &ranges }};
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try diff(&aw.writer, &idx, &changes, .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
+}
+
+// --- events ---------------------------------------------------------------
+
+test "events json groups a key with role/verb/file/line/in site objects" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "bus.py", .data =
+        \\@register("start")
+        \\def handle_start(msg):
+        \\    return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function go() {
+        \\    socket.send("start");
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try events(&aw.writer, &idx, "", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+    const grp = p.value.array.items[0].object;
+    try testing.expectEqualStrings("start", grp.get("key").?.string);
+    const sites = grp.get("sites").?.array.items;
+    try testing.expectEqual(@as(usize, 2), sites.len);
+    var saw_handler = false;
+    var saw_emitter = false;
+    for (sites) |s| {
+        const o = s.object;
+        const role = o.get("role").?.string;
+        try testing.expect(o.get("verb").?.string.len > 0);
+        try testing.expect(o.get("line").?.integer >= 1);
+        if (std.mem.eql(u8, role, "handler")) {
+            saw_handler = true;
+            // The decorator binds to its enclosing function.
+            try testing.expectEqualStrings("handle_start", o.get("in").?.string);
+        } else if (std.mem.eql(u8, role, "emitter")) {
+            saw_emitter = true;
+            try testing.expect(std.mem.endsWith(u8, o.get("file").?.string, "client.ts"));
+        }
+    }
+    try testing.expect(saw_handler and saw_emitter);
+}
+
+test "events json honors the filter and limit" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.js", .data =
+        \\function f() {
+        \\    bus.on("alpha");
+        \\    bus.emit("alpha");
+        \\    bus.on("beta");
+        \\    bus.emit("beta");
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    { // filter narrows to a single key.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try events(&aw.writer, &idx, "alpha", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+        try testing.expectEqualStrings("alpha", p.value.array.items[0].object.get("key").?.string);
+    }
+    { // limit caps the number of key groups.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try events(&aw.writer, &idx, "", .{ .format = .json, .limit = 1 });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+    }
+}
+
+// --- neighbors ------------------------------------------------------------
+
+test "neighbors json splits callees and callers with call-site lines" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "n.zig", .data =
+        \\pub fn leaf() void {}
+        \\pub fn mid() void { leaf(); }
+        \\pub fn top() void { mid(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try neighbors(&aw.writer, &idx, "mid", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const o = p.value.array.items[0].object;
+    try testing.expectEqualStrings("mid", o.get("name").?.string);
+    const callees = o.get("callees").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callees.len);
+    try testing.expectEqualStrings("leaf", callees[0].object.get("name").?.string);
+    try testing.expect(callees[0].object.get("site").?.integer >= 1);
+    const callers = o.get("callers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqualStrings("top", callers[0].object.get("name").?.string);
+    try testing.expect(callers[0].object.get("site").?.integer >= 1);
+}
+
+// --- unused ---------------------------------------------------------------
+
+test "unused json flags a test-only symbol with test_only:true" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.py", .data =
+        \\def prod_used():
+        \\    return 1
+        \\def helper_tested_only():
+        \\    return 2
+        \\def truly_dead():
+        \\    return 3
+        \\def entry():
+        \\    return prod_used()
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "test_lib.py", .data =
+        \\from lib import helper_tested_only
+        \\def test_it():
+        \\    assert helper_tested_only() == 2
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try unused(&aw.writer, &idx, "", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    var test_only_flagged = false;
+    var dead_plain = false;
+    var found_prod = false;
+    for (p.value.array.items) |item| {
+        const o = item.object;
+        const name = o.get("name").?.string;
+        if (std.mem.eql(u8, name, "prod_used")) found_prod = true;
+        if (std.mem.eql(u8, name, "helper_tested_only")) {
+            test_only_flagged = o.get("test_only") != null and o.get("test_only").?.bool;
+        }
+        if (std.mem.eql(u8, name, "truly_dead")) {
+            // A truly-dead symbol carries no test_only annotation.
+            dead_plain = o.get("test_only") == null;
+        }
+    }
+    try testing.expect(test_only_flagged);
+    try testing.expect(dead_plain);
+    // A production-used symbol is not reported at all.
+    try testing.expect(!found_prod);
+}
+
+// --- files / imports / importers -----------------------------------------
+
+test "files json lists file, lang, and symbol count per indexed file" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.zig", .data =
+        \\pub fn one() void {}
+        \\pub fn two() void {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try listFiles(&aw.writer, &idx, "", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+    const o = p.value.array.items[0].object;
+    try testing.expect(std.mem.endsWith(u8, o.get("file").?.string, "f.zig"));
+    try testing.expectEqualStrings("zig", o.get("lang").?.string);
+    try testing.expect(o.get("symbols").?.integer >= 2);
+}
+
+test "imports and importers json describe the file dependency edges" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "core.zig", .data =
+        \\pub fn shared() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data =
+        \\const core = @import("core.zig");
+        \\pub fn use() void { core.shared(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    { // imports: app.zig imports core.zig under the binding `core`.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try listImports(&aw.writer, &idx, "app.zig", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+        const o = p.value.array.items[0].object;
+        try testing.expect(std.mem.endsWith(u8, o.get("file").?.string, "app.zig"));
+        const imps = o.get("imports").?.array.items;
+        try testing.expect(imps.len >= 1);
+        try testing.expect(std.mem.endsWith(u8, imps[0].object.get("target").?.string, "core.zig"));
+        try testing.expectEqualStrings("core", imps[0].object.get("binding").?.string);
+    }
+    { // importers: core.zig is imported by app.zig.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try listImporters(&aw.writer, &idx, "core.zig", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
+        const o = p.value.array.items[0].object;
+        try testing.expect(std.mem.endsWith(u8, o.get("file").?.string, "core.zig"));
+        const users = o.get("importers").?.array.items;
+        try testing.expectEqual(@as(usize, 1), users.len);
+        try testing.expect(std.mem.endsWith(u8, users[0].string, "app.zig"));
+    }
+}
+
+// --- path -----------------------------------------------------------------
+
+test "path json returns the chain of symbols and empties when none exists" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p.zig", .data =
+        \\pub fn dst() void {}
+        \\pub fn src() void { dst(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    { // src → dst is one hop.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try shortestPath(&aw.writer, &idx, "src", "dst", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        const chain = p.value.array.items;
+        try testing.expectEqual(@as(usize, 2), chain.len);
+        try testing.expectEqualStrings("src", chain[0].object.get("name").?.string);
+        try testing.expectEqualStrings("dst", chain[1].object.get("name").?.string);
+    }
+    { // dst → src has no call path → empty array.
+        var aw = tjWriter();
+        defer aw.deinit();
+        try shortestPath(&aw.writer, &idx, "dst", "src", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
+    }
+}
+
+// --- modifiers ------------------------------------------------------------
+
+test "json modifiers array carries static, classmethod, and abstract" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "mods.py", .data =
+        \\class C:
+        \\    @staticmethod
+        \\    def s():
+        \\        return 1
+        \\    @classmethod
+        \\    def c(cls):
+        \\        return 2
+        \\    @abstractmethod
+        \\    def a(self):
+        \\        ...
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    const M = struct {
+        fn has(idxp: *const Index, name: []const u8, mod: []const u8) !bool {
+            var aw = tjWriter();
+            defer aw.deinit();
+            try showDef(&aw.writer, idxp, name, .{ .format = .json });
+            var p = try tjParse(aw.written());
+            defer p.deinit();
+            const mods = p.value.array.items[0].object.get("modifiers") orelse return false;
+            for (mods.array.items) |m| if (std.mem.eql(u8, m.string, mod)) return true;
+            return false;
+        }
+    };
+    try testing.expect(try M.has(&idx, "s", "static"));
+    try testing.expect(try M.has(&idx, "c", "classmethod"));
+    try testing.expect(try M.has(&idx, "a", "abstract"));
+    // The base kind is unaffected by the modifier annotation.
+    {
+        var aw = tjWriter();
+        defer aw.deinit();
+        try showDef(&aw.writer, &idx, "s", .{ .format = .json });
+        var p = try tjParse(aw.written());
+        defer p.deinit();
+        try testing.expectEqualStrings("method", p.value.array.items[0].object.get("kind").?.string);
+    }
+}
+
+// --- full-body verbosity escaping -----------------------------------------
+
+test "def json at full verbosity embeds an escaped body and stays well-formed" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "q.zig", .data =
+        \\pub fn quoter() []const u8 {
+        \\    return "he said \"hi\"";
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try showDef(&aw.writer, &idx, "quoter", .{ .format = .json, .verbosity = .full });
+    const out = aw.written();
+    var p = try tjParse(out);
+    defer p.deinit();
+    const o = p.value.array.items[0].object;
+    // The body round-trips through the JSON parser: its literal quote characters
+    // survive intact, proving writeString's escaping was reversible.
+    const body = o.get("body").?.string;
+    try testing.expect(std.mem.indexOf(u8, body, "he said") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, body, '"') != null);
+    // The raw JSON escaped the interior quote as \" (a backslash then a quote).
+    try testing.expect(std.mem.indexOf(u8, out, "\\\"hi") != null);
+    try testing.expect(balancedBrackets(out));
+}

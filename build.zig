@@ -155,6 +155,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Emit the two test executables to stable paths (`zig-out/bin/{mod,exe}-tests`)
+    // without running them, so an external coverage runner (kcov) can execute
+    // them under instrumentation. See `scripts/coverage.sh`.
+    const install_mod_tests = b.addInstallArtifact(mod_tests, .{ .dest_sub_path = "mod-tests" });
+    const install_exe_tests = b.addInstallArtifact(exe_tests, .{ .dest_sub_path = "exe-tests" });
+    const test_bin_step = b.step("test-bin", "Emit test binaries for coverage tooling");
+    test_bin_step.dependOn(&install_mod_tests.step);
+    test_bin_step.dependOn(&install_exe_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

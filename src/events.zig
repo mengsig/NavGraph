@@ -160,3 +160,330 @@ test "roleOf classifies verbs case-insensitively and strips a decorator @" {
     try std.testing.expectEqual(Role.emitter, roleOf("emit").?);
     try std.testing.expectEqual(@as(?Role, null), roleOf("computeTotal"));
 }
+
+
+// ---------------------------------------------------------------------------
+// Appended hardening tests for src/events.zig
+// ---------------------------------------------------------------------------
+
+fn tokenizeForTest(gpa: std.mem.Allocator, src: []const u8, toks: *std.ArrayList(Token)) !void {
+    try lexer.tokenize(gpa, src, language.configFor(.python), toks);
+}
+
+fn quotedKey(comptime n: usize) []const u8 {
+    return "\"" ++ ("a" ** n) ++ "\"";
+}
+
+// ---- roleOf: every handler verb ------------------------------------------
+
+test "roleOf maps every handler verb to .handler" {
+    const handlers = [_][]const u8{ "register", "on", "subscribe", "listen", "addlistener" };
+    for (handlers) |v| {
+        try std.testing.expectEqual(Role.handler, roleOf(v).?);
+    }
+}
+
+// ---- roleOf: every emitter verb ------------------------------------------
+
+test "roleOf maps every emitter verb to .emitter" {
+    const emitters = [_][]const u8{
+        "emit", "send", "dispatch", "publish", "trigger",
+        "fire", "broadcast", "notify", "sendmessage",
+    };
+    for (emitters) |v| {
+        try std.testing.expectEqual(Role.emitter, roleOf(v).?);
+    }
+}
+
+// ---- roleOf: case-insensitivity on both sides -----------------------------
+
+test "roleOf is case-insensitive for handler and emitter verbs" {
+    try std.testing.expectEqual(Role.handler, roleOf("REGISTER").?);
+    try std.testing.expectEqual(Role.handler, roleOf("SubScribe").?);
+    try std.testing.expectEqual(Role.handler, roleOf("ADDLISTENER").?);
+    try std.testing.expectEqual(Role.emitter, roleOf("EMIT").?);
+    try std.testing.expectEqual(Role.emitter, roleOf("SendMessage").?);
+    try std.testing.expectEqual(Role.emitter, roleOf("BroadCast").?);
+}
+
+// ---- roleOf: decorator @ stripping ---------------------------------------
+
+test "roleOf strips a leading decorator @ before matching" {
+    try std.testing.expectEqual(Role.handler, roleOf("@register").?);
+    try std.testing.expectEqual(Role.handler, roleOf("@on").?);
+    // @ strip combined with case folding.
+    try std.testing.expectEqual(Role.handler, roleOf("@ON").?);
+    try std.testing.expectEqual(Role.emitter, roleOf("@emit").?);
+}
+
+test "roleOf returns null for a bare @ with no verb after it" {
+    try std.testing.expectEqual(@as(?Role, null), roleOf("@"));
+}
+
+// ---- roleOf: unknown / deliberately-excluded verbs -----------------------
+
+test "roleOf returns null for unknown verbs" {
+    try std.testing.expectEqual(@as(?Role, null), roleOf("computeTotal"));
+    try std.testing.expectEqual(@as(?Role, null), roleOf("log"));
+}
+
+test "roleOf returns null for the deliberately-excluded generic verbs" {
+    // Documented exclusions: generic invocations / HTTP-ish verbs / DOM listener.
+    const excluded = [_][]const u8{
+        "handle", "bind", "event", "addeventlistener",
+        "post", "call", "invoke", "get", "put",
+    };
+    for (excluded) |v| {
+        try std.testing.expectEqual(@as(?Role, null), roleOf(v));
+    }
+}
+
+// ---- roleOf: length boundaries -------------------------------------------
+
+test "roleOf returns null on empty verb" {
+    try std.testing.expectEqual(@as(?Role, null), roleOf(""));
+}
+
+test "roleOf returns null when verb exceeds 32 bytes without overflowing" {
+    const long = "a" ** 33; // > 32, rejected before the lowercase buffer is used
+    try std.testing.expectEqual(@as(?Role, null), roleOf(long));
+}
+
+test "roleOf handles a 32-byte unknown verb via the lowercase path without matching" {
+    const at_limit = "A" ** 32; // exactly 32: exercises lowerString, still not a known verb
+    try std.testing.expectEqual(@as(usize, 32), at_limit.len);
+    try std.testing.expectEqual(@as(?Role, null), roleOf(at_limit));
+}
+
+// ---- eventKey: valid keys across quote styles and prefixes ----------------
+
+test "eventKey extracts the body of a double-quoted literal" {
+    try std.testing.expectEqualStrings("start", eventKey("\"start\"").?);
+}
+
+test "eventKey accepts single-quote and backtick literals" {
+    try std.testing.expectEqualStrings("start", eventKey("'start'").?);
+    try std.testing.expectEqualStrings("start", eventKey("`start`").?);
+}
+
+test "eventKey reads an f-string / prefixed literal by its quoted body" {
+    try std.testing.expectEqualStrings("start", eventKey("f\"start\"").?);
+    try std.testing.expectEqualStrings("start", eventKey("rb\"start\"").?);
+}
+
+test "eventKey permits a literal $ that is not an interpolation" {
+    try std.testing.expectEqualStrings("a$b", eventKey("\"a$b\"").?);
+}
+
+// ---- eventKey: null cases -------------------------------------------------
+
+test "eventKey rejects an empty key" {
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"\""));
+}
+
+test "eventKey rejects literals shorter than two characters" {
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\""));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey(""));
+}
+
+test "eventKey rejects a non-string token" {
+    // No opening quote after any prefix letters.
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("xyz"));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("123"));
+}
+
+test "eventKey rejects a mismatched closing quote" {
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"start'"));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("'start\""));
+}
+
+test "eventKey rejects whitespace-bearing prose keys" {
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"a b\""));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"a\tb\""));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"a\nb\""));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"a\rb\""));
+}
+
+test "eventKey rejects URL-path keys containing a slash" {
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"/api/jobs\""));
+}
+
+test "eventKey rejects keys with an interpolation brace" {
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"a{b\""));
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey("\"a${b}\""));
+}
+
+// ---- eventKey: max_key_len boundary --------------------------------------
+
+test "eventKey accepts a key of exactly max_key_len bytes" {
+    const raw = comptime quotedKey(max_key_len);
+    const got = eventKey(raw).?;
+    try std.testing.expectEqual(@as(usize, max_key_len), got.len);
+}
+
+test "eventKey rejects a key one byte over max_key_len" {
+    const raw = comptime quotedKey(max_key_len + 1);
+    try std.testing.expectEqual(@as(?[]const u8, null), eventKey(raw));
+}
+
+// ---- stripStringPrefix ----------------------------------------------------
+
+test "stripStringPrefix leaves an unprefixed literal unchanged" {
+    try std.testing.expectEqualStrings("\"x\"", stripStringPrefix("\"x\""));
+    try std.testing.expectEqualStrings("'x'", stripStringPrefix("'x'"));
+    try std.testing.expectEqualStrings("`x`", stripStringPrefix("`x`"));
+}
+
+test "stripStringPrefix drops leading Python string-prefix letters" {
+    try std.testing.expectEqualStrings("\"x\"", stripStringPrefix("f\"x\""));
+    try std.testing.expectEqualStrings("\"x\"", stripStringPrefix("rb\"x\""));
+    try std.testing.expectEqualStrings("\"x\"", stripStringPrefix("F\"x\"")); // case-folded letter
+    try std.testing.expectEqualStrings("'x'", stripStringPrefix("f'x'"));
+}
+
+test "stripStringPrefix returns the empty tail when there is no quote" {
+    try std.testing.expectEqualStrings("", stripStringPrefix("abc"));
+    try std.testing.expectEqualStrings("", stripStringPrefix(""));
+}
+
+test "stripStringPrefix returns raw unchanged when a non-letter precedes the quote" {
+    try std.testing.expectEqualStrings("1\"x\"", stripStringPrefix("1\"x\""));
+    try std.testing.expectEqualStrings("-\"x\"", stripStringPrefix("-\"x\""));
+}
+
+// ---- isPunct --------------------------------------------------------------
+
+test "isPunct matches only the requested punctuation at a punct token" {
+    const gpa = std.testing.allocator;
+    const src = "send(\"x\")";
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenizeForTest(gpa, src, &toks);
+    // Tokens: [ident send][punct (][string "x"][punct )]
+    try std.testing.expect(isPunct(toks.items, src, 1, '('));
+    try std.testing.expect(!isPunct(toks.items, src, 1, ')')); // right index, wrong char
+    try std.testing.expect(!isPunct(toks.items, src, 0, '(')); // identifier, not punct
+    try std.testing.expect(isPunct(toks.items, src, 3, ')'));
+}
+
+test "isPunct returns false for an out-of-range index" {
+    const gpa = std.testing.allocator;
+    const src = "send(\"x\")";
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenizeForTest(gpa, src, &toks);
+    try std.testing.expect(!isPunct(toks.items, src, 999, '('));
+}
+
+// ---- collect / collectSource ---------------------------------------------
+
+test "collectSource recognizes the bare, member, and decorator dispatch forms" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\@register("evt")
+        \\send("evt")
+        \\bus.emit("evt")
+    ;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
+    try std.testing.expectEqual(Role.handler, out.items[0].role);
+    // The Python lexer keeps the decorator @ in the identifier token; roleOf
+    // strips it, but the stored verb retains the raw text.
+    try std.testing.expectEqualStrings("@register", out.items[0].verb);
+    try std.testing.expectEqual(Role.emitter, out.items[1].role);
+    try std.testing.expectEqualStrings("send", out.items[1].verb);
+    try std.testing.expectEqual(Role.emitter, out.items[2].role);
+    try std.testing.expectEqualStrings("emit", out.items[2].verb);
+    for (out.items) |ref| try std.testing.expectEqualStrings("evt", ref.key);
+}
+
+test "collectSource records line and offset of the key token" {
+    const gpa = std.testing.allocator;
+    const src = "send(\"x\")"; // string literal begins at byte 5, line 1
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(u32, 1), out.items[0].line);
+    try std.testing.expectEqual(@as(u32, 5), out.items[0].offset);
+}
+
+test "collectSource assigns the correct line for a key on a later line" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\x = 1
+        \\emit("later")
+    ;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(u32, 2), out.items[0].line);
+    try std.testing.expectEqualStrings("later", out.items[0].key);
+}
+
+test "collectSource skips unknown verbs, prose, and dynamic keys" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\log("hello world")
+        \\emit("saving files here")
+        \\bus.emit("dyn_${x}")
+        \\emit("/api/route")
+        \\handle("evt")
+    ;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    // log -> unknown verb; the two prose keys have spaces; ${} is dynamic;
+    // /api/route is a URL path; handle is an excluded verb. Nothing survives.
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "collectSource skips a call whose argument is not a string" {
+    const gpa = std.testing.allocator;
+    const src = "emit(evt)"; // identifier arg, not a string literal
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "collectSource skips a call whose verb token is not an identifier" {
+    const gpa = std.testing.allocator;
+    const src = "123(\"evt\")"; // number before '(' is not an identifier verb
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "collectSource returns nothing for empty or trivially short input" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, "", &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    try collectSource(gpa, "x", &out); // < 3 tokens
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "collectSource pairs multiple distinct keys independently" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\@register("alpha")
+        \\emit("beta")
+        \\subscribe("gamma")
+    ;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
+    try std.testing.expectEqualStrings("alpha", out.items[0].key);
+    try std.testing.expectEqual(Role.handler, out.items[0].role);
+    try std.testing.expectEqualStrings("beta", out.items[1].key);
+    try std.testing.expectEqual(Role.emitter, out.items[1].role);
+    try std.testing.expectEqualStrings("gamma", out.items[2].key);
+    try std.testing.expectEqual(Role.handler, out.items[2].role);
+}

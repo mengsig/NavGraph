@@ -4336,3 +4336,710 @@ fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     }
     out.deinit(testing.allocator);
 }
+
+
+// ===========================================================================
+// APPENDED TESTS — parser.zig hardening
+// ===========================================================================
+
+// --- Universal edge cases -------------------------------------------------
+
+test "edge: empty source yields no symbols across languages" {
+    inline for (.{
+        language.Language.zig,      language.Language.c,
+        language.Language.cpp,      language.Language.csharp,
+        language.Language.python,   language.Language.javascript,
+        language.Language.typescript, language.Language.tsx,
+        language.Language.lua,      language.Language.go,
+        language.Language.rust,     language.Language.ruby,
+    }) |lang| {
+        var out = try parseForTest("", lang);
+        defer freeRefs(&out);
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+}
+
+test "edge: a comment-only file produces no symbols" {
+    var z = try parseForTest("// just a comment\n// another\n", .zig);
+    defer freeRefs(&z);
+    try testing.expectEqual(@as(usize, 0), z.items.len);
+
+    var p = try parseForTest("# a python comment\n# more\n", .python);
+    defer freeRefs(&p);
+    try testing.expectEqual(@as(usize, 0), p.items.len);
+}
+
+test "edge: keywords inside a string literal do not create symbols" {
+    const src =
+        \\const s = "pub fn ghost() void {}";
+        \\pub fn real() void { return 1; }
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    // The string body must not be scanned as code.
+    try testing.expect(findSym(out.items, "ghost") == null);
+    // The binding it belongs to is a plain constant, and real() is a function.
+    try testing.expectEqual(SymbolKind.constant, findSym(out.items, "s").?.kind);
+    try testing.expectEqual(SymbolKind.function, findSym(out.items, "real").?.kind);
+}
+
+test "edge: unterminated function body does not crash and still emits the symbol" {
+    // No matching `}` for the body — the parser falls back to the declaration path.
+    const src = "pub fn broken() void {";
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const broken = findSym(out.items, "broken").?;
+    try testing.expectEqual(SymbolKind.function, broken.kind);
+}
+
+test "edge: unterminated parameter list does not crash and emits nothing" {
+    const src = "pub fn broken(a: i32";
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    // With no matching `)` the declaration is abandoned (no phantom symbol).
+    try testing.expect(findSym(out.items, "broken") == null);
+}
+
+test "edge: truncated python/js/rust input parses without crashing" {
+    inline for (.{
+        .{ "def foo(", language.Language.python },
+        .{ "function bar(", language.Language.javascript },
+        .{ "pub fn baz(", language.Language.rust },
+        .{ "class C {", language.Language.javascript },
+    }) |case| {
+        var out = try parseForTest(case[0], case[1]);
+        freeRefs(&out); // just proving it neither crashes nor leaks.
+    }
+}
+
+// --- Zig ------------------------------------------------------------------
+
+test "zig: @import const binds a module import edge" {
+    const src =
+        \\const std = @import("std");
+        \\const other = @import("./other.zig");
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const std_imp = findSym(out.items, "std").?;
+    try testing.expectEqual(SymbolKind.import, std_imp.kind);
+    try testing.expectEqualStrings("std", std_imp.import_path);
+    try testing.expectEqualStrings("./other.zig", findSym(out.items, "other").?.import_path);
+}
+
+test "zig: top-level var is a variable, non-fn const is a constant" {
+    const src =
+        \\var counter: u32 = 0;
+        \\const MAX: u32 = 100;
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.variable, findSym(out.items, "counter").?.kind);
+    try testing.expectEqual(SymbolKind.constant, findSym(out.items, "MAX").?.kind);
+    // Neither is `pub`, so both are file-private.
+    try testing.expect(!findSym(out.items, "counter").?.exported);
+    try testing.expect(!findSym(out.items, "MAX").?.exported);
+}
+
+test "zig: opaque and packed/extern struct containers are struct-kinded" {
+    const src =
+        \\pub const Handle = opaque {};
+        \\const Flags = packed struct { a: bool, b: bool };
+        \\const Raw = extern struct { x: i32 };
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Handle").?.kind);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Flags").?.kind);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Raw").?.kind);
+}
+
+test "zig: pub controls the exported flag on functions" {
+    const src =
+        \\pub fn visible() void {}
+        \\fn hidden() void {}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "visible").?.exported);
+    try testing.expect(!findSym(out.items, "hidden").?.exported);
+}
+
+test "zig: nested struct declaration yields a parented method" {
+    const src =
+        \\pub const Outer = struct {
+        \\    const Inner = struct {
+        \\        pub fn run(self: *Inner) void { return; }
+        \\    };
+        \\};
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const outer = findSym(out.items, "Outer").?;
+    try testing.expectEqual(SymbolKind.@"struct", outer.kind);
+    const inner = findSym(out.items, "Inner").?;
+    try testing.expectEqual(SymbolKind.@"struct", inner.kind);
+    try testing.expect(inner.parent_local != null);
+    // `run` is nested inside Inner → a method with a parent.
+    const run = findSym(out.items, "run").?;
+    try testing.expectEqual(SymbolKind.method, run.kind);
+    try testing.expect(run.parent_local != null);
+}
+
+test "zig: a non-doc line comment is not attached as documentation" {
+    const src =
+        \\// not a doc comment
+        \\pub fn f() void {}
+        \\/// real doc
+        \\pub fn g() void {}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    try testing.expectEqual(@as(usize, 0), findSym(out.items, "f").?.doc.len);
+    try testing.expect(std.mem.indexOf(u8, findSym(out.items, "g").?.doc, "real doc") != null);
+}
+
+test "zig: extern fn declaration without a body is still a function" {
+    const src =
+        \\pub extern fn c_api(a: i32) i32;
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const f = findSym(out.items, "c_api").?;
+    try testing.expectEqual(SymbolKind.function, f.kind);
+    try testing.expect(f.exported); // leading `pub`
+}
+
+test "zig: multi-line function signature captures the body call" {
+    const src =
+        \\pub fn wide(
+        \\    a: i32,
+        \\    b: i32,
+        \\) i32 {
+        \\    return add(a, b);
+        \\}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const wide = findSym(out.items, "wide").?;
+    try testing.expectEqual(SymbolKind.function, wide.kind);
+    try testing.expect(hasCallRef(wide, "add"));
+    // Signature stops at the body brace: `add` is not part of the collapsed sig.
+    try testing.expect(std.mem.indexOf(u8, src[wide.span_start..wide.sig_end], "add") == null);
+}
+
+// --- C --------------------------------------------------------------------
+
+test "c: named struct and enum records are indexed with the right kind" {
+    const src =
+        \\struct Point { int x; int y; };
+        \\enum Color { RED, GREEN, BLUE };
+        \\int area(struct Point* p) { return p->compute(); }
+    ;
+    var out = try parseForTest(src, .c);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Point").?.kind);
+    try testing.expectEqual(SymbolKind.@"enum", findSym(out.items, "Color").?.kind);
+    // The `->` member call records the receiver as the qualifier.
+    const area = findSym(out.items, "area").?;
+    var q: []const u8 = "";
+    for (area.refs) |r| {
+        if (std.mem.eql(u8, r.name, "compute")) q = r.qualifier;
+    }
+    try testing.expectEqualStrings("p", q);
+}
+
+test "c: function-like macro with parameters is a macro symbol" {
+    const src =
+        \\#define SQUARE(x) ((x) * (x))
+        \\#define PI 3.14
+    ;
+    var out = try parseForTest(src, .c);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.macro, findSym(out.items, "SQUARE").?.kind);
+    try testing.expectEqual(SymbolKind.macro, findSym(out.items, "PI").?.kind);
+    // A macro from a #define has external visibility.
+    try testing.expect(findSym(out.items, "SQUARE").?.exported);
+}
+
+test "c: a block comment hides the code inside it" {
+    const src =
+        \\/* int ghost(void) { return 0; } */
+        \\int real(void) { return 1; }
+    ;
+    var out = try parseForTest(src, .c);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "ghost") == null);
+    try testing.expectEqual(SymbolKind.function, findSym(out.items, "real").?.kind);
+}
+
+// --- C++ ------------------------------------------------------------------
+
+test "cpp: struct body methods are indexed and nested under the struct" {
+    const src =
+        \\struct Vec {
+        \\    double len() const { return 0.0; }
+        \\    void scale(double f) { this->normalize(); }
+        \\    void normalize();
+        \\};
+    ;
+    var out = try parseForTest(src, .cpp);
+    defer freeRefs(&out);
+    const vec = findSym(out.items, "Vec").?;
+    try testing.expectEqual(SymbolKind.@"struct", vec.kind);
+    const len = findSym(out.items, "len").?;
+    try testing.expectEqual(SymbolKind.method, len.kind);
+    try testing.expect(len.parent_local != null);
+    // A declaration-only member is still a method.
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "normalize").?.kind);
+    // `this->normalize()` records `this` as the qualifier.
+    const scale = findSym(out.items, "scale").?;
+    var q: []const u8 = "";
+    for (scale.refs) |r| {
+        if (std.mem.eql(u8, r.name, "normalize")) q = r.qualifier;
+    }
+    try testing.expectEqualStrings("this", q);
+}
+
+test "cpp: nested namespaces surface as modules and inner functions are found" {
+    const src =
+        \\namespace outer {
+        \\namespace inner {
+        \\int deep() { return 1; }
+        \\}
+        \\int shallow() { return inner::deep(); }
+        \\}
+    ;
+    var out = try parseForTest(src, .cpp);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.module, findSym(out.items, "outer").?.kind);
+    try testing.expectEqual(SymbolKind.module, findSym(out.items, "inner").?.kind);
+    try testing.expect(findSym(out.items, "deep") != null);
+    // `inner::deep()` records `inner` as the scope qualifier.
+    const shallow = findSym(out.items, "shallow").?;
+    var q: []const u8 = "";
+    for (shallow.refs) |r| {
+        if (std.mem.eql(u8, r.name, "deep")) q = r.qualifier;
+    }
+    try testing.expectEqualStrings("inner", q);
+}
+
+// --- C# -------------------------------------------------------------------
+
+test "c#: struct with methods and a generic class are indexed" {
+    const src =
+        \\namespace App;
+        \\public struct Point
+        \\{
+        \\    public int Sum() { return 0; }
+        \\}
+        \\public class Box<T>
+        \\{
+        \\    public T Get() { return this.Load(); }
+        \\    private T Load() { return default; }
+        \\}
+    ;
+    var out = try parseForTest(src, .csharp);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Point").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "Sum").?.kind);
+    try testing.expectEqual(SymbolKind.class, findSym(out.items, "Box").?.kind);
+    // Generic method inside a generic class still resolves and records `this`.
+    const get = findSym(out.items, "Get").?;
+    try testing.expectEqual(SymbolKind.method, get.kind);
+    try testing.expect(hasCallRef(get, "Load"));
+}
+
+test "c#: a bracketed namespace nests its class" {
+    const src =
+        \\namespace Shop
+        \\{
+        \\    public class Cart
+        \\    {
+        \\        public void Add() {}
+        \\    }
+        \\}
+    ;
+    var out = try parseForTest(src, .csharp);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.module, findSym(out.items, "Shop").?.kind);
+    const cart = findSym(out.items, "Cart").?;
+    try testing.expectEqual(SymbolKind.class, cart.kind);
+    // A bracketed C# namespace is a transparent scope: its members are NOT
+    // re-parented under the namespace symbol (the class stays top-level).
+    try testing.expect(cart.parent_local == null);
+    // The method, however, IS parented under its enclosing class.
+    try testing.expect(findSym(out.items, "Add").?.parent_local != null);
+}
+
+// --- Python ---------------------------------------------------------------
+
+test "python: plain and aliased imports bind their names" {
+    const src =
+        \\import os
+        \\import numpy as np
+        \\import a.b.c
+        \\import a.b.c as abc
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    // `import os` binds `os` → module os.
+    try testing.expectEqualStrings("os", findSym(out.items, "os").?.import_path);
+    // `import numpy as np` binds the alias.
+    const np = findSym(out.items, "np").?;
+    try testing.expectEqual(SymbolKind.import, np.kind);
+    try testing.expectEqualStrings("numpy", np.import_path);
+    // `import a.b.c as abc` binds the alias to the dotted path.
+    try testing.expectEqualStrings("a.b.c", findSym(out.items, "abc").?.import_path);
+}
+
+test "python: from-import with parenthesized names records the module edge" {
+    const src =
+        \\from pkg.sub import (
+        \\    one,
+        \\    two,
+        \\)
+        \\def use():
+        \\    return one() + two()
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    var saw_mod = false;
+    for (out.items) |s| {
+        if (s.kind == .import and std.mem.eql(u8, s.import_path, "pkg.sub")) saw_mod = true;
+    }
+    try testing.expect(saw_mod);
+    // The named targets are bare-callable references of use().
+    const use = findSym(out.items, "use").?;
+    try testing.expect(hasCallRef(use, "one"));
+    try testing.expect(hasCallRef(use, "two"));
+}
+
+test "python: nested class inside a class is parented" {
+    const src =
+        \\class Outer:
+        \\    class Inner:
+        \\        def ping(self):
+        \\            return 1
+        \\    def outer_method(self):
+        \\        return 2
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const outer = findSym(out.items, "Outer").?;
+    try testing.expectEqual(SymbolKind.class, outer.kind);
+    const inner = findSym(out.items, "Inner").?;
+    try testing.expectEqual(SymbolKind.class, inner.kind);
+    try testing.expect(inner.parent_local != null);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "ping").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "outer_method").?.kind);
+}
+
+test "python: a '#' comment and a triple-quoted string do not spawn symbols" {
+    const src =
+        \\# def ghost_comment(): pass
+        \\x = """
+        \\def ghost_string(): pass
+        \\"""
+        \\def real():
+        \\    return 1
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "ghost_comment") == null);
+    try testing.expect(findSym(out.items, "ghost_string") == null);
+    try testing.expect(findSym(out.items, "real") != null);
+}
+
+// --- JavaScript / TypeScript ----------------------------------------------
+
+test "js: es-module import bindings — default, namespace, and named" {
+    const src =
+        \\import React from 'react';
+        \\import * as utils from './utils';
+        \\import { render } from './dom';
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    // Default import binds the name.
+    try testing.expectEqualStrings("react", findSym(out.items, "React").?.import_path);
+    // Namespace import binds the alias.
+    try testing.expectEqualStrings("./utils", findSym(out.items, "utils").?.import_path);
+    // Named import has an empty binding but still records the module edge.
+    var saw_dom = false;
+    for (out.items) |s| {
+        if (s.kind == .import and std.mem.eql(u8, s.import_path, "./dom")) saw_dom = true;
+    }
+    try testing.expect(saw_dom);
+}
+
+test "js: export default function is exported" {
+    const src =
+        \\export default function boot() { return start(); }
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    const boot = findSym(out.items, "boot").?;
+    try testing.expectEqual(SymbolKind.function, boot.kind);
+    try testing.expect(boot.exported);
+    try testing.expect(hasCallRef(boot, "start"));
+}
+
+test "js: async arrow const is a function carrying the async modifier" {
+    const src =
+        \\export const load = async () => { return fetchData(); };
+        \\const sync = () => 1;
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    const load = findSym(out.items, "load").?;
+    try testing.expectEqual(SymbolKind.function, load.kind);
+    try testing.expect(load.modifiers.is_async);
+    try testing.expect(hasCallRef(load, "fetchData"));
+    // A non-async arrow carries no dispatch modifier.
+    try testing.expect(!findSym(out.items, "sync").?.modifiers.is_async);
+}
+
+test "js: a plain const initializer is a variable with no refs" {
+    const src =
+        \\const config = { timeout: 30 };
+        \\let count = 0;
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.variable, findSym(out.items, "config").?.kind);
+    try testing.expectEqual(SymbolKind.variable, findSym(out.items, "count").?.kind);
+}
+
+test "js: line and block comments hide code from the parser" {
+    const src =
+        \\// function ghostLine() {}
+        \\/* function ghostBlock() {} */
+        \\function real() { return 1; }
+    ;
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "ghostLine") == null);
+    try testing.expect(findSym(out.items, "ghostBlock") == null);
+    try testing.expect(findSym(out.items, "real") != null);
+}
+
+test "ts: a type-only brace import does not bind the literal name 'type'" {
+    const src =
+        \\import type { User } from './models';
+    ;
+    var out = try parseForTest(src, .typescript);
+    defer freeRefs(&out);
+    // The `type` keyword must not become an import binding.
+    for (out.items) |s| {
+        try testing.expect(!std.mem.eql(u8, s.name, "type"));
+    }
+    // The named type-only import still records the module edge.
+    var saw = false;
+    for (out.items) |s| {
+        if (s.kind == .import and std.mem.eql(u8, s.import_path, "./models")) saw = true;
+    }
+    try testing.expect(saw);
+}
+
+test "ts: a union type alias is a type symbol" {
+    const src =
+        \\export type Shape = Circle | Square | Triangle;
+    ;
+    var out = try parseForTest(src, .typescript);
+    defer freeRefs(&out);
+    const shape = findSym(out.items, "Shape").?;
+    try testing.expectEqual(SymbolKind.type, shape.kind);
+    try testing.expect(shape.exported);
+}
+
+// --- Lua ------------------------------------------------------------------
+
+test "lua: a colon method is a method and captures its call sites" {
+    const src =
+        \\local M = {}
+        \\function M:run(n)
+        \\  return self:helper(n)
+        \\end
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    const run = findSym(out.items, "run").?;
+    try testing.expectEqual(SymbolKind.method, run.kind);
+    // The `self:helper(n)` call site is captured (colon receivers are not yet
+    // recorded as qualifiers, but the call edge is present).
+    try testing.expect(hasCallRef(run, "helper"));
+}
+
+test "lua: a local variable is private, a global is exported" {
+    const src =
+        \\local secret = 42
+        \\config = 7
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    const secret = findSym(out.items, "secret").?;
+    try testing.expectEqual(SymbolKind.variable, secret.kind);
+    try testing.expect(!secret.exported); // `local`
+    const config = findSym(out.items, "config").?;
+    try testing.expectEqual(SymbolKind.variable, config.kind);
+    try testing.expect(config.exported); // global
+}
+
+test "lua: a function-expression assigned to a local is a private function" {
+    const src =
+        \\local handler = function(evt)
+        \\  return dispatch(evt)
+        \\end
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    const handler = findSym(out.items, "handler").?;
+    try testing.expectEqual(SymbolKind.function, handler.kind);
+    try testing.expect(!handler.exported);
+    try testing.expect(hasCallRef(handler, "dispatch"));
+}
+
+// --- Go -------------------------------------------------------------------
+
+test "go: single-line import records the module edge; type alias and defined type" {
+    const src =
+        \\package main
+        \\import "fmt"
+        \\type Celsius = float64
+        \\type MyInt int
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    // A single-line `import "fmt"` records the module path (the binding name is a
+    // separate concern handled by resolution).
+    var saw_fmt = false;
+    for (out.items) |s| {
+        if (s.kind == .import and std.mem.eql(u8, s.import_path, "fmt")) saw_fmt = true;
+    }
+    try testing.expect(saw_fmt);
+    // Both an alias (`= float64`) and a defined type surface as `type`.
+    try testing.expectEqual(SymbolKind.type, findSym(out.items, "Celsius").?.kind);
+    try testing.expectEqual(SymbolKind.type, findSym(out.items, "MyInt").?.kind);
+}
+
+test "go: package-level const/var declarations are not emitted as symbols" {
+    // The Go scanner only recognizes func/type/import at package scope.
+    const src =
+        \\package main
+        \\const MaxSize = 1024
+        \\var registry = 0
+        \\func use() int { return MaxSize }
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "MaxSize") == null);
+    try testing.expect(findSym(out.items, "registry") == null);
+    // Functions are still found normally.
+    try testing.expect(findSym(out.items, "use") != null);
+}
+
+test "go: a method's pointer receiver is bound so member calls carry a receiver" {
+    const src =
+        \\package main
+        \\type Server struct{ n int }
+        \\func (s *Server) Start() { s.boot() }
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    const start = findSym(out.items, "Start").?;
+    try testing.expectEqual(SymbolKind.method, start.kind);
+    var q: []const u8 = "";
+    for (start.refs) |r| {
+        if (std.mem.eql(u8, r.name, "boot")) q = r.qualifier;
+    }
+    try testing.expectEqualStrings("s", q);
+}
+
+// --- Rust -----------------------------------------------------------------
+
+test "rust: inline module nests items; a bare mod declaration is an import" {
+    const src =
+        \\mod util {
+        \\    pub fn helper() -> u32 { 1 }
+        \\}
+        \\mod external;
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+    const util = findSym(out.items, "util").?;
+    try testing.expectEqual(SymbolKind.module, util.kind);
+    const helper = findSym(out.items, "helper").?;
+    try testing.expectEqual(SymbolKind.function, helper.kind);
+    try testing.expect(helper.parent_local != null);
+    // `mod external;` is a file-module reference → an import edge.
+    try testing.expectEqual(SymbolKind.import, findSym(out.items, "external").?.kind);
+}
+
+test "rust: unit and tuple structs are struct-kinded" {
+    const src =
+        \\pub struct Unit;
+        \\pub struct Pair(i32, i32);
+        \\struct Private;
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Unit").?.kind);
+    try testing.expect(findSym(out.items, "Unit").?.exported);
+    try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Pair").?.kind);
+    // Visibility is honored: no `pub` → private.
+    try testing.expect(!findSym(out.items, "Private").?.exported);
+}
+
+test "rust: a const-fn modifier is not mistaken for a plain const" {
+    const src =
+        \\pub const fn compute() -> u32 { helper() }
+        \\const LIMIT: u32 = 5;
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+    // `const fn` is a function, not a constant.
+    const compute = findSym(out.items, "compute").?;
+    try testing.expectEqual(SymbolKind.function, compute.kind);
+    try testing.expect(hasCallRef(compute, "helper"));
+    // A real const is still a constant.
+    try testing.expectEqual(SymbolKind.constant, findSym(out.items, "LIMIT").?.kind);
+}
+
+// --- Ruby -----------------------------------------------------------------
+
+test "ruby: instance method member call records the receiver qualifier" {
+    const src =
+        \\class Worker
+        \\  def run
+        \\    queue.push(job)
+        \\  end
+        \\end
+    ;
+    var out = try parseForTest(src, .ruby);
+    defer freeRefs(&out);
+    const run = findSym(out.items, "run").?;
+    try testing.expectEqual(SymbolKind.method, run.kind);
+    var q: []const u8 = "";
+    for (run.refs) |r| {
+        if (std.mem.eql(u8, r.name, "push")) q = r.qualifier;
+    }
+    try testing.expectEqualStrings("queue", q);
+}
+
+test "ruby: a method with default-valued params keeps its body refs" {
+    const src =
+        \\class Api
+        \\  def fetch(id, limit = 10)
+        \\    build(id)
+        \\    paginate(limit)
+        \\  end
+        \\end
+    ;
+    var out = try parseForTest(src, .ruby);
+    defer freeRefs(&out);
+    const fetch = findSym(out.items, "fetch").?;
+    try testing.expectEqual(SymbolKind.method, fetch.kind);
+    try testing.expect(hasCallRef(fetch, "build"));
+    try testing.expect(hasCallRef(fetch, "paginate"));
+}

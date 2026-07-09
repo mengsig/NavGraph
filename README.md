@@ -35,6 +35,14 @@ Run the tests:
 zig build test --summary all
 ```
 
+Estimate test coverage (call-graph reachability from `test` blocks, computed with
+NavGraph itself — kcov cannot read Zig 0.16's DWARF5, so there is no line-coverage
+tool for this codebase):
+
+```sh
+python3 scripts/coverage.py --list      # per-fn reachability + the unreached set
+```
+
 ## Usage
 
 ```

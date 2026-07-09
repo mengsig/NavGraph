@@ -38,6 +38,12 @@ export async function deleteOrder(id: number): Promise<void> {
   await axios.delete(`/api/orders/${id}`);
 }
 
+// POST /api/orders/:id/ship -> ship_order
+export async function shipOrder(id: number): Promise<Order> {
+  const res = await axios.post(`/api/orders/${id}/ship`);
+  return res.data;
+}
+
 // GET /health -> health
 export async function checkHealth(): Promise<boolean> {
   const res = await fetch("/health");

@@ -3,6 +3,8 @@
 const std = @import("std");
 const vm = @import("vm.zig");
 const lexer = @import("lexer.zig");
+const bytecode_vm = @import("bytecode_vm.zig");
+const stack = @import("stack.zig");
 
 /// A short usage banner. The example lines deliberately contain code-shaped
 /// text so we can confirm that text inside a multiline string is never parsed
@@ -30,6 +32,18 @@ pub fn main() void {
     // ...then evaluate through the module-qualified high-level helper.
     const result = vm.eval(program);
     printValue(result);
+
+    // Now run the *same* program through the compiled bytecode back-end, which
+    // reaches lexer.tokenize by way of compiler.compile.
+    const compiled = bytecode_vm.evalBytecode(program) catch {
+        std.debug.print("bytecode error\n", .{});
+        return;
+    };
+    std.debug.print("bytecode = {d}\n", .{compiled});
+
+    // A tiny diagnostic that also exercises the generic anytype fold.
+    const digits = [_]i64{ 3, 4, 2 };
+    std.debug.print("operand sum = {d}\n", .{stack.foldSum(&digits)});
 }
 
 /// Print a computed VM value to stderr.

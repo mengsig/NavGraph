@@ -35,16 +35,47 @@ static int vec_grow(Vec *v) {
     return 0;
 }
 
+/* Internal: true when i addresses a currently-live element. */
+static int vec_in_bounds(const Vec *v, size_t i) {
+    return i < v->len;
+}
+
 /* Append x, growing the buffer via vec_grow when it is full. */
 int vec_push(Vec *v, int x) {
     if (v->len == v->cap) {
         if (vec_grow(v) != 0) {
-            return -1;
+            return DS_ERR_OOM;
         }
     }
     v->data[v->len] = x;
     v->len += 1;
-    return 0;
+    return DS_OK;
+}
+
+/* Remove the last element into *out. Returns DS_ERR_RANGE when empty. */
+int vec_pop(Vec *v, int *out) {
+    if (v->len == 0) {
+        return DS_ERR_RANGE;
+    }
+    v->len -= 1;
+    *out = v->data[v->len];
+    return DS_OK;
+}
+
+/* Copy element i into *out. Returns DS_OK, or DS_ERR_RANGE when i is out of
+ * range. Bounds are checked through vec_in_bounds. */
+int vec_get(const Vec *v, size_t i, int *out) {
+    if (!vec_in_bounds(v, i)) {
+        return DS_ERR_RANGE;
+    }
+    *out = v->data[i];
+    return DS_OK;
+}
+
+/* Intentionally dead (fixture): a shrink helper we never wire up. Uses the
+ * DS_UNUSED macro so the parameter does not warn. */
+static void vec_shrink_to_fit(Vec *v) {
+    DS_UNUSED(v);
 }
 
 /* Release the backing buffer and the Vec itself. */

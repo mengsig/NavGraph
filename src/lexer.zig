@@ -619,3 +619,789 @@ test "C++ char prefix (L'a') stays a char literal; code after it survives" {
     try std.testing.expect(!leaked_a);
     try std.testing.expect(saw_fn);
 }
+
+
+// ===================================================================
+// Appended hardening tests for lexer.zig
+// ===================================================================
+
+/// Tokenize `src` under `lang`'s config, returning the owned token list.
+/// Caller must `deinit(gpa)` it.
+fn lexAll(gpa: std.mem.Allocator, src: []const u8, lang: language.Language) !std.ArrayList(Token) {
+    var toks: std.ArrayList(Token) = .empty;
+    errdefer toks.deinit(gpa);
+    try tokenize(gpa, src, language.configFor(lang), &toks);
+    return toks;
+}
+
+/// Whether any `.identifier` token has exactly `name` for its text.
+fn hasIdent(toks: []const Token, src: []const u8, name: []const u8) bool {
+    for (toks) |t| {
+        if (t.kind == .identifier and std.mem.eql(u8, t.text(src), name)) return true;
+    }
+    return false;
+}
+
+fn countKind(toks: []const Token, kind: TokenKind) usize {
+    var n: usize = 0;
+    for (toks) |t| {
+        if (t.kind == kind) n += 1;
+    }
+    return n;
+}
+
+/// Return the first token of `kind`, or null.
+fn firstOfKind(toks: []const Token, kind: TokenKind) ?Token {
+    for (toks) |t| {
+        if (t.kind == kind) return t;
+    }
+    return null;
+}
+
+/// Whether a `.punct` token exists whose single byte equals `c`.
+fn hasPunct(toks: []const Token, src: []const u8, c: u8) bool {
+    for (toks) |t| {
+        if (t.kind == .punct and t.end == t.start + 1 and src[t.start] == c) return true;
+    }
+    return false;
+}
+
+// ---- character-class predicates (direct unit tests) ----------------
+
+test "isIdentStart accepts letters/_/$/@/high-bytes, rejects digits and punct" {
+    try std.testing.expect(isIdentStart('a'));
+    try std.testing.expect(isIdentStart('Z'));
+    try std.testing.expect(isIdentStart('_'));
+    try std.testing.expect(isIdentStart('$'));
+    try std.testing.expect(isIdentStart('@'));
+    try std.testing.expect(isIdentStart(0x80)); // start of a UTF-8 lead byte range
+    try std.testing.expect(isIdentStart(0xC3));
+    try std.testing.expect(!isIdentStart('0'));
+    try std.testing.expect(!isIdentStart('9'));
+    try std.testing.expect(!isIdentStart(' '));
+    try std.testing.expect(!isIdentStart('-'));
+    try std.testing.expect(!isIdentStart('.'));
+}
+
+test "isIdentCont accepts alnum/_/$/high-bytes but NOT @" {
+    try std.testing.expect(isIdentCont('a'));
+    try std.testing.expect(isIdentCont('0'));
+    try std.testing.expect(isIdentCont('9'));
+    try std.testing.expect(isIdentCont('_'));
+    try std.testing.expect(isIdentCont('$'));
+    try std.testing.expect(isIdentCont(0x80));
+    // '@' is a valid START char but not a CONT char (so `a@b` splits).
+    try std.testing.expect(!isIdentCont('@'));
+    try std.testing.expect(!isIdentCont(' '));
+    try std.testing.expect(!isIdentCont('-'));
+    try std.testing.expect(!isIdentCont('.'));
+}
+
+test "isQuoteChar only single and double quotes" {
+    try std.testing.expect(isQuoteChar('"'));
+    try std.testing.expect(isQuoteChar('\''));
+    try std.testing.expect(!isQuoteChar('`'));
+    try std.testing.expect(!isQuoteChar('a'));
+    try std.testing.expect(!isQuoteChar(0));
+}
+
+test "isStringDelim honours the per-language delimiter set" {
+    const zig_cfg = language.configFor(.zig);
+    try std.testing.expect(isStringDelim(zig_cfg, '"'));
+    try std.testing.expect(isStringDelim(zig_cfg, '\''));
+    try std.testing.expect(!isStringDelim(zig_cfg, '`'));
+    // unknown has no string delimiters at all.
+    const unknown_cfg = language.configFor(.unknown);
+    try std.testing.expect(!isStringDelim(unknown_cfg, '"'));
+    try std.testing.expect(!isStringDelim(unknown_cfg, '\''));
+}
+
+test "isTripleClose true only on three matching quotes" {
+    const cfg = language.configFor(.python);
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\"""x
+        , .cfg = cfg };
+        try std.testing.expect(isTripleClose(&lx, '"'));
+        // Wrong quote char never closes.
+        try std.testing.expect(!isTripleClose(&lx, '\''));
+    }
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\""x
+        , .cfg = cfg };
+        try std.testing.expect(!isTripleClose(&lx, '"'));
+    }
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\'''
+        , .cfg = cfg };
+        try std.testing.expect(isTripleClose(&lx, '\''));
+    }
+}
+
+test "isRustCharLiteral distinguishes char literals from lifetimes" {
+    const cfg = language.configFor(.rust);
+    // 'x' -> closing quote at offset 2 -> char literal.
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\'x'
+        , .cfg = cfg };
+        try std.testing.expect(isRustCharLiteral(&lx));
+    }
+    // '\n' -> escape at offset 1 -> char literal.
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\'\n'
+        , .cfg = cfg };
+        try std.testing.expect(isRustCharLiteral(&lx));
+    }
+    // 'ab -> no closing quote at offset 2 -> lifetime, not a char literal.
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\'ab
+        , .cfg = cfg };
+        try std.testing.expect(!isRustCharLiteral(&lx));
+    }
+    // 'static -> lifetime.
+    {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source =
+            \\'static
+        , .cfg = cfg };
+        try std.testing.expect(!isRustCharLiteral(&lx));
+    }
+}
+
+test "detectPyFString matches f/F prefixes and 2-char raw-f combos only" {
+    const cfg = language.configFor(.python);
+    const Case = struct { src: []const u8, quote: u8, prefix: u32 };
+    const yes = [_]Case{
+        .{ .src = "f\"x\"", .quote = '"', .prefix = 1 },
+        .{ .src = "F'x'", .quote = '\'', .prefix = 1 },
+        .{ .src = "rf\"x\"", .quote = '"', .prefix = 2 },
+        .{ .src = "fr'x'", .quote = '\'', .prefix = 2 },
+        .{ .src = "Rf\"x\"", .quote = '"', .prefix = 2 },
+        .{ .src = "fR\"x\"", .quote = '"', .prefix = 2 },
+    };
+    for (yes) |cse| {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source = cse.src, .cfg = cfg };
+        const got = detectPyFString(&lx);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqual(cse.quote, got.?.quote);
+        try std.testing.expectEqual(cse.prefix, got.?.prefix_len);
+    }
+    // Non-f strings and non-strings never match.
+    const no = [_][]const u8{ "r\"x\"", "b\"x\"", "\"x\"", "foo", "f x", "rr\"x\"" };
+    for (no) |src| {
+        var lx = Lexer{ .gpa = std.testing.allocator, .source = src, .cfg = cfg };
+        try std.testing.expect(detectPyFString(&lx) == null);
+    }
+}
+
+// ---- tokenize: structural basics -----------------------------------
+
+test "empty source yields only an eof token at offset 0" {
+    const gpa = std.testing.allocator;
+    var toks = try lexAll(gpa, "", .zig);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), toks.items.len);
+    try std.testing.expectEqual(TokenKind.eof, toks.items[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), toks.items[0].start);
+}
+
+test "whitespace-only source yields only an eof token" {
+    const gpa = std.testing.allocator;
+    var toks = try lexAll(gpa, "  \n\t\r  \n", .zig);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), toks.items.len);
+    try std.testing.expectEqual(TokenKind.eof, toks.items[0].kind);
+}
+
+test "tokenize always appends a trailing eof token last" {
+    const gpa = std.testing.allocator;
+    var toks = try lexAll(gpa, "const x = 1;", .zig);
+    defer toks.deinit(gpa);
+    try std.testing.expect(toks.items.len > 1);
+    try std.testing.expectEqual(TokenKind.eof, toks.items[toks.items.len - 1].kind);
+    // Exactly one eof, and it is last.
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .eof));
+}
+
+test "Token.text returns the exact source slice" {
+    const gpa = std.testing.allocator;
+    const src = "abc + def";
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    const id = firstOfKind(toks.items, .identifier).?;
+    try std.testing.expectEqualStrings("abc", id.text(src));
+    try std.testing.expect(hasIdent(toks.items, src, "def"));
+    try std.testing.expect(hasPunct(toks.items, src, '+'));
+}
+
+test "line and column are tracked across newlines and within a line" {
+    const gpa = std.testing.allocator;
+    const src = "const x\ny\nzz";
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    // `const` starts line 1 col 0; `x` is on line 1 at col 6.
+    try std.testing.expectEqual(@as(u32, 1), toks.items[0].line);
+    try std.testing.expectEqual(@as(u32, 0), toks.items[0].col);
+    try std.testing.expectEqual(@as(u32, 6), toks.items[1].col);
+    try std.testing.expectEqual(@as(u32, 1), toks.items[1].line);
+    // `y` -> line 2 col 0; `zz` -> line 3 col 0.
+    var saw_y = false;
+    var saw_zz = false;
+    for (toks.items) |t| {
+        if (t.kind != .identifier) continue;
+        if (std.mem.eql(u8, t.text(src), "y")) {
+            saw_y = true;
+            try std.testing.expectEqual(@as(u32, 2), t.line);
+            try std.testing.expectEqual(@as(u32, 0), t.col);
+        }
+        if (std.mem.eql(u8, t.text(src), "zz")) {
+            saw_zz = true;
+            try std.testing.expectEqual(@as(u32, 3), t.line);
+        }
+    }
+    try std.testing.expect(saw_y and saw_zz);
+}
+
+// ---- numbers -------------------------------------------------------
+
+test "numbers with underscore digit separators are a single token" {
+    const gpa = std.testing.allocator;
+    const src = "const n = 1_000_000;";
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    const num = firstOfKind(toks.items, .number).?;
+    try std.testing.expectEqualStrings("1_000_000", num.text(src));
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .number));
+}
+
+test "hex, float and alnum-suffixed numbers are single number tokens" {
+    const gpa = std.testing.allocator;
+    // Hex + underscore, float, and a Rust-style typed literal all stay one token.
+    const src = "let a = 0xDEAD_BEEF; let b = 3.14; let c = 1000u32;";
+    var toks = try lexAll(gpa, src, .rust);
+    defer toks.deinit(gpa);
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(gpa);
+    for (toks.items) |t| {
+        if (t.kind == .number) try texts.append(gpa, t.text(src));
+    }
+    try std.testing.expectEqual(@as(usize, 3), texts.items.len);
+    try std.testing.expectEqualStrings("0xDEAD_BEEF", texts.items[0]);
+    try std.testing.expectEqualStrings("3.14", texts.items[1]);
+    try std.testing.expectEqualStrings("1000u32", texts.items[2]);
+}
+
+// ---- comments ------------------------------------------------------
+
+test "zig line comment: plain vs doc (/// and //!) is_doc flag" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\// plain comment ghostA
+        \\/// doc comment ghostB
+        \\//! module doc ghostC
+        \\const real = 1;
+    ;
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), countKind(toks.items, .comment));
+    var plain_doc = true;
+    var slashes_doc = false;
+    var bang_doc = false;
+    for (toks.items) |t| {
+        if (t.kind != .comment) continue;
+        const txt = t.text(src);
+        if (std.mem.indexOf(u8, txt, "ghostA") != null) plain_doc = t.is_doc;
+        if (std.mem.indexOf(u8, txt, "ghostB") != null) slashes_doc = t.is_doc;
+        if (std.mem.indexOf(u8, txt, "ghostC") != null) bang_doc = t.is_doc;
+    }
+    try std.testing.expect(!plain_doc); // `//` is not a doc comment
+    try std.testing.expect(slashes_doc); // `///` is
+    try std.testing.expect(bang_doc); // `//!` is
+    // Comment contents never surface as identifiers.
+    try std.testing.expect(!hasIdent(toks.items, src, "ghostA"));
+    try std.testing.expect(hasIdent(toks.items, src, "real"));
+}
+
+test "python # line comment hides its contents" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\# def hidden(): pass
+        \\value = 1
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .comment));
+    try std.testing.expect(!hasIdent(toks.items, src, "hidden"));
+    try std.testing.expect(hasIdent(toks.items, src, "value"));
+    // A python # comment is never a doc comment via the lexer.
+    try std.testing.expect(!firstOfKind(toks.items, .comment).?.is_doc);
+}
+
+test "C block comment: /** is doc, /* is not, contents hidden" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\/** doc block ghostDoc */
+        \\/* plain block ghostPlain */
+        \\int real;
+    ;
+    var toks = try lexAll(gpa, src, .c);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), countKind(toks.items, .comment));
+    for (toks.items) |t| {
+        if (t.kind != .comment) continue;
+        const txt = t.text(src);
+        if (std.mem.indexOf(u8, txt, "ghostDoc") != null) try std.testing.expect(t.is_doc);
+        if (std.mem.indexOf(u8, txt, "ghostPlain") != null) try std.testing.expect(!t.is_doc);
+    }
+    try std.testing.expect(!hasIdent(toks.items, src, "ghostDoc"));
+    try std.testing.expect(hasIdent(toks.items, src, "real"));
+}
+
+test "multi-line block comment is one token and hides interior code" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\int before;
+        \\/* line one
+        \\   int hidden;
+        \\   line three */
+        \\int after;
+    ;
+    var toks = try lexAll(gpa, src, .c);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .comment));
+    try std.testing.expect(hasIdent(toks.items, src, "before"));
+    try std.testing.expect(hasIdent(toks.items, src, "after"));
+    try std.testing.expect(!hasIdent(toks.items, src, "hidden"));
+}
+
+test "unterminated block comment runs to EOF without crashing" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\int a; /* never closed int b;
+    ;
+    var toks = try lexAll(gpa, src, .c);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "a"));
+    // Everything after the unterminated opener is swallowed by the comment.
+    try std.testing.expect(!hasIdent(toks.items, src, "b"));
+    const cmt = firstOfKind(toks.items, .comment).?;
+    try std.testing.expectEqual(@as(u32, @intCast(src.len)), cmt.end);
+}
+
+test "lua: --[[ block ]] is preferred over -- line comment" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\--[[ block with function ghostBlock
+        \\ still in block ]]
+        \\-- line function ghostLine
+        \\function shown() end
+    ;
+    var toks = try lexAll(gpa, src, .lua);
+    defer toks.deinit(gpa);
+    // one block comment + one line comment.
+    try std.testing.expectEqual(@as(usize, 2), countKind(toks.items, .comment));
+    try std.testing.expect(!hasIdent(toks.items, src, "ghostBlock"));
+    try std.testing.expect(!hasIdent(toks.items, src, "ghostLine"));
+    try std.testing.expect(hasIdent(toks.items, src, "shown"));
+    // lua doc_style is none -> no comment is ever a doc comment.
+    for (toks.items) |t| {
+        if (t.kind == .comment) try std.testing.expect(!t.is_doc);
+    }
+}
+
+// ---- strings -------------------------------------------------------
+
+test "plain double-quoted string is one opaque token; escapes stay inside" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const char *s = "a\"b\"c"; int after;
+    ;
+    var toks = try lexAll(gpa, src, .c);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    // Escaped quotes do not terminate the string, so b/c never surface.
+    try std.testing.expect(!hasIdent(toks.items, src, "b"));
+    try std.testing.expect(!hasIdent(toks.items, src, "c"));
+    try std.testing.expect(hasIdent(toks.items, src, "after"));
+}
+
+test "single-quoted string in value position hides its contents" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\name = 'hidden_word'
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "hidden_word"));
+    try std.testing.expect(hasIdent(toks.items, src, "name"));
+}
+
+test "python triple-quoted string spans lines as one token" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\doc = """
+        \\def hidden(): pass
+        \\class AlsoHidden: ...
+        \\"""
+        \\value = 1
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "hidden"));
+    try std.testing.expect(!hasIdent(toks.items, src, "AlsoHidden"));
+    try std.testing.expect(hasIdent(toks.items, src, "value"));
+}
+
+test "triple-single-quoted string with interior single quotes stays one token" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\doc = '''it's a 'quoted' thing with fn ghost'''
+        \\value = 1
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "ghost"));
+    try std.testing.expect(hasIdent(toks.items, src, "value"));
+}
+
+test "unterminated triple-quoted string runs to EOF without crashing" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\doc = """never closed def ghost(): pass
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    const s = firstOfKind(toks.items, .string).?;
+    try std.testing.expectEqual(@as(u32, @intCast(src.len)), s.end);
+    try std.testing.expect(!hasIdent(toks.items, src, "ghost"));
+}
+
+test "go backtick raw string is one token and interpolation is not code" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const s = `raw with func ghostGo and ${notCode}`
+        \\func realGo() {}
+    ;
+    var toks = try lexAll(gpa, src, .go);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "ghostGo"));
+    try std.testing.expect(!hasIdent(toks.items, src, "notCode"));
+    try std.testing.expect(hasIdent(toks.items, src, "realGo"));
+}
+
+test "JS backtick template literal is one string; ${} is not tokenized as code" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const s = `hello ${userName} world`;
+        \\function afterTpl() {}
+    ;
+    var toks = try lexAll(gpa, src, .typescript);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    // JS template interpolation is (deliberately) NOT split into code tokens.
+    try std.testing.expect(!hasIdent(toks.items, src, "userName"));
+    try std.testing.expect(hasIdent(toks.items, src, "afterTpl"));
+}
+
+// ---- zig line strings ----------------------------------------------
+
+test "zig line string swallows quotes and code-shaped text on the line" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const s =
+        \\    \\ "not a string" and 'x' fn ghost()
+        \\;
+        \\pub fn survive() void {}
+    ;
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    // The `\\...` line lexes as exactly one string token; the quotes inside do
+    // NOT open real string literals.
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "ghost"));
+    try std.testing.expect(!hasIdent(toks.items, src, "not"));
+    try std.testing.expect(hasIdent(toks.items, src, "survive"));
+    try std.testing.expect(hasIdent(toks.items, src, "s"));
+}
+
+// ---- python f-strings ----------------------------------------------
+
+test "f-string literal chunks are strings and holes are code" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\msg = f"pre {value} post"
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    // "pre " and " post" become two separate string chunks; `value` is code.
+    try std.testing.expectEqual(@as(usize, 2), countKind(toks.items, .string));
+    try std.testing.expect(hasIdent(toks.items, src, "value"));
+    try std.testing.expect(hasIdent(toks.items, src, "msg"));
+}
+
+test "f-string escaped braces {{ }} are literal, not interpolation holes" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\s = f"{{not_a_hole}} {real_var}"
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expect(!hasIdent(toks.items, src, "not_a_hole"));
+    try std.testing.expect(hasIdent(toks.items, src, "real_var"));
+}
+
+test "f-string format spec has nested braces; both names surface" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\s = f"{val:>{width}}"
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "val"));
+    try std.testing.expect(hasIdent(toks.items, src, "width"));
+}
+
+test "nested f-string inside a hole tokenizes the inner name" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\s = f"{f'{inner_name}'}"
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "inner_name"));
+}
+
+test "raw f-string (rf prefix) still interpolates" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\p = rf"\d+ {captured}"
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "captured"));
+    try std.testing.expect(hasIdent(toks.items, src, "p"));
+}
+
+test "triple-quoted f-string interpolates across lines" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\s = f"""
+        \\head {compute(y)} tail
+        \\"""
+        \\value = 1
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "compute"));
+    try std.testing.expect(hasIdent(toks.items, src, "y"));
+    try std.testing.expect(hasIdent(toks.items, src, "value"));
+}
+
+test "empty f-string does not crash and produces no code tokens" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\s = f"" + after
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "after"));
+    try std.testing.expect(hasIdent(toks.items, src, "s"));
+    // No identifier came from inside the (empty) f-string.
+    try std.testing.expect(countKind(toks.items, .string) >= 1);
+}
+
+test "f-string interpolation keeps the token stream sorted by start offset" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\m = f"a {x} b {g(y)} c"
+    ;
+    var toks = try lexAll(gpa, src, .python);
+    defer toks.deinit(gpa);
+    var last: u32 = 0;
+    for (toks.items) |t| {
+        try std.testing.expect(t.start >= last);
+        last = t.start;
+    }
+    try std.testing.expect(hasIdent(toks.items, src, "g"));
+    try std.testing.expect(hasIdent(toks.items, src, "y"));
+}
+
+// ---- char literals & language-specific quote guards ----------------
+
+test "C++ digit separator emits number, punct, number" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\int budget() { return 1'000; }
+    ;
+    var toks = try lexAll(gpa, src, .cpp);
+    defer toks.deinit(gpa);
+    // 1'000 -> number("1"), punct("'"), number("000"); no string opened.
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .string));
+    try std.testing.expect(hasPunct(toks.items, src, '\''));
+    try std.testing.expect(countKind(toks.items, .number) >= 2);
+}
+
+test "C char literal (no number before) stays a string and hides its char" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\char c = 'a'; int after;
+    ;
+    var toks = try lexAll(gpa, src, .c);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "a"));
+    try std.testing.expect(hasIdent(toks.items, src, "after"));
+}
+
+test "C++ u8 char prefix keeps the char literal intact" {
+    const gpa = std.testing.allocator;
+    // Previous token before the quote is the identifier `u8`, not a number,
+    // so the digit-separator guard does not fire and 'x' is a char literal.
+    const src =
+        \\char cc = u8'x'; int fnAfter(int q) { return q; }
+    ;
+    var toks = try lexAll(gpa, src, .cpp);
+    defer toks.deinit(gpa);
+    try std.testing.expect(!hasIdent(toks.items, src, "x"));
+    try std.testing.expect(hasIdent(toks.items, src, "fnAfter"));
+    try std.testing.expect(countKind(toks.items, .string) >= 1);
+}
+
+test "rust lifetimes do not open strings; names around them survive" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\fn longest<'a>(x: &'a str) -> &'a str { x }
+        \\fn afterFn() {}
+    ;
+    var toks = try lexAll(gpa, src, .rust);
+    defer toks.deinit(gpa);
+    // Lifetimes are punct + ident, never strings.
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .string));
+    try std.testing.expect(hasIdent(toks.items, src, "longest"));
+    try std.testing.expect(hasIdent(toks.items, src, "str"));
+    try std.testing.expect(hasIdent(toks.items, src, "afterFn"));
+    // The lifetime name `a` surfaces as a normal identifier.
+    try std.testing.expect(hasIdent(toks.items, src, "a"));
+}
+
+test "rust char literal is a string; code after it survives" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\fn f() { let c = 'x'; let n = '\n'; bar(); }
+    ;
+    var toks = try lexAll(gpa, src, .rust);
+    defer toks.deinit(gpa);
+    // Two char literals -> two string tokens; the inner chars do not leak.
+    try std.testing.expectEqual(@as(usize, 2), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "x"));
+    try std.testing.expect(hasIdent(toks.items, src, "bar"));
+}
+
+test "JSX prose apostrophe becomes punct; word halves both surface" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\function V() { return <p>you'll and don't end</p>; }
+        \\function afterProse() { return realCall(); }
+    ;
+    var toks = try lexAll(gpa, src, .tsx);
+    defer toks.deinit(gpa);
+    // No string swallows the rest of the file.
+    try std.testing.expect(hasIdent(toks.items, src, "realCall"));
+    try std.testing.expect(hasIdent(toks.items, src, "afterProse"));
+    // The apostrophe is emitted as punct, so `you` and `ll` both surface.
+    try std.testing.expect(hasIdent(toks.items, src, "you"));
+    try std.testing.expect(hasIdent(toks.items, src, "ll"));
+    try std.testing.expect(hasPunct(toks.items, src, '\''));
+}
+
+test "real single-quoted JS value string is still a string" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const mode = 'production_mode';
+    ;
+    var toks = try lexAll(gpa, src, .javascript);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), countKind(toks.items, .string));
+    try std.testing.expect(!hasIdent(toks.items, src, "production_mode"));
+    try std.testing.expect(hasIdent(toks.items, src, "mode"));
+}
+
+// ---- zig @"..." identifiers & @builtins ----------------------------
+
+test "zig @-builtin lexes as a single identifier token" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const std = @import("x");
+    ;
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    try std.testing.expect(hasIdent(toks.items, src, "@import"));
+}
+
+test "zig @\"quoted identifier\" spans the quotes as one identifier" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const @"has space" = 5;
+        \\pub fn realFn() void {}
+    ;
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    var found = false;
+    for (toks.items) |t| {
+        if (t.kind == .identifier and std.mem.eql(u8, t.text(src), "@\"has space\"")) found = true;
+    }
+    try std.testing.expect(found);
+    // The interior words are not separate identifiers, and it is NOT a string.
+    try std.testing.expect(!hasIdent(toks.items, src, "has"));
+    try std.testing.expect(!hasIdent(toks.items, src, "space"));
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .string));
+    try std.testing.expect(hasIdent(toks.items, src, "realFn"));
+}
+
+// ---- unknown language (no comment/string config) -------------------
+
+test "unknown language: no string delims means quotes are punct and names leak" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\"hello" world
+    ;
+    var toks = try lexAll(gpa, src, .unknown);
+    defer toks.deinit(gpa);
+    // Nothing is a string or comment; `hello` surfaces as an identifier.
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .string));
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .comment));
+    try std.testing.expect(hasIdent(toks.items, src, "hello"));
+    try std.testing.expect(hasIdent(toks.items, src, "world"));
+}
+
+test "unknown language: // is not a comment marker" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\// notacomment here
+    ;
+    var toks = try lexAll(gpa, src, .unknown);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .comment));
+    try std.testing.expect(hasIdent(toks.items, src, "notacomment"));
+}
+
+// ---- single-char punctuation & division vs comment -----------------
+
+test "zig single slash is punct division, not a comment" {
+    const gpa = std.testing.allocator;
+    const src = "const q = a / b;";
+    var toks = try lexAll(gpa, src, .zig);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), countKind(toks.items, .comment));
+    try std.testing.expect(hasPunct(toks.items, src, '/'));
+    try std.testing.expect(hasIdent(toks.items, src, "a"));
+    try std.testing.expect(hasIdent(toks.items, src, "b"));
+}
