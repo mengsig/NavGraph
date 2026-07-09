@@ -178,6 +178,8 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
             return fail(error.Usage, "unexpected extra argument '{s}'", .{a});
         }
     }
+    // `navgraph search --help` — the help flag overrides the command wholesale.
+    if (result.command == .help) return .{ .command = .help };
     if (!hasRequiredArgs(command, result)) {
         if (command == .path) return fail(error.Usage, "path needs two symbol names: navgraph path <A> <B>", .{});
         return fail(error.Usage, "{s} needs an argument: navgraph {s} <arg> [flags]", .{ @tagName(command), @tagName(command) });
@@ -320,6 +322,11 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.unused_follow_imports = true;
         return i;
     }
+    // `navgraph <cmd> --help` — everyone types it eventually; make it work.
+    if (eqAny(f.name, &.{ "-h", "--help" })) {
+        out.command = .help;
+        return i;
+    }
     return fail(error.UnknownFlag, "unknown flag '{s}' — run `navgraph help` for the list", .{raw});
 }
 
@@ -386,6 +393,11 @@ test "parse basic commands and flags" {
 
     try std.testing.expectError(error.Usage, parse(&.{"def"}));
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "def", "x", "--nope" }));
+}
+
+test "--help anywhere resolves to the help command" {
+    try std.testing.expectEqual(Command.help, (try parse(&.{ "search", "--help" })).command);
+    try std.testing.expectEqual(Command.help, (try parse(&.{ "def", "x", "-h" })).command);
 }
 
 test "parse diagnostics: named flag, bad kind, zero limit, flag-before-command" {

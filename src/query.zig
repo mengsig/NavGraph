@@ -1026,6 +1026,9 @@ fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     pat.exact = opts.exact;
     var shown: u32 = 0;
     outer: for (idx.graph.symbols) |sym| {
+        // The test scope applies to the *referencing* symbol: `--no-tests`
+        // hides use sites inside tests (the "who uses X in production" view).
+        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         for (sym.refs) |ref| {
             if (!pat.matches(ref)) continue;
             // One row per *distinct* use-site line. A name referenced on several

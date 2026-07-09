@@ -109,6 +109,8 @@ pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Opti
     var shown: u32 = 0;
     try w.writeByte('[');
     outer: for (idx.graph.symbols) |sym| {
+        // Test scope applies to the referencing symbol (mirrors the text path).
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
         for (sym.refs) |ref| {
             if (!pat.matches(ref)) continue;
             // One object per distinct use-site line (mirrors the text renderer).
