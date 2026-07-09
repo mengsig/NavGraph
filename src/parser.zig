@@ -734,6 +734,15 @@ fn parseZigTest(ctx: *Ctx, start_i: u32, test_i: u32, hi: u32, parent: ?u32) !u3
     }
     const body_open = findNext(ctx, j, hi, '{');
     if (body_open == sentinel or ctx.close[body_open] == sentinel) return start_i;
+    // A braceless `test` (a syntax error mid-edit) must not swallow the *next*
+    // declaration's `{}` body: if a top-level decl keyword intervenes before the
+    // brace, treat this `test` as malformed and consume only the keyword.
+    var g = j;
+    while (g < body_open) : (g += 1) {
+        if (isLineStart(ctx, g) and (ctx.identEql(g, "fn") or ctx.identEql(g, "pub") or
+            ctx.identEql(g, "const") or ctx.identEql(g, "var") or ctx.identEql(g, "test")))
+            return start_i + 1;
+    }
     const body_close = ctx.close[body_open];
     const span_start = lineStartOffset(ctx, start_i);
     const body = try collectRefs(ctx, sentinel, body_open + 1, body_close, "", zig_keywords);
@@ -2543,13 +2552,28 @@ fn parseGoScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
 /// constant/variable symbol; exportedness follows Go's capitalization rule.
 fn parseGoConstVar(ctx: *Ctx, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     const kind: SymbolKind = if (ctx.identEql(kw_i, "const")) .constant else .variable;
-    // Grouped form: `const ( ... )` — emit each line-leading name inside.
+    // Grouped form: `const ( ... )` — emit each declaration's leading name.
     if (kw_i + 1 < hi and ctx.isPunct(kw_i + 1, '(')) {
         const close = ctx.close[kw_i + 1];
         if (close == sentinel) return kw_i;
         var j = kw_i + 2;
-        while (j < close) : (j += 1) {
-            if (ctx.toks[j].kind == .identifier and isLineStart(ctx, j)) try emitGoValue(ctx, j, kind, parent);
+        while (j < close) {
+            // Skip a bracketed value (`= newClient( … )`, `[]T{ … }`) whole, so its
+            // continuation lines aren't mistaken for new declarations.
+            if (ctx.isPunct(j, '(') or ctx.isPunct(j, '[') or ctx.isPunct(j, '{')) {
+                const nb = skipBracket(ctx, j);
+                j = if (nb > j) nb else j + 1;
+                continue;
+            }
+            // A declaration is a line-leading identifier — unless the previous line
+            // ended on a continuation token (a trailing operator like `base +`),
+            // which makes this line part of the prior value, not a new name.
+            if (ctx.toks[j].kind == .identifier and isLineStart(ctx, j) and
+                (j == kw_i + 2 or !goLineContinues(ctx, j - 1)))
+            {
+                try emitGoValue(ctx, j, kind, parent);
+            }
+            j += 1;
         }
         return close + 1;
     }
@@ -2557,6 +2581,17 @@ fn parseGoConstVar(ctx: *Ctx, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
     try emitGoValue(ctx, kw_i + 1, kind, parent);
     return kw_i + 2;
+}
+
+/// Whether Go token `prev` ends a line that continues onto the next — a trailing
+/// binary operator or separator — so the next line-leading identifier belongs to
+/// this value, not a new declaration.
+fn goLineContinues(ctx: *const Ctx, prev: u32) bool {
+    if (ctx.toks[prev].kind != .punct) return false;
+    return switch (ctx.ch(prev)) {
+        '+', '-', '*', '/', '%', '&', '|', '^', '=', '<', '>', ',', '.' => true,
+        else => false,
+    };
 }
 
 fn emitGoValue(ctx: *Ctx, name_i: u32, kind: SymbolKind, parent: ?u32) AllocError!void {
@@ -5344,4 +5379,31 @@ test "go: a single-line import binds its path segment, not the `import` keyword"
     defer freeRefs(&out);
     try testing.expect(findSym(out.items, "fmt") != null); // bound as `fmt`
     try testing.expect(findSym(out.items, "import") == null); // never the keyword
+}
+
+test "go: grouped const/var skips multi-line initializers (no phantom symbols)" {
+    const src =
+        \\package main
+        \\var (
+        \\    client = newClient(
+        \\        config,
+        \\        timeout,
+        \\    )
+        \\    logger = mk
+        \\)
+        \\const (
+        \\    Prefix = base +
+        \\        suffix
+        \\)
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "client") != null);
+    try testing.expect(findSym(out.items, "logger") != null);
+    try testing.expect(findSym(out.items, "Prefix") != null);
+    // Call arguments and operator-continuation lines are part of the value, not
+    // new declarations — they must not become phantom symbols.
+    try testing.expect(findSym(out.items, "config") == null);
+    try testing.expect(findSym(out.items, "timeout") == null);
+    try testing.expect(findSym(out.items, "suffix") == null);
 }
