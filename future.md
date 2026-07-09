@@ -1,5 +1,32 @@
 # Future work
 
+## Agent-trial hardening rounds (2026-07-09/10, 10 Sonnet trials + A/B vs grep)
+
+Three rounds of agent trials (own src, testenv/fullstack, Caddy ~100k-line Go,
+pallets/click, CLI stress audit, and a navgraph-vs-grep A/B on identical
+questions) drove: `.navgraphignore` + `!` re-include over the built-in skip set
+(issue #2), `*` glob patterns for names/paths (issue #3), the JSON test-scope
+bug fix, exit codes (0/1/2 + quiet SIGPIPE), one-line named-flag errors,
+did-you-mean suggestions, multi-match banners, minified-file quarantine,
+`testdata/` as test scope, scope-aware `hot` ranking, the >4-candidate
+heuristic-dispatch cap, Go package-qualified resolution (`caddy.Load`) via
+`package X` module symbols, Go receiver→type parenting (`Metrics.Provision`
+pins), inheritance clauses in outlines, JSON `parent`, kwarg/loop-var binding
+capture (killed false cross-file arrows), `unused` dispatch/protocol/
+external-base/route-call annotations, `--no-recurse`, `search -e`, and use-site
+source lines in `search --refs`.
+
+**Parked from these trials** (value clear, needs design):
+- **`fields <Type>` / shape-usage** — which properties of a type are actually
+  dereferenced downstream (the "what breaks if I rename this JSON key" query).
+  Attribute-read refs (`.field` pins) already hold most of the data.
+- **Stub/no-op body detection** for `events`/`routes` pairings (an empty
+  `emit() {}` transport looked wired when it wasn't).
+- **`--tests-only` noise**: test-helper classes defined and used inside a
+  single test function still read as unused test helpers.
+- **Go admin-mux route registration** (`caddyconfig/load.go` style) isn't
+  recognized by `routes` (only decorator/`app.get`-style and HTTP clients).
+
 Ideas parked for when they're justified by evidence. Ordered by value-for-effort.
 Context: profiling (2026-07-07) shows NavGraph's index work on a 550-file tree is
 below the process-startup noise floor (~15 ms). The parser is a fast single-pass
