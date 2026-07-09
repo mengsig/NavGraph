@@ -1390,6 +1390,13 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     }
     if (shown == 0) {
         try w.print("(no unused functions under '{s}')\n", .{filter});
+        // The default (`--tests with`) reports only code used *nowhere*, which is
+        // often empty in a well-tested repo. Point at the wider views so an empty
+        // result isn't mistaken for a failure.
+        if (opts.tests == .with) {
+            try w.writeAll("  (default lists only code used nowhere; try --no-tests " ++
+                "for code used only by tests, or --tests-only for unused test helpers)\n");
+        }
         try skippedNote(w, idx);
     }
     if (hidden_exported > 0) {
