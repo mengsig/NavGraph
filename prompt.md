@@ -152,7 +152,25 @@ backend handler with the TypeScript frontend call that hits it.
 - **`*` patterns are globs**: `def 'Ba*'`, `search '*_handler'`,
   `callers 'Matcher.is*'`, `files '*_test.py'`, `outline 'src/**/*.ts'`.
   Globs anchor on the whole name; without `*`, names substring-match. Quote
-  them so the shell doesn't expand.
+  them so the shell doesn't expand. `search -e` demands name equality (find
+  `Order` without every `createOrder`).
+- **Exit codes are scriptable**: 0 = found results, 1 = ran fine but found
+  nothing (the `(no …)` note), 2 = usage error. `if navgraph def X -j > d.json`
+  works; piping into `head` is safe.
+- **Misses help you recover**: a not-found prints `did you mean:` near-misses
+  (casing/typos), an ambiguous name prints `N definitions match — pin with
+  Parent.name or name@path`, and `path` tells you which endpoint name was
+  unknown vs a genuine "no call path".
+- **Minified/bundled files are skipped** (`*.min.*`, one-enormous-line
+  artifacts) and named in the `(not indexed — skipped: …)` note. `testdata/`
+  counts as test scope.
+- **`outline`/`files` take `--no-recurse`** for "this directory only" (a Go
+  package, not its subpackages).
+- **Go interface dispatch is not guessed**: a call like `x.Provision()` with
+  many same-named implementations stays external (`~ ext`) rather than being
+  pinned to an arbitrary one; `unused` annotates such names (and Go stdlib
+  interface names like `MarshalJSON`, `Len/Less/Swap`) as possible-dispatch —
+  verify before deleting.
 - `path A B` printing "no call path" is a real answer (A genuinely doesn't reach
   B), not a failure.
 - Don't gauge "is X indexed?" with `navgraph search X | wc -l`: the not-found

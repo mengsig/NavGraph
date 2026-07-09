@@ -112,6 +112,8 @@ navgraph <command> [arg] [flags]
 | `-k, --kind <k1,k2>`          | Restrict `outline`/`search` to kinds (`fn`, `struct`, …). |
 | `-t, --tests <with\|without\|only>` | Unified test-scope for `outline`/`search`/`callers`/`hot`/`unused`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
 | `-r, --refs`                  | `search`: match use sites; `calls`/`neighbors`: include var/const/field reads. |
+| `-e, --exact`                 | `search`: name must equal the pattern (no substring hits). |
+| `--no-recurse`                | `outline`/`files`: only files directly in the given dir, not subtrees. |
 | `-s, --strict`                | Follow only high-confidence edges (drop heuristic `?` edges). |
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
 | `--sort <path\|symbols>`      | `files`: order by path (default) or symbol count. |
@@ -129,7 +131,15 @@ gitignore-style — `files '*_test.py'` matches basenames at any depth,
 **Ignores.** `.gitignore` is respected everywhere. A `.navgraphignore`
 (same syntax, per-directory) adds navgraph-only rules — scratch dirs, vendored
 code, fixtures — without touching git; a negated rule (`!vendor/`) re-includes
-a directory the built-in skip set would prune.
+a directory the built-in skip set would prune. Minified/bundled artifacts
+(`*.min.*`, one-enormous-line files) are skipped automatically and named in
+the skipped-note.
+
+**Exit codes.** `0` = found results, `1` = the query ran but found nothing
+(grep convention), `2` = usage error. Piping into `head` exits quietly (141).
+A not-found suggests near-miss names (`did you mean: …`); an ambiguous name
+prints how many definitions matched and the `Parent.name` / `name@path` pin
+syntax.
 
 ## Examples
 
