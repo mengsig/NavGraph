@@ -1100,6 +1100,16 @@ fn testCallerCount(idx: *const Index, id: SymbolId) u32 {
     return n;
 }
 
+/// Whether `sym`'s body issues at least one HTTP client call (a `route_call`
+/// reference) — an `unused` hint that the symbol is a client leg of a
+/// `routes` pairing rather than plain dead code.
+fn callsRoutes(sym: model.Symbol) bool {
+    for (sym.refs) |ref| {
+        if (ref.kind == .route_call) return true;
+    }
+    return false;
+}
+
 /// Whether any indexed file (or inline Zig `test` block) is test code — when
 /// none is, `--no-tests`/`--tests-only` can't change anything, and saying so
 /// beats letting identical outputs read as a tooling bug.
@@ -1682,6 +1692,10 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
             }
         } else if (interfaceDispatchHint(idx, sym)) |hint| {
             try w.print("  ({s} — verify before removing)\n", .{hint});
+        } else if (callsRoutes(sym)) {
+            // Caller-less but issues HTTP calls: likely a UI/event entry point
+            // the in-repo call graph can't see (a trial misread one as dead).
+            try w.writeAll("  (calls HTTP routes — may be an entry point wired outside the graph)\n");
         } else if (sym.exported) {
             try w.writeAll("  (exported — may be public API)\n");
         } else {
