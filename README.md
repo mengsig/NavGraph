@@ -35,12 +35,13 @@ Run the tests:
 zig build test --summary all
 ```
 
-Estimate test coverage (call-graph reachability from `test` blocks, computed with
-NavGraph itself — kcov cannot read Zig 0.16's DWARF5, so there is no line-coverage
-tool for this codebase):
+Estimate test coverage — the fraction of `fn`/`method` symbols reachable in the
+call graph from a test (kcov cannot read Zig 0.16's DWARF5, so there is no
+line-coverage tool for this codebase; this is a dependency-free substitute):
 
 ```sh
-python3 scripts/coverage.py --list      # per-fn reachability + the unreached set
+navgraph coverage src            # per-file % + overall, computed natively
+navgraph coverage src -j         # same, as JSON
 ```
 
 ## Usage
@@ -60,6 +61,7 @@ navgraph <command> [arg] [flags]
 | `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
 | `unused [filter]`  | Dead-code candidates; `--no-public`/`--no-test` narrow it, `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
+| `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `help`             | Show help.                                                    |
 
 **Flags**
@@ -70,6 +72,7 @@ navgraph <command> [arg] [flags]
 | `-d, --depth <N>`             | Graph depth for `calls`/`callers` (default `1`). |
 | `-C, --root <path>`           | Project root to index (default `.`).       |
 | `-l, --limit <N>`             | Max results (default `300`).               |
+| `-t, --tests <with\|without\|only>` | Test-scope for `outline`/`search`/`callers`/`hot`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
 
 ## Examples
 

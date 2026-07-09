@@ -27,7 +27,9 @@ sections below curate them by theme.
 Measuring this very task's coverage hit a wall that turned into the single
 highest-value idea here.
 
-### A1. Index `test` blocks as first-class symbols  **[gap]**
+### A1. Index `test` blocks as first-class symbols  **[✅ shipped]**
+*Shipped:* Zig `test "…" {}` blocks are now `.test_case` symbols with body
+edges, so `callers foo` shows the tests that exercise `foo`.
 `navgraph outline src/gitdiff.zig` lists the functions but **none of the `test`
 blocks**, though the file has several. Zig `test "name" { ... }` are executable
 units with a call graph, but NavGraph drops them. Consequences I hit directly:
@@ -41,9 +43,11 @@ Proposal: parse `test` blocks as a `test` symbol-kind (name = the test string),
 record their edges like any function, and let `callers foo` show `test "…"`
 entries. Generalizes to Rust `#[test]`, Python `def test_*`, JS `it()/test()`.
 
-### A2. A `coverage` / `reached-by-test` verb  **[nice]**
-Once tests are symbols (A1), NavGraph could answer "which functions are reachable
-from a test?" natively. I had to build this out-of-tree (`scripts/coverage.py`)
+### A2. A `coverage` / `reached-by-test` verb  **[✅ shipped]**
+*Shipped:* `navgraph coverage [path]` reports the per-file and overall fraction
+of `fn`/`method` reachable from a test (text + JSON) — replacing the throwaway
+external script. Once tests are symbols (A1), NavGraph answers "which functions
+are reachable from a test?" natively. This was needed
 because there is **no working line-coverage tool for this codebase**: kcov 43
 cannot parse Zig 0.16's DWARF5 line programs (even a trivial `zig test` binary
 reports 0 lines) and Zig has no built-in coverage. A static call-graph
@@ -76,7 +80,11 @@ internally for changed symbols; exposing the general op would generalize it.
 
 ---
 
-## C. Scope-blind reference resolution — recurring false edges (highest-impact bug class)
+## C. Scope-blind reference resolution — recurring false edges (highest-impact bug class)  **[✅ shipped: graph edges]**
+
+*Shipped:* JS/TS object-literal keys and untyped params/locals no longer create
+false call/read edges — `callers`/`calls`/`hot`/`path` are clean. (The `unused`
+token-tally's scope-blindness is tracked with §E.)
 
 Name-based reference matching still leaks across scopes, producing **both false
 callers and hidden dead code**. ROADMAP Tier 1 fixed type-scoped *member* calls,

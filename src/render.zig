@@ -158,7 +158,7 @@ fn writeQualifiedName(w: *Writer, idx: *const Index, sym: Symbol) !void {
 fn writeSigSuffix(w: *Writer, sym: Symbol, source: []const u8) !void {
     const is_value = switch (sym.kind) {
         .function, .method => false,
-        .class, .@"struct", .@"enum", .interface, .import, .macro, .module => return,
+        .class, .@"struct", .@"enum", .interface, .import, .macro, .module, .test_case => return,
         else => true,
     };
     const suffix = if (is_value)

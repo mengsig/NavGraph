@@ -8,7 +8,7 @@ const render = @import("render.zig");
 pub const Command = enum {
     outline, def, calls, callers, search, routes, events,
     neighbors, unused, imports, importers, path, hot, diff,
-    files, read, strings, help,
+    files, read, strings, coverage, help,
 };
 
 pub const Parsed = struct {
@@ -53,6 +53,7 @@ const usage_text =
     \\                     add --sort symbols to rank biggest-first
     \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
     \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
+    \\  coverage [path]    % of fn/method reachable from a test (call-graph, no instrumentation)
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -63,6 +64,10 @@ const usage_text =
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  --sort <path|symbols>                  files: order by path (default) or symbol count
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
+    \\  -t, --tests <with|without|only>        Test-scope for outline/search/callers/hot:
+    \\                                         include tests (default), exclude (--no-tests),
+    \\                                         or only tests (--tests-only). Test = a Zig
+    \\                                         `test` block, a test_* fn, or a test-dir file.
     \\  -s, --strict                           Follow only high-confidence edges
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
@@ -86,6 +91,9 @@ const usage_text =
     \\  navgraph search resolve --refs
     \\  navgraph neighbors resolveOne
     \\  navgraph unused --no-public --no-test
+    \\  navgraph callers parse --tests-only        # which tests exercise parse
+    \\  navgraph outline src --no-tests            # production structure only
+    \\  navgraph coverage src                      # test reach per file
     \\  navgraph path parse emit
     \\
 ;
@@ -148,6 +156,7 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "read", Command.read },       .{ "cat", Command.read },
         .{ "strings", Command.strings }, .{ "str", Command.strings },
         .{ "literals", Command.strings },
+        .{ "coverage", Command.coverage }, .{ "cov", Command.coverage },
 
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },
@@ -161,7 +170,7 @@ fn parseCommand(s: []const u8) ?Command {
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff => true,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage => true,
         .path => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
@@ -199,8 +208,20 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.file_sort = query.FileSort.parse(try f.value(args, i)) orelse return error.BadValue;
         return f.next(i);
     }
+    if (eqAny(f.name, &.{ "-t", "--tests" })) {
+        out.options.tests = query.TestScope.parse(try f.value(args, i)) orelse return error.BadValue;
+        return f.next(i);
+    }
     // Boolean flags: an attached `=value` is a usage error.
     if (f.inline_val != null) return error.BadValue;
+    if (eqAny(f.name, &.{"--no-tests"})) {
+        out.options.tests = .without;
+        return i;
+    }
+    if (eqAny(f.name, &.{"--tests-only"})) {
+        out.options.tests = .only;
+        return i;
+    }
     if (eqAny(f.name, &.{ "-s", "--strict" })) {
         out.options.strict = true;
         return i;
@@ -805,4 +826,20 @@ test "parse: multiple mixed flags accumulate onto one Parsed" {
     try std.testing.expectEqualStrings("fn", p.options.kinds);
     try std.testing.expect(p.options.strict);
     try std.testing.expectEqual(query.OutputFormat.json, p.options.format);
+}
+
+test "coverage command and unified --tests scope selector" {
+    const t = std.testing;
+    try t.expectEqual(Command.coverage, (try parse(&.{"coverage"})).command);
+    try t.expectEqual(Command.coverage, (try parse(&.{"cov"})).command);
+    // value form (next token, short alias, attached)
+    try t.expectEqual(query.TestScope.only, (try parse(&.{ "callers", "foo", "--tests", "only" })).options.tests);
+    try t.expectEqual(query.TestScope.without, (try parse(&.{ "outline", "-t", "without" })).options.tests);
+    try t.expectEqual(query.TestScope.with, (try parse(&.{ "outline", "--tests=with" })).options.tests);
+    // boolean aliases
+    try t.expectEqual(query.TestScope.without, (try parse(&.{ "outline", "--no-tests" })).options.tests);
+    try t.expectEqual(query.TestScope.only, (try parse(&.{ "callers", "foo", "--tests-only" })).options.tests);
+    // default is `with`
+    try t.expectEqual(query.TestScope.with, (try parse(&.{"outline"})).options.tests);
+    try t.expectError(error.BadValue, parse(&.{ "outline", "--tests", "nope" }));
 }

@@ -288,7 +288,7 @@ fn walkCallers(
 /// is the share of callers in test files; `--strict` drops entries whose
 /// connectivity is entirely heuristic.
 pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
-    const ranked = try query.collectHot(idx, filter);
+    const ranked = try query.collectHot(idx, filter, opts.tests);
     defer idx.gpa.free(ranked);
     const limit = query.hotLimit(opts);
     try w.writeByte('[');
@@ -498,6 +498,43 @@ pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Option
         try w.print(",\"lang\":\"{s}\",\"symbols\":{d}}}", .{ file.language.tag(), query.fileSymbolCount(idx, file) });
     }
     try w.writeAll("]\n");
+}
+
+pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    _ = opts;
+    const reached = try query.testReachable(idx, idx.gpa);
+    defer idx.gpa.free(reached);
+    var total: u32 = 0;
+    var covered: u32 = 0;
+    var first = true;
+    try w.writeAll("{\"files\":[");
+    for (idx.graph.files) |file| {
+        if (!query.matchesFilter(file.path, filter)) continue;
+        var ft: u32 = 0;
+        var fc: u32 = 0;
+        var i = file.sym_start;
+        while (i < file.sym_end) : (i += 1) {
+            const sym = idx.graph.symbols[i];
+            if (sym.kind != .function and sym.kind != .method) continue;
+            if (query.isTestSymbol(idx, sym)) continue;
+            ft += 1;
+            if (reached[sym.id]) fc += 1;
+        }
+        if (ft == 0) continue;
+        total += ft;
+        covered += fc;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"file\":");
+        try writeString(w, file.path);
+        try w.print(",\"covered\":{d},\"total\":{d},\"percent\":{d:.1}}}", .{ fc, ft, covPct(fc, ft) });
+    }
+    try w.print("],\"covered\":{d},\"total\":{d},\"percent\":{d:.1}}}\n", .{ covered, total, covPct(covered, total) });
+}
+
+fn covPct(num: u32, den: u32) f64 {
+    if (den == 0) return 100.0;
+    return 100.0 * @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
 }
 
 pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {

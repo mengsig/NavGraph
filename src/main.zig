@@ -70,6 +70,7 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .path => try query.shortestPath(out, idx, parsed.arg, parsed.arg2, parsed.options),
         .hot => try query.hot(out, idx, parsed.arg, parsed.options),
         .diff => try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .coverage => try query.coverage(out, idx, parsed.arg, parsed.options),
         .help => unreachable,
     }
 }

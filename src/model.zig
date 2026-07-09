@@ -27,6 +27,10 @@ pub const SymbolKind = enum {
     module,
     import,
     route,
+    /// A test unit with its own body/call-graph: a Zig `test "…" {}` block (and,
+    /// in future, other native test constructs). Kept as a first-class symbol so
+    /// `callers`/`coverage` can see which tests exercise a function.
+    test_case,
     unknown,
 
     pub fn tag(self: SymbolKind) []const u8 {
@@ -45,6 +49,7 @@ pub const SymbolKind = enum {
             .module => "mod",
             .import => "import",
             .route => "route",
+            .test_case => "test",
             .unknown => "sym",
         };
     }
@@ -322,7 +327,7 @@ test "SymbolKind.tag is unique across every kind" {
         }
         seen += 1;
     }
-    try std.testing.expectEqual(@as(usize, 15), seen);
+    try std.testing.expectEqual(@as(usize, 16), seen);
 }
 
 test "isTopLevelInteresting is false only for import, field and unknown" {
@@ -343,6 +348,7 @@ test "isTopLevelInteresting is false only for import, field and unknown" {
     try std.testing.expect(SymbolKind.macro.isTopLevelInteresting());
     try std.testing.expect(SymbolKind.module.isTopLevelInteresting());
     try std.testing.expect(SymbolKind.route.isTopLevelInteresting());
+    try std.testing.expect(SymbolKind.test_case.isTopLevelInteresting());
 }
 
 test "isTopLevelInteresting count matches expectation across all kinds" {
@@ -356,7 +362,7 @@ test "isTopLevelInteresting count matches expectation across all kinds" {
         }
     }
     try std.testing.expectEqual(@as(usize, 3), boring);
-    try std.testing.expectEqual(@as(usize, 12), interesting);
+    try std.testing.expectEqual(@as(usize, 13), interesting);
 }
 
 test "Mods.any is false for the empty modifier set" {

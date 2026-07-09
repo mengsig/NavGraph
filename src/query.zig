@@ -35,6 +35,29 @@ pub const FileSort = enum {
     }
 };
 
+/// Unified test-scope selector shared by every verb: whether test code (Zig
+/// `test` blocks, `test_*` functions, files under a test dir) is in view.
+///   `with`    — production + tests (the default)
+///   `without` — production only (alias `--no-tests`)
+///   `only`    — tests only (alias `--tests-only`)
+pub const TestScope = enum {
+    with,
+    without,
+    only,
+
+    pub fn parse(s: []const u8) ?TestScope {
+        if (eqAny(s, &.{ "with", "both", "all" })) return .with;
+        if (eqAny(s, &.{ "without", "no", "none", "exclude", "prod" })) return .without;
+        if (eqAny(s, &.{ "only", "tests", "test" })) return .only;
+        return null;
+    }
+
+    fn eqAny(s: []const u8, opts: []const []const u8) bool {
+        for (opts) |o| if (std.mem.eql(u8, s, o)) return true;
+        return false;
+    }
+};
+
 /// Default result cap (also a sentinel: `limit == default_limit` means "the user
 /// did not pass -l", which `hot` uses to pick its own shorter default).
 pub const default_limit: u32 = 300;
@@ -71,7 +94,31 @@ pub const Options = struct {
     unused_follow_imports: bool = false,
     /// `files`: result ordering (discovery order or descending symbol count).
     file_sort: FileSort = .path,
+    /// Unified test-scope selector: include test code (default), exclude it
+    /// (`--no-tests`), or restrict to it (`--tests-only`). Applies to
+    /// `outline`/`search`/`callers`/`hot`.
+    tests: TestScope = .with,
 };
+
+/// Whether `sym` is test code: a Zig `test` block, a symbol in a test file/dir,
+/// or a `test_*` function (pytest). Drives the `--tests` scope selector and the
+/// `coverage` seed set.
+pub fn isTestSymbol(idx: *const Index, sym: model.Symbol) bool {
+    if (sym.kind == .test_case) return true;
+    const file = idx.graph.files[sym.file];
+    if (isTestPath(file.path)) return true;
+    if (file.language == .python and std.mem.startsWith(u8, sym.name, "test_")) return true;
+    return false;
+}
+
+/// Apply the `--tests` scope selector to a symbol's test-ness.
+fn inTestScope(scope: TestScope, is_test: bool) bool {
+    return switch (scope) {
+        .with => true,
+        .without => !is_test,
+        .only => is_test,
+    };
+}
 
 /// Whether `kind` passes the (comma-separated) `--kind` filter. Empty filter
 /// matches everything. Matches against the short tag (`fn`, `struct`, `route`…)
@@ -149,7 +196,9 @@ pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Opt
     var summarized: u32 = 0;
     for (idx.graph.files) |file| {
         if (!matchesFilter(file.path, path_filter)) continue;
-        if (!fileHasVisible(idx, file)) continue;
+        // Skip a file with nothing to show under the active kind/test-scope
+        // filters, so `--tests only`/`--no-tests` never print an empty header.
+        if (visibleSymbolCount(idx, file, opts) == 0) continue;
         any = true;
         try w.print("# {s} ({s})\n", .{ file.path, file.language.tag() });
         // Once the symbol budget is spent, keep naming every remaining file (with
@@ -207,6 +256,7 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         const indent = 1 + parentDepth(idx, sym);
         try render.symbol(w, idx, sym, opts.verbosity, indent, false);
         count += 1;
@@ -227,17 +277,10 @@ fn visibleSymbolCount(idx: *const Index, file: model.SourceFile, opts: Options) 
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         count += 1;
     }
     return count;
-}
-
-fn fileHasVisible(idx: *const Index, file: model.SourceFile) bool {
-    var i = file.sym_start;
-    while (i < file.sym_end) : (i += 1) {
-        if (idx.graph.symbols[i].kind != .import) return true;
-    }
-    return false;
 }
 
 fn parentDepth(idx: *const Index, sym: model.Symbol) usize {
@@ -628,6 +671,9 @@ fn walkCallers(
     defer lines.deinit(idx.gpa);
     for (idx.callersOf(id)) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
+        // `--tests only` keeps only test callers ("which tests exercise this");
+        // `--no-tests` keeps only production callers.
+        if (!inTestScope(opts.tests, isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
         // The edge (caller → this symbol) lives at its call site(s) in the caller.
         try callSiteLines(idx, cid, id, &lines);
         try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), visited, heuristic);
@@ -653,6 +699,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         if (std.mem.indexOf(u8, sym.name, pattern) == null) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         shown += 1;
@@ -767,7 +814,7 @@ fn fanOutExact(sym: model.Symbol) u32 {
 /// fan-out. Honors an optional path `filter` and `-l` for the count.
 pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
     if (opts.format == .json) return json_out.hot(w, idx, filter, opts);
-    const ranked = try collectHot(idx, filter);
+    const ranked = try collectHot(idx, filter, opts.tests);
     defer idx.gpa.free(ranked);
     // `hot` is an orientation view — a short ranked list is the point, so it
     // caps at a small default (raise `-l` for more) via the limit sentinel.
@@ -845,7 +892,7 @@ pub const HotEntry = struct {
 /// Collect callable symbols under `filter`, sorted by *exact* fan-in then exact
 /// fan-out (descending), so heuristic name-collision edges can't float a symbol
 /// to the top. Ties fall back to total fan-in/out. Caller frees the slice.
-pub fn collectHot(idx: *const Index, filter: []const u8) ![]HotEntry {
+pub fn collectHot(idx: *const Index, filter: []const u8, scope: TestScope) ![]HotEntry {
     // Exact incoming-edge count per symbol (heuristic `?` edges excluded), so a
     // symbol's rank reflects edges we can actually stand behind.
     var exact_in = try idx.gpa.alloc(u32, idx.graph.symbols.len);
@@ -861,6 +908,7 @@ pub fn collectHot(idx: *const Index, filter: []const u8) ![]HotEntry {
     for (idx.graph.symbols) |sym| {
         if (sym.kind != .function and sym.kind != .method) continue;
         if (!matchesFilter(idx.graph.files[sym.file].path, filter)) continue;
+        if (!inTestScope(scope, isTestSymbol(idx, sym))) continue;
         const fan_in: u32 = @intCast(idx.callersOf(sym.id).len);
         const fan_out = fanOut(sym);
         if (fan_in == 0 and fan_out == 0) continue; // isolated: not informative
@@ -887,6 +935,81 @@ fn hotLessThan(_: void, a: HotEntry, b: HotEntry) bool {
     if (a.fan_in != b.fan_in) return a.fan_in > b.fan_in;
     if (a.fan_out != b.fan_out) return a.fan_out > b.fan_out;
     return a.id < b.id;
+}
+
+fn pct(num: u32, den: u32) f64 {
+    if (den == 0) return 100.0;
+    return 100.0 * @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
+}
+
+/// Mark every symbol reachable in the call graph from a test symbol (BFS over
+/// resolved edges from the `isTestSymbol` seed set). Caller owns the returned
+/// slice, indexed by `SymbolId`. Backs `coverage`.
+pub fn testReachable(idx: *const Index, gpa: std.mem.Allocator) ![]bool {
+    const reached = try gpa.alloc(bool, idx.graph.symbols.len);
+    errdefer gpa.free(reached);
+    @memset(reached, false);
+    var work: std.ArrayList(SymbolId) = .empty;
+    defer work.deinit(gpa);
+    for (idx.graph.symbols) |sym| {
+        if (isTestSymbol(idx, sym) and !reached[sym.id]) {
+            reached[sym.id] = true;
+            try work.append(gpa, sym.id);
+        }
+    }
+    var wi: usize = 0;
+    while (wi < work.items.len) : (wi += 1) {
+        for (idx.graph.symbols[work.items[wi]].refs) |ref| {
+            if (ref.target != invalid and !reached[ref.target]) {
+                reached[ref.target] = true;
+                try work.append(gpa, ref.target);
+            }
+        }
+    }
+    return reached;
+}
+
+/// `coverage [path]` — for each file, the fraction of its non-test fn/method
+/// symbols reachable in the call graph from at least one test. A dependency-free,
+/// language-agnostic substitute for line coverage (kcov cannot read Zig 0.16's
+/// DWARF5). Conservative: only resolved edges are followed, so real coverage is
+/// at least the number reported.
+pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    if (opts.format == .json) return json_out.coverage(w, idx, filter, opts);
+    const reached = try testReachable(idx, idx.gpa);
+    defer idx.gpa.free(reached);
+    var total: u32 = 0;
+    var covered: u32 = 0;
+    var any = false;
+    var shown: u32 = 0;
+    for (idx.graph.files) |file| {
+        if (!matchesFilter(file.path, filter)) continue;
+        var ft: u32 = 0;
+        var fc: u32 = 0;
+        var i = file.sym_start;
+        while (i < file.sym_end) : (i += 1) {
+            const sym = idx.graph.symbols[i];
+            if (sym.kind != .function and sym.kind != .method) continue;
+            if (isTestSymbol(idx, sym)) continue;
+            ft += 1;
+            if (reached[sym.id]) fc += 1;
+        }
+        if (ft == 0) continue;
+        any = true;
+        total += ft;
+        covered += fc;
+        if (shown < opts.limit) {
+            try w.print("  {d:>5.1}%  {s}  ({d}/{d})\n", .{ pct(fc, ft), file.path, fc, ft });
+            shown += 1;
+        }
+    }
+    if (!any) {
+        try w.print("(no fn/method symbols under '{s}')\n", .{filter});
+        try skippedNote(w, idx);
+        return;
+    }
+    try truncationNote(w, opts, shown);
+    try w.print("  overall: {d:.1}%  ({d}/{d} fn/method reachable from a test)\n", .{ pct(covered, total), covered, total });
 }
 
 /// List HTTP route definitions and, under each, its handler (callee) and the
@@ -2412,7 +2535,7 @@ test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly
     try testing.expect(idx.callersOf(create_run.id).len > 0);
 
     // Its fan-in is entirely heuristic: total > 0, exact == 0.
-    const ranked = try collectHot(&idx, "");
+    const ranked = try collectHot(&idx, "", .with);
     defer idx.gpa.free(ranked);
     var found = false;
     for (ranked) |e| {
@@ -3125,7 +3248,7 @@ test "hot ranks the most-called function first" {
     var idx = try index_mod.build(testing.allocator, io, root, false);
     defer idx.deinit();
 
-    const ranked = try collectHot(&idx, "");
+    const ranked = try collectHot(&idx, "", .with);
     defer idx.gpa.free(ranked);
     try testing.expect(ranked.len >= 2);
     // `shared` has 3 callers (a, b, c) — the most, so it ranks first.
@@ -3164,7 +3287,7 @@ test "hot splits test callers from production callers" {
     var idx = try index_mod.build(testing.allocator, io, root, false);
     defer idx.deinit();
 
-    const ranked = try collectHot(&idx, "");
+    const ranked = try collectHot(&idx, "", .with);
     defer idx.gpa.free(ranked);
     try testing.expectEqualStrings("shared", idx.graph.symbols[ranked[0].id].name);
     try testing.expectEqual(@as(u32, 1), ranked[0].fan_in_test);
@@ -4279,5 +4402,67 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         defer aw.deinit();
         try hot(&aw.writer, &idx, "missing", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no functions under 'missing'") != null);
+    }
+}
+
+test "TestScope.parse accepts aliases and rejects garbage" {
+    try std.testing.expectEqual(TestScope.with, TestScope.parse("with").?);
+    try std.testing.expectEqual(TestScope.with, TestScope.parse("both").?);
+    try std.testing.expectEqual(TestScope.without, TestScope.parse("no").?);
+    try std.testing.expectEqual(TestScope.only, TestScope.parse("only").?);
+    try std.testing.expect(TestScope.parse("bogus") == null);
+}
+
+test "test-awareness: Zig test block is a caller; --tests scope + coverage" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn used() u32 { return 1; }
+        \\pub fn coveredNever() u32 { return 2; }
+        \\test "exercises used" {
+        \\    _ = used();
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The `test` block is a first-class symbol and a caller of `used`.
+    const used = idx.lookup("used")[0];
+    const test_sym = idx.graph.symbols[idx.lookup("exercises used")[0]];
+    try testing.expectEqual(model.SymbolKind.test_case, test_sym.kind);
+    try testing.expect(isTestSymbol(&idx, test_sym));
+    try testing.expect(!isTestSymbol(&idx, idx.graph.symbols[used]));
+    try testing.expectEqual(test_sym.id, idx.callersOf(used)[0]);
+
+    // `callers used --tests-only` shows the test; `--no-tests` shows nothing.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "used", true, .{ .tests = .only });
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "exercises used") != null);
+    }
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try walk(&aw.writer, &idx, "used", true, .{ .tests = .without });
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "exercises used") == null);
+    }
+
+    // coverage: `used` is reachable from the test, `coveredNever` is not → 50%.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        try coverage(&aw.writer, &idx, "", .{});
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "50.0%") != null);
     }
 }

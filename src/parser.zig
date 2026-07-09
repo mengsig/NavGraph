@@ -713,7 +713,44 @@ fn parseZigDecl(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !u32 {
     if (ctx.identEql(k, "const") or ctx.identEql(k, "var")) {
         return parseZigConst(ctx, i, k, hi, parent, exported);
     }
+    if (ctx.identEql(k, "test")) return parseZigTest(ctx, i, k, hi, parent);
     return i;
+}
+
+/// A Zig `test "name" { ... }` block (or `test ident {}` / `test {}`). Emitted as
+/// a `.test_case` symbol whose body references are collected like any function's,
+/// so `callers foo` can show the tests that exercise `foo` and `coverage` can
+/// measure test reach. The name is the test string / identifier, or "test".
+fn parseZigTest(ctx: *Ctx, start_i: u32, test_i: u32, hi: u32, parent: ?u32) !u32 {
+    var name: []const u8 = "test";
+    var j = test_i + 1;
+    if (j < hi and ctx.toks[j].kind == .string) {
+        name = stripQuotes(ctx.textOf(j));
+        j += 1;
+    } else if (j < hi and ctx.toks[j].kind == .identifier) {
+        name = ctx.textOf(j);
+        j += 1;
+        while (j + 1 < hi and ctx.isPunct(j, '.') and ctx.toks[j + 1].kind == .identifier) j += 2;
+    }
+    const body_open = findNext(ctx, j, hi, '{');
+    if (body_open == sentinel or ctx.close[body_open] == sentinel) return start_i;
+    const body_close = ctx.close[body_open];
+    const span_start = lineStartOffset(ctx, start_i);
+    const body = try collectRefs(ctx, sentinel, body_open + 1, body_close, "", zig_keywords);
+    _ = try emit(ctx, .{
+        .name = if (name.len == 0) "test" else name,
+        .kind = .test_case,
+        .line = ctx.toks[test_i].line,
+        .span_start = span_start,
+        .span_end = ctx.toks[body_close].end,
+        .sig_end = ctx.toks[body_open].start,
+        .doc = "",
+        .exported = false,
+        .parent_local = parent,
+        .refs = body.refs,
+        .bindings = body.bindings,
+    });
+    return tokenAfterOffset(ctx, ctx.toks[body_close].end, hi);
 }
 
 fn isZigModifier(ctx: *const Ctx, i: u32) bool {
@@ -4275,7 +4312,7 @@ test "ruby: endless methods and bang/question method names" {
     try testing.expect(double.parent_local != null);
 }
 
-test "zig: enum and tagged union are indexed; a test block yields no phantom symbol" {
+test "zig: enum and tagged union are indexed; a test block is a test_case symbol with body refs" {
     const src =
         \\pub const Dir = enum { north, south };
         \\pub const Payload = union(enum) { a: u8, b: u16 };
@@ -4288,10 +4325,13 @@ test "zig: enum and tagged union are indexed; a test block yields no phantom sym
     try testing.expectEqual(SymbolKind.@"enum", findSym(out.items, "Dir").?.kind);
     // A `union(enum)` is modeled as a struct-like container.
     try testing.expectEqual(SymbolKind.@"struct", findSym(out.items, "Payload").?.kind);
-    // The `test "adds"` block is not a definition — neither it nor its inner call
-    // becomes a symbol.
+    // The `test "adds"` block is now a first-class `.test_case` symbol named by
+    // its test string, and its body call `add(1)` is recorded as a reference, so
+    // `callers add` can show the test. `add` itself is still not a definition.
+    const t = findSym(out.items, "adds").?;
+    try testing.expectEqual(SymbolKind.test_case, t.kind);
+    try testing.expect(hasCallRef(t, "add"));
     try testing.expect(findSym(out.items, "add") == null);
-    try testing.expect(findSym(out.items, "adds") == null);
 }
 
 test "python: subclass async method captures nested fn and call refs" {
