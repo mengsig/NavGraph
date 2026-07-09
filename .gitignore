@@ -5,3 +5,6 @@ zig-out/
 .navgraph/
 coverage-out/
 .claude/
+# generated visualization output at the repo root (navgraph graph > graph.html);
+# src/viz.html is the template and is tracked (this pattern is root-anchored).
+/*.html

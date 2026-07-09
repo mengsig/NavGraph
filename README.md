@@ -2,6 +2,13 @@
 
 **Steroids for a coding agent's understanding of a repository.**
 
+<p align="center">
+  <img src="assets/navgraph-graph.gif" alt="NavGraph rendering its own source as an interactive, dependency-layered graph — callers on top, callees below, click any symbol to trace its callers and callees" width="840">
+</p>
+<p align="center">
+  <sub><b><code>navgraph graph src &gt; graph.html</code></b> — the whole codebase as one interactive, dependency-layered page (callers → callees, top-down). Click a symbol to trace it. <a href="#visualize-the-graph">Details ↓</a></sub>
+</p>
+
 NavGraph builds a dependency graph of your codebase — definitions, calls,
 references, imports — and exposes it through a fast CLI that emits
 *hyper-compressed*, token-frugal views. It is designed so an agent can navigate
@@ -44,16 +51,26 @@ navgraph coverage src            # per-file % + overall, computed natively
 navgraph coverage src -j         # same, as JSON
 ```
 
-Visualize the whole graph as a **standalone, offline HTML page** — a **layered
-dependency view** (callers on top, callees below, edges flowing downward), with a
-force-directed mode one click away. Zoom, pan, search, and click any symbol to
-trace its callers/callees; colored by file. No server, no CDN, no dependencies:
-the data and the renderer are inlined into one self-contained file.
+## Visualize the graph
+
+Turn the whole graph into a **standalone, offline HTML page** — the animation at
+the top is NavGraph rendering *its own* source. It's a **layered dependency view**
+(callers on top, callees below, edges flowing downward), with a force-directed
+mode one click away. Zoom, pan, search, and **click any symbol to trace its
+callers/callees**; nodes are sized by fan-in and colored by file. No server, no
+CDN, no dependencies — the data *and* the renderer are inlined into one
+self-contained file you can open (or email) anywhere.
 
 ```sh
 navgraph graph src --no-tests > graph.html   # then open graph.html in a browser
-navgraph graph -j > graph.json               # raw {nodes, edges} model for other tools
+navgraph graph                                # whole repo (tests hidden in the initial view)
+navgraph graph -C src/lexer.zig > lexer.html  # scope to a single file
+navgraph graph -j > graph.json                # raw {nodes, edges} model for other tools
 ```
+
+> Tip: GitHub won't run the page's JavaScript inline, so a repo shows a
+> screenshot/GIF like the one above — but the file itself is fully interactive the
+> moment you open it locally.
 
 ## Usage
 
