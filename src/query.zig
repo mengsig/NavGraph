@@ -1995,12 +1995,6 @@ pub fn isDeadCandidateScoped(
     return matchesFilter(idx.graph.files[sym.file].path, filter);
 }
 
-/// `isDeadCandidateScoped` with the production-focused (`without`) scope — the
-/// stable 4-arg form used by callers/tests that predate the `--tests` selector.
-pub fn isDeadCandidate(idx: *const Index, sym: model.Symbol, filter: []const u8, refs: *const RefSets) !bool {
-    return isDeadCandidateScoped(idx, sym, filter, refs, .without);
-}
-
 /// Whether `sym` counts as used. By default this is the safe family-wide name
 /// tally. Under `--follow-imports` a *colliding* name (defined more than once in
 /// its family, which the tally can't disambiguate) is instead resolved by import
@@ -2348,8 +2342,8 @@ test "shortest path and dead-code detection over a call chain" {
     defer ref_names.deinit();
     const orphan = idx.graph.symbols[idx.lookup("orphan")[0]];
     const gamma = idx.graph.symbols[idx.lookup("gamma")[0]];
-    try testing.expect(try isDeadCandidate(&idx, orphan, "", &ref_names));
-    try testing.expect(!try isDeadCandidate(&idx, gamma, "", &ref_names));
+    try testing.expect(try isDeadCandidateScoped(&idx, orphan, "", &ref_names, .without));
+    try testing.expect(!try isDeadCandidateScoped(&idx, gamma, "", &ref_names, .without));
 }
 
 test "calls hides var/const data reads by default, shows them with --refs; graph stays symmetric" {
@@ -2560,7 +2554,7 @@ test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly
     // The dispatch heuristic gives it a caller, so it is NOT dead code.
     var ref_names = try buildReferencedNames(&idx);
     defer ref_names.deinit();
-    try testing.expect(!try isDeadCandidate(&idx, create_run, "", &ref_names));
+    try testing.expect(!try isDeadCandidateScoped(&idx, create_run, "", &ref_names, .without));
     try testing.expect(idx.callersOf(create_run.id).len > 0);
 
     // Its fan-in is entirely heuristic: total > 0, exact == 0.
@@ -2694,8 +2688,8 @@ test "unused: a dead symbol is flagged despite a used same-name twin in another 
     const py_ids = resolveIds(&idx, "getOptions@service.py", &pbuf);
     try testing.expect(ts_ids.len == 1 and py_ids.len == 1);
     // Dead in the JS family, live in the Python family — scoped independently.
-    try testing.expect(try isDeadCandidate(&idx, idx.graph.symbols[ts_ids[0]], "", &refs));
-    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[py_ids[0]], "", &refs));
+    try testing.expect(try isDeadCandidateScoped(&idx, idx.graph.symbols[ts_ids[0]], "", &refs, .without));
+    try testing.expect(!try isDeadCandidateScoped(&idx, idx.graph.symbols[py_ids[0]], "", &refs, .without));
 }
 
 test "unused --follow-imports flags a same-family dead twin the tally masks" {
@@ -2733,15 +2727,15 @@ test "unused --follow-imports flags a same-family dead twin the tally masks" {
     // Default: family tally masks both (each is "used" because the name is used).
     var refs = try buildReferencedNames(&idx);
     defer refs.deinit();
-    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[a_id], "", &refs));
-    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[b_id], "", &refs));
+    try testing.expect(!try isDeadCandidateScoped(&idx, idx.graph.symbols[a_id], "", &refs, .without));
+    try testing.expect(!try isDeadCandidateScoped(&idx, idx.graph.symbols[b_id], "", &refs, .without));
 
     // --follow-imports: a is unreachable (dead), b is used via the barrel (live).
     var scoped = try buildReferencedNames(&idx);
     defer scoped.deinit();
     scoped.scope = try buildCollisionScope(&idx);
-    try testing.expect(try isDeadCandidate(&idx, idx.graph.symbols[a_id], "", &scoped));
-    try testing.expect(!try isDeadCandidate(&idx, idx.graph.symbols[b_id], "", &scoped));
+    try testing.expect(try isDeadCandidateScoped(&idx, idx.graph.symbols[a_id], "", &scoped, .without));
+    try testing.expect(!try isDeadCandidateScoped(&idx, idx.graph.symbols[b_id], "", &scoped, .without));
 }
 
 test "unused: a multi-line decorator suppresses a framework-wired handler" {
@@ -4562,7 +4556,7 @@ test "unused: a JS object-literal key does not mask a dead function (tally scope
     defer refs.deinit();
     // `{ tallyThing: 1 }` is an object key, not a call — so tallyThing is dead.
     const dead = idx.graph.symbols[idx.lookup("tallyThing")[0]];
-    try testing.expect(try isDeadCandidate(&idx, dead, "", &refs));
+    try testing.expect(try isDeadCandidateScoped(&idx, dead, "", &refs, .without));
 }
 
 test "unused: a dead @dataclass class is reported (decorated classes are not framework-wired)" {
@@ -4589,6 +4583,6 @@ test "unused: a dead @dataclass class is reported (decorated classes are not fra
     defer refs.deinit();
     const dead = idx.graph.symbols[idx.lookup("DeadRow")[0]];
     const live = idx.graph.symbols[idx.lookup("LiveRow")[0]];
-    try testing.expect(try isDeadCandidate(&idx, dead, "", &refs)); // dead dataclass surfaces
-    try testing.expect(!try isDeadCandidate(&idx, live, "", &refs)); // used one does not
+    try testing.expect(try isDeadCandidateScoped(&idx, dead, "", &refs, .without)); // dead dataclass surfaces
+    try testing.expect(!try isDeadCandidateScoped(&idx, live, "", &refs, .without)); // used one does not
 }
