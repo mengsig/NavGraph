@@ -99,7 +99,16 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     }
     const arena = arena_box.allocator();
 
-    var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    // `-C <path>` normally names a directory. If it names a single file, index
+    // just that file (rooted at its parent dir) instead of erroring with NotDir —
+    // so `outline -C src/parser.zig` scopes to one file.
+    var single_file: ?[]const u8 = null;
+    var root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch |err| dir: {
+        if (err != error.NotDir) return err;
+        single_file = std.fs.path.basename(root_path);
+        const dir_part = std.fs.path.dirname(root_path) orelse ".";
+        break :dir try std.Io.Dir.cwd().openDir(io, dir_part, .{ .iterate = true });
+    };
     defer root_dir.close(io);
 
     var b = Builder{
@@ -124,7 +133,12 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
 
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
-    try collectDir(&b, root_dir, &path_buf);
+    if (single_file) |f| {
+        // An explicitly-named file is indexed directly (no .gitignore pruning).
+        try maybeAddFile(&b, f);
+    } else {
+        try collectDir(&b, root_dir, &path_buf);
+    }
 
     const graph = model.Graph{
         .files = try gpa.dupe(model.SourceFile, b.files.items),
@@ -2110,4 +2124,21 @@ test "scope-blind refs: JS object key and param do not create false caller edges
     // key and the `count` parameter are not references to it.
     const count = qualifiedFileSym(&idx, "db.js", "count").?;
     try testing.expectEqual(@as(usize, 0), idx.callersOf(count).len);
+}
+
+test "build indexes a single file when the root path names a file, not a directory" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub fn one() u32 { return 1; }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "pub fn two() u32 { return 2; }" });
+    var path_buf: [256]u8 = undefined;
+    const file_root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, file_root, false);
+    defer idx.deinit();
+    // Only a.zig is indexed; its symbol resolves, b.zig's does not.
+    try testing.expectEqual(@as(usize, 1), idx.graph.files.len);
+    try testing.expectEqual(@as(usize, 1), idx.lookup("one").len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("two").len);
 }

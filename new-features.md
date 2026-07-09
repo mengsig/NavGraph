@@ -251,29 +251,33 @@ in §C).
 
 ---
 
-## K. Engine bugs found while writing the Zig unit tests
+## K. Engine bugs found while writing the Zig unit tests  **[✅ several shipped]**
 
 Writing white-box tests against the parser/index surfaced defects that
 black-box fixture dogfooding didn't. Each was observed by asserting on the
 in-memory graph (`idx.graph.symbols[...].refs`, `callersOf`, `findSym`).
 
-- **[bug] Single-line Go `import "fmt"` binds the wrong name.** `emitGoImport`
-  treats the preceding `import` keyword (same-line identifier) as an alias, so
-  the import binds the name `"import"` instead of `fmt`. The grouped
-  `import ( "fmt" )` form is fine — so single vs grouped imports disagree.
-- **[bug/gap] Direct self-recursion produces no call edge.** For
-  `fn rec() void { rec(); }`, `rec` has **zero refs** — the self-call is dropped,
-  so `calls rec`, `callers rec`, and `hot` all under-count recursive functions.
+- **[✅ shipped] Single-line Go `import "fmt"` bound the wrong name.**
+  `emitGoImport` treated the preceding `import` keyword as an alias, binding the
+  import as `"import"`; it now skips the keyword and binds `fmt`.
+- **[✅ shipped] Rust `impl<'a> Type<'a>` orphaned its methods.**
+  `rustImplTypeName` grabbed the last identifier before `{` (a lifetime); it now
+  skips the impl's generic clause and each type's own args, nesting methods under
+  the real type.
+- **[✅ shipped] `-C <file>` (a single file path)** now scopes the index to that
+  file instead of erroring with `NotDir`.
+- **[✅ shipped] Zig `test` blocks omitted from `outline`** — fixed in §A1.
 - **[gap] `import type X from '...'` binds the literal name `type`.** The `type`
   keyword is only skipped before `{`/`*`, so a default type-only import emits an
   import symbol literally named `type`.
 - **[gap] Lua colon-method calls drop the receiver.** `memberQualifier` handles
   `.`/`->`/`::`/`?.`/`!.` but not Lua's `self:helper()`, so the `self` receiver
   is lost and the call can't be type-scoped (unlike `self.helper()`).
-- **[gap] Zig `test` blocks omitted from `outline`** — independently confirms §A1.
-- **[nice] `-C <file>` (a single file path) errors with `NotDir`** instead of
-  scoping the index to just that file — a natural "index only this file" request
-  that fails. `-C` currently must be a directory.
+- **[gap, deliberate?] Direct self-recursion produces no call edge.** For
+  `fn rec() void { rec(); }`, `rec` has zero refs — a *bare* self-reference is
+  suppressed by design (recursion noise) and the resolver also skips self-binding.
+  Surfacing it (with a recursion marker) would let `calls`/`callers`/`hot` reflect
+  recursive functions, but it's a design change, not an obvious bug — left as-is.
 - **[nice] Single-character reference names are dropped.** `collectRefs` skips
   identifiers with `name.len < 2`, so a `p->x()` call/field (1-char name, valid
   in C/Go) is never recorded as an edge.

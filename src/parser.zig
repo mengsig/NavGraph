@@ -2743,8 +2743,12 @@ fn emitGoImport(ctx: *Ctx, str_i: u32) AllocError!void {
     if (path.len == 0) return;
     var binding = lastPathSegment(path);
     var span_start_tok = str_i;
+    // A preceding same-line identifier is an import alias (`alias "path"`) — but
+    // NOT the `import` keyword itself of a single, ungrouped `import "fmt"`, which
+    // would otherwise bind the import under the name "import".
     if (str_i > 0 and ctx.toks[str_i - 1].kind == .identifier and
-        ctx.toks[str_i - 1].line == ctx.toks[str_i].line)
+        ctx.toks[str_i - 1].line == ctx.toks[str_i].line and
+        !ctx.identEql(str_i - 1, "import"))
     {
         binding = ctx.textOf(str_i - 1);
         span_start_tok = str_i - 1;
@@ -3014,22 +3018,38 @@ fn rustImplBodyOpen(ctx: *const Ctx, from: u32, hi: u32) u32 {
 /// The last path segment of the type an `impl` targets: the identifier after
 /// `for` in `impl Trait for Type`, else the first path's last segment.
 fn rustImplTypeName(ctx: *const Ctx, from: u32, open: u32) []const u8 {
-    var last_ident: []const u8 = "";
-    var j = from;
-    var after_for = false;
+    // Skip the impl's own generic-parameter clause so `impl<'a> Lexer<'a>` binds
+    // to `Lexer`, not the lifetime `'a` (the old last-identifier scan grabbed the
+    // final ident before `{`, which for a generic-parameterized impl is inside the
+    // `<…>` — orphaning every method to the top level).
+    var j = skipRustGenerics(ctx, from, open);
+    var type_ident: []const u8 = "";
     var for_ident: []const u8 = "";
+    var after_for = false;
     while (j < open) : (j += 1) {
+        // A type's own generic arguments (`Lexer<'a>`, `Vec<T>`) are not the name.
+        if (ctx.isPunct(j, '<')) {
+            const nj = skipRustGenerics(ctx, j, open);
+            if (nj > j) {
+                j = nj - 1; // the loop's `j += 1` re-advances past the `>`
+                continue;
+            }
+        }
         if (ctx.identEql(j, "for")) {
             after_for = true;
-            for_ident = "";
             continue;
         }
         if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) {
-            last_ident = ctx.textOf(j);
-            if (after_for) for_ident = ctx.textOf(j);
+            // The impl'd type is the first identifier; `impl Trait for Type` names
+            // the type after `for` instead.
+            if (after_for) {
+                if (for_ident.len == 0) for_ident = ctx.textOf(j);
+            } else if (type_ident.len == 0) {
+                type_ident = ctx.textOf(j);
+            }
         }
     }
-    return if (after_for and for_ident.len != 0) for_ident else last_ident;
+    return if (after_for and for_ident.len != 0) for_ident else type_ident;
 }
 
 /// Index of an already-emitted struct/enum/interface named `name`, for nesting
@@ -5293,4 +5313,35 @@ test "csharp: expression-bodied method is indexed with its body references" {
     try testing.expectEqual(SymbolKind.method, expr.kind);
     try testing.expect(hasCallRef(expr, "Helper")); // the expression body's call is collected
     try testing.expect(findSym(out.items, "Helper") != null);
+}
+
+test "rust: a lifetime/generic-parameterized impl nests its methods under the type" {
+    const src =
+        \\struct Lexer<'a> { s: &'a str }
+        \\impl<'a> Lexer<'a> {
+        \\    fn new(s: &'a str) -> Lexer<'a> { return Lexer { s }; }
+        \\    fn peek(&self) -> u8 { return 0; }
+        \\}
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+    const new_m = findSym(out.items, "new").?;
+    try testing.expectEqual(SymbolKind.method, new_m.kind);
+    try testing.expect(new_m.parent_local != null);
+    // The parent is `Lexer`, not the lifetime `'a` (the old scan grabbed the last
+    // identifier before `{`, which lives inside the `<…>`).
+    try testing.expectEqualStrings("Lexer", out.items[new_m.parent_local.?].name);
+    try testing.expect(findSym(out.items, "peek").?.parent_local != null);
+}
+
+test "go: a single-line import binds its path segment, not the `import` keyword" {
+    const src =
+        \\package m
+        \\import "fmt"
+        \\func F() { fmt.Println() }
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "fmt") != null); // bound as `fmt`
+    try testing.expect(findSym(out.items, "import") == null); // never the keyword
 }
