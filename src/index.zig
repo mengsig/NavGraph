@@ -293,10 +293,19 @@ fn noteSkipped(b: *Builder, name: []const u8) !void {
     try b.skipped.append(b.gpa, try b.arena.dupe(u8, name));
 }
 
+/// Record a skipped minified/bundled file for the skipped-note, annotated so it
+/// reads as a file judgement rather than a pruned directory.
+fn noteSkippedMinified(b: *Builder, basename: []const u8) !void {
+    const label = try std.fmt.allocPrint(b.arena, "{s} (minified)", .{basename});
+    for (b.skipped.items) |s| if (std.mem.eql(u8, s, label)) return;
+    try b.skipped.append(b.gpa, label);
+}
+
 fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     const lang = language.detect(rel_path);
     if (lang == .unknown) return;
     if (b.ignore.isIgnored(rel_path, false)) return;
+    if (isMinifiedName(rel_path)) return noteSkippedMinified(b, basenameOf(rel_path));
     const stat = statOf(b, rel_path) orelse return;
 
     if (b.store) |*s| {
@@ -309,8 +318,33 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     }
     const text = b.root_dir.readFileAlloc(b.io, rel_path, b.arena, .limited(max_file_bytes)) catch return;
     std.debug.assert(text.len <= std.math.maxInt(u32));
+    // A minified/bundled artifact (one enormous line) indexes as thousands of
+    // meaningless one-letter symbols that pollute `hot`/`unused`/`search` — a
+    // real trial hit this with a vendored asciinema player under `testdata/`.
+    // Skip it and record the basename for the skipped-note.
+    if (isMinifiedText(text)) return noteSkippedMinified(b, basenameOf(rel_path));
     const parsed = try parseFile(b, text, lang);
     try appendFile(b, rel_path, lang, text, parsed, stat);
+}
+
+fn basenameOf(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    return if (slash) |i| path[i + 1 ..] else path;
+}
+
+/// Conventionally-minified basenames: `x.min.js`, `x.bundle.js`, `x.min.mjs`, …
+fn isMinifiedName(path: []const u8) bool {
+    const base = basenameOf(path);
+    return std.mem.indexOf(u8, base, ".min.") != null or
+        std.mem.indexOf(u8, base, ".bundle.") != null;
+}
+
+/// Content heuristic for minified/generated code: a big file whose average
+/// line length is machine-scale (no human writes 4 KiB of 300+-char lines).
+fn isMinifiedText(text: []const u8) bool {
+    if (text.len < 4096) return false;
+    const lines = 1 + std.mem.count(u8, text, "\n");
+    return text.len / lines > 300;
 }
 
 /// (mtime, size) of `rel_path`, or null when the file cannot be stat'd (e.g. it
@@ -541,11 +575,13 @@ fn heuristicMethodTarget(idx: *const Index, from: model.Symbol, name: []const u8
     const from_lang = idx.graph.files[from.file].language.family();
     var best: SymbolId = invalid;
     var best_score: i32 = -1;
+    var eligible: u32 = 0;
     for (candidates) |cid| {
         if (cid == from.id) continue;
         const cand = idx.graph.symbols[cid];
         if (cand.kind != .function and cand.kind != .method) continue;
         if (idx.graph.files[cand.file].language.family() != from_lang) continue;
+        eligible += 1;
         var score: i32 = 0;
         if (cand.kind == .method) score += 2; // `recv.x()` most likely hits a method
         if (cand.file == from.file) score += 1;
@@ -554,8 +590,17 @@ fn heuristicMethodTarget(idx: *const Index, from: model.Symbol, name: []const u8
             best = cid;
         }
     }
+    // A name with many same-named callables is an interface-dispatch pattern
+    // (Go `Provision` across 100+ modules, `sort.Interface.Less`, …). Picking
+    // one would pile every call site onto an arbitrary implementation —
+    // confidently wrong. Better to leave the call external than to guess 1-in-N.
+    if (eligible > max_heuristic_candidates) return invalid;
     return best;
 }
+
+/// Above this many same-named callable candidates, a receiver-unknown call is
+/// left unresolved instead of heuristically bound (see heuristicMethodTarget).
+const max_heuristic_candidates = 4;
 
 /// The file an imported module `binding` refers to inside `file`, if any.
 fn importTarget(idx: *const Index, file: FileId, binding: []const u8) ?FileId {

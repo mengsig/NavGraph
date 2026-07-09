@@ -24,19 +24,22 @@ const Options = query.Options;
 
 const max_sig_len: usize = 160;
 
-/// Outline: array of files, each with its visible symbols.
-pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
+/// Outline: array of files, each with its visible symbols. Returns whether any
+/// symbol was written.
+pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !bool {
     var shown: u32 = 0;
     var first_file = true;
     try w.writeByte('[');
     for (idx.graph.files) |file| {
         if (!query.matchesFilter(file.path, path_filter)) continue;
+        if (opts.no_recurse and !query.inDirNonRecursive(file.path, path_filter)) continue;
         if (shown >= opts.limit) break;
         const wrote = try outlineFile(w, idx, file, opts, &shown, !first_file);
         if (wrote) first_file = false;
     }
     try w.writeByte(']');
     try w.writeByte('\n');
+    return shown > 0;
 }
 
 fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Options, shown: *u32, sep: bool) !bool {
@@ -65,15 +68,18 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
     return wrote_any;
 }
 
-/// Definition(s) of `name`: a JSON array of symbol objects.
-pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+/// Definition(s) of `name`: a JSON array of symbol objects. Returns whether the
+/// name resolved to at least one definition.
+pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     var buf: [64]SymbolId = undefined;
     const ids = query.resolveIds(idx, name, &buf);
     try symbolArray(w, idx, ids, opts.verbosity);
+    return ids.len > 0;
 }
 
-/// Substring search: a JSON array of matching symbol objects.
-pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+/// Substring search: a JSON array of matching symbol objects. Returns whether
+/// any symbol matched.
+pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     var shown: u32 = 0;
     try w.writeByte('[');
@@ -81,20 +87,25 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         if (sym.kind == .import) continue;
         if (!query.kindAllowed(sym.kind, opts.kinds)) continue;
         if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
-        if (!query.matchesName(pattern, sym.name)) continue;
+        if (opts.exact) {
+            if (!std.mem.eql(u8, sym.name, pattern)) continue;
+        } else if (!query.matchesName(pattern, sym.name)) continue;
         if (shown != 0) try w.writeByte(',');
         try symbolObject(w, idx, sym, opts.verbosity);
         shown += 1;
         if (shown >= opts.limit) break;
     }
     try w.writeAll("]\n");
+    return shown > 0;
 }
 
 /// `search --refs --json`: array of `{name, file, line, in, qualifier?, target?}`
-/// reference objects (use sites), mirroring the text usages listing.
-pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+/// reference objects (use sites), mirroring the text usages listing. Returns
+/// whether any reference matched.
+pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
-    const pat = query.RefPattern.parse(pattern);
+    var pat = query.RefPattern.parse(pattern);
+    pat.exact = opts.exact;
     var shown: u32 = 0;
     try w.writeByte('[');
     outer: for (idx.graph.symbols) |sym| {
@@ -117,6 +128,7 @@ pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Opti
         }
     }
     try w.writeAll("]\n");
+    return shown > 0;
 }
 
 fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, line: u32) !void {
@@ -138,7 +150,8 @@ fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, l
 }
 
 /// `strings --json`: array of `{file, line, text}` string-literal matches.
-pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+/// Returns whether any literal matched.
+pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     var toks: std.ArrayList(lexer.Token) = .empty;
     defer toks.deinit(idx.gpa);
@@ -165,10 +178,12 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
         }
     }
     try w.writeAll("]\n");
+    return shown > 0;
 }
 
-/// Call-graph walk: a JSON array of tree roots (callees or callers).
-pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !void {
+/// Call-graph walk: a JSON array of tree roots (callees or callers). Returns
+/// whether `name` resolved to at least one root.
+pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !bool {
     var buf: [64]SymbolId = undefined;
     const ids = query.resolveIds(idx, name, &buf);
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
@@ -180,6 +195,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
         try walkNode(w, idx, id, incoming, opts, 0, 0, 1, &.{}, true, &visited);
     }
     try w.writeAll("]\n");
+    return ids.len > 0;
 }
 
 fn walkNode(
@@ -294,7 +310,7 @@ fn walkCallers(
 /// ranked by connectivity. `*_exact` exclude heuristic `?` edges; `fan_in_test`
 /// is the share of callers in test files; `--strict` drops entries whose
 /// connectivity is entirely heuristic.
-pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     const ranked = try query.collectHot(idx, filter, opts.tests);
     defer idx.gpa.free(ranked);
     const limit = query.hotLimit(opts);
@@ -314,10 +330,12 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !vo
         });
     }
     try w.writeAll("]\n");
+    return shown > 0;
 }
 
-/// Routes: array of `{route, file, line, handler, callers}` objects.
-pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Routes: array of `{route, file, line, handler, callers}` objects. Returns
+/// whether any route matched.
+pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.symbols) |sym| {
@@ -329,6 +347,7 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
         if (shown >= opts.limit) break;
     }
     try w.writeAll("]\n");
+    return shown > 0;
 }
 
 fn routeObject(w: *Writer, idx: *const Index, route: Symbol) !void {
@@ -355,9 +374,11 @@ fn routeObject(w: *Writer, idx: *const Index, route: Symbol) !void {
 }
 
 /// Diff: array of `{file, symbols:[{...symbol, callers:[...]}]}` — changed symbols
-/// and their direct callers (blast radius) per file.
-pub fn diff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !void {
+/// and their direct callers (blast radius) per file. Returns whether any changed
+/// symbol was reported.
+pub fn diff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !bool {
     _ = opts;
+    var any_symbol = false;
     try w.writeByte('[');
     var first_file = true;
     for (changes) |change| {
@@ -378,6 +399,7 @@ pub fn diff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, 
             } else {
                 try w.writeByte(',');
             }
+            any_symbol = true;
             try nodeHead(w, idx, sym);
             try w.writeAll(",\"callers\":[");
             for (idx.callersOf(sym.id), 0..) |cid, k| {
@@ -389,10 +411,12 @@ pub fn diff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, 
         if (opened) try w.writeAll("]}");
     }
     try w.writeAll("]\n");
+    return any_symbol;
 }
 
-/// Events: array of `{key, sites:[{role, verb, file, line, in}]}` grouped by key.
-pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Events: array of `{key, sites:[{role, verb, file, line, in}]}` grouped by
+/// key. Returns whether any key group was written.
+pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     const sites = try query.collectEvents(idx, filter);
     defer idx.gpa.free(sites);
     try w.writeByte('[');
@@ -415,6 +439,7 @@ pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         if (shown_keys >= opts.limit) break;
     }
     try w.writeAll("]\n");
+    return shown_keys > 0;
 }
 
 fn eventSiteObject(w: *Writer, idx: *const Index, site: query.EventSite) !void {
@@ -434,8 +459,9 @@ fn eventSiteObject(w: *Writer, idx: *const Index, site: query.EventSite) !void {
     try w.writeByte('}');
 }
 
-/// Neighbors: `{symbol, callees:[...], callers:[...]}` per resolved id.
-pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+/// Neighbors: `{symbol, callees:[...], callers:[...]}` per resolved id. Returns
+/// whether `name` resolved to at least one symbol.
+pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     var buf: [64]SymbolId = undefined;
     const ids = query.resolveIds(idx, name, &buf);
     try w.writeByte('[');
@@ -456,6 +482,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         try w.writeAll("]}");
     }
     try w.writeAll("]\n");
+    return ids.len > 0;
 }
 
 fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
@@ -470,8 +497,9 @@ fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
     }
 }
 
-/// Unused: a JSON array of zero-caller function/method symbols.
-pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Unused: a JSON array of zero-caller function/method symbols. Returns
+/// whether any candidate was reported.
+pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     var refs = try query.buildReferencedNames(idx);
     defer refs.deinit();
     if (opts.unused_follow_imports) refs.scope = try query.buildCollisionScope(idx);
@@ -488,16 +516,18 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         if (shown >= opts.limit) break;
     }
     try w.writeAll("]\n");
+    return shown > 0;
 }
 
 /// Imports: `{file, imports:[{target, binding}]}` per in-scope file.
-/// Index coverage manifest: `{file, lang, symbols}` per indexed file.
-pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
-    _ = opts;
+/// Index coverage manifest: `{file, lang, symbols}` per indexed file. Returns
+/// whether any file matched.
+pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     var first = true;
     try w.writeByte('[');
     for (idx.graph.files) |file| {
         if (!query.matchesFilter(file.path, filter)) continue;
+        if (opts.no_recurse and !query.inDirNonRecursive(file.path, filter)) continue;
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -505,9 +535,12 @@ pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Option
         try w.print(",\"lang\":\"{s}\",\"symbols\":{d}}}", .{ file.language.tag(), query.fileSymbolCount(idx, file) });
     }
     try w.writeAll("]\n");
+    return !first;
 }
 
-pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any file with fn/method symbols matched (i.e. the coverage
+/// report is non-empty).
+pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     _ = opts;
     const reached = try query.testReachable(idx, idx.gpa);
     defer idx.gpa.free(reached);
@@ -537,6 +570,7 @@ pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options
         try w.print(",\"covered\":{d},\"total\":{d},\"percent\":{d:.1}}}", .{ fc, ft, covPct(fc, ft) });
     }
     try w.print("],\"covered\":{d},\"total\":{d},\"percent\":{d:.1}}}\n", .{ covered, total, covPct(covered, total) });
+    return !first;
 }
 
 fn covPct(num: u32, den: u32) f64 {
@@ -544,7 +578,8 @@ fn covPct(num: u32, den: u32) f64 {
     return 100.0 * @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
 }
 
-pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any in-scope file had imports to report.
+pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     _ = opts;
     var first = true;
     try w.writeByte('[');
@@ -567,12 +602,16 @@ pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Opti
         try w.writeAll("]}");
     }
     try w.writeAll("]\n");
+    return !first;
 }
 
-/// Importers: `{file, importers:[path...]}` per file matching `path`.
-pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !void {
+/// Importers: `{file, importers:[path...]}` per file matching `path`. Returns
+/// whether any importer was actually found (mirrors the text renderer, which
+/// counts a target with zero importers as nothing found).
+pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !bool {
     _ = opts;
     var first = true;
+    var any_importer = false;
     try w.writeByte('[');
     for (idx.graph.files) |target| {
         if (!query.matchesFilter(target.path, path)) continue;
@@ -587,10 +626,12 @@ pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Opti
             if (wrote != 0) try w.writeByte(',');
             try writeString(w, src.path);
             wrote += 1;
+            any_importer = true;
         }
         try w.writeAll("]}");
     }
     try w.writeAll("]\n");
+    return any_importer;
 }
 
 fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool {
@@ -598,14 +639,15 @@ fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool 
     return false;
 }
 
-/// Path: a JSON array of the symbols on the shortest call path (empty if none).
-pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !void {
+/// Path: a JSON array of the symbols on the shortest call path (empty if
+/// none). Returns whether a path was found.
+pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !bool {
     _ = opts;
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
     const chain = query.shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf) catch {
         try w.writeAll("[]\n");
-        return;
+        return false;
     };
     defer idx.gpa.free(chain);
     try w.writeByte('[');
@@ -615,6 +657,7 @@ pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_nam
         try w.writeByte('}');
     }
     try w.writeAll("]\n");
+    return chain.len > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +813,7 @@ test "json output is well-formed and escapes control characters" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "run", false, .{ .depth = 2, .verbosity = .doc, .format = .json });
+    _ = try walk(&aw.writer, &idx, "run", false, .{ .depth = 2, .verbosity = .doc, .format = .json });
     const out = aw.written();
 
     try testing.expect(out.len > 2);
@@ -786,7 +829,7 @@ test "json output is well-formed and escapes control characters" {
     defer dbuf.deinit(testing.allocator);
     var daw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &dbuf);
     defer daw.deinit();
-    try showDef(&daw.writer, &idx, "add", .{ .verbosity = .doc, .format = .json });
+    _ = try showDef(&daw.writer, &idx, "add", .{ .verbosity = .doc, .format = .json });
     const def_out = daw.written();
     try testing.expect(std.mem.indexOf(u8, def_out, "\\\"safely\\\"") != null);
     try testing.expect(balancedBrackets(def_out));
@@ -814,7 +857,7 @@ test "json carries modifiers and the strings verb is well-formed" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "value", .{ .format = .json });
+        _ = try showDef(&aw.writer, &idx, "value", .{ .format = .json });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"method\"") != null);
         try testing.expect(std.mem.indexOf(u8, out, "\"modifiers\":[\"getter\"]") != null);
@@ -825,7 +868,7 @@ test "json carries modifiers and the strings verb is well-formed" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try strings(&aw.writer, &idx, "/api/health", .{ .format = .json });
+        _ = try strings(&aw.writer, &idx, "/api/health", .{ .format = .json });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "\"text\":\"\\\"/api/health\\\"\"") != null);
         try testing.expect(balancedBrackets(out));
@@ -981,7 +1024,7 @@ test "outline json is a well-formed array of files carrying symbol fields" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try outline(&aw.writer, &idx, "", .{ .format = .json });
+    _ = try outline(&aw.writer, &idx, "", .{ .format = .json });
     const out = aw.written();
 
     var p = try tjParse(out);
@@ -1025,7 +1068,7 @@ test "outline json verbosity adds sig, then doc, then body" {
         fn field(verb: render.Verbosity, idxp: *const Index, key: []const u8) !bool {
             var aw = tjWriter();
             defer aw.deinit();
-            try outline(&aw.writer, idxp, "", .{ .format = .json, .verbosity = verb });
+            _ = try outline(&aw.writer, idxp, "", .{ .format = .json, .verbosity = verb });
             var p = try tjParse(aw.written());
             defer p.deinit();
             const sym = p.value.array.items[0].object.get("symbols").?.array.items[0].object;
@@ -1058,7 +1101,7 @@ test "outline json empties on a non-matching filter and truncates at the limit" 
     { // filter matches no file → empty array.
         var aw = tjWriter();
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "nosuchpath", .{ .format = .json });
+        _ = try outline(&aw.writer, &idx, "nosuchpath", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
@@ -1066,7 +1109,7 @@ test "outline json empties on a non-matching filter and truncates at the limit" 
     { // limit caps the total symbols shown.
         var aw = tjWriter();
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{ .format = .json, .limit = 2 });
+        _ = try outline(&aw.writer, &idx, "", .{ .format = .json, .limit = 2 });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 2), p.value.array.items[0].object.get("symbols").?.array.items.len);
@@ -1090,7 +1133,7 @@ test "def json returns symbol objects with parent and exported fields" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try showDef(&aw.writer, &idx, "open", .{ .format = .json });
+    _ = try showDef(&aw.writer, &idx, "open", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expect(p.value == .array);
@@ -1114,7 +1157,7 @@ test "def json for an unknown name is an empty array" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try showDef(&aw.writer, &idx, "absent_symbol", .{ .format = .json });
+    _ = try showDef(&aw.writer, &idx, "absent_symbol", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
@@ -1136,7 +1179,7 @@ test "search json matches substrings, honors kinds, truncates, and empties" {
     { // substring "load" matches both fns (case-sensitive → not the const).
         var aw = tjWriter();
         defer aw.deinit();
-        try search(&aw.writer, &idx, "load", .{ .format = .json });
+        _ = try search(&aw.writer, &idx, "load", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 2), p.value.array.items.len);
@@ -1144,7 +1187,7 @@ test "search json matches substrings, honors kinds, truncates, and empties" {
     { // kinds filter restricted to const → only LoadCount.
         var aw = tjWriter();
         defer aw.deinit();
-        try search(&aw.writer, &idx, "Load", .{ .format = .json, .kinds = "const" });
+        _ = try search(&aw.writer, &idx, "Load", .{ .format = .json, .kinds = "const" });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1153,7 +1196,7 @@ test "search json matches substrings, honors kinds, truncates, and empties" {
     { // limit truncates.
         var aw = tjWriter();
         defer aw.deinit();
-        try search(&aw.writer, &idx, "load", .{ .format = .json, .limit = 1 });
+        _ = try search(&aw.writer, &idx, "load", .{ .format = .json, .limit = 1 });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1161,7 +1204,7 @@ test "search json matches substrings, honors kinds, truncates, and empties" {
     { // no match → empty array.
         var aw = tjWriter();
         defer aw.deinit();
-        try search(&aw.writer, &idx, "zzznope", .{ .format = .json });
+        _ = try search(&aw.writer, &idx, "zzznope", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
@@ -1182,7 +1225,7 @@ test "search --refs json emits reference objects with the resolved target" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try searchRefs(&aw.writer, &idx, "add", .{ .format = .json });
+    _ = try searchRefs(&aw.writer, &idx, "add", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expect(p.value.array.items.len >= 1);
@@ -1213,7 +1256,7 @@ test "strings json emits file/line/text with a collapsed, escaped literal" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try strings(&aw.writer, &idx, "hello", .{ .format = .json });
+    _ = try strings(&aw.writer, &idx, "hello", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1242,7 +1285,7 @@ test "calls json nests callees and marks a mutual-recursion cycle" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "ping", false, .{ .format = .json, .depth = 4 });
+    _ = try walk(&aw.writer, &idx, "ping", false, .{ .format = .json, .depth = 4 });
     const out = aw.written();
     var p = try tjParse(out);
     defer p.deinit();
@@ -1270,7 +1313,7 @@ test "calls json lists unresolved calls under ext" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "caller", false, .{ .format = .json, .depth = 2 });
+    _ = try walk(&aw.writer, &idx, "caller", false, .{ .format = .json, .depth = 2 });
     var p = try tjParse(aw.written());
     defer p.deinit();
     const root = p.value.array.items[0].object;
@@ -1298,7 +1341,7 @@ test "calls json aggregates multiple call sites with sites and lines" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "multi", false, .{ .format = .json, .depth = 2 });
+    _ = try walk(&aw.writer, &idx, "multi", false, .{ .format = .json, .depth = 2 });
     var p = try tjParse(aw.written());
     defer p.deinit();
     const callees = p.value.array.items[0].object.get("callees").?.array.items;
@@ -1327,7 +1370,7 @@ test "callers json nests incoming edges with a call-site line" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "leaf", true, .{ .format = .json, .depth = 2 });
+    _ = try walk(&aw.writer, &idx, "leaf", true, .{ .format = .json, .depth = 2 });
     var p = try tjParse(aw.written());
     defer p.deinit();
     const root = p.value.array.items[0].object;
@@ -1361,7 +1404,7 @@ test "calls json flags a heuristic edge with exact:false; strict drops it" {
     { // Default walk annotates the heuristic edge with exact:false.
         var aw = tjWriter();
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "handle", false, .{ .format = .json, .depth = 2 });
+        _ = try walk(&aw.writer, &idx, "handle", false, .{ .format = .json, .depth = 2 });
         const out = aw.written();
         var p = try tjParse(out);
         defer p.deinit();
@@ -1370,7 +1413,7 @@ test "calls json flags a heuristic edge with exact:false; strict drops it" {
     { // Strict follows only exact edges → the heuristic callee is gone.
         var aw = tjWriter();
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "handle", false, .{ .format = .json, .depth = 2, .strict = true });
+        _ = try walk(&aw.writer, &idx, "handle", false, .{ .format = .json, .depth = 2, .strict = true });
         const out = aw.written();
         var p = try tjParse(out);
         defer p.deinit();
@@ -1396,7 +1439,7 @@ test "hot json ranks by fan-in and carries the fan counters plus a sig" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try hot(&aw.writer, &idx, "", .{ .format = .json });
+    _ = try hot(&aw.writer, &idx, "", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     const items = p.value.array.items;
@@ -1432,7 +1475,7 @@ test "hot json strict drops an entry whose connectivity is entirely heuristic" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try hot(&aw.writer, &idx, "", .{ .format = .json, .strict = true });
+    _ = try hot(&aw.writer, &idx, "", .{ .format = .json, .strict = true });
     const out = aw.written();
     var p = try tjParse(out);
     defer p.deinit();
@@ -1459,7 +1502,7 @@ test "routes json links a handler object and null for an inline arrow" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try listRoutes(&aw.writer, &idx, "", .{ .format = .json });
+    _ = try listRoutes(&aw.writer, &idx, "", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     var saw_get = false;
@@ -1507,7 +1550,7 @@ test "diff json reports changed symbols and their callers (blast radius)" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try diff(&aw.writer, &idx, &changes, .{ .format = .json });
+    _ = try diff(&aw.writer, &idx, &changes, .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1539,7 +1582,7 @@ test "diff json is an empty array when no changed file is indexed" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try diff(&aw.writer, &idx, &changes, .{ .format = .json });
+    _ = try diff(&aw.writer, &idx, &changes, .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
@@ -1567,7 +1610,7 @@ test "events json groups a key with role/verb/file/line/in site objects" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try events(&aw.writer, &idx, "", .{ .format = .json });
+    _ = try events(&aw.writer, &idx, "", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1613,7 +1656,7 @@ test "events json honors the filter and limit" {
     { // filter narrows to a single key.
         var aw = tjWriter();
         defer aw.deinit();
-        try events(&aw.writer, &idx, "alpha", .{ .format = .json });
+        _ = try events(&aw.writer, &idx, "alpha", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1622,7 +1665,7 @@ test "events json honors the filter and limit" {
     { // limit caps the number of key groups.
         var aw = tjWriter();
         defer aw.deinit();
-        try events(&aw.writer, &idx, "", .{ .format = .json, .limit = 1 });
+        _ = try events(&aw.writer, &idx, "", .{ .format = .json, .limit = 1 });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1646,7 +1689,7 @@ test "neighbors json splits callees and callers with call-site lines" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try neighbors(&aw.writer, &idx, "mid", .{ .format = .json });
+    _ = try neighbors(&aw.writer, &idx, "mid", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     const o = p.value.array.items[0].object;
@@ -1690,7 +1733,7 @@ test "unused json flags a test-only symbol with test_only:true" {
     defer aw.deinit();
     // `--no-tests` is the production-focused view where a test-only-used symbol
     // surfaces (and carries test_only:true).
-    try unused(&aw.writer, &idx, "", .{ .format = .json, .tests = .without });
+    _ = try unused(&aw.writer, &idx, "", .{ .format = .json, .tests = .without });
     var p = try tjParse(aw.written());
     defer p.deinit();
     var test_only_flagged = false;
@@ -1730,7 +1773,7 @@ test "files json lists file, lang, and symbol count per indexed file" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try listFiles(&aw.writer, &idx, "", .{ .format = .json });
+    _ = try listFiles(&aw.writer, &idx, "", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1758,7 +1801,7 @@ test "imports and importers json describe the file dependency edges" {
     { // imports: app.zig imports core.zig under the binding `core`.
         var aw = tjWriter();
         defer aw.deinit();
-        try listImports(&aw.writer, &idx, "app.zig", .{ .format = .json });
+        _ = try listImports(&aw.writer, &idx, "app.zig", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1772,7 +1815,7 @@ test "imports and importers json describe the file dependency edges" {
     { // importers: core.zig is imported by app.zig.
         var aw = tjWriter();
         defer aw.deinit();
-        try listImporters(&aw.writer, &idx, "core.zig", .{ .format = .json });
+        _ = try listImporters(&aw.writer, &idx, "core.zig", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -1801,7 +1844,7 @@ test "path json returns the chain of symbols and empties when none exists" {
     { // src → dst is one hop.
         var aw = tjWriter();
         defer aw.deinit();
-        try shortestPath(&aw.writer, &idx, "src", "dst", .{ .format = .json });
+        _ = try shortestPath(&aw.writer, &idx, "src", "dst", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         const chain = p.value.array.items;
@@ -1812,7 +1855,7 @@ test "path json returns the chain of symbols and empties when none exists" {
     { // dst → src has no call path → empty array.
         var aw = tjWriter();
         defer aw.deinit();
-        try shortestPath(&aw.writer, &idx, "dst", "src", .{ .format = .json });
+        _ = try shortestPath(&aw.writer, &idx, "dst", "src", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
@@ -1845,7 +1888,7 @@ test "json modifiers array carries static, classmethod, and abstract" {
         fn has(idxp: *const Index, name: []const u8, mod: []const u8) !bool {
             var aw = tjWriter();
             defer aw.deinit();
-            try showDef(&aw.writer, idxp, name, .{ .format = .json });
+            _ = try showDef(&aw.writer, idxp, name, .{ .format = .json });
             var p = try tjParse(aw.written());
             defer p.deinit();
             const mods = p.value.array.items[0].object.get("modifiers") orelse return false;
@@ -1860,7 +1903,7 @@ test "json modifiers array carries static, classmethod, and abstract" {
     {
         var aw = tjWriter();
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "s", .{ .format = .json });
+        _ = try showDef(&aw.writer, &idx, "s", .{ .format = .json });
         var p = try tjParse(aw.written());
         defer p.deinit();
         try testing.expectEqualStrings("method", p.value.array.items[0].object.get("kind").?.string);
@@ -1884,7 +1927,7 @@ test "def json at full verbosity embeds an escaped body and stays well-formed" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    try showDef(&aw.writer, &idx, "quoter", .{ .format = .json, .verbosity = .full });
+    _ = try showDef(&aw.writer, &idx, "quoter", .{ .format = .json, .verbosity = .full });
     const out = aw.written();
     var p = try tjParse(out);
     defer p.deinit();

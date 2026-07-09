@@ -4,6 +4,7 @@
 const std = @import("std");
 const query = @import("query.zig");
 const render = @import("render.zig");
+const model = @import("model.zig");
 
 pub const Command = enum {
     outline, def, calls, callers, search, routes, events,
@@ -26,6 +27,24 @@ pub const Parsed = struct {
 };
 
 pub const ParseError = error{ Usage, UnknownFlag, MissingValue, BadValue };
+
+/// Detail for the last `parse()` error: one preformatted line naming the
+/// offending token and the expected form, so the CLI can print a precise,
+/// single-line message instead of a generic reason plus the full help text
+/// (a ~75-line dump per typo an agent pays for in tokens). Threadlocal so
+/// parallel tests never race; read right after a failed parse.
+threadlocal var diag_buf: [192]u8 = undefined;
+threadlocal var diag_msg: []const u8 = "";
+
+pub fn diag() []const u8 {
+    return diag_msg;
+}
+
+/// Record a diagnostic and return the error (single-expression error paths).
+fn fail(err: ParseError, comptime fmt: []const u8, args: anytype) ParseError {
+    diag_msg = std.fmt.bufPrint(&diag_buf, fmt, args) catch fmt;
+    return err;
+}
 
 const usage_text =
     \\NavGraph — a code-graph navigator for agents.
@@ -71,6 +90,10 @@ const usage_text =
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  --sort <path|symbols>                  files: order by path (default) or symbol count
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
+    \\  -e, --exact                            search: name must equal the pattern
+    \\                                         (finds `Order` without every `createOrder`)
+    \\  --no-recurse                           outline/files: only files directly in the
+    \\                                         given dir, not its subtrees
     \\  -t, --tests <with|without|only>        Unified test-scope for outline/search/
     \\                                         callers/hot/unused: with (default) |
     \\                                         without | only. A test is a Zig `test`
@@ -131,8 +154,14 @@ pub fn reason(err: ParseError) []const u8 {
 
 /// Parse argv (excluding the program name at index 0).
 pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
+    diag_msg = "";
     if (args.len == 0) return error.Usage;
-    const command = parseCommand(args[0]) orelse return error.Usage;
+    const command = parseCommand(args[0]) orelse {
+        if (args[0].len != 0 and args[0][0] == '-') {
+            return fail(error.Usage, "flags go after the command: navgraph <command> [arg] [flags]", .{});
+        }
+        return fail(error.Usage, "unknown command '{s}' — run `navgraph help` for the list", .{args[0]});
+    };
     if (command == .help) return .{ .command = .help };
 
     var result = Parsed{ .command = command };
@@ -146,10 +175,13 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
         } else if (result.arg2.len == 0 and command == .path) {
             result.arg2 = a;
         } else {
-            return error.Usage; // extra positional
+            return fail(error.Usage, "unexpected extra argument '{s}'", .{a});
         }
     }
-    if (!hasRequiredArgs(command, result)) return error.Usage;
+    if (!hasRequiredArgs(command, result)) {
+        if (command == .path) return fail(error.Usage, "path needs two symbol names: navgraph path <A> <B>", .{});
+        return fail(error.Usage, "{s} needs an argument: navgraph {s} <arg> [flags]", .{ @tagName(command), @tagName(command) });
+    }
     return result;
 }
 
@@ -203,36 +235,51 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     const f = splitFlag(raw);
 
     if (eqAny(f.name, &.{ "-v", "--verbosity" })) {
-        const val = try f.value(args, i);
-        out.options.verbosity = render.Verbosity.parse(val) orelse return error.BadValue;
+        const val = try f.value(args, i, f.name);
+        out.options.verbosity = render.Verbosity.parse(val) orelse
+            return fail(error.BadValue, "invalid value '{s}' for -v/--verbosity (expected names|sig|doc|full)", .{val});
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-d", "--depth" })) {
-        out.options.depth = try parseUint(try f.value(args, i));
+        out.options.depth = try parseUint(try f.value(args, i, f.name), "-d/--depth");
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-l", "--limit" })) {
-        out.options.limit = try parseUint(try f.value(args, i));
+        out.options.limit = try parseUint(try f.value(args, i, f.name), "-l/--limit");
+        if (out.options.limit == 0)
+            return fail(error.BadValue, "-l/--limit must be at least 1", .{});
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-C", "--root" })) {
-        out.root = try f.value(args, i);
+        out.root = try f.value(args, i, f.name);
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-k", "--kind" })) {
-        out.options.kinds = try f.value(args, i);
+        const val = try f.value(args, i, f.name);
+        var it = std.mem.tokenizeScalar(u8, val, ',');
+        while (it.next()) |raw_kind| {
+            const t = std.mem.trim(u8, raw_kind, " ");
+            if (!model.SymbolKind.validName(t))
+                return fail(error.BadValue, "unknown kind '{s}' for -k (known: fn,method,class,struct,enum,interface,type,variable,constant,field,macro,module,route,test)", .{t});
+        }
+        out.options.kinds = val;
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "--sort" })) {
-        out.options.file_sort = query.FileSort.parse(try f.value(args, i)) orelse return error.BadValue;
+        const val = try f.value(args, i, f.name);
+        out.options.file_sort = query.FileSort.parse(val) orelse
+            return fail(error.BadValue, "invalid value '{s}' for --sort (expected path|symbols)", .{val});
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-t", "--tests" })) {
-        out.options.tests = query.TestScope.parse(try f.value(args, i)) orelse return error.BadValue;
+        const val = try f.value(args, i, f.name);
+        out.options.tests = query.TestScope.parse(val) orelse
+            return fail(error.BadValue, "invalid value '{s}' for -t/--tests (expected with|without|only)", .{val});
         return f.next(i);
     }
     // Boolean flags: an attached `=value` is a usage error.
-    if (f.inline_val != null) return error.BadValue;
+    if (f.inline_val != null)
+        return fail(error.BadValue, "flag {s} takes no value", .{f.name});
     if (eqAny(f.name, &.{"--no-tests"})) {
         out.options.tests = .without;
         return i;
@@ -253,6 +300,14 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.refs = true;
         return i;
     }
+    if (eqAny(f.name, &.{ "-e", "--exact" })) {
+        out.options.exact = true;
+        return i;
+    }
+    if (eqAny(f.name, &.{"--no-recurse"})) {
+        out.options.no_recurse = true;
+        return i;
+    }
     if (eqAny(f.name, &.{"--no-cache"})) {
         out.use_cache = false;
         return i;
@@ -265,7 +320,7 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.unused_follow_imports = true;
         return i;
     }
-    return error.UnknownFlag;
+    return fail(error.UnknownFlag, "unknown flag '{s}' — run `navgraph help` for the list", .{raw});
 }
 
 /// A flag token split into its name and an optional attached value. Handles both
@@ -275,12 +330,12 @@ const SplitFlag = struct {
     inline_val: ?[]const u8,
 
     /// The flag's value: the attached one if present, else the next token.
-    fn value(self: SplitFlag, args: []const [:0]const u8, i: usize) ParseError![]const u8 {
+    fn value(self: SplitFlag, args: []const [:0]const u8, i: usize, flag: []const u8) ParseError![]const u8 {
         if (self.inline_val) |v| {
-            if (v.len == 0) return error.MissingValue;
+            if (v.len == 0) return fail(error.MissingValue, "flag {s} is missing its value", .{flag});
             return v;
         }
-        if (i + 1 >= args.len) return error.MissingValue;
+        if (i + 1 >= args.len) return fail(error.MissingValue, "flag {s} is missing its value", .{flag});
         return args[i + 1];
     }
 
@@ -305,8 +360,9 @@ fn splitFlag(raw: []const u8) SplitFlag {
     return .{ .name = raw, .inline_val = null };
 }
 
-fn parseUint(s: []const u8) ParseError!u32 {
-    return std.fmt.parseInt(u32, s, 10) catch error.BadValue;
+fn parseUint(s: []const u8, flag: []const u8) ParseError!u32 {
+    return std.fmt.parseInt(u32, s, 10) catch
+        fail(error.BadValue, "invalid value '{s}' for {s} (expected a non-negative integer)", .{ s, flag });
 }
 
 fn eqAny(s: []const u8, options: []const []const u8) bool {
@@ -330,6 +386,24 @@ test "parse basic commands and flags" {
 
     try std.testing.expectError(error.Usage, parse(&.{"def"}));
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "def", "x", "--nope" }));
+}
+
+test "parse diagnostics: named flag, bad kind, zero limit, flag-before-command" {
+    // Unknown kind is rejected at parse time (was: silently zero results).
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "-k", "xyz123" }));
+    try std.testing.expect(std.mem.indexOf(u8, diag(), "xyz123") != null);
+    // `-l 0` is rejected (was: silently behaved like -l 1).
+    try std.testing.expectError(error.BadValue, parse(&.{ "outline", "-l", "0" }));
+    try std.testing.expect(std.mem.indexOf(u8, diag(), "at least 1") != null);
+    // A flag before the command gets the move-it hint.
+    try std.testing.expectError(error.Usage, parse(&.{ "-j", "def", "x" }));
+    try std.testing.expect(std.mem.indexOf(u8, diag(), "after the command") != null);
+    // Bad value names the flag and the expected keywords.
+    try std.testing.expectError(error.BadValue, parse(&.{ "def", "x", "-v", "bogus" }));
+    try std.testing.expect(std.mem.indexOf(u8, diag(), "--verbosity") != null);
+    // A successful parse clears the diagnostic.
+    _ = try parse(&.{ "def", "x" });
+    try std.testing.expectEqualStrings("", diag());
 }
 
 test "attached flag values: -d2, --depth=2, -l50" {
@@ -808,45 +882,45 @@ test "splitFlag: short flag with and without an attached value" {
 test "SplitFlag.value: attached value wins and value() ignores args" {
     const args = [_][:0]const u8{ "--depth", "IGNORED" };
     const sf = SplitFlag{ .name = "--depth", .inline_val = "9" };
-    try std.testing.expectEqualStrings("9", try sf.value(&args, 0));
+    try std.testing.expectEqualStrings("9", try sf.value(&args, 0, sf.name));
     try std.testing.expectEqual(@as(usize, 0), sf.next(0));
 }
 
 test "SplitFlag.value: separate value reads the next token" {
     const args = [_][:0]const u8{ "-d", "5" };
     const sf = SplitFlag{ .name = "-d", .inline_val = null };
-    try std.testing.expectEqualStrings("5", try sf.value(&args, 0));
+    try std.testing.expectEqualStrings("5", try sf.value(&args, 0, sf.name));
     try std.testing.expectEqual(@as(usize, 1), sf.next(0));
 }
 
 test "SplitFlag.value: empty attached value is MissingValue" {
     const args = [_][:0]const u8{"--sort"};
     const sf = SplitFlag{ .name = "--sort", .inline_val = "" };
-    try std.testing.expectError(error.MissingValue, sf.value(&args, 0));
+    try std.testing.expectError(error.MissingValue, sf.value(&args, 0, sf.name));
 }
 
 test "SplitFlag.value: no next token is MissingValue" {
     const args = [_][:0]const u8{"-d"};
     const sf = SplitFlag{ .name = "-d", .inline_val = null };
-    try std.testing.expectError(error.MissingValue, sf.value(&args, 0));
+    try std.testing.expectError(error.MissingValue, sf.value(&args, 0, sf.name));
 }
 
 test "parseUint: valid decimals including bounds" {
-    try std.testing.expectEqual(@as(u32, 0), try parseUint("0"));
-    try std.testing.expectEqual(@as(u32, 42), try parseUint("42"));
-    try std.testing.expectEqual(@as(u32, 7), try parseUint("007")); // leading zeros ok
-    try std.testing.expectEqual(@as(u32, 4294967295), try parseUint("4294967295")); // u32 max
+    try std.testing.expectEqual(@as(u32, 0), try parseUint("0", "-l/--limit"));
+    try std.testing.expectEqual(@as(u32, 42), try parseUint("42", "-l/--limit"));
+    try std.testing.expectEqual(@as(u32, 7), try parseUint("007", "-l/--limit")); // leading zeros ok
+    try std.testing.expectEqual(@as(u32, 4294967295), try parseUint("4294967295", "-l/--limit")); // u32 max
 }
 
 test "parseUint: overflow, non-digit, empty and negative are BadValue" {
-    try std.testing.expectError(error.BadValue, parseUint("4294967296")); // u32 max + 1
-    try std.testing.expectError(error.BadValue, parseUint("99999999999"));
-    try std.testing.expectError(error.BadValue, parseUint("abc"));
-    try std.testing.expectError(error.BadValue, parseUint("12x"));
-    try std.testing.expectError(error.BadValue, parseUint(""));
-    try std.testing.expectError(error.BadValue, parseUint("-1"));
-    try std.testing.expectError(error.BadValue, parseUint("0x10")); // base 10 only
-    try std.testing.expectError(error.BadValue, parseUint(" 5")); // no whitespace
+    try std.testing.expectError(error.BadValue, parseUint("4294967296", "-l/--limit")); // u32 max + 1
+    try std.testing.expectError(error.BadValue, parseUint("99999999999", "-l/--limit"));
+    try std.testing.expectError(error.BadValue, parseUint("abc", "-l/--limit"));
+    try std.testing.expectError(error.BadValue, parseUint("12x", "-l/--limit"));
+    try std.testing.expectError(error.BadValue, parseUint("", "-l/--limit"));
+    try std.testing.expectError(error.BadValue, parseUint("-1", "-l/--limit"));
+    try std.testing.expectError(error.BadValue, parseUint("0x10", "-l/--limit")); // base 10 only
+    try std.testing.expectError(error.BadValue, parseUint(" 5", "-l/--limit")); // no whitespace
 }
 
 test "eqAny: membership, misses and empty option set" {

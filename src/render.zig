@@ -205,6 +205,20 @@ fn writeLocation(w: *Writer, idx: *const Index, sym: Symbol, source: []const u8,
 }
 
 /// Collapse runs of whitespace to single spaces, capping length with an ellipsis.
+/// The (1-based) `line_no`-th line of `text`, or "" when out of range. Linear
+/// scan — callers print at most a few hundred rows per query.
+pub fn sourceLine(text: []const u8, line_no: u32) []const u8 {
+    if (line_no == 0) return "";
+    var rest = text;
+    var n: u32 = 1;
+    while (n < line_no) : (n += 1) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+        rest = rest[nl + 1 ..];
+    }
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.mem.trim(u8, rest[0..end], " \t\r");
+}
+
 pub fn writeCollapsed(w: *Writer, text: []const u8, cap: usize) !void {
     var written: usize = 0;
     var prev_space = false;
@@ -1005,4 +1019,13 @@ test "symbol honors indent depth for the leading field" {
     const out = aw.written();
     // Two levels of indent (four spaces) then the kind field.
     try testing.expect(std.mem.startsWith(u8, out, "    fn foo"));
+}
+
+test "sourceLine returns the trimmed 1-based line, and empty out of range" {
+    const src = "first\n  second line  \nthird";
+    try std.testing.expectEqualStrings("first", sourceLine(src, 1));
+    try std.testing.expectEqualStrings("second line", sourceLine(src, 2));
+    try std.testing.expectEqualStrings("third", sourceLine(src, 3));
+    try std.testing.expectEqualStrings("", sourceLine(src, 4));
+    try std.testing.expectEqualStrings("", sourceLine(src, 0));
 }

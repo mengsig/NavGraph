@@ -97,6 +97,12 @@ pub const Options = struct {
     /// (`--no-tests`), or restrict to it (`--tests-only`). Applies to
     /// `outline`/`search`/`callers`/`hot`.
     tests: TestScope = .with,
+    /// `search --exact`: names must equal the pattern (no substring match) —
+    /// the way to find refs to `Order` without every `createOrder` hit.
+    exact: bool = false,
+    /// `outline`/`files --no-recurse`: only files directly in the given
+    /// directory, not its subtrees (Go "outline this package", not the world).
+    no_recurse: bool = false,
 };
 
 /// Whether `sym` is test code: a Zig `test` block, a symbol in a test file/dir,
@@ -188,13 +194,15 @@ pub fn callSiteLines(idx: *const Index, from: SymbolId, to: SymbolId, out: *std.
 
 /// Print an outline of the file(s) under `path_filter` (a path prefix, or ""
 /// for the whole project). Symbols are grouped by file and indented by nesting.
-pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
+/// Returns whether any symbol was printed.
+pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.outline(w, idx, path_filter, opts);
     var shown: u32 = 0;
     var any = false;
     var summarized: u32 = 0;
     for (idx.graph.files) |file| {
         if (!matchesFilter(file.path, path_filter)) continue;
+        if (opts.no_recurse and !inDirNonRecursive(file.path, path_filter)) continue;
         // Skip a file with nothing to show under the active kind/test-scope
         // filters, so `--tests only`/`--no-tests` never print an empty header.
         if (visibleSymbolCount(idx, file, opts) == 0) continue;
@@ -223,6 +231,7 @@ pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Opt
             try w.print("… (stopped at -l {d}; raise -l to see more)\n", .{opts.limit});
         }
     }
+    return shown > 0;
 }
 
 /// Warn when output was capped by `-l`, so a truncated result is never mistaken
@@ -242,7 +251,12 @@ fn skippedNote(w: *Writer, idx: *const Index) !void {
     try w.writeAll("  (not indexed — skipped: ");
     for (idx.skipped_dirs, 0..) |d, i| {
         if (i != 0) try w.writeAll(", ");
-        try w.print("{s}/", .{d});
+        // Annotated entries ("x.js (minified)") are files, not pruned dirs.
+        if (std.mem.endsWith(u8, d, ")")) {
+            try w.print("{s}", .{d});
+        } else {
+            try w.print("{s}/", .{d});
+        }
     }
     try w.writeAll("; index one with `-C <dir>`)\n");
 }
@@ -250,12 +264,23 @@ fn skippedNote(w: *Writer, idx: *const Index) !void {
 fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Options, shown: *u32) !u32 {
     var count: u32 = 0;
     var i = file.sym_start;
+    // At `-v full`, the end line of the last full-body symbol printed: a child
+    // whose whole span that source already contains (a dataclass's fields, a
+    // class's methods) would print the same text twice — skip it. A `-k` filter
+    // that excludes the parent leaves the child as the only copy, which still
+    // prints because nothing set `full_span_end` over it.
+    var full_span_end: u32 = 0;
     while (i < file.sym_end) : (i += 1) {
         const sym = idx.graph.symbols[i];
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
+        if (opts.verbosity == .full) {
+            const end = sym.endLine(file.text);
+            if (sym.parent != invalid and end <= full_span_end) continue;
+            full_span_end = @max(full_span_end, end);
+        }
         const indent = 1 + parentDepth(idx, sym);
         try render.symbol(w, idx, sym, opts.verbosity, indent, false);
         count += 1;
@@ -302,6 +327,17 @@ pub fn matchesFilter(path: []const u8, filter: []const u8) bool {
     return std.mem.startsWith(u8, path, filter) or std.mem.indexOf(u8, path, filter) != null;
 }
 
+/// `--no-recurse`: whether `path` sits *directly* in directory `dir` (no
+/// intermediate subdirectory) — the "outline this package, not its subpackages"
+/// scope. `dir` may carry a trailing `/`.
+pub fn inDirNonRecursive(path: []const u8, dir: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const parent = if (slash) |i| path[0..i] else "";
+    var d = dir;
+    while (d.len != 0 and d[d.len - 1] == '/') d = d[0 .. d.len - 1];
+    return std.mem.eql(u8, parent, d);
+}
+
 /// Whether `pattern` opts into glob matching. Only `*` triggers glob mode — a
 /// lone `?` stays literal because Ruby method names legitimately end in `?`.
 pub fn isGlobPattern(pattern: []const u8) bool {
@@ -341,13 +377,15 @@ pub fn wrapStringPattern(gpa: std.mem.Allocator, pattern: []const u8) ![]const u
 /// symbol count. Lets an agent verify what NavGraph actually parsed — a file
 /// that's absent (in an ignored dir) or shows 0 symbols is visible here, so a
 /// "not found" from another verb can be diagnosed instead of trusted blindly.
-pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any indexed file matched `filter`.
+pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listFiles(w, idx, filter, opts);
     if (opts.file_sort == .symbols) return listFilesBySymbols(w, idx, filter, opts);
     var any = false;
     var shown: u32 = 0;
     for (idx.graph.files) |file| {
         if (!matchesFilter(file.path, filter)) continue;
+        if (opts.no_recurse and !inDirNonRecursive(file.path, filter)) continue;
         any = true;
         const n = fileSymbolCount(idx, file);
         try w.print("{s}  ({s}, {d} symbol{s})\n", .{ file.path, file.language.tag(), n, if (n == 1) "" else "s" });
@@ -359,21 +397,24 @@ pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Option
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+    return any;
 }
 
 /// `files --sort symbols`: list in-scope files ranked by symbol count
 /// (descending, ties broken by path) so the biggest files surface first.
-fn listFilesBySymbols(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any file matched.
+fn listFilesBySymbols(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     var ranked: std.ArrayList(RankedFile) = .empty;
     defer ranked.deinit(idx.gpa);
     for (idx.graph.files) |file| {
         if (!matchesFilter(file.path, filter)) continue;
+        if (opts.no_recurse and !inDirNonRecursive(file.path, filter)) continue;
         try ranked.append(idx.gpa, .{ .id = file.id, .count = fileSymbolCount(idx, file) });
     }
     if (ranked.items.len == 0) {
         try w.print("(no indexed files under '{s}')\n", .{filter});
         try skippedNote(w, idx);
-        return;
+        return false;
     }
     std.mem.sort(RankedFile, ranked.items, idx, rankedFileLessThan);
     var shown: u32 = 0;
@@ -385,6 +426,7 @@ fn listFilesBySymbols(w: *Writer, idx: *const Index, filter: []const u8, opts: O
         if (shown >= opts.limit) break;
     }
     try truncationNote(w, opts, shown);
+    return true;
 }
 
 const RankedFile = struct { id: model.FileId, count: u32 };
@@ -412,8 +454,9 @@ const max_read_bytes = 8 * 1024 * 1024;
 /// The escape hatch for text NavGraph can't attribute to a symbol: module-scope
 /// statements, config, comments, an arbitrary line. Bytes come from the in-memory
 /// index when the file is indexed, else are read from disk relative to `root`, so
-/// config files and files under ignored dirs are reachable too.
-pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !void {
+/// config files and files under ignored dirs are reachable too. Returns whether
+/// at least one source line was printed.
+pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !bool {
     _ = opts;
     var path = spec;
     // Empty `ranges` means the whole file; one or more means `file:A-B,C-D` — a
@@ -432,17 +475,17 @@ pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, sp
     const text = indexedText(idx, path) orelse blk: {
         var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
             try w.print("(cannot open root '{s}')\n", .{root});
-            return;
+            return false;
         };
         defer rd.close(io);
         const bytes = rd.readFileAlloc(io, path, idx.gpa, .limited(max_read_bytes)) catch {
             try w.print("(no such file: '{s}' — give a path relative to the repo root; `navgraph files` lists them)\n", .{path});
-            return;
+            return false;
         };
         owned = bytes;
         break :blk bytes;
     };
-    try printNumbered(w, path, text, ranges);
+    return printNumbered(w, path, text, ranges);
 }
 
 /// The in-memory text of an indexed file matching `path` (exact, else a unique
@@ -509,27 +552,34 @@ fn lineCount(text: []const u8) usize {
 }
 
 /// Emit `text`'s lines in `[lo, hi]` as `N\t<line>` (single pass from the top).
-fn emitRange(w: *Writer, text: []const u8, lo: usize, hi: usize) !void {
+/// Returns the number of lines emitted.
+fn emitRange(w: *Writer, text: []const u8, lo: usize, hi: usize) !usize {
     var start: usize = 0;
     var line_no: usize = 1;
+    var emitted: usize = 0;
     while (start < text.len) {
         const nl = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        if (line_no >= lo and line_no <= hi) try w.print("{d}\t{s}\n", .{ line_no, text[start..nl] });
+        if (line_no >= lo and line_no <= hi) {
+            try w.print("{d}\t{s}\n", .{ line_no, text[start..nl] });
+            emitted += 1;
+        }
         if (line_no >= hi) break;
         start = nl + 1;
         line_no += 1;
     }
+    return emitted;
 }
 
 /// Emit `text` for `ranges` (empty = whole file) as numbered lines under a header
 /// naming the file and line count. Disjoint ranges are separated by a `⋯` gap
-/// marker so it's clear lines were skipped between them.
-fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const LineRange) !void {
+/// marker so it's clear lines were skipped between them. Returns whether at
+/// least one source line was emitted.
+fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const LineRange) !bool {
     const total = lineCount(text);
     if (ranges.len == 0) {
         try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
-        try emitRange(w, text, 1, std.math.maxInt(usize));
-        return;
+        const emitted = try emitRange(w, text, 1, std.math.maxInt(usize));
+        return emitted > 0;
     }
     if (ranges.len == 1 and ranges[0].hi != std.math.maxInt(usize)) {
         const r = ranges[0];
@@ -538,15 +588,17 @@ fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const
         try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
     }
     var prev_hi: usize = 0;
+    var emitted: usize = 0;
     for (ranges) |r| {
         if (r.lo > total) {
             try w.print("(no such line: {d}; file has {d})\n", .{ r.lo, total });
             continue;
         }
         if (prev_hi != 0 and r.lo > prev_hi + 1) try w.writeAll("  ⋯\n");
-        try emitRange(w, text, r.lo, r.hi);
+        emitted += try emitRange(w, text, r.lo, r.hi);
         prev_hi = @min(r.hi, total);
     }
+    return emitted > 0;
 }
 
 /// Search the *contents of string literals* across every indexed file for
@@ -556,7 +608,8 @@ fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const
 /// `read`/grep for. Language-agnostic: it re-lexes each file with the shared
 /// tokenizer and matches only `.string` tokens, so a hit is never an identifier
 /// that merely shares the text (stricter than a raw grep).
-pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+/// Returns whether any string literal matched.
+pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     if (opts.format == .json) return json_out.strings(w, idx, pattern, opts);
     var toks: std.ArrayList(lexer.Token) = .empty;
@@ -584,32 +637,130 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+    return shown > 0;
 }
 
-/// Show the definition(s) of `name` (supports `Parent.name`).
-pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+/// Show the definition(s) of `name` (supports `Parent.name`). Returns whether
+/// `name` resolved to at least one definition.
+pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.showDef(w, idx, name, opts);
     var buf: [64]SymbolId = undefined;
     const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no definition named '{s}')\n", .{name});
-        return;
+        try suggestNear(w, idx, name);
+        return false;
     }
+    try multiMatchNote(w, name, ids.len, buf.len);
     for (ids) |id| {
         try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 0, true);
     }
+    return true;
+}
+
+/// After a not-found, suggest up to 4 near-miss definition names: exact
+/// case-insensitive hits first (`context` → `Context`), then case-insensitive
+/// substrings, then names within edit distance 2 (`Contxt` → `Context`). Saves
+/// the agent a `search` round-trip when the miss was casing or a typo.
+fn suggestNear(w: *Writer, idx: *const Index, name: []const u8) !void {
+    // Strip pin syntax; suggest on the bare symbol name.
+    var nm = name;
+    if (std.mem.lastIndexOfScalar(u8, nm, '@')) |at| nm = nm[0..at];
+    if (std.mem.lastIndexOfScalar(u8, nm, '.')) |dot| nm = nm[dot + 1 ..];
+    if (nm.len < 2 or isGlobPattern(nm)) return;
+
+    var names: [4][]const u8 = undefined;
+    var scores: [4]u8 = .{ 0, 0, 0, 0 }; // 3 = ci-equal, 2 = ci-substring, 1 = edit≤2
+    for (idx.graph.symbols) |sym| {
+        // Imports aren't definitions; test blocks have prose names ("outline
+        // lists …") that read as garbage in a did-you-mean list.
+        if (sym.kind == .import or sym.kind == .test_case) continue;
+        const score: u8 = if (std.ascii.eqlIgnoreCase(sym.name, nm))
+            3
+        else if (std.ascii.indexOfIgnoreCase(sym.name, nm) != null)
+            2
+        else if (withinEditDistance2(nm, sym.name))
+            1
+        else
+            continue;
+        // Insert if it beats the weakest slot; dedupe by name.
+        var weakest: usize = 0;
+        var dup = false;
+        for (0..names.len) |i| {
+            if (scores[i] != 0 and std.mem.eql(u8, names[i], sym.name)) {
+                dup = true;
+                break;
+            }
+            if (scores[i] < scores[weakest]) weakest = i;
+        }
+        if (dup or scores[weakest] >= score) continue;
+        names[weakest] = sym.name;
+        scores[weakest] = score;
+    }
+    var wrote = false;
+    // Emit best-first (score 3, then 2, then 1).
+    var want: u8 = 3;
+    while (want >= 1) : (want -= 1) {
+        for (0..names.len) |i| {
+            if (scores[i] != want) continue;
+            try w.writeAll(if (wrote) ", " else "  (did you mean: ");
+            try w.print("{s}", .{names[i]});
+            wrote = true;
+        }
+        if (want == 1) break;
+    }
+    if (wrote) try w.writeAll("?)\n");
+}
+
+/// Bounded Levenshtein: true when `a` and `b` are within edit distance 2.
+fn withinEditDistance2(a: []const u8, b: []const u8) bool {
+    if (a.len > b.len) return withinEditDistance2(b, a);
+    if (b.len - a.len > 2) return false;
+    if (b.len > 64) return false; // long names: substring checks above suffice
+    // Two-row DP with a band; sizes are tiny so brute force is fine.
+    var prev: [65]u8 = undefined;
+    var cur: [65]u8 = undefined;
+    for (0..a.len + 1) |j| prev[j] = @intCast(@min(j, 3));
+    for (1..b.len + 1) |i| {
+        cur[0] = @intCast(@min(i, 3));
+        var row_min: u8 = cur[0];
+        for (1..a.len + 1) |j| {
+            const cost: u8 = if (a[j - 1] == b[i - 1]) 0 else 1;
+            var v = prev[j - 1] + cost; // substitute
+            v = @min(v, prev[j] + 1); // delete
+            v = @min(v, cur[j - 1] + 1); // insert
+            cur[j] = @min(v, 3);
+            row_min = @min(row_min, cur[j]);
+        }
+        if (row_min > 2) return false;
+        prev = cur;
+    }
+    return prev[a.len] <= 2;
+}
+
+/// One-line banner when a name resolves to several definitions, so two
+/// concatenated bodies are never misread as one and the pin syntax is
+/// discoverable at the moment it's needed (a trial misread exactly this).
+fn multiMatchNote(w: *Writer, name: []const u8, n: usize, cap: usize) !void {
+    if (n <= 1) return;
+    try w.print("({d}{s} definitions match '{s}' — pin one with Parent.name or name@path)\n", .{
+        n, if (n == cap) "+" else "", name,
+    });
 }
 
 /// Walk the call graph from `name`. `incoming` selects callers vs callees.
-pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !void {
+/// Returns whether `name` resolved to at least one symbol.
+pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !bool {
     if (opts.format == .json) return json_out.walk(w, idx, name, incoming, opts);
     var buf: [64]SymbolId = undefined;
     const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no symbol named '{s}')\n", .{name});
+        try suggestNear(w, idx, name);
         try skippedNote(w, idx);
-        return;
+        return false;
     }
+    try multiMatchNote(w, name, ids.len, buf.len);
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
     defer visited.deinit();
     var heuristic: usize = 0;
@@ -625,6 +776,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
             heuristic, if (heuristic == 1) "" else "s",
         });
     }
+    return true;
 }
 
 fn walkNode(
@@ -736,7 +888,8 @@ pub fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
 /// Substring search over symbol names; prints matches like `def`. With
 /// `--refs`, searches *use sites* (references) instead — a resolved-graph grep
 /// that answers "where is this used", which name-only search cannot.
-pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+/// Returns whether any symbol (or, with `--refs`, any reference) matched.
+pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     if (opts.refs) return searchRefs(w, idx, pattern, opts);
     if (opts.format == .json) return json_out.search(w, idx, pattern, opts);
@@ -745,16 +898,20 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         if (sym.kind == .import) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
-        if (!matchesName(pattern, sym.name)) continue;
+        if (opts.exact) {
+            if (!std.mem.eql(u8, sym.name, pattern)) continue;
+        } else if (!matchesName(pattern, sym.name)) continue;
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         shown += 1;
         if (shown >= opts.limit) break;
     }
     if (shown == 0) {
         try w.print("(no symbol matching '{s}')\n", .{pattern});
+        try suggestNear(w, idx, pattern);
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+    return shown > 0;
 }
 
 /// A `search --refs` query. A bare `name` substring-matches any reference; a
@@ -766,6 +923,8 @@ pub const RefPattern = struct {
     /// "" matches any receiver (leading-dot form); else an exact receiver.
     qualifier: ?[]const u8,
     name: []const u8,
+    /// `--exact`: the bare-name form must equal the pattern, not contain it.
+    exact: bool = false,
 
     pub fn parse(pattern: []const u8) RefPattern {
         if (std.mem.lastIndexOfScalar(u8, pattern, '.')) |dot| {
@@ -781,7 +940,7 @@ pub const RefPattern = struct {
     /// receiver).
     pub fn matches(self: RefPattern, ref: model.Reference) bool {
         const q = self.qualifier orelse
-            return matchesName(self.name, ref.name);
+            return if (self.exact) std.mem.eql(u8, ref.name, self.name) else matchesName(self.name, ref.name);
         if (ref.qualifier.len == 0) return false;
         if (q.len != 0 and !partMatches(q, ref.qualifier)) return false;
         return self.name.len == 0 or partMatches(self.name, ref.name);
@@ -794,9 +953,10 @@ pub const RefPattern = struct {
 /// enclosing symbol, with the call-site line and whether it resolved. This is the
 /// "find usages" verb — structured, comment/string-free, resolution-aware.
 /// `Recv.field`/`.field` patterns pin instance-attribute reads.
-fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !void {
+fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.searchRefs(w, idx, pattern, opts);
-    const pat = RefPattern.parse(pattern);
+    var pat = RefPattern.parse(pattern);
+    pat.exact = opts.exact;
     var shown: u32 = 0;
     outer: for (idx.graph.symbols) |sym| {
         for (sym.refs) |ref| {
@@ -807,12 +967,12 @@ fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
             // first (the "found only one of its reads" recall gap a trial hit).
             if (ref.lines.len > 1) {
                 for (ref.lines) |ln| {
-                    try printRefRow(w, idx, sym, ref, ln);
+                    try printRefRow(w, idx, sym, ref, ln, opts.verbosity);
                     shown += 1;
                     if (shown >= opts.limit) break :outer;
                 }
             } else {
-                try printRefRow(w, idx, sym, ref, ref.line);
+                try printRefRow(w, idx, sym, ref, ref.line, opts.verbosity);
                 shown += 1;
                 if (shown >= opts.limit) break :outer;
             }
@@ -823,17 +983,29 @@ fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+    return shown > 0;
 }
 
 /// Print one `search --refs` row: `path:line  name [(on recv)]  in owner [→ …]`.
-fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Reference, line: u32) !void {
-    try w.print("{s}:{d}  {s}", .{ idx.graph.files[sym.file].path, line, ref.name });
+fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Reference, line: u32, verbosity: render.Verbosity) !void {
+    const file = idx.graph.files[sym.file];
+    try w.print("{s}:{d}  {s}", .{ file.path, line, ref.name });
     if (ref.qualifier.len != 0) try w.print(" (on {s})", .{ref.qualifier});
     try w.print("  in {s}", .{sym.name});
     if (ref.target != invalid) {
         try w.print("  → {s}", .{idx.graph.files[idx.graph.symbols[ref.target].file].path});
     } else if (ref.kind == .call or ref.kind == .route_call) {
         try w.writeAll("  → ~ext");
+    }
+    // The use-site's source text, so "what does this hit look like" doesn't
+    // cost a follow-up `read` per row (a trial burned 6 calls on exactly that).
+    // `-v names` is the opt-out for a minimal location list.
+    if (verbosity != .names) {
+        const src_line = render.sourceLine(file.text, line);
+        if (src_line.len != 0) {
+            try w.writeAll("\n      | ");
+            try render.writeCollapsed(w, src_line, 140);
+        }
     }
     try w.writeByte('\n');
 }
@@ -860,7 +1032,8 @@ fn fanOutExact(sym: model.Symbol) u32 {
 /// and list the busiest — the load-bearing symbols an agent should read first to
 /// understand a repo, and where changes ripple widest. Ranked by fan-in, then
 /// fan-out. Honors an optional path `filter` and `-l` for the count.
-pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any entry was reported.
+pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.hot(w, idx, filter, opts);
     const ranked = try collectHot(idx, filter, opts.tests);
     defer idx.gpa.free(ranked);
@@ -883,11 +1056,12 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !vo
     if (shown == 0) {
         try w.print("(no functions under '{s}')\n", .{filter});
         try skippedNote(w, idx);
-        return;
+        return false;
     }
     if (eligible > shown) {
         try w.print("… ({d} more; raise -l to see them)\n", .{eligible - shown});
     }
+    return true;
 }
 
 /// Fan-in/out suffix for a `hot` row. Default surfaces the heuristic share as a
@@ -926,6 +1100,54 @@ fn testCallerCount(idx: *const Index, id: SymbolId) u32 {
     return n;
 }
 
+/// Whether any indexed file (or inline Zig `test` block) is test code — when
+/// none is, `--no-tests`/`--tests-only` can't change anything, and saying so
+/// beats letting identical outputs read as a tooling bug.
+fn indexHasTests(idx: *const Index) bool {
+    for (idx.graph.files) |f| {
+        if (isTestPath(f.path)) return true;
+    }
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .test_case) return true;
+    }
+    return false;
+}
+
+/// A hint that `sym`, though caller-less in the graph, is likely invoked via a
+/// mechanism the graph can't see: a name shared by many same-named callables
+/// (interface dispatch — Go `Provision`, `sort.Interface`) or a well-known
+/// stdlib-interface method name in Go (`MarshalJSON`, `Len/Less/Swap`, …,
+/// dispatched structurally/reflectively).
+fn interfaceDispatchHint(idx: *const Index, sym: model.Symbol) ?[]const u8 {
+    if (sym.kind != .function and sym.kind != .method) return null;
+    if (idx.graph.files[sym.file].language == .go and go_interface_names.has(sym.name)) {
+        return "commonly satisfies a stdlib interface in Go";
+    }
+    var callables: u32 = 0;
+    for (idx.lookup(sym.name)) |cid| {
+        const c = idx.graph.symbols[cid];
+        if (c.kind == .function or c.kind == .method) callables += 1;
+    }
+    if (callables > 4) return "many same-named defs — possible interface dispatch";
+    return null;
+}
+
+const go_interface_names = std.StaticStringMap(void).initComptime(.{
+    .{"MarshalJSON"},   .{"UnmarshalJSON"}, .{"MarshalText"},  .{"UnmarshalText"},
+    .{"MarshalBinary"}, .{"UnmarshalBinary"}, .{"String"},     .{"GoString"},
+    .{"Error"},         .{"Len"},           .{"Less"},         .{"Swap"},
+    .{"ServeHTTP"},     .{"Read"},          .{"Write"},        .{"Close"},
+});
+
+/// Caller count with the test scope applied to each *caller* (see collectHot).
+fn scopedCallerCount(idx: *const Index, id: SymbolId, scope: TestScope) u32 {
+    var n: u32 = 0;
+    for (idx.callersOf(id)) |cid| {
+        if (inTestScope(scope, isTestSymbol(idx, idx.graph.symbols[cid]))) n += 1;
+    }
+    return n;
+}
+
 pub const HotEntry = struct {
     id: SymbolId,
     fan_in: u32,
@@ -942,11 +1164,16 @@ pub const HotEntry = struct {
 /// to the top. Ties fall back to total fan-in/out. Caller frees the slice.
 pub fn collectHot(idx: *const Index, filter: []const u8, scope: TestScope) ![]HotEntry {
     // Exact incoming-edge count per symbol (heuristic `?` edges excluded), so a
-    // symbol's rank reflects edges we can actually stand behind.
+    // symbol's rank reflects edges we can actually stand behind. The test scope
+    // filters the *edges*, not just the listed symbols: under `--no-tests` a
+    // caller in test code contributes nothing, so a production-file helper that
+    // only tests call ranks by its true production fan-in (zero) instead of
+    // floating to the top on harness traffic.
     var exact_in = try idx.gpa.alloc(u32, idx.graph.symbols.len);
     defer idx.gpa.free(exact_in);
     @memset(exact_in, 0);
     for (idx.graph.symbols) |sym| {
+        if (!inTestScope(scope, isTestSymbol(idx, sym))) continue;
         for (sym.refs) |ref| {
             if (ref.target != invalid and ref.exact) exact_in[ref.target] += 1;
         }
@@ -957,14 +1184,15 @@ pub fn collectHot(idx: *const Index, filter: []const u8, scope: TestScope) ![]Ho
         if (sym.kind != .function and sym.kind != .method) continue;
         if (!matchesFilter(idx.graph.files[sym.file].path, filter)) continue;
         if (!inTestScope(scope, isTestSymbol(idx, sym))) continue;
-        const fan_in: u32 = @intCast(idx.callersOf(sym.id).len);
+        const fan_in = scopedCallerCount(idx, sym.id, scope);
         const fan_out = fanOut(sym);
         if (fan_in == 0 and fan_out == 0) continue; // isolated: not informative
         try list.append(idx.gpa, .{
             .id = sym.id,
             .fan_in = fan_in,
             .fan_in_exact = exact_in[sym.id],
-            .fan_in_test = testCallerCount(idx, sym.id),
+            // The prod/test breakdown only makes sense when both are in view.
+            .fan_in_test = if (scope == .with) testCallerCount(idx, sym.id) else 0,
             .fan_out = fan_out,
             .fan_out_exact = fanOutExact(sym),
         });
@@ -1022,7 +1250,9 @@ pub fn testReachable(idx: *const Index, gpa: std.mem.Allocator) ![]bool {
 /// language-agnostic substitute for line coverage (kcov cannot read Zig 0.16's
 /// DWARF5). Conservative: only resolved edges are followed, so real coverage is
 /// at least the number reported.
-pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any file with fn/method symbols matched (i.e. a non-empty
+/// coverage report was printed).
+pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.coverage(w, idx, filter, opts);
     const reached = try testReachable(idx, idx.gpa);
     defer idx.gpa.free(reached);
@@ -1054,15 +1284,17 @@ pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options
     if (!any) {
         try w.print("(no fn/method symbols under '{s}')\n", .{filter});
         try skippedNote(w, idx);
-        return;
+        return false;
     }
     try truncationNote(w, opts, shown);
     try w.print("  overall: {d:.1}%  ({d}/{d} fn/method reachable from a test)\n", .{ pct(covered, total), covered, total });
+    return true;
 }
 
 /// List HTTP route definitions and, under each, its handler (callee) and the
 /// client call sites that hit it (callers) — the API surface across languages.
-pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any route matched.
+pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listRoutes(w, idx, filter, opts);
     var any = false;
     var shown: u32 = 0;
@@ -1080,6 +1312,7 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
+    return any;
 }
 
 fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
@@ -1207,7 +1440,8 @@ fn nextSymbolAfter(idx: *const Index, file: model.SourceFile, offset: u32) ?mode
 /// List string-keyed message-bus dispatch: each event key with its handler
 /// registrations and emitter sites, paired by the shared key. The event-bus
 /// analogue of `routes` (which only sees HTTP). Heuristic and token-based.
-pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any event key group was printed.
+pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.events(w, idx, filter, opts);
     const sites = try collectEvents(idx, filter);
     defer idx.gpa.free(sites);
@@ -1218,9 +1452,10 @@ pub fn events(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
             try w.writeAll("(no string-keyed event dispatch found)\n");
         }
         try skippedNote(w, idx);
-        return;
+        return false;
     }
     try emitEventGroups(w, idx, sites, opts);
+    return true;
 }
 
 /// Render key-sorted sites as `event "key"` groups, paired keys first. Stops once
@@ -1256,22 +1491,23 @@ fn printEventSite(w: *Writer, idx: *const Index, site: EventSite) !void {
 /// working tree) and, under each, its direct callers — the blast radius of a
 /// change. Runs `git diff` and maps each hunk to the symbol whose span it
 /// overlaps, turning a line-oriented diff into a symbol-oriented review.
-pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []const u8, opts: Options) !void {
+/// Returns whether at least one changed symbol was reported.
+pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []const u8, opts: Options) !bool {
     const spec = if (ref.len != 0) ref else "HEAD";
     const result = runGitDiff(idx.gpa, io, root, spec) catch |err| {
         try w.print("navgraph: could not run git diff ({s})\n", .{@errorName(err)});
-        return;
+        return false;
     };
     defer idx.gpa.free(result.stdout);
     defer idx.gpa.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         try w.print("navgraph: git diff {s} failed: {s}\n", .{ spec, std.mem.trim(u8, result.stderr, " \n\r\t") });
-        return;
+        return false;
     }
     const changes = try gitdiff.parse(idx.gpa, result.stdout);
     defer gitdiff.freeChanges(idx.gpa, changes);
     if (opts.format == .json) return json_out.diff(w, idx, changes, opts);
-    try renderDiff(w, idx, changes, opts);
+    return renderDiff(w, idx, changes, opts);
 }
 
 /// Run `git -C <root> diff --unified=0 --no-color <ref>` and return its result
@@ -1287,7 +1523,8 @@ fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const
 }
 
 /// Render each changed file, its touched symbols, and their direct callers.
-pub fn renderDiff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !void {
+/// Returns whether at least one changed symbol was reported.
+pub fn renderDiff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !bool {
     var any_symbol = false;
     var shown: u32 = 0;
     for (changes) |change| {
@@ -1311,9 +1548,10 @@ pub fn renderDiff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileCh
     }
     if (!any_symbol) {
         try w.writeAll("(no changed symbols — the diff is empty or touches only non-symbol lines)\n");
-        return;
+        return false;
     }
     try truncationNote(w, opts, shown);
+    return true;
 }
 
 /// Print the deduplicated direct callers of a changed symbol (its blast radius),
@@ -1365,15 +1603,18 @@ fn pathSuffixMatch(a: []const u8, b: []const u8) bool {
 
 /// Show `name`'s callees and callers together (each one level deep) — a quick
 /// "what's around this symbol" view without choosing a direction.
-pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !void {
+/// Returns whether `name` resolved to at least one symbol.
+pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.neighbors(w, idx, name, opts);
     var buf: [64]SymbolId = undefined;
     const ids = resolveIds(idx, name, &buf);
     if (ids.len == 0) {
         try w.print("(no symbol named '{s}')\n", .{name});
+        try suggestNear(w, idx, name);
         try skippedNote(w, idx);
-        return;
+        return false;
     }
+    try multiMatchNote(w, name, ids.len, buf.len);
     for (ids) |id| {
         try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 0, true);
         try w.writeAll("  ↓ calls\n");
@@ -1386,6 +1627,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
             try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id));
         }
     }
+    return true;
 }
 
 /// Render the resolved callees of `id` at `indent`, listing unresolved names on
@@ -1412,7 +1654,8 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
 
 /// List functions/methods that have no callers — candidate dead code. Exported
 /// symbols may legitimately be external API, so they are marked, not hidden.
-pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any unused candidate was reported.
+pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.unused(w, idx, filter, opts);
     var refs = try buildReferencedNames(idx);
     defer refs.deinit();
@@ -1427,9 +1670,18 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         }
         try render.symbol(w, idx, sym, opts.verbosity, 0, true);
         // Under `--no-tests` a name reached only from tests is a genuine cleanup
-        // target with no application caller — flag it; otherwise note public API.
+        // target with no application caller — flag it; otherwise warn when the
+        // name smells like interface dispatch (uncounted by the call graph),
+        // then note public API.
         if (refs.testsContains(familyOf(idx, sym), sym.name)) {
-            try w.writeAll("  (only used by tests)\n");
+            const sites = testCallerCount(idx, sym.id);
+            if (sites > 0) {
+                try w.print("  (only used by tests — {d} test caller{s})\n", .{ sites, if (sites == 1) "" else "s" });
+            } else {
+                try w.writeAll("  (only used by tests)\n");
+            }
+        } else if (interfaceDispatchHint(idx, sym)) |hint| {
+            try w.print("  ({s} — verify before removing)\n", .{hint});
         } else if (sym.exported) {
             try w.writeAll("  (exported — may be public API)\n");
         } else {
@@ -1437,6 +1689,9 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         }
         shown += 1;
         if (shown >= opts.limit) break;
+    }
+    if (opts.tests != .with and !indexHasTests(idx)) {
+        try w.writeAll("  (note: no test files detected in this index — test-scope flags have nothing to exclude)\n");
     }
     if (shown == 0) {
         try w.print("(no unused functions under '{s}')\n", .{filter});
@@ -1453,6 +1708,7 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
         try w.print("  ({d} exported symbol(s) hidden by --no-public — re-run without it to audit public API)\n", .{hidden_exported});
     }
     try truncationNote(w, opts, shown);
+    return shown > 0;
 }
 
 /// Names used *somewhere*, decided by an identifier-token count rather than the
@@ -2144,14 +2400,15 @@ fn isTestPath(path: []const u8) bool {
 
 /// A path component that conventionally holds tests/fixtures in any ecosystem.
 fn isTestDirName(comp: []const u8) bool {
-    inline for (.{ "tests", "test", "__tests__", "__mocks__", "spec", "e2e" }) |d| {
+    inline for (.{ "tests", "test", "__tests__", "__mocks__", "spec", "e2e", "testdata" }) |d| {
         if (std.mem.eql(u8, comp, d)) return true;
     }
     return false;
 }
 
 /// List, per in-scope file, the local modules it imports (resolved edges only).
-pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+/// Returns whether any in-scope file had imports to report.
+pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listImports(w, idx, filter, opts);
     var any = false;
     for (idx.graph.files) |file| {
@@ -2166,10 +2423,12 @@ pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Opti
         }
     }
     if (!any) try w.print("(no local imports under '{s}')\n", .{filter});
+    return any;
 }
 
 /// List files that import the file(s) matching `path` — reverse dependencies.
-pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !void {
+/// Returns whether any importer was found.
+pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listImporters(w, idx, path, opts);
     var any = false;
     for (idx.graph.files) |target| {
@@ -2186,6 +2445,7 @@ pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Opti
         }
     }
     if (!any) try w.print("(no importers of '{s}')\n", .{path});
+    return any;
 }
 
 fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool {
@@ -2195,20 +2455,33 @@ fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool 
 
 /// Print the shortest call path from `from_name` to `to_name` (BFS over call
 /// edges), or a "no path" note. Renders the chain as an indented cascade.
-pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !void {
+/// Returns whether a call path was found (both names must resolve; false when
+/// resolved but disconnected, i.e. "no call path from A to B").
+pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.shortestPath(w, idx, from_name, to_name, opts);
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
     const chain = try shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf);
     defer idx.gpa.free(chain);
     if (chain.len == 0) {
+        // Distinguish "name unknown" (a lookup miss) from "genuinely no path"
+        // (a real negative answer) — an agent acts differently on each.
+        var probe: [1]SymbolId = undefined;
+        inline for (.{ from_name, to_name }) |nm| {
+            if (resolveIds(idx, nm, &probe).len == 0) {
+                try w.print("(no symbol named '{s}')\n", .{nm});
+                try suggestNear(w, idx, nm);
+                return false;
+            }
+        }
         try w.print("(no call path from '{s}' to '{s}')\n", .{ from_name, to_name });
-        return;
+        return false;
     }
     for (chain, 0..) |id, indent| {
         const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
         try render.symbol(w, idx, idx.graph.symbols[id], v, indent, true);
     }
+    return true;
 }
 
 /// The shortest call path from `from_name` to `to_name` as source→…→target
@@ -2449,7 +2722,7 @@ test "calls hides var/const data reads by default, shows them with --refs; graph
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
+        _ = try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
         try testing.expect(std.mem.indexOf(u8, out, "LIMIT") == null);
@@ -2460,7 +2733,7 @@ test "calls hides var/const data reads by default, shows them with --refs; graph
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .refs = true });
+        _ = try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .refs = true });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "helper") != null);
         try testing.expect(std.mem.indexOf(u8, out, "LIMIT") != null);
@@ -2516,7 +2789,7 @@ test "call-site line annotation, usages search, and @path disambiguation" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
+        _ = try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "↳:5") != null);
     }
@@ -2527,7 +2800,7 @@ test "call-site line annotation, usages search, and @path disambiguation" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try search(&aw.writer, &idx, "helper", .{ .refs = true });
+        _ = try search(&aw.writer, &idx, "helper", .{ .refs = true });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "m.zig:5") != null);
         try testing.expect(std.mem.indexOf(u8, out, "in run") != null);
@@ -2580,7 +2853,7 @@ test "heuristic (ambiguous name-match) edges are marked with `?`; strict drops t
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
+        _ = try walk(&aw.writer, &idx, "run", false, .{ .depth = 1 });
         try testing.expect(std.mem.indexOf(u8, aw.written(), " ?") != null);
         // A footer nudges the agent to `-s` instead of leaving it to guess.
         try testing.expect(std.mem.indexOf(u8, aw.written(), "re-run with -s") != null);
@@ -2592,7 +2865,7 @@ test "heuristic (ambiguous name-match) edges are marked with `?`; strict drops t
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .strict = true });
+        _ = try walk(&aw.writer, &idx, "run", false, .{ .depth = 1, .strict = true });
         try testing.expect(std.mem.indexOf(u8, aw.written(), " ?") == null);
         try testing.expect(std.mem.indexOf(u8, aw.written(), "re-run with -s") == null);
     }
@@ -2651,7 +2924,7 @@ test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try hot(&aw.writer, &idx, "", .{});
+        _ = try hot(&aw.writer, &idx, "", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "?)") != null);
     }
     // `--strict` drops a symbol whose connectivity is entirely heuristic.
@@ -2660,7 +2933,7 @@ test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try hot(&aw.writer, &idx, "", .{ .strict = true });
+        _ = try hot(&aw.writer, &idx, "", .{ .strict = true });
         try testing.expect(std.mem.indexOf(u8, aw.written(), "create_run") == null);
     }
 }
@@ -2695,7 +2968,7 @@ test "unused: a helper used only via a template literal or past JSX prose is not
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    _ = try unused(&aw.writer, &idx, "", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "reallyDead") != null);
     try testing.expect(std.mem.indexOf(u8, out, "afterProse") == null);
@@ -2728,7 +3001,7 @@ test "unused: a class never instantiated is dead; an instantiated one is live" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    _ = try unused(&aw.writer, &idx, "", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "DeadThing") != null);
     try testing.expect(std.mem.indexOf(u8, out, "UsedThing") == null);
@@ -2840,7 +3113,7 @@ test "unused: a multi-line decorator suppresses a framework-wired handler" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    _ = try unused(&aw.writer, &idx, "", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "ws_handler") == null);
     try testing.expect(std.mem.indexOf(u8, out, "plain_dead") != null);
@@ -2873,7 +3146,7 @@ test "unused: a decorator function applied as @name is live, not dead" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    _ = try unused(&aw.writer, &idx, "", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "register") == null);
     try testing.expect(std.mem.indexOf(u8, out, "orphan") != null);
@@ -2896,7 +3169,7 @@ test "unused: --no-public reports how many exported symbols it hid" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{ .unused_skip_exported = true });
+    _ = try unused(&aw.writer, &idx, "", .{ .unused_skip_exported = true });
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "deadPublic") == null);
     try testing.expect(std.mem.indexOf(u8, out, "hidden by --no-public") != null);
@@ -2929,7 +3202,7 @@ test "unused: a name only re-exported/imported is dead; called or aliased-and-us
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{});
+    _ = try unused(&aw.writer, &idx, "", .{});
     const out = aw.written();
     // Only re-exported through a barrel, never called → dead.
     try testing.expect(std.mem.indexOf(u8, out, "reExportedDead") != null);
@@ -2972,7 +3245,7 @@ test "unused: used-only-from-tests is flagged and annotated; production use is n
     defer aw.deinit();
     // `--no-tests` is the production-focused view: test usage does not count, so a
     // test-only-used symbol surfaces, annotated.
-    try unused(&aw.writer, &idx, "", .{ .tests = .without });
+    _ = try unused(&aw.writer, &idx, "", .{ .tests = .without });
     const out = aw.written();
     // Used in production → not reported.
     try testing.expect(std.mem.indexOf(u8, out, "prod_used") == null);
@@ -3012,7 +3285,7 @@ test "unused: default (--tests with) treats test usage as real; --tests-only fin
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try unused(&aw.writer, &idx, "", .{});
+        _ = try unused(&aw.writer, &idx, "", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "helper_tested_only") == null); // used by a test
         try testing.expect(std.mem.indexOf(u8, out, "truly_dead") != null); // used nowhere
@@ -3023,7 +3296,7 @@ test "unused: default (--tests with) treats test usage as real; --tests-only fin
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try unused(&aw.writer, &idx, "", .{ .tests = .only });
+        _ = try unused(&aw.writer, &idx, "", .{ .tests = .only });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "dead_test_helper") != null); // dead test helper
         try testing.expect(std.mem.indexOf(u8, out, "truly_dead") == null); // production, out of test scope
@@ -3064,7 +3337,7 @@ test "unused: a Zig fn used only inside an inline test {} block is test-only, no
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{ .tests = .without });
+    _ = try unused(&aw.writer, &idx, "", .{ .tests = .without });
     const out = aw.written();
     // Called from a production body → live.
     try testing.expect(std.mem.indexOf(u8, out, "prod_used") == null);
@@ -3097,7 +3370,7 @@ test "callers shows call-site multiplicity (×N) when a caller invokes the targe
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
+    _ = try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
     const out = aw.written();
     // `dashboard` calls it three times → the edge is annotated ×3, not collapsed
     // to a single call site; `once` (a single call) carries no multiplier.
@@ -3131,7 +3404,7 @@ test "callers lists every distinct call-site line when a caller hits the target 
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
+    _ = try walk(&aw.writer, &idx, "helper", true, .{ .depth = 1 });
     const out = aw.written();
     // Every distinct call-site line is shown, in order.
     try testing.expect(std.mem.indexOf(u8, out, "4,5,6") != null);
@@ -3165,7 +3438,7 @@ test "read: numbered lines, a range, and a non-indexed file via disk fallback" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try readLines(&aw.writer, io, &idx, root, "m.py:2-3", .{});
+        _ = try readLines(&aw.writer, io, &idx, root, "m.py:2-3", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "2\tdef a():") != null);
         try testing.expect(std.mem.indexOf(u8, out, "3\t") != null);
@@ -3176,7 +3449,7 @@ test "read: numbered lines, a range, and a non-indexed file via disk fallback" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try readLines(&aw.writer, io, &idx, root, "conf.json", .{});
+        _ = try readLines(&aw.writer, io, &idx, root, "conf.json", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "\"port\": 8080") != null);
     }
@@ -3202,7 +3475,7 @@ test "files lists indexed files with their symbol counts" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try listFiles(&aw.writer, &idx, "", .{});
+    _ = try listFiles(&aw.writer, &idx, "", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "a.py") != null);
     try testing.expect(std.mem.indexOf(u8, out, "2 symbols") != null);
@@ -3234,7 +3507,7 @@ test "files --sort symbols ranks the file with more symbols first" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try listFiles(&aw.writer, &idx, "", .{ .file_sort = .symbols });
+    _ = try listFiles(&aw.writer, &idx, "", .{ .file_sort = .symbols });
     const out = aw.written();
     const big = std.mem.indexOf(u8, out, "big.py") orelse return error.TestUnexpectedResult;
     const small = std.mem.indexOf(u8, out, "small.py") orelse return error.TestUnexpectedResult;
@@ -3301,7 +3574,7 @@ test "events pairs a decorator handler with an emitter across files" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try events(&aw.writer, &idx, "", .{});
+    _ = try events(&aw.writer, &idx, "", .{});
     const out = aw.written();
     // The key groups both sites; the decorator handler binds to its function; the
     // spaced prose message is not treated as an event key.
@@ -3339,7 +3612,7 @@ test "diff maps a changed hunk to its symbol and lists the blast radius" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try renderDiff(&aw.writer, &idx, &changes, .{});
+    _ = try renderDiff(&aw.writer, &idx, &changes, .{});
     const out = aw.written();
     // helper is the changed symbol; run is its caller (the blast radius).
     try testing.expect(std.mem.indexOf(u8, out, "~ ") != null);
@@ -3371,7 +3644,7 @@ test "events marks a key with only one side unpaired and honors the filter" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try events(&aw.writer, &idx, "only", .{});
+    _ = try events(&aw.writer, &idx, "only", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "only_emitted") != null);
     try testing.expect(std.mem.indexOf(u8, out, "unpaired") != null);
@@ -3408,7 +3681,7 @@ test "hot ranks the most-called function first" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try hot(&aw.writer, &idx, "", .{});
+    _ = try hot(&aw.writer, &idx, "", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "shared") != null);
     try testing.expect(std.mem.indexOf(u8, out, "←3 callers") != null);
@@ -3444,7 +3717,7 @@ test "hot splits test callers from production callers" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try hot(&aw.writer, &idx, "", .{});
+    _ = try hot(&aw.writer, &idx, "", .{});
     try testing.expect(std.mem.indexOf(u8, aw.written(), "[1 prod / 1 test]") != null);
 }
 
@@ -3470,7 +3743,7 @@ test "line range renders end line for a multi-line definition" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try outline(&aw.writer, &idx, "", .{});
+    _ = try outline(&aw.writer, &idx, "", .{});
     const out = aw.written();
     // `multi` spans lines 1–4 (outline uses `L<start>-<end>` for nested rows);
     // `single` is a one-liner rendered without a range suffix.
@@ -3504,7 +3777,7 @@ test "render surfaces accessor/async modifiers in the kind field" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "value", .{});
+        _ = try showDef(&aw.writer, &idx, "value", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "get Store.value") != null);
         try testing.expect(std.mem.indexOf(u8, out, "method Store.value") == null);
@@ -3514,8 +3787,8 @@ test "render surfaces accessor/async modifiers in the kind field" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "load", .{});
-        try showDef(&aw.writer, &idx, "boot", .{});
+        _ = try showDef(&aw.writer, &idx, "load", .{});
+        _ = try showDef(&aw.writer, &idx, "boot", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "async method Store.load") != null);
         try testing.expect(std.mem.indexOf(u8, out, "async fn boot") != null);
@@ -3546,7 +3819,7 @@ test "strings finds text inside string literals, never bare identifiers" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try strings(&aw.writer, &idx, "/api/health", .{});
+        _ = try strings(&aw.writer, &idx, "/api/health", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "svc.py:3") != null);
         try testing.expect(std.mem.indexOf(u8, out, "client.ts:1") != null);
@@ -3556,7 +3829,7 @@ test "strings finds text inside string literals, never bare identifiers" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try strings(&aw.writer, &idx, "LOG_MSG", .{});
+        _ = try strings(&aw.writer, &idx, "LOG_MSG", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no string literal") != null);
     }
 }
@@ -3587,7 +3860,7 @@ test "search --refs lists every distinct use-site line of a name" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try search(&aw.writer, &idx, "helper", .{ .refs = true });
+    _ = try search(&aw.writer, &idx, "helper", .{ .refs = true });
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "m.zig:5") != null);
     try testing.expect(std.mem.indexOf(u8, out, "m.zig:6") != null);
@@ -3619,7 +3892,7 @@ test "search --refs pins instance-attribute reads by receiver" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try search(&aw.writer, &idx, "self.rows", .{ .refs = true });
+    _ = try search(&aw.writer, &idx, "self.rows", .{ .refs = true });
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "t.py:3") != null);
     try testing.expect(std.mem.indexOf(u8, out, "t.py:5") != null);
@@ -3631,7 +3904,7 @@ test "search --refs pins instance-attribute reads by receiver" {
     defer buf2.deinit(testing.allocator);
     var aw2: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf2);
     defer aw2.deinit();
-    try search(&aw2.writer, &idx, ".rows", .{ .refs = true });
+    _ = try search(&aw2.writer, &idx, ".rows", .{ .refs = true });
     try testing.expect(std.mem.indexOf(u8, aw2.written(), "in external") != null);
 }
 
@@ -3661,7 +3934,7 @@ test "def -v full includes leading decorators and multi-line python literals" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "handler", .{ .verbosity = .full });
+        _ = try showDef(&aw.writer, &idx, "handler", .{ .verbosity = .full });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "@functools.lru_cache") != null);
         try testing.expect(std.mem.indexOf(u8, out, "@app.get(\"/x\")") != null);
@@ -3672,7 +3945,7 @@ test "def -v full includes leading decorators and multi-line python literals" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "GP_GROUPS", .{ .verbosity = .full });
+        _ = try showDef(&aw.writer, &idx, "GP_GROUPS", .{ .verbosity = .full });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "stations") != null);
         try testing.expect(std.mem.indexOf(u8, out, "visual") != null);
@@ -3701,7 +3974,7 @@ test "read: multiple comma-separated ranges with a gap marker" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try readLines(&aw.writer, io, &idx, root, "m.py:1,4-5", .{});
+    _ = try readLines(&aw.writer, io, &idx, root, "m.py:1,4-5", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "1\tdef a():") != null);
     try testing.expect(std.mem.indexOf(u8, out, "4\t    z = 3") != null);
@@ -3742,7 +4015,7 @@ test "unused: a prod fn used only from a tests/ directory is test-only (dir scop
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try unused(&aw.writer, &idx, "", .{ .tests = .without });
+    _ = try unused(&aw.writer, &idx, "", .{ .tests = .without });
     const out = aw.written();
     // Used only from a tests/ helper → reported and flagged.
     try testing.expect(std.mem.indexOf(u8, out, "helper_target") != null);
@@ -3899,7 +4172,7 @@ test "outline -k restricts to the requested kind, both sides of the branch" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{});
+        _ = try outline(&aw.writer, &idx, "", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "struct Widget") != null);
         try testing.expect(std.mem.indexOf(u8, out, "fn build") != null);
@@ -3909,7 +4182,7 @@ test "outline -k restricts to the requested kind, both sides of the branch" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{ .kinds = "fn" });
+        _ = try outline(&aw.writer, &idx, "", .{ .kinds = "fn" });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "fn build") != null);
         try testing.expect(std.mem.indexOf(u8, out, "Widget") == null);
@@ -3919,7 +4192,7 @@ test "outline -k restricts to the requested kind, both sides of the branch" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{ .kinds = "struct" });
+        _ = try outline(&aw.writer, &idx, "", .{ .kinds = "struct" });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "struct Widget") != null);
         try testing.expect(std.mem.indexOf(u8, out, "build") == null);
@@ -3946,7 +4219,7 @@ test "outline -v names drops the signature that the default sig view shows" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{ .verbosity = .sig });
+        _ = try outline(&aw.writer, &idx, "", .{ .verbosity = .sig });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "fn add") != null);
         try testing.expect(std.mem.indexOf(u8, out, "(a: u32") != null);
@@ -3956,7 +4229,7 @@ test "outline -v names drops the signature that the default sig view shows" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{ .verbosity = .names });
+        _ = try outline(&aw.writer, &idx, "", .{ .verbosity = .names });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "fn add") != null);
         try testing.expect(std.mem.indexOf(u8, out, "(a: u32") == null);
@@ -3988,7 +4261,7 @@ test "outline truncates per-file and names the unexpanded overflow files under -
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "", .{ .limit = 1 });
+        _ = try outline(&aw.writer, &idx, "", .{ .limit = 1 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "symbol") != null and
             std.mem.indexOf(u8, out, "here (raise -l to list)") != null);
@@ -3999,7 +4272,7 @@ test "outline truncates per-file and names the unexpanded overflow files under -
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try outline(&aw.writer, &idx, "a.zig", .{ .limit = 1 });
+        _ = try outline(&aw.writer, &idx, "a.zig", .{ .limit = 1 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "stopped at -l 1") != null);
         try testing.expect(std.mem.indexOf(u8, out, "more file(s) named") == null);
@@ -4023,7 +4296,7 @@ test "outline path filter with no match reports an explicit empty result" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try outline(&aw.writer, &idx, "does_not_exist", .{});
+    _ = try outline(&aw.writer, &idx, "does_not_exist", .{});
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "no source symbols under 'does_not_exist'") != null);
     try testing.expect(std.mem.indexOf(u8, out, "present") == null);
@@ -4047,7 +4320,7 @@ test "outline --format json is well-formed and carries path/lang/symbols" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try outline(&aw.writer, &idx, "", .{ .format = .json });
+    _ = try outline(&aw.writer, &idx, "", .{ .format = .json });
     const out = aw.written();
 
     // Parse to prove it is a valid JSON document, then assert on the schema.
@@ -4087,7 +4360,7 @@ test "listFiles: default order filters by path and reports an empty scope" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listFiles(&aw.writer, &idx, "keep", .{});
+        _ = try listFiles(&aw.writer, &idx, "keep", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "keep.py") != null);
         try testing.expect(std.mem.indexOf(u8, out, "drop.py") == null);
@@ -4098,7 +4371,7 @@ test "listFiles: default order filters by path and reports an empty scope" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listFiles(&aw.writer, &idx, "nowhere", .{});
+        _ = try listFiles(&aw.writer, &idx, "nowhere", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no indexed files under 'nowhere'") != null);
     }
 }
@@ -4123,7 +4396,7 @@ test "read: out-of-range line noted; open-ended A- tail runs to EOF" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try readLines(&aw.writer, io, &idx, root, "m.py:10-20", .{});
+        _ = try readLines(&aw.writer, io, &idx, root, "m.py:10-20", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no such line: 10; file has 3") != null);
     }
     { // Open-ended `2-` emits from line 2 through the last line, dropping line 1.
@@ -4131,7 +4404,7 @@ test "read: out-of-range line noted; open-ended A- tail runs to EOF" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try readLines(&aw.writer, io, &idx, root, "m.py:2-", .{});
+        _ = try readLines(&aw.writer, io, &idx, root, "m.py:2-", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "2\tb = 2") != null);
         try testing.expect(std.mem.indexOf(u8, out, "3\tc = 3") != null);
@@ -4164,7 +4437,7 @@ test "showDef: unknown name is reported; @path selects one of several twins" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "ghost", .{});
+        _ = try showDef(&aw.writer, &idx, "ghost", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no definition named 'ghost'") != null);
     }
     { // Bare name shows both twins (each with its own file path).
@@ -4172,7 +4445,7 @@ test "showDef: unknown name is reported; @path selects one of several twins" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "dup", .{});
+        _ = try showDef(&aw.writer, &idx, "dup", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "left.zig") != null);
         try testing.expect(std.mem.indexOf(u8, out, "right.zig") != null);
@@ -4182,7 +4455,7 @@ test "showDef: unknown name is reported; @path selects one of several twins" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try showDef(&aw.writer, &idx, "dup@right", .{});
+        _ = try showDef(&aw.writer, &idx, "dup@right", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "right.zig") != null);
         try testing.expect(std.mem.indexOf(u8, out, "left.zig") == null);
@@ -4213,7 +4486,7 @@ test "walk: unknown symbol reported; callees followed to depth 2" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "absent", false, .{ .depth = 1 });
+        _ = try walk(&aw.writer, &idx, "absent", false, .{ .depth = 1 });
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol named 'absent'") != null);
     }
     { // depth 1 from top reaches mid but not the transitively-called leaf.
@@ -4221,7 +4494,7 @@ test "walk: unknown symbol reported; callees followed to depth 2" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "top", false, .{ .depth = 1 });
+        _ = try walk(&aw.writer, &idx, "top", false, .{ .depth = 1 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "mid") != null);
         try testing.expect(std.mem.indexOf(u8, out, "leaf") == null);
@@ -4231,7 +4504,7 @@ test "walk: unknown symbol reported; callees followed to depth 2" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "top", false, .{ .depth = 2 });
+        _ = try walk(&aw.writer, &idx, "top", false, .{ .depth = 2 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "mid") != null);
         try testing.expect(std.mem.indexOf(u8, out, "leaf") != null);
@@ -4259,7 +4532,7 @@ test "search: matches names, honors -k, and reports no match" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try search(&aw.writer, &idx, "onfig", .{});
+        _ = try search(&aw.writer, &idx, "onfig", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "Config") != null);
         try testing.expect(std.mem.indexOf(u8, out, "configure") != null);
@@ -4269,7 +4542,7 @@ test "search: matches names, honors -k, and reports no match" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try search(&aw.writer, &idx, "onfig", .{ .kinds = "struct" });
+        _ = try search(&aw.writer, &idx, "onfig", .{ .kinds = "struct" });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "Config") != null);
         try testing.expect(std.mem.indexOf(u8, out, "configure") == null);
@@ -4279,7 +4552,7 @@ test "search: matches names, honors -k, and reports no match" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try search(&aw.writer, &idx, "zzzz", .{});
+        _ = try search(&aw.writer, &idx, "zzzz", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol matching 'zzzz'") != null);
     }
 }
@@ -4308,7 +4581,7 @@ test "neighbors: shows both callees and callers, and reports a missing symbol" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try neighbors(&aw.writer, &idx, "mid", .{});
+        _ = try neighbors(&aw.writer, &idx, "mid", .{});
         const out = aw.written();
         const calls_hdr = std.mem.indexOf(u8, out, "↓ calls").?;
         const callers_hdr = std.mem.indexOf(u8, out, "↑ callers").?;
@@ -4324,7 +4597,7 @@ test "neighbors: shows both callees and callers, and reports a missing symbol" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try neighbors(&aw.writer, &idx, "nobody", .{});
+        _ = try neighbors(&aw.writer, &idx, "nobody", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol named 'nobody'") != null);
     }
 }
@@ -4356,7 +4629,7 @@ test "routes: a route renders with its handler callee and its client caller" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try listRoutes(&aw.writer, &idx, "", .{});
+    _ = try listRoutes(&aw.writer, &idx, "", .{});
     const out = aw.written();
     // The route symbol (METHOD path), its handler callee, and the client caller.
     try testing.expect(std.mem.indexOf(u8, out, "GET /orders") != null);
@@ -4384,7 +4657,7 @@ test "routes: a filter that matches no route reports an empty scope" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listRoutes(&aw.writer, &idx, "health", .{});
+        _ = try listRoutes(&aw.writer, &idx, "health", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "GET /health") != null);
     }
     { // A non-matching filter → the not-found note.
@@ -4392,7 +4665,7 @@ test "routes: a filter that matches no route reports an empty scope" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listRoutes(&aw.writer, &idx, "billing", .{});
+        _ = try listRoutes(&aw.writer, &idx, "billing", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no routes under 'billing'") != null);
     }
 }
@@ -4421,7 +4694,7 @@ test "imports: listImports shows a local import with its binding; empty scope no
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listImports(&aw.writer, &idx, "user", .{});
+        _ = try listImports(&aw.writer, &idx, "user", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "user.zig") != null);
         try testing.expect(std.mem.indexOf(u8, out, "→ dep.zig") != null);
@@ -4432,7 +4705,7 @@ test "imports: listImports shows a local import with its binding; empty scope no
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listImports(&aw.writer, &idx, "dep.zig", .{});
+        _ = try listImports(&aw.writer, &idx, "dep.zig", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no local imports under 'dep.zig'") != null);
     }
 }
@@ -4461,7 +4734,7 @@ test "imports: listImporters lists reverse deps and reports none for a leaf" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listImporters(&aw.writer, &idx, "dep.zig", .{});
+        _ = try listImporters(&aw.writer, &idx, "dep.zig", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "dep.zig ← imported by") != null);
         try testing.expect(std.mem.indexOf(u8, out, "user.zig") != null);
@@ -4471,7 +4744,7 @@ test "imports: listImporters lists reverse deps and reports none for a leaf" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try listImporters(&aw.writer, &idx, "user.zig", .{});
+        _ = try listImporters(&aw.writer, &idx, "user.zig", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no importers of 'user.zig'") != null);
     }
 }
@@ -4500,7 +4773,7 @@ test "shortestPath renders the chain, a same-node path, and a no-path note" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try shortestPath(&aw.writer, &idx, "alpha", "gamma", .{});
+        _ = try shortestPath(&aw.writer, &idx, "alpha", "gamma", .{});
         const out = aw.written();
         const a = std.mem.indexOf(u8, out, "alpha").?;
         const b = std.mem.indexOf(u8, out, "beta").?;
@@ -4512,7 +4785,7 @@ test "shortestPath renders the chain, a same-node path, and a no-path note" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try shortestPath(&aw.writer, &idx, "alpha", "alpha", .{});
+        _ = try shortestPath(&aw.writer, &idx, "alpha", "alpha", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "alpha") != null);
         try testing.expect(std.mem.indexOf(u8, out, "beta") == null);
@@ -4522,7 +4795,7 @@ test "shortestPath renders the chain, a same-node path, and a no-path note" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try shortestPath(&aw.writer, &idx, "gamma", "alpha", .{});
+        _ = try shortestPath(&aw.writer, &idx, "gamma", "alpha", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no call path from 'gamma' to 'alpha'") != null);
     }
 }
@@ -4551,7 +4824,7 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try hot(&aw.writer, &idx, "", .{ .limit = 1 });
+        _ = try hot(&aw.writer, &idx, "", .{ .limit = 1 });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "shared") != null); // rank 1
         try testing.expect(std.mem.indexOf(u8, out, "more; raise -l to see them") != null);
@@ -4561,7 +4834,7 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try hot(&aw.writer, &idx, "core", .{});
+        _ = try hot(&aw.writer, &idx, "core", .{});
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "shared") != null);
         try testing.expect(std.mem.indexOf(u8, out, "helper") == null);
@@ -4571,7 +4844,7 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try hot(&aw.writer, &idx, "missing", .{});
+        _ = try hot(&aw.writer, &idx, "missing", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no functions under 'missing'") != null);
     }
 }
@@ -4615,7 +4888,7 @@ test "test-awareness: Zig test block is a caller; --tests scope + coverage" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "used", true, .{ .tests = .only });
+        _ = try walk(&aw.writer, &idx, "used", true, .{ .tests = .only });
         try testing.expect(std.mem.indexOf(u8, aw.written(), "exercises used") != null);
     }
     {
@@ -4623,7 +4896,7 @@ test "test-awareness: Zig test block is a caller; --tests scope + coverage" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try walk(&aw.writer, &idx, "used", true, .{ .tests = .without });
+        _ = try walk(&aw.writer, &idx, "used", true, .{ .tests = .without });
         try testing.expect(std.mem.indexOf(u8, aw.written(), "exercises used") == null);
     }
 
@@ -4633,7 +4906,7 @@ test "test-awareness: Zig test block is a caller; --tests scope + coverage" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        try coverage(&aw.writer, &idx, "", .{});
+        _ = try coverage(&aw.writer, &idx, "", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "50.0%") != null);
     }
 }

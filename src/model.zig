@@ -33,6 +33,19 @@ pub const SymbolKind = enum {
     test_case,
     unknown,
 
+    /// Whether `t` names a known kind: a tag (`fn`, `struct`, …) or a CLI alias
+    /// (`function`/`func`, `constant`, `variable`). Lets the CLI reject a typo'd
+    /// `-k` filter instead of silently matching nothing.
+    pub fn validName(t: []const u8) bool {
+        inline for (@typeInfo(SymbolKind).@"enum".fields) |f| {
+            if (std.mem.eql(u8, t, @field(SymbolKind, f.name).tag())) return true;
+        }
+        inline for (.{ "function", "func", "constant", "variable" }) |a| {
+            if (std.mem.eql(u8, t, a)) return true;
+        }
+        return false;
+    }
+
     pub fn tag(self: SymbolKind) []const u8 {
         return switch (self) {
             .function => "fn",
@@ -291,6 +304,17 @@ fn mkSymForTest(
         .exported = false,
         .refs = &.{},
     };
+}
+
+test "SymbolKind.validName accepts every tag and alias, rejects typos" {
+    inline for (@typeInfo(SymbolKind).@"enum".fields) |f| {
+        try std.testing.expect(SymbolKind.validName(@field(SymbolKind, f.name).tag()));
+    }
+    try std.testing.expect(SymbolKind.validName("function"));
+    try std.testing.expect(SymbolKind.validName("func"));
+    try std.testing.expect(SymbolKind.validName("variable"));
+    try std.testing.expect(!SymbolKind.validName("xyz123"));
+    try std.testing.expect(!SymbolKind.validName("fns"));
 }
 
 test "SymbolKind.tag returns the exact short tag for every kind" {

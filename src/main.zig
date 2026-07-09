@@ -28,10 +28,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const parsed = cli.parse(args) catch |err| {
-        // A malformed invocation is a usage error: explain it on stderr and exit
-        // non-zero so callers (agents, scripts) can detect the failure.
-        try err_out.print("navgraph: {s}\n\n", .{cli.reason(err)});
-        try cli.usage(err_out);
+        // A malformed invocation is a usage error: one precise line on stderr
+        // (never the full help dump — ~75 lines an agent pays for per typo) and
+        // exit non-zero so callers (agents, scripts) can detect the failure.
+        const detail = cli.diag();
+        if (detail.len != 0) {
+            try err_out.print("navgraph: {s}\n", .{detail});
+        } else {
+            try err_out.print("navgraph: {s}\n", .{cli.reason(err)});
+        }
+        try err_out.writeAll("run `navgraph help` for usage\n");
         try err_out.flush();
         std.process.exit(2);
     };
@@ -48,12 +54,25 @@ pub fn main(init: std.process.Init) !void {
     };
     defer idx.deinit();
 
-    try dispatch(out, io, &idx, parsed);
-    try out.flush();
+    const found = dispatch(out, io, &idx, parsed) catch |err| switch (err) {
+        // Downstream closed the pipe (`navgraph … | head`). That's a normal way
+        // to consume a Unix tool, not an internal error: exit quietly with the
+        // conventional SIGPIPE status instead of spraying `error.WriteFailed`.
+        error.WriteFailed => std.process.exit(141),
+        else => return err,
+    };
+    // flush's only error is WriteFailed — same broken-pipe treatment.
+    out.flush() catch std.process.exit(141);
+    // grep convention: 0 = found results, 1 = query ran fine but found nothing
+    // (the "(no …)" note), so scripts/agents can branch on $? instead of
+    // re-parsing output. Usage errors exit 2, indexing failures propagate.
+    if (!found) std.process.exit(1);
 }
 
-fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !void {
-    switch (parsed.command) {
+/// Run the parsed command; true when at least one real result row was printed
+/// (notes, suggestions, and empty JSON arrays don't count).
+fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !bool {
+    return switch (parsed.command) {
         .outline => try query.outline(out, idx, parsed.arg, parsed.options),
         .files => try query.listFiles(out, idx, parsed.arg, parsed.options),
         .read => try query.readLines(out, io, idx, parsed.root, parsed.arg, parsed.options),
@@ -72,9 +91,12 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .hot => try query.hot(out, idx, parsed.arg, parsed.options),
         .diff => try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .coverage => try query.coverage(out, idx, parsed.arg, parsed.options),
-        .graph => try viz.graph(out, idx, parsed.arg, parsed.options),
+        .graph => blk: {
+            try viz.graph(out, idx, parsed.arg, parsed.options);
+            break :blk true; // graph always emits a page/model
+        },
         .help => unreachable,
-    }
+    };
 }
 
 
@@ -146,7 +168,7 @@ fn dispatchOwned(alloc: std.mem.Allocator, io: std.Io, idx: *index_mod.Index, pa
     defer buf.deinit(alloc);
     var aw: std.Io.Writer.Allocating = .fromArrayList(alloc, &buf);
     defer aw.deinit();
-    try dispatch(&aw.writer, io, idx, parsed);
+    _ = try dispatch(&aw.writer, io, idx, parsed);
     return alloc.dupe(u8, aw.written());
 }
 
