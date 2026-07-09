@@ -108,7 +108,14 @@ would improve `callers`, `calls`, `hot`, and `unused` precision at once.
 
 ---
 
-## D. Missing or mislabeled symbol kinds (per-language parser depth)
+## D. Missing or mislabeled symbol kinds (per-language parser depth)  **[✅ partly shipped]**
+
+*Shipped:* Go package-level `const`/`var` (single and grouped `const ( … )`) are
+now indexed; C# **expression-bodied methods** (`M() => expr;`) are now indexed
+with their body references (previously their `=>` body matched neither a `{`
+body nor a `;` declaration, so they vanished). *Still open below:* C# properties/
+fields/generic-methods, the Zig generic-container idiom, the C++ items, and
+union labeling.
 
 Whole categories of real symbols are invisible or wrong. Each makes `outline`,
 `def`, `search`, and `unused` incomplete for that language.

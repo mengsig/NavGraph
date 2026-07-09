@@ -1287,6 +1287,31 @@ fn tryCppMethod(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: u32) A
         });
         return body_close + 1;
     }
+    // C# expression-bodied member: `M(...) => expr;` — the expression is the body,
+    // so its calls/reads are collected. (C# only; C/C++ have no such form.)
+    if (ctx.cfg.language == .csharp) {
+        const arrow = csArrowBody(ctx, params_close, hi);
+        if (arrow != sentinel) {
+            const semi_a = findNext(ctx, arrow + 2, hi, ';');
+            if (semi_a != sentinel) {
+                const body = try collectRefs(ctx, params_open, arrow + 2, semi_a, ctx.textOf(name_i), ctx.ckw);
+                _ = try emit(ctx, .{
+                    .name = ctx.textOf(name_i),
+                    .kind = .method,
+                    .line = ctx.toks[name_i].line,
+                    .span_start = lineStartOffset(ctx, name_i),
+                    .span_end = ctx.toks[semi_a].end,
+                    .sig_end = ctx.toks[arrow].start,
+                    .doc = collectDoc(ctx, name_i),
+                    .exported = exported,
+                    .parent_local = parent,
+                    .refs = body.refs,
+                    .bindings = body.bindings,
+                });
+                return semi_a + 1;
+            }
+        }
+    }
     // Declaration `NAME(params) [qualifiers] ;`
     const semi = declEnd(ctx, params_close, hi);
     if (semi == sentinel) return name_i;
@@ -1357,6 +1382,23 @@ fn declEnd(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
         const ok = ctx.toks[j].kind == .identifier or ctx.toks[j].kind == .number or
             ctx.isPunct(j, '=');
         if (!ok) return sentinel;
+    }
+    return sentinel;
+}
+
+/// A C# expression-bodied member arrow `=>` following the parameter list closing
+/// at `params_close` (allowing a couple of trailing qualifier idents). Returns the
+/// index of the `=` of `=>`, or `sentinel`.
+fn csArrowBody(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
+    var j = params_close + 1;
+    var guard: u32 = 0;
+    while (j + 1 < hi and guard < 4) : ({
+        j += 1;
+        guard += 1;
+    }) {
+        if (ctx.isPunct(j, '=') and ctx.isPunct(j + 1, '>')) return j;
+        if (ctx.toks[j].kind == .identifier) continue;
+        return sentinel;
     }
     return sentinel;
 }
@@ -2481,12 +2523,57 @@ fn parseGoScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
                 continue;
             }
         }
+        if ((ctx.identEql(i, "const") or ctx.identEql(i, "var")) and isLineStart(ctx, i)) {
+            const adv = try parseGoConstVar(ctx, i, hi, parent);
+            if (adv > i) {
+                i = adv;
+                continue;
+            }
+        }
         if (ctx.isPunct(i, '{') or ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
             i = skipBracket(ctx, i);
             continue;
         }
         i += 1;
     }
+}
+
+/// Package-level Go `const`/`var`, single (`const MaxN = 10`, `var total int`) or
+/// grouped (`const ( A = 1\n B = 2 )`). Each declared name becomes a
+/// constant/variable symbol; exportedness follows Go's capitalization rule.
+fn parseGoConstVar(ctx: *Ctx, kw_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
+    const kind: SymbolKind = if (ctx.identEql(kw_i, "const")) .constant else .variable;
+    // Grouped form: `const ( ... )` — emit each line-leading name inside.
+    if (kw_i + 1 < hi and ctx.isPunct(kw_i + 1, '(')) {
+        const close = ctx.close[kw_i + 1];
+        if (close == sentinel) return kw_i;
+        var j = kw_i + 2;
+        while (j < close) : (j += 1) {
+            if (ctx.toks[j].kind == .identifier and isLineStart(ctx, j)) try emitGoValue(ctx, j, kind, parent);
+        }
+        return close + 1;
+    }
+    // Single form: `const NAME ...` / `var NAME ...`.
+    if (kw_i + 1 >= hi or ctx.toks[kw_i + 1].kind != .identifier) return kw_i;
+    try emitGoValue(ctx, kw_i + 1, kind, parent);
+    return kw_i + 2;
+}
+
+fn emitGoValue(ctx: *Ctx, name_i: u32, kind: SymbolKind, parent: ?u32) AllocError!void {
+    const name = ctx.textOf(name_i);
+    const span_end = lineEndOffset(ctx, ctx.toks[name_i].start);
+    _ = try emit(ctx, .{
+        .name = name,
+        .kind = kind,
+        .line = ctx.toks[name_i].line,
+        .span_start = lineStartOffset(ctx, name_i),
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = goExported(name),
+        .parent_local = parent,
+        .refs = &.{},
+    });
 }
 
 fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
@@ -5000,20 +5087,28 @@ test "go: single-line import records the module edge; type alias and defined typ
     try testing.expectEqual(SymbolKind.type, findSym(out.items, "MyInt").?.kind);
 }
 
-test "go: package-level const/var declarations are not emitted as symbols" {
-    // The Go scanner only recognizes func/type/import at package scope.
+test "go: package-level const/var declarations are emitted as symbols (single + grouped)" {
     const src =
         \\package main
         \\const MaxSize = 1024
         \\var registry = 0
+        \\const (
+        \\    A = 1
+        \\    B = 2
+        \\)
         \\func use() int { return MaxSize }
     ;
     var out = try parseForTest(src, .go);
     defer freeRefs(&out);
-    try testing.expect(findSym(out.items, "MaxSize") == null);
-    try testing.expect(findSym(out.items, "registry") == null);
-    // Functions are still found normally.
+    try testing.expectEqual(SymbolKind.constant, findSym(out.items, "MaxSize").?.kind);
+    try testing.expectEqual(SymbolKind.variable, findSym(out.items, "registry").?.kind);
+    // Grouped `const ( A = 1\n B = 2 )` members are each emitted.
+    try testing.expect(findSym(out.items, "A") != null);
+    try testing.expect(findSym(out.items, "B") != null);
+    // Functions are still found normally; Go capitalization drives exportedness.
     try testing.expect(findSym(out.items, "use") != null);
+    try testing.expect(findSym(out.items, "MaxSize").?.exported); // capital M
+    try testing.expect(!findSym(out.items, "registry").?.exported); // lowercase r
 }
 
 test "go: a method's pointer receiver is bound so member calls carry a receiver" {
@@ -5178,4 +5273,24 @@ test "csharp: explicit access modifiers set member visibility (for --no-public)"
     // A bare member stays exported (conservative: its default depends on the
     // container, so don't over-hide it from `unused --no-public`).
     try testing.expect(findSym(out.items, "Bare").?.exported);
+}
+
+test "csharp: expression-bodied method is indexed with its body references" {
+    const src =
+        \\namespace N {
+        \\  class Q {
+        \\    public int Expr() => Helper() + 1;
+        \\    int Helper() { return 1; }
+        \\    public T Gen<T>(T x) => x;
+        \\  }
+        \\}
+    ;
+    var out = try parseForTest(src, .csharp);
+    defer freeRefs(&out);
+    // `Expr() => expr;` is a method (previously dropped: its `=>` body was
+    // recognized as neither a `{` body nor a `;` declaration).
+    const expr = findSym(out.items, "Expr").?;
+    try testing.expectEqual(SymbolKind.method, expr.kind);
+    try testing.expect(hasCallRef(expr, "Helper")); // the expression body's call is collected
+    try testing.expect(findSym(out.items, "Helper") != null);
 }
