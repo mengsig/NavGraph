@@ -15,6 +15,7 @@ pub const cache = @import("cache.zig");
 pub const query = @import("query.zig");
 pub const json_out = @import("json_out.zig");
 pub const render = @import("render.zig");
+pub const viz = @import("viz.zig");
 pub const cli = @import("cli.zig");
 
 test {

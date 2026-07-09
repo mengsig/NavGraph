@@ -4,6 +4,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const index_mod = @import("index.zig");
 const query = @import("query.zig");
+const viz = @import("viz.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -71,6 +72,7 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .hot => try query.hot(out, idx, parsed.arg, parsed.options),
         .diff => try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .coverage => try query.coverage(out, idx, parsed.arg, parsed.options),
+        .graph => try viz.graph(out, idx, parsed.arg, parsed.options),
         .help => unreachable,
     }
 }

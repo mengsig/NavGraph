@@ -52,6 +52,7 @@ supported code, and each has a required replacement:
 | Hunting for unused code (functions/methods **and types**) | `navgraph unused [filter]` — default is *truly unused* (no app or test caller = removal candidate, not "broken"); `--no-public` hides exported/public API |
 | Finding which tests exercise a symbol | `navgraph callers <name> --tests-only` (Zig `test` blocks & `test_*` fns are indexed) |
 | Measuring test reach / coverage | `navgraph coverage [path]` (% of fn/method reachable from a test; `-j` for JSON) |
+| Giving a human a visual map of the codebase | `navgraph graph [path] > graph.html` — self-contained, offline interactive HTML (nodes = symbols, edges = calls; zoom/search/click-to-trace); `-j` emits the raw `{nodes, edges}` model |
 | Reading routers + client to map an endpoint | `navgraph routes [filter]` (cross-language) |
 | Reading handler + caller to trace a message-bus / WS event | `navgraph events [filter]` (pairs `register`/`on` handlers with `send`/`emit` emitters, cross-language) |
 | Reading imports at the top of files | `navgraph imports [filter]` / `importers <file>` |

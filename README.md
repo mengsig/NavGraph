@@ -44,6 +44,17 @@ navgraph coverage src            # per-file % + overall, computed natively
 navgraph coverage src -j         # same, as JSON
 ```
 
+Visualize the whole graph as a **standalone, offline HTML page** — a **layered
+dependency view** (callers on top, callees below, edges flowing downward), with a
+force-directed mode one click away. Zoom, pan, search, and click any symbol to
+trace its callers/callees; colored by file. No server, no CDN, no dependencies:
+the data and the renderer are inlined into one self-contained file.
+
+```sh
+navgraph graph src --no-tests > graph.html   # then open graph.html in a browser
+navgraph graph -j > graph.json               # raw {nodes, edges} model for other tools
+```
+
 ## Usage
 
 ```
@@ -70,6 +81,7 @@ navgraph <command> [arg] [flags]
 | `read <file[:A-B]>`| Print raw source lines (numbered); batch ranges: `file:A-B,C-D`. |
 | `strings <pattern>`| Search inside string literals (URLs, log/error text, regexes). |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
+| `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges}` JSON. Respects `--tests`. |
 | `help`             | Show help.                                                    |
 
 **Flags**

@@ -8,7 +8,7 @@ const render = @import("render.zig");
 pub const Command = enum {
     outline, def, calls, callers, search, routes, events,
     neighbors, unused, imports, importers, path, hot, diff,
-    files, read, strings, coverage, help,
+    files, read, strings, coverage, graph, help,
 };
 
 pub const Parsed = struct {
@@ -58,6 +58,8 @@ const usage_text =
     \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
     \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
     \\  coverage [path]    % of fn/method reachable from a test (call-graph, no instrumentation)
+    \\  graph [path]       Interactive HTML visualization of the code graph
+    \\                     (redirect stdout to a .html file; -j emits the raw JSON model)
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -99,6 +101,7 @@ const usage_text =
     \\  navgraph callers parse --tests-only        # which tests exercise parse
     \\  navgraph outline src --no-tests            # production structure only
     \\  navgraph coverage src                      # test reach per file
+    \\  navgraph graph src --no-tests > graph.html # visualize the production graph
     \\  navgraph path parse emit
     \\
 ;
@@ -162,6 +165,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "strings", Command.strings }, .{ "str", Command.strings },
         .{ "literals", Command.strings },
         .{ "coverage", Command.coverage }, .{ "cov", Command.coverage },
+        .{ "graph", Command.graph },     .{ "viz", Command.graph },
+        .{ "visualize", Command.graph }, .{ "html", Command.graph },
 
         .{ "help", Command.help },       .{ "--help", Command.help },
         .{ "-h", Command.help },
@@ -175,7 +180,7 @@ fn parseCommand(s: []const u8) ?Command {
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage => true,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage, .graph => true,
         .path => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
@@ -423,6 +428,8 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.files, parseCommand("files").?);
     try std.testing.expectEqual(Command.read, parseCommand("read").?);
     try std.testing.expectEqual(Command.strings, parseCommand("strings").?);
+    try std.testing.expectEqual(Command.coverage, parseCommand("coverage").?);
+    try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
 }
 
@@ -443,6 +450,9 @@ test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.read, parseCommand("cat").?);
     try std.testing.expectEqual(Command.strings, parseCommand("str").?);
     try std.testing.expectEqual(Command.strings, parseCommand("literals").?);
+    try std.testing.expectEqual(Command.graph, parseCommand("viz").?);
+    try std.testing.expectEqual(Command.graph, parseCommand("visualize").?);
+    try std.testing.expectEqual(Command.coverage, parseCommand("cov").?);
     // help aliases
     try std.testing.expectEqual(Command.help, parseCommand("--help").?);
     try std.testing.expectEqual(Command.help, parseCommand("-h").?);
