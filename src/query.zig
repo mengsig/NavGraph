@@ -933,6 +933,11 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         try w.print("(no symbol matching '{s}')\n", .{pattern});
         try suggestNear(w, idx, pattern);
         try kindHint(w, idx, "", opts);
+        // A slash/space never occurs in a symbol name — the query is literal
+        // text (a route path, a log message). Point at the right verb.
+        if (std.mem.indexOfAny(u8, pattern, "/ ") != null) {
+            try w.print("  (symbol names never contain '/' or spaces — try `strings '{s}'` for literal text)\n", .{pattern});
+        }
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
