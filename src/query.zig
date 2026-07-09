@@ -1761,6 +1761,15 @@ fn tallyUses(
             i = try scanPyStmt(toks, text, i, bucket);
             continue;
         }
+        // A JS/TS object-literal property key (`{ count: v }`) names a field, not
+        // a use of a same-named symbol — don't count it toward "used" (mirrors the
+        // parser's edge suppression, so a dead fn isn't masked by an object key).
+        if (js and i > 0 and punctIs(toks, text, i + 1, ':') and
+            (punctIs(toks, text, i - 1, '{') or punctIs(toks, text, i - 1, ',')))
+        {
+            i += 1;
+            continue;
+        }
         // A decorator application lexes as one `@name` token (the lexer treats
         // `@` as an identifier byte for Zig builtins). For decorator languages
         // strip it so `@websocket_handler` counts as a use of `websocket_handler`
@@ -1959,10 +1968,13 @@ pub fn isDeadCandidate(
     if (isDunder(sym.name)) return false;
     if (std.mem.eql(u8, sym.name, "constructor")) return false;
     if (std.mem.startsWith(u8, sym.name, "test_")) return false;
-    // A decorated definition is wired in by the decorator, not called by name
-    // (`@field_validator`, `@app.on_event`, `@pytest.fixture`, `@abstractmethod`).
-    // Treat it like a route handler: invoked, just not by a visible call site.
-    if (precededByDecorator(idx, sym)) return false;
+    // A decorated *function/method* is wired in by the decorator, not called by
+    // name (`@field_validator`, `@app.on_event`, `@pytest.fixture`,
+    // `@abstractmethod`) — treat it like a route handler: invoked, just not at a
+    // visible call site. A decorated *class* (`@dataclass`, `@final`) is NOT
+    // framework-invoked — it's still referenced by name when used — so a dead one
+    // (e.g. an unused dataclass) should still be reported.
+    if ((sym.kind == .function or sym.kind == .method) and precededByDecorator(idx, sym)) return false;
     // Used somewhere → live. Reporting a live symbol as dead is the false positive
     // that costs trust. A name used *only* from tests is NOT excluded here — it
     // surfaces as a cleanup candidate, annotated.
@@ -4465,4 +4477,52 @@ test "test-awareness: Zig test block is a caller; --tests scope + coverage" {
         try coverage(&aw.writer, &idx, "", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "50.0%") != null);
     }
+}
+
+test "unused: a JS object-literal key does not mask a dead function (tally scope)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.js", .data =
+        \\function tallyThing() { return 0; }
+        \\export function h(res) { res.json({ tallyThing: 1 }); }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    var refs = try buildReferencedNames(&idx);
+    defer refs.deinit();
+    // `{ tallyThing: 1 }` is an object key, not a call — so tallyThing is dead.
+    const dead = idx.graph.symbols[idx.lookup("tallyThing")[0]];
+    try testing.expect(try isDeadCandidate(&idx, dead, "", &refs));
+}
+
+test "unused: a dead @dataclass class is reported (decorated classes are not framework-wired)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\from dataclasses import dataclass
+        \\@dataclass
+        \\class DeadRow:
+        \\    x: int
+        \\@dataclass
+        \\class LiveRow:
+        \\    y: int
+        \\def use():
+        \\    return LiveRow(1)
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    var refs = try buildReferencedNames(&idx);
+    defer refs.deinit();
+    const dead = idx.graph.symbols[idx.lookup("DeadRow")[0]];
+    const live = idx.graph.symbols[idx.lookup("LiveRow")[0]];
+    try testing.expect(try isDeadCandidate(&idx, dead, "", &refs)); // dead dataclass surfaces
+    try testing.expect(!try isDeadCandidate(&idx, live, "", &refs)); // used one does not
 }

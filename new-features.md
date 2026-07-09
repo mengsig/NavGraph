@@ -159,16 +159,25 @@ nested-table function fields flattened to the outermost table.
 
 ---
 
-## E. `unused` precision — dead **types** and access modifiers
+## E. `unused` precision — dead **types** and access modifiers  **[✅ partly shipped]**
 
-- **[gap] Dead types are never reported.** `unused` reports dead functions (and
-  TS interfaces) but not dead C `struct`s, Lua tables, or Python
-  classes/dataclasses — the idiomatic "dead class" is invisible. (C, Lua,
-  fullstack.)
-- **[gap] Access modifiers ignored, so `--no-public` over-hides.** A genuinely
-  `private void _rebuildIndex()` (C#) or a Ruby `private` method is treated as
-  possibly-public and dropped by `--no-public`, so the *actually-dead* set is
-  unusable for C#/Ruby. Model `private`/`internal`/`protected`.
+*Shipped:* (1) C# access modifiers — an explicit `private`/`protected`/`internal`
+member is `exported=false`, so `unused --no-public` no longer over-hides a
+genuinely-private dead helper. (2) A dead **decorated class** (`@dataclass`) is
+now reported — `precededByDecorator` only excludes decorated *functions/methods*
+(framework hooks), not classes. (3) A JS/TS object-literal key no longer counts
+as a "use" in the dead-code tally, so it can't mask a dead function.
+
+*Still open:*
+- **Ruby visibility** (statement-form `private`/`protected` toggling subsequent
+  defs) is not yet modeled — more involved than C#'s per-member modifiers.
+- **Dead types via the name-tally**: a self-referential type (its name appears
+  in its own fields) still reads as "used"; Lua tables are `.variable`-kind (not
+  a reportable dead kind); a C function-pointer `typedef` isn't indexed at all
+  (see §D). A genuinely-dead, non-self-referential type *is* reported.
+- **Param-shadow in the tally**: a bare parameter used in its own body still
+  counts toward a same-named global's usage (the *graph* is correct after §C, but
+  the `unused` token-tally needs scope-aware tallying to match).
 - **[bug] Dead code in a nested namespace is missed** when a sibling is used —
   `geo::detail::deadScale` (C++) is dead but absent from `unused`.
 

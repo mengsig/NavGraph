@@ -1237,7 +1237,7 @@ fn parseCppMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
         if (ctx.toks[i].kind == .identifier and !ctx.ckw.has(ctx.textOf(i)) and
             i + 1 < hi and ctx.isPunct(i + 1, '(') and !hasAssignBetween(ctx, stmt_start, i))
         {
-            const adv = try tryCppMethod(ctx, i, hi, parent);
+            const adv = try tryCppMethod(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
                 i = adv;
                 stmt_start = i;
@@ -1262,10 +1262,11 @@ fn hasAssignBetween(ctx: *const Ctx, lo: u32, hi: u32) bool {
 
 /// A C++ member function (definition `{...}` or declaration `;`) whose name is at
 /// `name_i` and params open at `name_i + 1`. Returns the index just past it.
-fn tryCppMethod(ctx: *Ctx, name_i: u32, hi: u32, parent: u32) AllocError!u32 {
+fn tryCppMethod(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: u32) AllocError!u32 {
     const params_open = name_i + 1;
     const params_close = ctx.close[params_open];
     if (params_close == sentinel) return name_i;
+    const exported = memberExported(ctx, stmt_start, name_i);
     const body_open = cBodyOpen(ctx, params_close, hi);
     if (body_open != sentinel) {
         const body_close = ctx.close[body_open];
@@ -1279,7 +1280,7 @@ fn tryCppMethod(ctx: *Ctx, name_i: u32, hi: u32, parent: u32) AllocError!u32 {
             .span_end = ctx.toks[body_close].end,
             .sig_end = ctx.toks[body_open].start,
             .doc = collectDoc(ctx, name_i),
-            .exported = true,
+            .exported = exported,
             .parent_local = parent,
             .refs = body.refs,
             .bindings = body.bindings,
@@ -1297,11 +1298,23 @@ fn tryCppMethod(ctx: *Ctx, name_i: u32, hi: u32, parent: u32) AllocError!u32 {
         .span_end = ctx.toks[semi].end,
         .sig_end = ctx.toks[params_close].end,
         .doc = collectDoc(ctx, name_i),
-        .exported = true,
+        .exported = exported,
         .parent_local = parent,
         .refs = &.{},
     });
     return semi + 1;
+}
+
+/// Visibility of a C-family member for `--no-public`. C# has explicit access
+/// modifiers, so a member marked `private`/`protected`/`internal` is not public
+/// API and must not be hidden by `unused --no-public`. C/C++ members carry no
+/// such keyword here and stay exported (`true`); a bare C# member (no modifier)
+/// also stays `true` to avoid over-hiding (its default depends on the container).
+fn memberExported(ctx: *const Ctx, stmt_start: u32, name_i: u32) bool {
+    if (ctx.cfg.language != .csharp) return true;
+    return !(hasKeywordBetween(ctx, stmt_start, name_i, "private") or
+        hasKeywordBetween(ctx, stmt_start, name_i, "protected") or
+        hasKeywordBetween(ctx, stmt_start, name_i, "internal"));
 }
 
 /// The `{` opening a function body after a parameter list closing at
@@ -5144,4 +5157,25 @@ test "scope: Python dict keys ARE references (object-key suppression is JS-only)
     defer freeRefs(&out);
     const build = findSym(out.items, "build").?;
     try testing.expect(hasRef(build, "item"));
+}
+
+test "csharp: explicit access modifiers set member visibility (for --no-public)" {
+    const src =
+        \\namespace N {
+        \\  class C {
+        \\    public int Pub() { return 1; }
+        \\    private int Priv() { return 2; }
+        \\    protected int Prot() { return 3; }
+        \\    int Bare() { return 4; }
+        \\  }
+        \\}
+    ;
+    var out = try parseForTest(src, .csharp);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "Pub").?.exported);
+    try testing.expect(!findSym(out.items, "Priv").?.exported);
+    try testing.expect(!findSym(out.items, "Prot").?.exported);
+    // A bare member stays exported (conservative: its default depends on the
+    // container, so don't over-hide it from `unused --no-public`).
+    try testing.expect(findSym(out.items, "Bare").?.exported);
 }
