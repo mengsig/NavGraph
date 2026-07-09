@@ -56,6 +56,17 @@ to provide: `navgraph coverage [path]` → per-file % of fn/method reachable fro
 test + the unreached list. Conservative vs. line coverage, zero instrumentation,
 works on every language NavGraph parses.
 
+### A4. Recognize non-Zig *inline* tests (esp. Rust `#[cfg(test)]`)  **[gap]**
+The `--tests`/`coverage`/`unused` machinery is cross-language via `isTestPath`
+(any file under `test/`/`spec/`/`__tests__/`, or `_test.*`/`.spec.*`/`conftest.py`/
+`test_*`), plus Zig `test` blocks. That covers Go (`_test.go`), Ruby (`_spec.rb`),
+Python, JS/TS, C#, etc. — verified. The hole: a **non-Zig inline test in a
+production file** — chiefly Rust's `#[cfg(test)] mod tests { #[test] fn … }`
+idiom. Those inline `#[test]` fns are indexed as ordinary production functions,
+so a helper used only by them reads as production-used (not test-only). Fix:
+recognize `#[test]`/`#[cfg(test)]` (Rust) — and ideally `describe/it` (JS/TS) —
+as test symbols, the same way Zig `test` blocks now are.
+
 ### A3. Unify the test axis into one `--tests` selector  **[✅ shipped]**
 *Shipped:* the confusing `--no-test` (unused-only) is gone; every verb —
 `outline`/`search`/`callers`/`hot`/`unused` — takes the same
