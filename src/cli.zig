@@ -7,7 +7,7 @@ const render = @import("render.zig");
 const model = @import("model.zig");
 
 pub const Command = enum {
-    outline, def, calls, callers, search, routes, events,
+    outline, def, calls, callers, search, routes, events, conforms,
     neighbors, unused, imports, importers, path, hot, diff,
     files, read, strings, coverage, graph, help,
 };
@@ -58,7 +58,10 @@ const usage_text =
     \\  callers <name>     Symbols that call/use <name> (callers), as a tree
     \\  search <pattern>   Find symbols by name (or use sites with --refs;
     \\                     Recv.field / .field pins instance-attribute reads)
-    \\  routes [filter]    List HTTP routes and the client calls that hit them
+    \\  routes [filter]    HTTP routes; mounted FastAPI prefixes are applied before
+    \\                     cross-language client calls are linked
+    \\  conforms <selector> Audit protocol implementations or sibling signature
+    \\                     divergence (aliases: impls, implements)
     \\  events [filter]    Link message-bus handlers (register/on) to emitters (send/emit)
     \\  neighbors <name>   Callees and callers of <name> in one view
     \\  unused [filter]    Unreferenced definitions (fns/methods & types) nothing calls
@@ -88,6 +91,8 @@ const usage_text =
     \\                                         file to scope to it (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
+    \\  -p, --vis <public|private|all>          Visibility for outline/search/def (default: all)
+    \\  --public, --private, --no-private       Visibility shortcuts
     \\  --sort <path|symbols>                  files: order by path (default) or symbol count
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
     \\  -e, --exact                            search: name must equal the pattern
@@ -99,7 +104,14 @@ const usage_text =
     \\                                         without | only. A test is a Zig `test`
     \\                                         block, a test_* fn, or a test-dir file.
     \\  --no-tests, --tests-only               Shortcuts for --tests without / --tests only.
-    \\  -s, --strict                           Follow only high-confidence edges
+    \\  -s, --strict                           Follow only high-confidence edges; drops
+    \\                                         heuristic `?` and structural impl edges
+    \\  -i, --impls                            calls/callers/neighbors/path: cross
+    \\                                         protocol/interface implementation edges
+    \\  --clients                              routes: show resolved client call sites
+    \\  --unhit                                routes: show routes with no client calls
+    \\  --orphan-calls                         routes: show calls matching no route
+    \\  --handler <name>                       routes: select by handler (glob accepted)
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\  --no-public                            unused: drop exported symbols (possible public API)
@@ -108,9 +120,11 @@ const usage_text =
     \\                                         by a used same-name twin; needs import resolution)
     \\
     \\  Locations are `path:line-endLine`; call trees annotate each edge with its
-    \\  call-site line as `↳:N`, and a trailing `?` marks a heuristic (ambiguous
-    \\  name-match) edge — verify those or use `-s` to drop them. Flag values may
-    \\  be attached (`-d2`, `--depth=2`).
+    \\  call-site line as `↳:N`, `⇒impl` marks a protocol implementation edge,
+    \\  and a trailing `?` marks a heuristic edge — verify those or use `-s` to
+    \\  drop them. A `navgraph: parse-health:` stderr warning means tokenizer
+    \\  desynchronization may have hidden symbols in the reported line range.
+    \\  Flag values may be attached (`-d2`, `--depth=2`).
     \\
     \\  PATTERNS: a name/filter containing `*` is a glob (`def Ba*`, `search *_handler`,
     \\  `callers Matcher.is*`). Globs anchor on the whole name; without `*`, names
@@ -134,6 +148,12 @@ const usage_text =
     \\  navgraph outline src --no-tests            # production structure only
     \\  navgraph coverage src                      # test reach per file
     \\  navgraph graph src --no-tests > graph.html # visualize the production graph
+    \\  navgraph callers Store.get --impls      # cross port dispatch to implementations
+    \\  navgraph conforms Store                 # audit impl signatures/asyncness
+    \\  navgraph outline src --public           # hide non-public symbols
+    \\  navgraph routes /v1/orders --clients    # resolved cross-language clients
+    \\  navgraph routes --unhit                 # endpoints with no resolved client
+    \\  navgraph routes --orphan-calls          # calls with no serving route
     \\  navgraph path parse emit
     \\
 ;
@@ -184,6 +204,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
         if (command == .path) return fail(error.Usage, "path needs two symbol names: navgraph path <A> <B>", .{});
         return fail(error.Usage, "{s} needs an argument: navgraph {s} <arg> [flags]", .{ @tagName(command), @tagName(command) });
     }
+    try validateCommandOptions(result);
     return result;
 }
 
@@ -195,6 +216,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "callers", Command.callers }, .{ "uses", Command.callers },
         .{ "search", Command.search },   .{ "grep", Command.search },
         .{ "routes", Command.routes },   .{ "api", Command.routes },
+        .{ "conforms", Command.conforms }, .{ "impls", Command.conforms },
+        .{ "implements", Command.conforms },
         .{ "events", Command.events },   .{ "dispatch", Command.events },
         .{ "bus", Command.events },
         .{ "neighbors", Command.neighbors }, .{ "near", Command.neighbors },
@@ -279,6 +302,16 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
             return fail(error.BadValue, "invalid value '{s}' for -t/--tests (expected with|without|only)", .{val});
         return f.next(i);
     }
+    if (eqAny(f.name, &.{ "-p", "--vis" })) {
+        const val = try f.value(args, i, f.name);
+        out.options.visibility = query.Vis.parse(val) orelse
+            return fail(error.BadValue, "invalid value '{s}' for -p/--vis (expected public|private|all)", .{val});
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--handler")) {
+        out.options.routes_handler = try f.value(args, i, f.name);
+        return f.next(i);
+    }
     // Boolean flags: an attached `=value` is a usage error.
     if (f.inline_val != null)
         return fail(error.BadValue, "flag {s} takes no value", .{f.name});
@@ -288,6 +321,30 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (eqAny(f.name, &.{"--tests-only"})) {
         out.options.tests = .only;
+        return i;
+    }
+    if (eqAny(f.name, &.{ "-i", "--impls" })) {
+        out.options.impls = true;
+        return i;
+    }
+    if (eqAny(f.name, &.{ "--public", "--no-private" })) {
+        out.options.visibility = .public;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--private")) {
+        out.options.visibility = .private;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--clients")) {
+        out.options.routes_clients = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--unhit")) {
+        out.options.routes_unhit = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--orphan-calls")) {
+        out.options.routes_orphan_calls = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-s", "--strict" })) {
@@ -365,6 +422,23 @@ fn splitFlag(raw: []const u8) SplitFlag {
         return .{ .name = raw[0..2], .inline_val = raw[2..] };
     }
     return .{ .name = raw, .inline_val = null };
+}
+
+fn validateCommandOptions(parsed: Parsed) ParseError!void {
+    const opts = parsed.options;
+    if (opts.impls and parsed.command != .calls and parsed.command != .callers and
+        parsed.command != .neighbors and parsed.command != .path)
+    {
+        return fail(error.Usage, "-i/--impls applies only to calls, callers, neighbors, and path", .{});
+    }
+    const route_flags = opts.routes_clients or opts.routes_unhit or opts.routes_orphan_calls or opts.routes_handler.len != 0;
+    if (route_flags and parsed.command != .routes)
+        return fail(error.Usage, "route view flags apply only to the routes command", .{});
+    if (opts.routes_orphan_calls and (opts.routes_clients or opts.routes_unhit or opts.routes_handler.len != 0))
+        return fail(error.Usage, "--orphan-calls cannot be combined with --clients, --unhit, or --handler", .{});
+    const vis_set = opts.visibility != .all;
+    if (vis_set and parsed.command != .outline and parsed.command != .search and parsed.command != .def)
+        return fail(error.Usage, "visibility flags apply only to outline, search, and def", .{});
 }
 
 fn parseUint(s: []const u8, flag: []const u8) ParseError!u32 {
@@ -551,6 +625,24 @@ test "parseCommand: every alias maps to its command" {
     // help aliases
     try std.testing.expectEqual(Command.help, parseCommand("--help").?);
     try std.testing.expectEqual(Command.help, parseCommand("-h").?);
+}
+
+test "phase 1 commands and scoped flags parse" {
+    const testing = std.testing;
+    try testing.expectEqual(Command.conforms, (try parse(&.{ "conforms", "Port" })).command);
+    try testing.expectEqual(Command.conforms, (try parse(&.{ "implements", "Port" })).command);
+
+    const calls = try parse(&.{ "calls", "Port.run", "--impls" });
+    try testing.expect(calls.options.impls);
+    const outline_cmd = try parse(&.{ "outline", "src", "-ppublic" });
+    try testing.expectEqual(query.Vis.public, outline_cmd.options.visibility);
+    const routes_cmd = try parse(&.{ "routes", "--clients", "--handler", "place_*" });
+    try testing.expect(routes_cmd.options.routes_clients);
+    try testing.expectEqualStrings("place_*", routes_cmd.options.routes_handler);
+
+    try testing.expectError(error.Usage, parse(&.{ "search", "x", "--impls" }));
+    try testing.expectError(error.Usage, parse(&.{ "calls", "x", "--clients" }));
+    try testing.expectError(error.Usage, parse(&.{ "routes", "--orphan-calls", "--unhit" }));
 }
 
 test "parseCommand: unknown and empty return null" {
@@ -831,7 +923,7 @@ test "usage: writes the full help banner" {
     try testing.expect(std.mem.indexOf(u8, out, "--no-cache") != null);
 }
 
-test "usage documents every command and test-scope flag (drift guard)" {
+test "usage documents every command and phase flags (drift guard)" {
     const testing = std.testing;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -844,8 +936,12 @@ test "usage documents every command and test-scope flag (drift guard)" {
     inline for (@typeInfo(Command).@"enum".fields) |f| {
         try testing.expect(std.mem.indexOf(u8, out, f.name) != null);
     }
-    // The unified test-scope flag and its aliases are documented.
-    for ([_][]const u8{ "--tests", "--no-tests", "--tests-only", "--no-public" }) |flag| {
+    // Unified test-scope and Phase 1 flags are documented.
+    for ([_][]const u8{
+        "--tests", "--no-tests", "--tests-only", "--no-public",
+        "--impls", "--vis", "--public", "--private", "--clients", "--unhit",
+        "--orphan-calls", "--handler", "parse-health", "⇒impl",
+    }) |flag| {
         try testing.expect(std.mem.indexOf(u8, out, flag) != null);
     }
 }

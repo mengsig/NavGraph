@@ -14,6 +14,7 @@ const query = @import("query.zig");
 const lexer = @import("lexer.zig");
 const language = @import("language.zig");
 const gitdiff = @import("gitdiff.zig");
+const impls_mod = @import("impls.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -52,6 +53,7 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
         if (!query.kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!query.visAllowed(sym, opts.visibility)) continue;
         if (!wrote_any) {
             if (sep) try w.writeByte(',');
             try w.print("{{\"path\":", .{});
@@ -73,8 +75,15 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
 pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     var buf: [64]SymbolId = undefined;
     const ids = query.resolveIds(idx, name, &buf);
-    try symbolArray(w, idx, ids, opts.verbosity);
-    return ids.len > 0;
+    var visible: [64]SymbolId = undefined;
+    var count: usize = 0;
+    for (ids) |id| {
+        if (!query.visAllowed(idx.graph.symbols[id], opts.visibility)) continue;
+        visible[count] = id;
+        count += 1;
+    }
+    try symbolArray(w, idx, visible[0..count], opts.verbosity);
+    return count > 0;
 }
 
 /// Substring search: a JSON array of matching symbol objects. Returns whether
@@ -86,6 +95,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
         if (!query.kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!query.visAllowed(sym, opts.visibility)) continue;
         if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
         if (opts.exact) {
             if (!std.mem.eql(u8, sym.name, pattern)) continue;
@@ -188,13 +198,15 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
 pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !bool {
     var buf: [64]SymbolId = undefined;
     const ids = query.resolveIds(idx, name, &buf);
+    var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
+    defer if (impl_graph) |*graph| graph.deinit();
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
     defer visited.deinit();
     try w.writeByte('[');
     for (ids, 0..) |id, k| {
         if (k != 0) try w.writeByte(',');
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, &.{}, true, &visited);
+        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited);
     }
     try w.writeAll("]\n");
     return ids.len > 0;
@@ -203,6 +215,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
 fn walkNode(
     w: *Writer,
     idx: *const Index,
+    impl_graph: ?*const impls_mod.Graph,
     id: SymbolId,
     incoming: bool,
     opts: Options,
@@ -211,6 +224,7 @@ fn walkNode(
     sites: u32,
     lines: []const u32,
     exact: bool,
+    implementation_edge: bool,
     visited: *std.AutoHashMap(SymbolId, void),
 ) anyerror!void {
     std.debug.assert(id < idx.graph.symbols.len);
@@ -229,16 +243,20 @@ fn walkNode(
         try w.writeByte(']');
     }
     // Only heuristic (name-match) edges are annotated; absence means confident.
-    if (site != 0 and !exact) try w.writeAll(",\"exact\":false");
-    if (depth >= opts.depth) return try w.writeByte('}');
+    if ((site != 0 or implementation_edge) and !exact) try w.writeAll(",\"exact\":false");
+    if (implementation_edge) try w.writeAll(",\"edge\":\"impl\"");
+    if (depth >= opts.depth) {
+        if (impl_graph) |graph| try implLeafArray(w, idx, graph, id, incoming, opts.strict);
+        return try w.writeByte('}');
+    }
     if ((try visited.getOrPut(id)).found_existing) {
         try w.writeAll(",\"recursion\":true}");
         return;
     }
     if (incoming) {
-        try walkCallers(w, idx, id, opts, depth, visited);
+        try walkCallers(w, idx, impl_graph, id, opts, depth, visited);
     } else {
-        try walkCallees(w, idx, id, opts, depth, visited);
+        try walkCallees(w, idx, impl_graph, id, opts, depth, visited);
     }
     try w.writeByte('}');
 }
@@ -246,6 +264,7 @@ fn walkNode(
 fn walkCallees(
     w: *Writer,
     idx: *const Index,
+    impl_graph: ?*const impls_mod.Graph,
     id: SymbolId,
     opts: Options,
     depth: u32,
@@ -262,14 +281,40 @@ fn walkCallees(
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (!opts.refs and query.isDataReadEdge(idx, ref)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, visited);
+            try walkNode(w, idx, impl_graph, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited);
             wrote += 1;
         } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
         }
     }
+    if (impl_graph) |graph| {
+        for (graph.edges) |edge| {
+            if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
+            if (wrote != 0) try w.writeByte(',');
+            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited);
+            wrote += 1;
+        }
+    }
     try w.writeByte(']');
     if (ext != 0) try writeExternals(w, sym, opts.strict);
+}
+
+fn implLeafArray(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, id: SymbolId, incoming: bool, strict: bool) !void {
+    var first = true;
+    for (graph.edges) |edge| {
+        if (strict and !edge.exact) continue;
+        var target: SymbolId = invalid;
+        if (edge.port_method == id) target = edge.implementation_method;
+        if (incoming and edge.implementation_method == id) target = edge.port_method;
+        if (target == invalid) continue;
+        if (first) try w.writeAll(",\"implementations\":[") else try w.writeByte(',');
+        first = false;
+        try nodeHead(w, idx, idx.graph.symbols[target]);
+        try w.writeAll(",\"edge\":\"impl\"");
+        if (!edge.exact) try w.writeAll(",\"exact\":false");
+        try w.writeByte('}');
+    }
+    if (!first) try w.writeByte(']');
 }
 
 fn writeExternals(w: *Writer, sym: Symbol, strict: bool) !void {
@@ -288,6 +333,7 @@ fn writeExternals(w: *Writer, sym: Symbol, strict: bool) !void {
 fn walkCallers(
     w: *Writer,
     idx: *const Index,
+    impl_graph: ?*const impls_mod.Graph,
     id: SymbolId,
     opts: Options,
     depth: u32,
@@ -302,8 +348,22 @@ fn walkCallers(
         if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
         if (wrote != 0) try w.writeByte(',');
         try query.callSiteLines(idx, cid, id, &lines);
-        try walkNode(w, idx, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), visited);
+        try walkNode(w, idx, impl_graph, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), false, visited);
         wrote += 1;
+    }
+    if (impl_graph) |graph| {
+        for (graph.edges) |edge| {
+            if (opts.strict and !edge.exact) continue;
+            const target = if (edge.port_method == id)
+                edge.implementation_method
+            else if (edge.implementation_method == id)
+                edge.port_method
+            else
+                continue;
+            if (wrote != 0) try w.writeByte(',');
+            try walkNode(w, idx, impl_graph, target, true, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited);
+            wrote += 1;
+        }
     }
     try w.writeByte(']');
 }
@@ -335,16 +395,115 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
     return shown > 0;
 }
 
-/// Routes: array of `{route, file, line, handler, callers}` objects. Returns
-/// whether any route matched.
-pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+/// Protocol conformance matrix. Structural relationships carry exact=false.
+pub fn conforms(w: *Writer, idx: *const Index, selector: []const u8, opts: Options) !bool {
+    var buf: [64]SymbolId = undefined;
+    const ids = query.resolveIds(idx, selector, &buf);
+    var graph = try impls_mod.build(idx.gpa, idx);
+    defer graph.deinit();
     var shown: u32 = 0;
     try w.writeByte('[');
-    for (idx.graph.symbols) |sym| {
-        if (sym.kind != .route) continue;
-        if (!query.matchesName(filter, sym.name)) continue;
+    for (ids) |id| {
+        var port = idx.graph.symbols[id];
+        if (port.kind == .method and port.parent != invalid) port = idx.graph.symbols[port.parent];
+        if (!impls_mod.isPort(idx, port)) continue;
         if (shown != 0) try w.writeByte(',');
-        try routeObject(w, idx, sym);
+        try conformanceObject(w, idx, &graph, port, opts.strict);
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    if (shown == 0 and !opts.strict and try siblingConformanceObject(w, idx, ids)) shown = 1;
+    try w.writeAll("]\n");
+    return shown > 0;
+}
+
+fn siblingConformanceObject(w: *Writer, idx: *const Index, ids: []const SymbolId) !bool {
+    var parents: [64]SymbolId = undefined;
+    const count = query.collectConformanceParents(idx, ids, &parents);
+    if (count < 2) return false;
+    try w.writeAll("{\"siblings\":[");
+    for (parents[0..count], 0..) |parent, k| {
+        if (k != 0) try w.writeByte(',');
+        try symbolObject(w, idx, idx.graph.symbols[parent], .names);
+    }
+    try w.writeAll("],\"members\":[");
+    var names = std.StringHashMap(void).init(idx.gpa);
+    defer names.deinit();
+    var first = true;
+    for (idx.graph.symbols) |expected| {
+        if (expected.kind != .method or !query.contains(parents[0..count], expected.parent)) continue;
+        if (query.idsContainMethods(idx, ids) and !query.contains(ids, expected.id)) continue;
+        if ((try names.getOrPut(expected.name)).found_existing) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try siblingMemberObject(w, idx, parents[0..count], expected);
+    }
+    try w.writeAll("]}");
+    return true;
+}
+
+fn siblingMemberObject(w: *Writer, idx: *const Index, parents: []const SymbolId, expected: Symbol) !void {
+    try w.writeAll("{\"expected\":");
+    try symbolObject(w, idx, expected, .sig);
+    try w.writeAll(",\"implementations\":[");
+    for (parents, 0..) |parent, k| {
+        if (k != 0) try w.writeByte(',');
+        const actual_id = impls_mod.methodOf(idx, parent, expected.name);
+        const actual = if (actual_id) |id| idx.graph.symbols[id] else null;
+        try w.writeAll("{\"verdict\":");
+        try writeString(w, @tagName(query.conformanceVerdict(idx, expected, actual)));
+        try w.writeAll(",\"symbol\":");
+        if (actual) |sym| try symbolObject(w, idx, sym, .sig) else try w.writeAll("null");
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+}
+
+fn conformanceObject(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, port: Symbol, strict: bool) !void {
+    try w.writeAll("{\"protocol\":");
+    try symbolObject(w, idx, port, .names);
+    try w.writeAll(",\"members\":[");
+    var first_method = true;
+    for (idx.graph.symbols) |expected| {
+        if (expected.parent != port.id or expected.kind != .method) continue;
+        if (!first_method) try w.writeByte(',');
+        first_method = false;
+        try conformanceMember(w, idx, graph, port.id, expected, strict);
+    }
+    try w.writeAll("]}");
+}
+
+fn conformanceMember(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, port: SymbolId, expected: Symbol, strict: bool) !void {
+    try w.writeAll("{\"expected\":");
+    try symbolObject(w, idx, expected, .sig);
+    try w.writeAll(",\"implementations\":[");
+    var first = true;
+    for (graph.relations) |rel| {
+        if (rel.port != port or (strict and !rel.exact)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        const actual_id = impls_mod.methodOf(idx, rel.implementation, expected.name);
+        try w.writeAll("{\"verdict\":");
+        const actual = if (actual_id) |aid| idx.graph.symbols[aid] else null;
+        try writeString(w, @tagName(query.conformanceVerdict(idx, expected, actual)));
+        try w.print(",\"exact\":{},\"symbol\":", .{rel.exact});
+        if (actual) |sym| try symbolObject(w, idx, sym, .sig) else try w.writeAll("null");
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+}
+
+/// Routes: route coverage views, or unresolved client calls with --orphan-calls.
+pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+    if (opts.routes_orphan_calls) return orphanRouteCalls(w, idx, filter, opts);
+    var shown: u32 = 0;
+    try w.writeByte('[');
+    for (idx.graph.symbols) |route| {
+        if (route.kind != .route) continue;
+        if (!query.routeMatches(idx, route, filter, opts.routes_handler)) continue;
+        if (opts.routes_unhit and idx.callersOf(route.id).len != 0) continue;
+        if (shown != 0) try w.writeByte(',');
+        try routeObject(w, idx, route, opts.routes_clients, opts.routes_unhit);
         shown += 1;
         if (shown >= opts.limit) break;
     }
@@ -352,27 +511,56 @@ pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Optio
     return shown > 0;
 }
 
-fn routeObject(w: *Writer, idx: *const Index, route: Symbol) !void {
+fn routeObject(w: *Writer, idx: *const Index, route: Symbol, clients_only: bool, unhit: bool) !void {
     try w.writeAll("{\"route\":");
     try writeString(w, route.name);
-    try w.print(",\"file\":", .{});
+    try w.writeAll(",\"file\":");
     try writeString(w, idx.graph.files[route.file].path);
     try w.print(",\"line\":{d},\"handler\":", .{route.line});
-    var handler: SymbolId = invalid;
-    for (route.refs) |ref| {
-        if (ref.kind == .call and ref.target != invalid) handler = ref.target;
-    }
-    if (handler == invalid) {
+    if (clients_only or query.routeHandler(idx, route) == null) {
         try w.writeAll("null");
     } else {
-        try symbolObject(w, idx, idx.graph.symbols[handler], .names);
+        try symbolObject(w, idx, query.routeHandler(idx, route).?, .names);
     }
-    try w.writeAll(",\"callers\":[");
+    try w.writeAll(",\"clients\":[");
+    for (idx.callersOf(route.id), 0..) |cid, k| {
+        if (k != 0) try w.writeByte(',');
+        const client = idx.graph.symbols[cid];
+        try w.writeAll("{\"lang\":");
+        try writeString(w, idx.graph.files[client.file].language.tag());
+        try w.writeAll(",\"symbol\":");
+        try symbolObject(w, idx, client, .names);
+        try w.print(",\"site\":{d}}}", .{query.callSiteLine(idx, cid, route.id)});
+    }
+    try w.writeAll("],\"callers\":[");
     for (idx.callersOf(route.id), 0..) |cid, k| {
         if (k != 0) try w.writeByte(',');
         try symbolObject(w, idx, idx.graph.symbols[cid], .names);
     }
-    try w.writeAll("]}");
+    try w.print("],\"unhit\":{}}}", .{unhit});
+}
+
+fn orphanRouteCalls(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+    var shown: u32 = 0;
+    try w.writeByte('[');
+    outer: for (idx.graph.symbols) |owner| {
+        for (owner.refs) |ref| {
+            if (ref.kind != .route_call or ref.target != invalid) continue;
+            if (!query.matchesName(filter, ref.name)) continue;
+            if (shown != 0) try w.writeByte(',');
+            try w.writeAll("{\"route_call\":");
+            try writeString(w, ref.name);
+            try w.writeAll(",\"lang\":");
+            try writeString(w, idx.graph.files[owner.file].language.tag());
+            try w.writeAll(",\"symbol\":");
+            try symbolObject(w, idx, owner, .names);
+            try w.print(",\"site\":{d},\"matched\":false}}", .{ref.line});
+            shown += 1;
+            if (shown >= opts.limit) break :outer;
+        }
+    }
+    try w.writeAll("]\n");
+    return shown > 0;
 }
 
 /// Diff: array of `{file, symbols:[{...symbol, callers:[...]}]}` — changed symbols
@@ -466,20 +654,39 @@ fn eventSiteObject(w: *Writer, idx: *const Index, site: query.EventSite) !void {
 pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     var buf: [64]SymbolId = undefined;
     const ids = query.resolveIds(idx, name, &buf);
+    var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
+    defer if (impl_graph) |*graph| graph.deinit();
     try w.writeByte('[');
     for (ids, 0..) |id, k| {
         if (k != 0) try w.writeByte(',');
         const sym = idx.graph.symbols[id];
         try nodeHead(w, idx, sym);
         try w.writeAll(",\"callees\":[");
-        try calleeArray(w, idx, sym, opts.strict);
+        try calleeArray(w, idx, if (impl_graph) |*g| g else null, sym, opts.strict);
         try w.writeAll("],\"callers\":[");
-        for (idx.callersOf(id), 0..) |cid, j| {
-            if (j != 0) try w.writeByte(',');
+        var wrote: usize = 0;
+        for (idx.callersOf(id)) |cid| {
+            if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
+            if (wrote != 0) try w.writeByte(',');
             try nodeHead(w, idx, idx.graph.symbols[cid]);
             const site = query.callSiteLine(idx, cid, id);
             if (site != 0) try w.print(",\"site\":{d}", .{site});
             try w.writeByte('}');
+            wrote += 1;
+        }
+        if (impl_graph) |*graph| {
+            for (graph.edges) |edge| {
+                if (opts.strict and !edge.exact) continue;
+                const target = if (edge.port_method == id)
+                    edge.implementation_method
+                else if (edge.implementation_method == id)
+                    edge.port_method
+                else
+                    continue;
+                if (wrote != 0) try w.writeByte(',');
+                try implNode(w, idx, target, edge.exact);
+                wrote += 1;
+            }
         }
         try w.writeAll("]}");
     }
@@ -487,7 +694,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
     return ids.len > 0;
 }
 
-fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
+fn calleeArray(w: *Writer, idx: *const Index, graph: ?*const impls_mod.Graph, sym: Symbol, strict: bool) !void {
     var wrote: u32 = 0;
     for (sym.refs) |ref| {
         if (ref.target == invalid or (strict and !ref.exact)) continue;
@@ -497,6 +704,21 @@ fn calleeArray(w: *Writer, idx: *const Index, sym: Symbol, strict: bool) !void {
         try w.writeByte('}');
         wrote += 1;
     }
+    if (graph) |impl_graph| {
+        for (impl_graph.edges) |edge| {
+            if (edge.port_method != sym.id or (strict and !edge.exact)) continue;
+            if (wrote != 0) try w.writeByte(',');
+            try implNode(w, idx, edge.implementation_method, edge.exact);
+            wrote += 1;
+        }
+    }
+}
+
+fn implNode(w: *Writer, idx: *const Index, id: SymbolId, exact: bool) !void {
+    try nodeHead(w, idx, idx.graph.symbols[id]);
+    try w.writeAll(",\"edge\":\"impl\"");
+    if (!exact) try w.writeAll(",\"exact\":false");
+    try w.writeByte('}');
 }
 
 /// Unused: a JSON array of zero-caller function/method symbols. Returns
@@ -644,10 +866,9 @@ fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool 
 /// Path: a JSON array of the symbols on the shortest call path (empty if
 /// none). Returns whether a path was found.
 pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !bool {
-    _ = opts;
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
-    const chain = query.shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf) catch {
+    const chain = query.shortestPathIdsWithOptions(idx, from_name, to_name, &fbuf, &tbuf, opts) catch {
         try w.writeAll("[]\n");
         return false;
     };

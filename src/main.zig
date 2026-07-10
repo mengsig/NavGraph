@@ -83,6 +83,7 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .search => try query.search(out, idx, parsed.arg, parsed.options),
         .routes => try query.listRoutes(out, idx, parsed.arg, parsed.options),
         .events => try query.events(out, idx, parsed.arg, parsed.options),
+        .conforms => try query.conforms(out, idx, parsed.arg, parsed.options),
         .neighbors => try query.neighbors(out, idx, parsed.arg, parsed.options),
         .unused => try query.unused(out, idx, parsed.arg, parsed.options),
         .imports => try query.listImports(out, idx, parsed.arg, parsed.options),

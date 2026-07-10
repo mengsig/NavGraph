@@ -10,6 +10,7 @@ pub const gitdiff = @import("gitdiff.zig");
 pub const imports = @import("imports.zig");
 pub const parser = @import("parser.zig");
 pub const index = @import("index.zig");
+pub const impls = @import("impls.zig");
 pub const gitignore = @import("gitignore.zig");
 pub const cache = @import("cache.zig");
 pub const query = @import("query.zig");

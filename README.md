@@ -14,9 +14,9 @@ references, imports — and exposes it through a fast CLI that emits
 *hyper-compressed*, token-frugal views. It is designed so an agent can navigate
 and understand a repo almost entirely through NavGraph instead of `grep` + `read`.
 
-Ask precise questions ("what does `foo()` call, 2 levels deep?", "who calls
-`bar`?", "outline this file at signature detail") and get exactly the
-information needed — nothing more.
+Ask precise questions ("what does `foo()` call, 2 levels deep?", "which classes
+implement this port?", "which clients hit this route?", "outline this file at
+signature detail") and get exactly the information needed — nothing more.
 
 - **Language-agnostic core.** Ships with Zig, C/C++, C#, Python, JavaScript,
   TypeScript, TSX, Lua, Go, Rust and Ruby.
@@ -24,6 +24,13 @@ information needed — nothing more.
   to a bounded depth.
 - **Verbosity levels.** `names` → `sig` → `doc` → `full`, so you spend tokens
   only where you need detail.
+- **Ports and adapters.** Follow Protocol/interface dispatch to nominal and
+  structural implementations, or audit sibling signature divergence in one query.
+- **Cross-language APIs.** Link HTTP routes to client calls, including mounted
+  FastAPI router prefixes, and expose unhit routes and orphan calls.
+- **Trust signals.** Type-scoped member resolution avoids global same-name guesses;
+  tokenizer desynchronization produces a parse-health warning instead of silently
+  presenting a partial index as complete.
 - **Fast.** A ~550-file project indexes and answers a query in ~0.2s. No daemon,
   no external dependencies, single static binary.
 
@@ -85,7 +92,8 @@ navgraph <command> [arg] [flags]
 | `calls <name>`     | Tree of what `<name>` calls/uses (callees).                   |
 | `callers <name>`   | Tree of who calls/uses `<name>` (callers).                    |
 | `search <pattern>` | Symbols whose name contains `<pattern>` (`--refs` for use sites; `Recv.field`/`.field` pins attribute reads). |
-| `routes [filter]`  | HTTP routes + the client calls that hit them — links server handlers to client calls across languages. |
+| `routes [filter]`  | HTTP routes and cross-language client calls. Views: `--clients`, `--unhit`, `--orphan-calls`, `--handler <glob>`. Mounted FastAPI router prefixes are applied automatically. |
+| `conforms <selector>` | Audit Protocol/interface implementations or compare sibling classes/methods for missing, signature, and async divergence. Aliases: `impls`, `implements`. |
 | `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
 | `neighbors <name>` | Callees and callers of `<name>` in one view.                  |
 | `unused [filter]`  | Unreferenced definitions (fns/methods & types) — removal candidates nothing calls or uses (**not** "broken" code). Default: truly unused (no caller in app or test code). `--no-tests` also lists code used only by tests (annotated); `--tests-only` lists unused test helpers; `--no-public` drops exported (maybe public API); `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
@@ -110,11 +118,17 @@ navgraph <command> [arg] [flags]
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
 | `-l, --limit <N>`             | Max results (default `300`).               |
 | `-k, --kind <k1,k2>`          | Restrict `outline`/`search` to kinds (`fn`, `struct`, …). |
+| `-p, --vis <scope>`            | Visibility for `outline`/`search`/`def`: `public`, `private`, or `all` (default). Shortcuts: `--public`, `--private`, `--no-private`. |
 | `-t, --tests <with\|without\|only>` | Unified test-scope for `outline`/`search`/`callers`/`hot`/`unused`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
 | `-r, --refs`                  | `search`: match use sites; `calls`/`neighbors`: include var/const/field reads. |
 | `-e, --exact`                 | `search`: name must equal the pattern (no substring hits). |
 | `--no-recurse`                | `outline`/`files`: only files directly in the given dir, not subtrees. |
-| `-s, --strict`                | Follow only high-confidence edges (drop heuristic `?` edges). |
+| `-s, --strict`                | Follow only high-confidence edges (drop heuristic `?` edges, including structural implementation edges). |
+| `-i, --impls`                 | On `calls`/`callers`/`neighbors`/`path`, cross Protocol/interface ↔ implementation edges (`⇒impl`). |
+| `--clients`                   | `routes`: show resolved client call sites, tagged by source language. |
+| `--unhit`                     | `routes`: show only routes with no resolved client calls. |
+| `--orphan-calls`              | `routes`: show client calls that match no indexed route. |
+| `--handler <glob>`            | `routes`: select routes by handler name. |
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
 | `--sort <path\|symbols>`      | `files`: order by path (default) or symbol count. |
 | `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild.  |
@@ -178,6 +192,47 @@ fn emit (ctx: *Ctx, sym: ParsedSymbol) !u32  src/parser.zig:216
   ...
 ```
 
+Who implements a port, and which dispatch sites reach it:
+
+```
+$ navgraph callers Store.get --impls
+method Store.get (...)  src/ports.py:8
+  method MemoryStore.get (...)  src/memory.py:12  ⇒impl ?
+```
+
+Structural implementation edges are heuristic (`?`); explicit nominal
+inheritance can be exact. `--strict` keeps only exact edges. The derived
+implementation graph is query-local, so it does not inflate `hot`, `unused`, or
+coverage.
+
+Audit a Protocol or compare sibling classes selected by a glob:
+
+```
+navgraph conforms Store
+navgraph conforms '*Runner' -j
+```
+
+`conforms` reports `OK`, `MISSING`, `SIG-DIFF`, and `ASYNC-DIFF`. A Protocol
+selector compares its methods with discovered implementations; a selector that
+matches multiple ordinary classes or methods produces a sibling divergence
+matrix.
+
+Inspect HTTP client coverage after mounted router prefixes are applied:
+
+```
+navgraph routes /v1/orders --clients
+navgraph routes --unhit
+navgraph routes --orphan-calls
+navgraph routes --handler 'place_*'
+```
+
+Visibility can be filtered without post-processing:
+
+```
+navgraph outline src --public
+navgraph search '*_handler' --vis private
+```
+
 Show a full definition:
 
 ```
@@ -190,7 +245,8 @@ fn bracketMatches(open: u8, cl: u8) bool {
 }
 ```
 
-Cross-file and cross-language resolution works out of the box (name-based):
+Cross-file resolution works out of the box; HTTP routes and events can also
+bridge language families:
 
 ```
 $ navgraph calls Server.start -C ./backend -d 2
@@ -209,12 +265,16 @@ method Server.start (self):  app/server.py:15
    navgraph-only rules on top — and a negated `!vendor/` rule there re-includes
    a directory the built-in skip set would prune.
 2. **Tokenize** each file with a shared, language-configured lexer that
-   correctly skips strings/comments.
+   correctly skips strings, comments, JavaScript regex literals, and JSX closing
+   tags. If an unterminated string still consumes the rest of a file, NavGraph
+   prints a `parse-health` warning with the affected line range.
 3. **Extract** definitions and their in-body references with per-language
    heuristic scanners (no per-language grammar required).
-4. **Resolve** references to definitions by name, preferring same-file, then
-   same-language-family, then callable targets, and build a reverse (callers)
-   index.
+4. **Resolve** references to definitions by name, with exact receiver-aware
+   handling for `self`/`this`, typed receivers, and imported modules. Member calls
+   are scoped to the enclosing or inferred receiver type; unknown receiver types
+   remain external or heuristic rather than being attached to an unrelated
+   same-named class. Build a reverse (callers) index.
 5. **Render** query results in a dense, indentation-based format tuned for low
    token cost.
 
@@ -228,10 +288,13 @@ Everything for one run lives in a single arena that is freed on exit.
   call on an untracked receiver falls back to a name match, marked heuristic
   (`?`); `--strict` drops those. Treat the graph as high-recall guidance.
 - Repeat runs are fast via an on-disk cache under `.navgraph/cache` (path +
-  mtime + size keyed); `--no-cache` forces a clean rebuild.
+  mtime + ctime + size keyed); `--no-cache` forces a clean rebuild.
 - **Cross-language linking** covers HTTP routes (`navgraph routes`, e.g. a TS
-  `fetch('/route')` paired with a Python/Flask handler) and message-bus events
-  (`navgraph events`). GraphQL / DB-model / protobuf schemas, and non-Zig
+  `fetch('/v1/route')` paired with a mounted Python/FastAPI handler) and
+  message-bus events (`navgraph events`). Literal FastAPI `include_router`
+  prefixes are resolved across imported modules before clients are linked;
+  dynamic prefixes and ambiguous mounts are left unresolved rather than guessed.
+  GraphQL / DB-model / protobuf schemas, and non-Zig
   *inline* tests (e.g. Rust `#[cfg(test)]`), are not yet handled.
 
 See `ROADMAP.md` for planned work and `new-features.md` for the current backlog.
@@ -239,4 +302,5 @@ See `ROADMAP.md` for planned work and `new-features.md` for the current backlog.
 ## Library use
 
 The engine is exposed as a Zig module (`src/root.zig`) — `language`, `lexer`,
-`model`, `parser`, `index`, `query`, `render` — so it can be embedded directly.
+`model`, `parser`, `index`, `query`, `render`, `api`, `impls`, and related query
+output modules — so it can be embedded directly.

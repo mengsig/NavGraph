@@ -32,7 +32,10 @@ you at specific lines may you `read` those exact lines.
 | Which tests hit a symbol | `navgraph callers <name> --tests-only` |
 | Test reach / coverage | `navgraph coverage [path]` |
 | Visual codebase map | `navgraph graph [path] > graph.html` (offline interactive) |
-| Mapping an HTTP endpoint | `navgraph routes [filter]` (cross-language) |
+| Mapping an HTTP endpoint | `navgraph routes [filter] --clients` (mounted prefixes + cross-language callers) |
+| Finding dead/unserved API edges | `navgraph routes --unhit` / `routes --orphan-calls` |
+| Auditing a port or sibling adapters | `navgraph conforms <Protocol|*Glob|Type.method>` |
+| Crossing Protocol/interface dispatch | add `--impls` to `calls`/`callers`/`neighbors`/`path` |
 | Tracing a bus/WS event | `navgraph events [filter]` (cross-language) |
 | Reading imports | `navgraph imports [filter]` / `importers <file>` |
 | grep inside string literals | `navgraph strings <pattern>` |
@@ -61,7 +64,12 @@ to navgraph to understand it.
 - `outline` already gives file:line — don't `def X` just to locate X.
 - Start container questions with `outline <file> -k class` — the inheritance
   clause is on the container line.
-- On a hub function use `-s` early; heuristic `?` edges are noise.
+- On a hub function use `-s` early; heuristic `?` edges are noise. For a
+  Protocol/interface boundary, first use `--impls`; combine it with `-s` only
+  when you intentionally want nominal/exact implementations and can drop
+  structural matches.
+- Use `conforms Port` instead of outlining every adapter and diffing signatures;
+  use a class/method glob for a sibling divergence matrix.
 - `path A B` beats `calls A -d3` for "how does A reach B".
 - Trust the JSON `parent` field for "which class owns this method".
 - Go: package-qualified calls resolve exactly; pin methods as `Type.method`; a
@@ -72,20 +80,29 @@ to navgraph to understand it.
 - `-v names|sig|doc|full` — detail (default sig).
 - `-d N` — graph depth for calls/callers/neighbors (default 1).
 - `-k fn,struct,…` — restrict outline/search kinds.
+- `-p`/`--vis public|private|all` — visibility for outline/search/def; shortcuts
+  `--public`, `--private`, `--no-private`.
+- `-i`/`--impls` — cross Protocol/interface ↔ implementation edges in
+  calls/callers/neighbors/path; structural links are heuristic and `-s` drops them.
 - `-s`/`--strict` — only high-confidence edges (a trailing `?` = heuristic).
 - `-l N`/`--limit` (default 300); `-r`/`--refs` — include use sites/reads.
 - `-t`/`--tests <with|without|only>` (aliases `--no-tests`, `--tests-only`) —
   test scope for outline/search/callers/hot/unused; default `with`.
 - `-C <path>` — index root (subtree or a single file).
 - `-j`/`--json` — stable JSON. `--sort path|symbols` (files).
+- Route views: `--clients`, `--unhit`, `--orphan-calls`, and
+  `--handler <glob>`. Literal imported FastAPI `include_router` prefixes are
+  applied automatically before route/client matching.
 - `--no-cache` — rebuild (`.navgraph/cache`); run after updating navgraph or big
   refactors. `--follow-imports` (unused) — disambiguate same-name symbols.
 
 ## Cross-package & cross-language
 
-Edges resolve across monorepo packages (import-resolved, not name-matched), so
-`unused`/`callers`/`path` are trustworthy across `apps/*`+`packages/*`. `routes`
-(HTTP) and `events` (bus/WS) bridge across languages, pairing e.g. a Python
+Edges resolve within the relevant language family, with receiver/type and import
+context used where NavGraph can establish it; unresolved or ambiguous cases stay
+external or are marked heuristic rather than being globally guessed. `--impls`
+adds a separate, query-local Protocol/interface dispatch graph. `routes` (HTTP)
+and `events` (bus/WS) bridge across languages, pairing e.g. a mounted Python
 handler with the TS call that hits it.
 
 ## Gotchas
@@ -99,8 +116,11 @@ handler with the TS call that hits it.
 - Misses print `did you mean:` / ambiguous prints `pin with Parent.name`.
 - Minified/bundled files are skipped and named in a note.
 - `outline`/`files` take `--no-recurse` (this dir only).
-- Go interface dispatch isn't guessed — stays external; `unused` annotates
-  possible-dispatch names, verify before deleting.
+- Go interface dispatch and other Protocol/interface dispatch is not included by
+  default; add `--impls`. Structural matches carry `?`, may over-match generic
+  single-method ports, and are removed by `--strict`.
+- A `navgraph: parse-health:` stderr warning means an unterminated string caused
+  tokenizer desynchronization; symbols in the named line range may be missing.
 - `path A B` "no call path" is a real answer, not a failure.
 - Don't gauge "is X indexed?" with `search X | wc -l` — the not-found message is
   one line too; read the actual output.

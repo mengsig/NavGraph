@@ -14,6 +14,7 @@ const language = @import("language.zig");
 const events_mod = @import("events.zig");
 const gitdiff = @import("gitdiff.zig");
 const gitignore = @import("gitignore.zig");
+const impls_mod = @import("impls.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -56,6 +57,19 @@ pub const TestScope = enum {
     fn eqAny(s: []const u8, opts: []const []const u8) bool {
         for (opts) |o| if (std.mem.eql(u8, s, o)) return true;
         return false;
+    }
+};
+
+pub const Vis = enum {
+    all,
+    public,
+    private,
+
+    pub fn parse(s: []const u8) ?Vis {
+        if (std.mem.eql(u8, s, "all")) return .all;
+        if (std.mem.eql(u8, s, "public")) return .public;
+        if (std.mem.eql(u8, s, "private")) return .private;
+        return null;
     }
 };
 
@@ -103,6 +117,15 @@ pub const Options = struct {
     /// `outline`/`files --no-recurse`: only files directly in the given
     /// directory, not its subtrees (Go "outline this package", not the world).
     no_recurse: bool = false,
+    /// Add inferred protocol/interface implementation edges to graph walks.
+    impls: bool = false,
+    /// Visibility scope for definition listings.
+    visibility: Vis = .all,
+    /// Alternate HTTP route views and handler selection.
+    routes_clients: bool = false,
+    routes_unhit: bool = false,
+    routes_orphan_calls: bool = false,
+    routes_handler: []const u8 = "",
 };
 
 /// Whether `sym` is test code: a Zig `test` block, a symbol in a test file/dir,
@@ -140,6 +163,15 @@ pub fn kindAllowed(kind: model.SymbolKind, filter: []const u8) bool {
         if (kind == .variable and std.mem.eql(u8, t, "variable")) return true;
     }
     return false;
+}
+
+pub fn visAllowed(sym: model.Symbol, vis: Vis) bool {
+    const public = sym.name.len > 0 and sym.name[0] != '_' and sym.exported;
+    return switch (vis) {
+        .all => true,
+        .public => public,
+        .private => !public,
+    };
 }
 
 /// The line where symbol `from` references symbol `to` (its earliest such
@@ -277,6 +309,7 @@ fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Opti
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!visAllowed(sym, opts.visibility)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         if (opts.verbosity == .full) {
             const end = sym.endLine(file.text);
@@ -303,6 +336,7 @@ fn visibleSymbolCount(idx: *const Index, file: model.SourceFile, opts: Options) 
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!visAllowed(sym, opts.visibility)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         count += 1;
     }
@@ -654,10 +688,15 @@ pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !
         return false;
     }
     try multiMatchNote(w, name, ids.len, buf.len);
+    var shown: usize = 0;
     for (ids) |id| {
-        try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 0, true);
+        const sym = idx.graph.symbols[id];
+        if (!visAllowed(sym, opts.visibility)) continue;
+        try render.symbol(w, idx, sym, opts.verbosity, 0, true);
+        shown += 1;
     }
-    return true;
+    if (shown == 0) try w.print("(definition '{s}' hidden by visibility filter)\n", .{name});
+    return shown > 0;
 }
 
 /// After a not-found, suggest up to 4 near-miss definition names: exact
@@ -785,12 +824,14 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
         return false;
     }
     try multiMatchNote(w, name, ids.len, buf.len);
+    var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
+    defer if (impl_graph) |*graph| graph.deinit();
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
     defer visited.deinit();
     var heuristic: usize = 0;
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, id, incoming, opts, 0, 0, 1, &.{}, true, &visited, &heuristic);
+        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited, &heuristic);
     }
     // If any ambiguous name-match (`?`) edges were shown, tell the agent how to
     // drop them rather than making it discover `-s` on its own. Only when they
@@ -806,6 +847,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
 fn walkNode(
     w: *Writer,
     idx: *const Index,
+    impl_graph: ?*const impls_mod.Graph,
     id: SymbolId,
     incoming: bool,
     opts: Options,
@@ -814,21 +856,29 @@ fn walkNode(
     sites: u32,
     lines: []const u32,
     exact: bool,
+    implementation_edge: bool,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
 ) anyerror!void {
     const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
-    try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, sites, lines, exact);
+    if (implementation_edge) {
+        try renderImplSymbol(w, idx, idx.graph.symbols[id], v, indent, exact);
+    } else {
+        try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, sites, lines, exact);
+    }
     if (indent > 0 and !exact) heuristic.* += 1;
-    if (indent >= opts.depth) return;
+    if (indent >= opts.depth) {
+        if (impl_graph) |graph| try renderImplLeaves(w, idx, graph, id, incoming, opts, indent, visited, heuristic);
+        return;
+    }
     if ((try visited.getOrPut(id)).found_existing) {
         try indentLine(w, indent + 1, "… (recursion)");
         return;
     }
     if (incoming) {
-        try walkCallers(w, idx, id, opts, indent, visited, heuristic);
+        try walkCallers(w, idx, impl_graph, id, opts, indent, visited, heuristic);
     } else {
-        try walkCallees(w, idx, id, opts, indent, visited, heuristic);
+        try walkCallees(w, idx, impl_graph, id, opts, indent, visited, heuristic);
     }
 }
 
@@ -849,6 +899,7 @@ pub fn isDataReadEdge(idx: *const Index, ref: model.Reference) bool {
 fn walkCallees(
     w: *Writer,
     idx: *const Index,
+    impl_graph: ?*const impls_mod.Graph,
     id: SymbolId,
     opts: Options,
     indent: usize,
@@ -866,10 +917,16 @@ fn walkCallees(
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (!opts.refs and isDataReadEdge(idx, ref)) continue;
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, visited, heuristic);
+            try walkNode(w, idx, impl_graph, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, heuristic);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
+        }
+    }
+    if (impl_graph) |graph| {
+        for (graph.edges) |edge| {
+            if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
+            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic);
         }
     }
     if (externals.items.len != 0) {
@@ -882,6 +939,7 @@ fn walkCallees(
 fn walkCallers(
     w: *Writer,
     idx: *const Index,
+    impl_graph: ?*const impls_mod.Graph,
     id: SymbolId,
     opts: Options,
     indent: usize,
@@ -897,7 +955,54 @@ fn walkCallers(
         if (!inTestScope(opts.tests, isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
         // The edge (caller → this symbol) lives at its call site(s) in the caller.
         try callSiteLines(idx, cid, id, &lines);
-        try walkNode(w, idx, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), visited, heuristic);
+        try walkNode(w, idx, impl_graph, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), false, visited, heuristic);
+    }
+    if (impl_graph) |graph| {
+        for (graph.edges) |edge| {
+            if (opts.strict and !edge.exact) continue;
+            if (edge.port_method == id) {
+                try walkNode(w, idx, impl_graph, edge.implementation_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic);
+            } else if (edge.implementation_method == id) {
+                try walkNode(w, idx, impl_graph, edge.port_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic);
+            }
+        }
+    }
+}
+
+fn renderImplSymbol(w: *Writer, idx: *const Index, sym: model.Symbol, v: render.Verbosity, indent: usize, exact: bool) !void {
+    std.debug.assert(sym.kind == .method);
+    std.debug.assert(indent > 0);
+    var i: usize = 0;
+    while (i < indent) : (i += 1) try w.writeAll("  ");
+    try w.writeAll("⇒impl ");
+    try render.symbol(w, idx, sym, v, 0, true);
+    if (!exact) {
+        i = 0;
+        while (i < indent + 1) : (i += 1) try w.writeAll("  ");
+        try w.writeAll("? structural match\n");
+    }
+}
+
+fn renderImplLeaves(
+    w: *Writer,
+    idx: *const Index,
+    graph: *const impls_mod.Graph,
+    id: SymbolId,
+    incoming: bool,
+    opts: Options,
+    indent: usize,
+    visited: *std.AutoHashMap(SymbolId, void),
+    heuristic: *usize,
+) !void {
+    _ = visited;
+    for (graph.edges) |edge| {
+        if (opts.strict and !edge.exact) continue;
+        var target: SymbolId = invalid;
+        if (edge.port_method == id) target = edge.implementation_method;
+        if (incoming and edge.implementation_method == id) target = edge.port_method;
+        if (target == invalid) continue;
+        try renderImplSymbol(w, idx, idx.graph.symbols[target], headerVerbosity(opts.verbosity), indent + 1, edge.exact);
+        if (!edge.exact) heuristic.* += 1;
     }
 }
 
@@ -921,6 +1026,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
         if (!kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!visAllowed(sym, opts.visibility)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         if (opts.exact) {
             if (!std.mem.eql(u8, sym.name, pattern)) continue;
@@ -1458,44 +1564,227 @@ pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options
     return true;
 }
 
-/// List HTTP route definitions and, under each, its handler (callee) and the
-/// client call sites that hit it (callers) — the API surface across languages.
-/// Returns whether any route matched.
-pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    if (opts.format == .json) return json_out.listRoutes(w, idx, filter, opts);
-    var any = false;
+pub const ConformanceVerdict = enum { ok, missing, sig_diff, async_diff };
+
+pub fn conformanceVerdict(idx: *const Index, expected: model.Symbol, actual: ?model.Symbol) ConformanceVerdict {
+    std.debug.assert(expected.kind == .method);
+    std.debug.assert(expected.parent != invalid);
+    const implementation = actual orelse return .missing;
+    if (expected.modifiers.is_async != implementation.modifiers.is_async) return .async_diff;
+    const expected_sig = signatureTail(idx, expected);
+    const actual_sig = signatureTail(idx, implementation);
+    return if (equalIgnoringWhitespace(expected_sig, actual_sig)) .ok else .sig_diff;
+}
+
+fn signatureTail(idx: *const Index, sym: model.Symbol) []const u8 {
+    const sig = sym.signature(idx.graph.files[sym.file].text);
+    const open = std.mem.indexOfScalar(u8, sig, '(') orelse return sig;
+    return sig[open..];
+}
+
+fn equalIgnoringWhitespace(a: []const u8, b: []const u8) bool {
+    var ai: usize = 0;
+    var bi: usize = 0;
+    while (true) {
+        while (ai < a.len and std.ascii.isWhitespace(a[ai])) ai += 1;
+        while (bi < b.len and std.ascii.isWhitespace(b[bi])) bi += 1;
+        if (ai == a.len or bi == b.len) return ai == a.len and bi == b.len;
+        if (a[ai] != b[bi]) return false;
+        ai += 1;
+        bi += 1;
+    }
+}
+
+/// Compare a protocol/interface's declared methods with every nominal or
+/// structural implementation discovered in the project.
+pub fn conforms(w: *Writer, idx: *const Index, selector: []const u8, opts: Options) !bool {
+    std.debug.assert(selector.len > 0);
+    std.debug.assert(opts.limit > 0);
+    if (opts.format == .json) return json_out.conforms(w, idx, selector, opts);
+    var ids_buf: [64]SymbolId = undefined;
+    const ids = resolveIds(idx, selector, &ids_buf);
+    var graph = try impls_mod.build(idx.gpa, idx);
+    defer graph.deinit();
     var shown: u32 = 0;
-    for (idx.graph.symbols) |sym| {
-        if (sym.kind != .route) continue;
-        if (!matchesName(filter, sym.name)) continue;
-        any = true;
-        try render.symbol(w, idx, sym, opts.verbosity, 0, true);
-        try routeRelations(w, idx, sym);
+    for (ids) |id| {
+        var port = idx.graph.symbols[id];
+        if (port.kind == .method and port.parent != invalid) port = idx.graph.symbols[port.parent];
+        if (!impls_mod.isPort(idx, port)) continue;
+        if (shown != 0) try w.writeByte('\n');
+        try renderConformancePort(w, idx, &graph, port, opts);
         shown += 1;
         if (shown >= opts.limit) break;
     }
-    if (!any) {
+    if (shown == 0 and !opts.strict) {
+        shown = if (try renderSiblingConformance(w, idx, ids, opts)) 1 else 0;
+    }
+    if (shown == 0) try w.print("(no protocol/interface or sibling set matching '{s}')\n", .{selector});
+    return shown > 0;
+}
+
+fn renderSiblingConformance(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options) !bool {
+    var parents: [64]SymbolId = undefined;
+    const parent_count = collectConformanceParents(idx, ids, &parents);
+    if (parent_count < 2) return false;
+    try w.print("# sibling conformance · {d} classes\n", .{parent_count});
+    var rendered_names = std.StringHashMap(void).init(idx.gpa);
+    defer rendered_names.deinit();
+    for (idx.graph.symbols) |method| {
+        if (method.kind != .method or !contains(parents[0..parent_count], method.parent)) continue;
+        if (idsContainMethods(idx, ids) and !contains(ids, method.id)) continue;
+        if ((try rendered_names.getOrPut(method.name)).found_existing) continue;
+        try render.symbol(w, idx, method, .sig, 1, true);
+        for (parents[0..parent_count]) |parent| {
+            const actual_id = impls_mod.methodOf(idx, parent, method.name);
+            try renderSiblingCell(w, idx, method, parent, actual_id);
+        }
+    }
+    _ = opts;
+    return rendered_names.count() > 0;
+}
+
+pub fn collectConformanceParents(idx: *const Index, ids: []const SymbolId, out: []SymbolId) usize {
+    std.debug.assert(out.len > 0);
+    var count: usize = 0;
+    for (ids) |id| {
+        const sym = idx.graph.symbols[id];
+        const parent = if (impls_mod.isContainer(sym)) sym.id else sym.parent;
+        if (parent == invalid or contains(out[0..count], parent)) continue;
+        if (count == out.len) break;
+        out[count] = parent;
+        count += 1;
+    }
+    return count;
+}
+
+pub fn idsContainMethods(idx: *const Index, ids: []const SymbolId) bool {
+    for (ids) |id| if (idx.graph.symbols[id].kind == .method) return true;
+    return false;
+}
+
+fn renderSiblingCell(w: *Writer, idx: *const Index, expected: model.Symbol, parent: SymbolId, actual_id: ?SymbolId) !void {
+    const actual = if (actual_id) |id| idx.graph.symbols[id] else null;
+    const verdict = conformanceVerdict(idx, expected, actual);
+    try w.print("    {s:<10} ", .{@tagName(verdict)});
+    if (actual) |sym| {
+        try render.symbol(w, idx, sym, .sig, 0, true);
+    } else {
+        const container = idx.graph.symbols[parent];
+        try w.print("{s} — no `{s}` member\n", .{ container.name, expected.name });
+    }
+}
+
+fn renderConformancePort(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, port: model.Symbol, opts: Options) !void {
+    const methods = impls_mod.methodCount(idx, port.id);
+    var implementations: usize = 0;
+    for (graph.relations) |rel| {
+        if (rel.port == port.id and (!opts.strict or rel.exact)) implementations += 1;
+    }
+    try w.print("# {s}  {s}:{d}  · {d} member{s} · {d} impl{s}\n", .{
+        port.name, idx.graph.files[port.file].path, port.line, methods, if (methods == 1) "" else "s",
+        implementations, if (implementations == 1) "" else "s",
+    });
+    for (idx.graph.symbols) |expected| {
+        if (expected.parent != port.id or expected.kind != .method) continue;
+        try render.symbol(w, idx, expected, .sig, 1, false);
+        for (graph.relations) |rel| {
+            if (rel.port != port.id or (opts.strict and !rel.exact)) continue;
+            const actual_id = impls_mod.methodOf(idx, rel.implementation, expected.name);
+            try renderConformanceCell(w, idx, expected, rel, actual_id);
+        }
+    }
+}
+
+fn renderConformanceCell(w: *Writer, idx: *const Index, expected: model.Symbol, rel: impls_mod.Relation, actual_id: ?SymbolId) !void {
+    const actual = if (actual_id) |id| idx.graph.symbols[id] else null;
+    const verdict = conformanceVerdict(idx, expected, actual);
+    const label = switch (verdict) {
+        .ok => "OK",
+        .missing => "MISSING",
+        .sig_diff => "SIG-DIFF",
+        .async_diff => "ASYNC-DIFF",
+    };
+    try w.print("    {s:<10} ", .{label});
+    if (actual) |sym| {
+        try render.symbol(w, idx, sym, .sig, 0, true);
+    } else {
+        const implementation = idx.graph.symbols[rel.implementation];
+        try w.print("{s}  {s}:{d} — no `{s}` member\n", .{
+            implementation.name, idx.graph.files[implementation.file].path, implementation.line, expected.name,
+        });
+    }
+    if (!rel.exact) try w.writeAll("      ? structural match\n");
+}
+
+/// List HTTP route definitions with selectable handler/client coverage views.
+pub fn listRoutes(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+    if (opts.format == .json) return json_out.listRoutes(w, idx, filter, opts);
+    if (opts.routes_orphan_calls) return listOrphanRouteCalls(w, idx, filter, opts);
+    var shown: u32 = 0;
+    for (idx.graph.symbols) |route| {
+        if (route.kind != .route) continue;
+        if (!routeMatches(idx, route, filter, opts.routes_handler)) continue;
+        if (opts.routes_unhit and idx.callersOf(route.id).len != 0) continue;
+        try render.symbol(w, idx, route, opts.verbosity, 0, true);
+        try routeRelations(w, idx, route, opts.routes_clients);
+        if (opts.routes_unhit) try w.writeAll("  (unhit: 0 client calls)\n");
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    if (shown == 0) {
         try w.print("(no routes under '{s}')\n", .{filter});
         try skippedNote(w, idx);
     }
     try truncationNote(w, opts, shown);
-    return any;
+    return shown > 0;
 }
 
-fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol) !void {
+pub fn routeHandler(idx: *const Index, route: model.Symbol) ?model.Symbol {
+    std.debug.assert(route.kind == .route);
+    std.debug.assert(route.id < idx.graph.symbols.len);
     for (route.refs) |ref| {
-        if (ref.kind == .call and ref.target != invalid) {
-            try render.symbol(w, idx, idx.graph.symbols[ref.target], .sig, 1, true);
-        }
+        if (ref.kind == .call and ref.target != invalid) return idx.graph.symbols[ref.target];
+    }
+    return null;
+}
+
+pub fn routeMatches(idx: *const Index, route: model.Symbol, filter: []const u8, handler_filter: []const u8) bool {
+    const handler = routeHandler(idx, route);
+    if (handler_filter.len != 0 and (handler == null or !matchesName(handler_filter, handler.?.name))) return false;
+    return filter.len == 0 or matchesName(filter, route.name) or (handler != null and matchesName(filter, handler.?.name));
+}
+
+fn routeRelations(w: *Writer, idx: *const Index, route: model.Symbol, clients_only: bool) !void {
+    if (!clients_only) {
+        if (routeHandler(idx, route)) |handler| try render.symbol(w, idx, handler, .sig, 1, true);
     }
     var lines: std.ArrayList(u32) = .empty;
     defer lines.deinit(idx.gpa);
     for (idx.callersOf(route.id)) |cid| {
-        // A route↔client link is a path match (its own resolver), not a name
-        // guess, so it is always rendered as confident.
+        const client = idx.graph.symbols[cid];
+        try w.print("  [{s}] ", .{idx.graph.files[client.file].language.tag()});
         try callSiteLines(idx, cid, route.id, &lines);
-        try render.symbolSite(w, idx, idx.graph.symbols[cid], .sig, 1, true, callSiteLine(idx, cid, route.id), callSiteCount(idx, cid, route.id), lines.items, true);
+        try render.symbolSite(w, idx, client, .sig, 0, true, callSiteLine(idx, cid, route.id), callSiteCount(idx, cid, route.id), lines.items, hasExactEdge(idx, cid, route.id));
     }
+}
+
+fn listOrphanRouteCalls(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+    var shown: u32 = 0;
+    outer: for (idx.graph.symbols) |owner| {
+        for (owner.refs) |ref| {
+            if (ref.kind != .route_call or ref.target != invalid) continue;
+            if (!matchesName(filter, ref.name)) continue;
+            const file = idx.graph.files[owner.file];
+            try w.print("orphan {s}\n  [{s}] ", .{ ref.name, file.language.tag() });
+            try render.symbolSite(w, idx, owner, .sig, 0, true, ref.line, ref.count, ref.lines, false);
+            try w.writeAll("  (no route serves this call)\n");
+            shown += 1;
+            if (shown >= opts.limit) break :outer;
+        }
+    }
+    if (shown == 0) try w.print("(no orphan route calls matching '{s}')\n", .{filter});
+    try truncationNote(w, opts, shown);
+    return shown > 0;
 }
 
 /// A single event-dispatch site tied to its file (path + enclosing-symbol lookup).
@@ -1782,16 +2071,37 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         return false;
     }
     try multiMatchNote(w, name, ids.len, buf.len);
+    var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
+    defer if (impl_graph) |*graph| graph.deinit();
     for (ids) |id| {
         try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 0, true);
         try w.writeAll("  ↓ calls\n");
         try renderCallees(w, idx, id, opts, 2);
+        if (impl_graph) |*graph| {
+            for (graph.edges) |edge| {
+                if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
+                try renderImplSymbol(w, idx, idx.graph.symbols[edge.implementation_method], headerVerbosity(opts.verbosity), 2, edge.exact);
+            }
+        }
         try w.writeAll("  ↑ callers\n");
         var lines: std.ArrayList(u32) = .empty;
         defer lines.deinit(idx.gpa);
         for (idx.callersOf(id)) |cid| {
+            if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
             try callSiteLines(idx, cid, id, &lines);
             try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id));
+        }
+        if (impl_graph) |*graph| {
+            for (graph.edges) |edge| {
+                if (opts.strict and !edge.exact) continue;
+                const target = if (edge.port_method == id)
+                    edge.implementation_method
+                else if (edge.implementation_method == id)
+                    edge.port_method
+                else
+                    continue;
+                try renderImplSymbol(w, idx, idx.graph.symbols[target], headerVerbosity(opts.verbosity), 2, edge.exact);
+            }
         }
     }
     return true;
@@ -2642,7 +2952,7 @@ pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_nam
     if (opts.format == .json) return json_out.shortestPath(w, idx, from_name, to_name, opts);
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
-    const chain = try shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf);
+    const chain = try shortestPathIdsWithOptions(idx, from_name, to_name, &fbuf, &tbuf, opts);
     defer idx.gpa.free(chain);
     if (chain.len == 0) {
         // Distinguish "name unknown" (a lookup miss) from "genuinely no path"
@@ -2675,10 +2985,23 @@ pub fn shortestPathIds(
     fbuf: []SymbolId,
     tbuf: []SymbolId,
 ) ![]SymbolId {
+    return shortestPathIdsWithOptions(idx, from_name, to_name, fbuf, tbuf, .{});
+}
+
+pub fn shortestPathIdsWithOptions(
+    idx: *const Index,
+    from_name: []const u8,
+    to_name: []const u8,
+    fbuf: []SymbolId,
+    tbuf: []SymbolId,
+    opts: Options,
+) ![]SymbolId {
     const from_ids = resolveIds(idx, from_name, fbuf);
     const to_ids = resolveIds(idx, to_name, tbuf);
     if (from_ids.len == 0 or to_ids.len == 0) return idx.gpa.alloc(SymbolId, 0);
-    const prev = try bfsPrev(idx, from_ids, to_ids, false);
+    var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
+    defer if (impl_graph) |*graph| graph.deinit();
+    const prev = try bfsPrev(idx, from_ids, to_ids, opts.strict, if (impl_graph) |*g| g else null);
     defer idx.gpa.free(prev);
     const end = firstReached(prev, to_ids) orelse return idx.gpa.alloc(SymbolId, 0);
     return reconstruct(idx.gpa, prev, end);
@@ -2700,7 +3023,13 @@ fn reconstruct(gpa: std.mem.Allocator, prev: []const SymbolId, end: SymbolId) ![
 
 /// BFS from all `from_ids` over call edges; returns a `prev` array where
 /// `prev[n]` is the predecessor of `n` (self for sources, `invalid` if unseen).
-fn bfsPrev(idx: *const Index, from_ids: []const SymbolId, to_ids: []const SymbolId, strict: bool) ![]SymbolId {
+fn bfsPrev(
+    idx: *const Index,
+    from_ids: []const SymbolId,
+    to_ids: []const SymbolId,
+    strict: bool,
+    impl_graph: ?*const impls_mod.Graph,
+) ![]SymbolId {
     const n = idx.graph.symbols.len;
     var prev = try idx.gpa.alloc(SymbolId, n);
     errdefer idx.gpa.free(prev);
@@ -2723,6 +3052,20 @@ fn bfsPrev(idx: *const Index, from_ids: []const SymbolId, to_ids: []const Symbol
             prev[ref.target] = cur;
             try queue.append(ref.target);
         }
+        if (impl_graph) |graph| {
+            for (graph.edges) |edge| {
+                if (strict and !edge.exact) continue;
+                const next = if (edge.port_method == cur)
+                    edge.implementation_method
+                else if (edge.implementation_method == cur)
+                    edge.port_method
+                else
+                    continue;
+                if (prev[next] != invalid) continue;
+                prev[next] = cur;
+                try queue.append(next);
+            }
+        }
     }
     return prev;
 }
@@ -2732,7 +3075,7 @@ fn firstReached(prev: []const SymbolId, to_ids: []const SymbolId) ?SymbolId {
     return null;
 }
 
-fn contains(ids: []const SymbolId, id: SymbolId) bool {
+pub fn contains(ids: []const SymbolId, id: SymbolId) bool {
     for (ids) |x| if (x == id) return true;
     return false;
 }
@@ -4818,6 +5161,46 @@ test "routes: a route renders with its handler callee and its client caller" {
     try testing.expect(std.mem.indexOf(u8, out, "loadOrders") != null);
 }
 
+test "phase 1 route views select clients, unhit routes, handlers, and orphan calls" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
+        \\@app.get("/hit")
+        \\def hit_handler(): return 1
+        \\@app.post("/idle")
+        \\def idle_handler(): return 2
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function loadHit() { return fetch("/hit"); }
+        \\function loadMissing() { return fetch("/missing"); }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    _ = try listRoutes(&aw.writer, &idx, "", .{ .routes_clients = true });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "[ts]") != null);
+    aw.clearRetainingCapacity();
+    _ = try listRoutes(&aw.writer, &idx, "", .{ .routes_unhit = true });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "POST /idle") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "GET /hit") == null);
+    aw.clearRetainingCapacity();
+    _ = try listRoutes(&aw.writer, &idx, "", .{ .routes_handler = "hit_*" });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "GET /hit") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "POST /idle") == null);
+    aw.clearRetainingCapacity();
+    _ = try listRoutes(&aw.writer, &idx, "", .{ .routes_orphan_calls = true });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "GET /missing") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "loadMissing") != null);
+}
+
 test "routes: a filter that matches no route reports an empty scope" {
     const testing = std.testing;
     const io = testing.io;
@@ -4849,6 +5232,78 @@ test "routes: a filter that matches no route reports an empty scope" {
         _ = try listRoutes(&aw.writer, &idx, "billing", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no routes under 'billing'") != null);
     }
+}
+
+test "phase 1 protocol walks and conformance share inferred implementation edges" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ports.py", .data =
+        \\from typing import Protocol
+        \\class Runner(Protocol):
+        \\    def run(self, value: str) -> str: ...
+        \\class FastRunner:
+        \\    def run(self, value: str) -> str: return value
+        \\class AlphaRunner:
+        \\    def run(self, value: str) -> str: return value
+        \\class BetaRunner:
+        \\    def run(self, value: int) -> str: return str(value)
+        \\def execute(runner: Runner) -> str:
+        \\    return runner.run("x")
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try walk(&aw.writer, &idx, "execute", false, .{ .impls = true }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "⇒impl") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "FastRunner.run") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try conforms(&aw.writer, &idx, "Runner", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "FastRunner.run") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "OK") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try conforms(&aw.writer, &idx, "*aRunner", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "sibling conformance") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "sig_diff") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try shortestPath(&aw.writer, &idx, "execute", "FastRunner.run", .{ .impls = true }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "FastRunner.run") != null);
+}
+
+test "phase 1 visibility filters outline and search consistently" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "visibility.py", .data =
+        \\def visible(): return 1
+        \\def _hidden(): return 2
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    _ = try outline(&aw.writer, &idx, "visibility.py", .{ .visibility = .public });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "visible") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "_hidden") == null);
+    aw.clearRetainingCapacity();
+    _ = try search(&aw.writer, &idx, "hidden", .{ .visibility = .private });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "_hidden") != null);
 }
 
 test "imports: listImports shows a local import with its binding; empty scope noted" {
