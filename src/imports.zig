@@ -280,7 +280,6 @@ test "lua require maps dotted modules to file and package init paths" {
     try std.testing.expectEqualStrings("lua/lib/util/init.lua", c[3]);
 }
 
-
 // ===========================================================================
 // Appended tests — imports.zig candidate generation & path helpers.
 // ===========================================================================

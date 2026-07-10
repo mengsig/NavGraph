@@ -574,7 +574,7 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // A JS/TS object-literal property key (`{ count: ... }`) names a field,
         // not a reference to a same-named binding — don't emit an edge for it.
         if (member_qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
-        const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
+        const is_call = referenceCallOpen(ctx, i, hi) != null;
         if (assignment.read) {
             try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, is_call, false);
         }
@@ -619,6 +619,26 @@ fn assignmentAccess(ctx: *const Ctx, i: u32, hi: u32) struct { read: bool, write
     return .{ .read = true, .write = false };
 }
 
+fn referenceCallOpen(ctx: *const Ctx, i: u32, hi: u32) ?u32 {
+    std.debug.assert(i < hi);
+    std.debug.assert(hi <= ctx.toks.len);
+    var cursor = i + 1;
+    if (cursor < hi and ctx.isPunct(cursor, '(')) return cursor;
+    const lang = ctx.cfg.language;
+    if (lang != .cpp and lang != .csharp and lang != .typescript and lang != .tsx and lang != .rust) return null;
+    if (cursor + 2 < hi and ctx.isPunct(cursor, ':') and ctx.isPunct(cursor + 1, ':') and ctx.isPunct(cursor + 2, '<')) cursor += 2;
+    if (cursor >= hi or !ctx.isPunct(cursor, '<')) return null;
+    var depth: u32 = 0;
+    while (cursor < hi) : (cursor += 1) {
+        if (ctx.isPunct(cursor, '<')) depth += 1;
+        if (!ctx.isPunct(cursor, '>')) continue;
+        if (depth == 0) return null;
+        depth -= 1;
+        if (depth == 0) return if (cursor + 1 < hi and ctx.isPunct(cursor + 1, '(')) cursor + 1 else null;
+    }
+    return null;
+}
+
 fn enclosingCallQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     std.debug.assert(lo <= i);
     std.debug.assert(i < ctx.toks.len);
@@ -646,18 +666,45 @@ fn enclosingCallQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
 /// If token `i` is the trailing member of a member access, return the receiver
 /// identifier; otherwise "".
 fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+    std.debug.assert(lo <= i);
+    std.debug.assert(i < ctx.toks.len);
     // `recv.name`
-    if (i >= lo + 2 and ctx.isPunct(i - 1, '.') and ctx.toks[i - 2].kind == .identifier)
-        return ctx.textOf(i - 2);
+    if (i >= lo + 2 and ctx.isPunct(i - 1, '.')) {
+        if (ctx.toks[i - 2].kind == .identifier) return ctx.textOf(i - 2);
+        if (ctx.isPunct(i - 2, '>')) return genericReceiver(ctx, i - 2, lo);
+    }
     // Two-punct member operators, receiver two tokens back:
     //   `recv?.name` / `recv!.name` — JS/TS optional-chaining & non-null assertion
     //   `recv->name`                — C/C++ pointer member
     //   `Scope::name`               — C++ scope resolution
-    if (i >= lo + 3 and ctx.toks[i - 3].kind == .identifier) {
-        if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
-            return ctx.textOf(i - 3);
-        if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
-        if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
+    if (i >= lo + 3) {
+        if (ctx.toks[i - 3].kind == .identifier) {
+            if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
+                return ctx.textOf(i - 3);
+            if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
+            if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
+        }
+        if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':') and ctx.isPunct(i - 3, '>'))
+            return genericReceiver(ctx, i - 3, lo);
+    }
+    return "";
+}
+
+fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) []const u8 {
+    std.debug.assert(lo <= close);
+    std.debug.assert(ctx.isPunct(close, '>'));
+    var depth: u32 = 1;
+    var cursor = close;
+    while (cursor > lo) {
+        cursor -= 1;
+        if (ctx.isPunct(cursor, '>')) depth += 1;
+        if (!ctx.isPunct(cursor, '<')) continue;
+        depth -= 1;
+        if (depth != 0) continue;
+        if (cursor > lo and ctx.toks[cursor - 1].kind == .identifier) return ctx.textOf(cursor - 1);
+        if (cursor >= lo + 3 and ctx.isPunct(cursor - 1, ':') and ctx.isPunct(cursor - 2, ':') and ctx.toks[cursor - 3].kind == .identifier)
+            return ctx.textOf(cursor - 3);
+        return "";
     }
     return "";
 }

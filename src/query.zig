@@ -13,6 +13,7 @@ const lexer = @import("lexer.zig");
 const language = @import("language.zig");
 const events_mod = @import("events.zig");
 const gitdiff = @import("gitdiff.zig");
+const gitutil = @import("gitutil.zig");
 const cache = @import("cache.zig");
 const gitignore = @import("gitignore.zig");
 const impls_mod = @import("impls.zig");
@@ -55,6 +56,17 @@ pub const FileSort = enum {
     pub fn parse(s: []const u8) ?FileSort {
         if (std.mem.eql(u8, s, "path") or std.mem.eql(u8, s, "name")) return .path;
         if (std.mem.eql(u8, s, "symbols") or std.mem.eql(u8, s, "size")) return .symbols;
+        return null;
+    }
+};
+
+pub const ChurnSort = enum {
+    commits,
+    lines,
+
+    pub fn parse(s: []const u8) ?ChurnSort {
+        if (std.mem.eql(u8, s, "commits") or std.mem.eql(u8, s, "changes")) return .commits;
+        if (std.mem.eql(u8, s, "lines") or std.mem.eql(u8, s, "churn")) return .lines;
         return null;
     }
 };
@@ -135,7 +147,9 @@ pub const Options = struct {
     summary: bool = false,
     /// Stable JSONL page offset, decoded from `v1:<ordinal>`.
     after: u32 = 0,
-    /// Follow only high-confidence (type/self-bound or unambiguous) edges.
+    /// Distinguishes an explicit `--after v1:0` from the default first page.
+    after_set: bool = false,
+    /// Follow only edges that the active analysis classifies as exact.
     strict: bool = false,
     format: OutputFormat = .text,
     /// `search`: match reference/use sites (usages), not just definition names.
@@ -156,6 +170,9 @@ pub const Options = struct {
     file_sort: FileSort = .path,
     /// Ranking for outline/search/hot. `.default` preserves existing output.
     sort: SortKey = .default,
+    churn_sort: ChurnSort = .commits,
+    history_last: u32 = 10,
+    history_last_set: bool = false,
     /// Directional reference filtering and flow type scope.
     writers: bool = false,
     readers: bool = false,
@@ -177,7 +194,9 @@ pub const Options = struct {
     no_recurse: bool = false,
     /// Add inferred protocol/interface implementation edges to graph walks.
     impls: bool = false,
-    /// Phase 3 workflow selectors and safe-refactor behavior.
+    /// Include per-method override relationships in `hierarchy`.
+    hierarchy_overrides: bool = false,
+    /// Workflow, history, and safe-refactor selectors.
     from_tests: bool = false,
     since: []const u8 = "",
     preview: bool = false,
@@ -679,30 +698,30 @@ fn renderUnresolvedStatus(w: *Writer, idx: *const Index, filter: []const u8, tot
 /// Returns whether any indexed file matched `filter`.
 pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listFiles(w, idx, filter, opts);
-    if (opts.file_sort == .symbols) return listFilesBySymbols(w, idx, filter, opts);
-    var any = false;
-    var shown: u32 = 0;
-    for (idx.graph.files) |file| {
-        if (!matchesFilter(file.path, filter)) continue;
-        if (opts.no_recurse and !inDirNonRecursive(file.path, filter)) continue;
-        any = true;
-        const n = fileSymbolCount(idx, file);
-        try w.print("{s}  ({s}, {d} symbol{s})\n", .{ file.path, file.language.tag(), n, if (n == 1) "" else "s" });
-        shown += 1;
-        if (shown >= opts.limit) break;
-    }
-    if (!any) {
+    const ranked = try collectFiles(idx, filter, opts);
+    defer idx.gpa.free(ranked);
+    if (ranked.len == 0) {
         try w.print("(no indexed files under '{s}')\n", .{filter});
         try skippedNote(w, idx);
+        return false;
     }
-    try truncationNote(w, opts, shown);
-    return any;
+    const shown = @min(ranked.len, opts.limit);
+    for (ranked[0..shown]) |entry| {
+        const file = idx.graph.files[entry.id];
+        try w.print("{s}  ({s}, {d} symbol{s})\n", .{
+            file.path, file.language.tag(), entry.count, if (entry.count == 1) "" else "s",
+        });
+    }
+    try truncationNote(w, opts, @intCast(shown));
+    return true;
 }
 
-/// `files --sort symbols`: list in-scope files ranked by symbol count
-/// (descending, ties broken by path) so the biggest files surface first.
-/// Returns whether any file matched.
-fn listFilesBySymbols(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+/// Collect in-scope files in the requested stable order. Renderers apply `limit`.
+pub const RankedFile = struct { id: model.FileId, count: u32 };
+
+pub fn collectFiles(idx: *const Index, filter: []const u8, opts: Options) ![]RankedFile {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.files.len <= std.math.maxInt(model.FileId));
     var ranked: std.ArrayList(RankedFile) = .empty;
     defer ranked.deinit(idx.gpa);
     for (idx.graph.files) |file| {
@@ -710,25 +729,9 @@ fn listFilesBySymbols(w: *Writer, idx: *const Index, filter: []const u8, opts: O
         if (opts.no_recurse and !inDirNonRecursive(file.path, filter)) continue;
         try ranked.append(idx.gpa, .{ .id = file.id, .count = fileSymbolCount(idx, file) });
     }
-    if (ranked.items.len == 0) {
-        try w.print("(no indexed files under '{s}')\n", .{filter});
-        try skippedNote(w, idx);
-        return false;
-    }
-    std.mem.sort(RankedFile, ranked.items, idx, rankedFileLessThan);
-    var shown: u32 = 0;
-    for (ranked.items) |rf| {
-        const file = idx.graph.files[rf.id];
-        const n = rf.count;
-        try w.print("{s}  ({s}, {d} symbol{s})\n", .{ file.path, file.language.tag(), n, if (n == 1) "" else "s" });
-        shown += 1;
-        if (shown >= opts.limit) break;
-    }
-    try truncationNote(w, opts, shown);
-    return true;
+    if (opts.file_sort == .symbols) std.mem.sort(RankedFile, ranked.items, idx, rankedFileLessThan);
+    return ranked.toOwnedSlice(idx.gpa);
 }
-
-const RankedFile = struct { id: model.FileId, count: u32 };
 
 /// Descending symbol count, then ascending path for a stable, readable order.
 fn rankedFileLessThan(idx: *const Index, a: RankedFile, b: RankedFile) bool {
@@ -756,7 +759,8 @@ const max_read_bytes = 8 * 1024 * 1024;
 /// config files and files under ignored dirs are reachable too. Returns whether
 /// at least one source line was printed.
 pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !bool {
-    _ = opts;
+    std.debug.assert(root.len > 0);
+    std.debug.assert(spec.len > 0);
     var path = spec;
     // Empty `ranges` means the whole file; one or more means `file:A-B,C-D` — a
     // batched read that pulls several disjoint slices in one call (a symbol and
@@ -773,17 +777,26 @@ pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, sp
     defer if (owned) |b| idx.gpa.free(b);
     const text = indexedText(idx, path) orelse blk: {
         var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
-            try w.print("(cannot open root '{s}')\n", .{root});
+            if (opts.format == .json) {
+                try json_out.readError(w, "cannot_open_root", root);
+            } else {
+                try w.print("(cannot open root '{s}')\n", .{root});
+            }
             return false;
         };
         defer rd.close(io);
         const bytes = rd.readFileAlloc(io, path, idx.gpa, .limited(max_read_bytes)) catch {
-            try w.print("(no such file: '{s}' — give a path relative to the repo root; `navgraph files` lists them)\n", .{path});
+            if (opts.format == .json) {
+                try json_out.readError(w, "no_such_file", path);
+            } else {
+                try w.print("(no such file: '{s}' — give a path relative to the repo root; `navgraph files` lists them)\n", .{path});
+            }
             return false;
         };
         owned = bytes;
         break :blk bytes;
     };
+    if (opts.format == .json) return json_out.sourceLines(w, path, text, ranges);
     return printNumbered(w, path, text, ranges);
 }
 
@@ -806,7 +819,7 @@ fn indexedText(idx: *const Index, path: []const u8) ?[]const u8 {
     return match;
 }
 
-const LineRange = struct { lo: usize, hi: usize };
+pub const LineRange = struct { lo: usize, hi: usize };
 
 /// Parse a `read` range suffix: `A-B`, `A-` (A to end), or `A` (single line).
 /// Returns null on anything unparseable so a genuine `:` in a path is left alone.
@@ -840,7 +853,7 @@ fn parseRanges(s: []const u8, buf: []LineRange) ?[]const LineRange {
 }
 
 /// The number of lines in `text` (a trailing newline is not counted as a line).
-fn lineCount(text: []const u8) usize {
+pub fn lineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     var total: usize = 1;
     for (text) |ch| {
@@ -1253,7 +1266,7 @@ fn walkCallees(
             if (!opts.refs and isDataReadEdge(idx, ref)) continue;
             // The edge (this symbol → callee) lives at ref.line in this file.
             try walkNode(w, idx, impl_graph, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, heuristic, budget);
-        } else if (ref.kind == .call or ref.kind == .route_call) {
+        } else if (ref.target == invalid and (ref.kind == .call or ref.kind == .route_call)) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
         }
@@ -1489,7 +1502,8 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 /// scope — so `-k struct` on a Python repo says "kinds here: class, fn,
 /// method…" instead of a bare miss (a trial burned a call on exactly that).
 pub fn collisions(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
-    std.debug.assert(idx.graph.symbols.len > 0);
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
     if (opts.format == .json) return json_out.collisions(w, idx, pattern, opts);
     const ids = try collectCollisionSymbols(idx, pattern, opts);
     defer idx.gpa.free(ids);
@@ -1514,7 +1528,8 @@ pub fn collisions(w: *Writer, idx: *const Index, pattern: []const u8, opts: Opti
 }
 
 pub fn collectCollisionSymbols(idx: *const Index, pattern: []const u8, opts: Options) ![]SymbolId {
-    std.debug.assert(idx.graph.symbols.len > 0);
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
     var list: std.ArrayList(SymbolId) = .empty;
     errdefer list.deinit(idx.gpa);
     for (idx.graph.symbols) |sym| {
@@ -1737,15 +1752,16 @@ fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Refe
 
 pub fn refSelected(idx: *const Index, owner: model.Symbol, ref: model.Reference, opts: Options) bool {
     std.debug.assert(owner.id < idx.graph.symbols.len);
+    std.debug.assert(ref.target == invalid or ref.target < idx.graph.symbols.len);
     if (opts.writers and !ref.write) return false;
     if (opts.readers and ref.write) return false;
     if (opts.unread and (!ref.write or ref.target == invalid or !targetUnread(idx, ref.target))) return false;
     if (opts.on_type.len == 0) return true;
-    if (matchesName(opts.on_type, ref.qualifier)) return true;
     for (owner.bindings) |binding| {
-        if (std.mem.eql(u8, binding.name, ref.qualifier) and matchesName(opts.on_type, binding.type_name)) return true;
+        if (!std.mem.eql(u8, binding.name, ref.qualifier)) continue;
+        return matchesName(opts.on_type, binding.type_name);
     }
-    return false;
+    return matchesName(opts.on_type, ref.qualifier);
 }
 
 fn targetUnread(idx: *const Index, target: SymbolId) bool {
@@ -2364,10 +2380,11 @@ fn pct(num: u32, den: u32) f64 {
     return 100.0 * @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
 }
 
-/// Mark every symbol reachable in the call graph from a test symbol (BFS over
-/// resolved edges from the `isTestSymbol` seed set). Caller owns the returned
-/// slice, indexed by `SymbolId`. Backs `coverage`.
+/// Mark every symbol reachable through exact executable edges from a test symbol.
+/// Caller owns the returned slice, indexed by `SymbolId`. Backs `coverage`.
 pub fn testReachable(idx: *const Index, gpa: std.mem.Allocator) ![]bool {
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
+    std.debug.assert(idx.callers.len == idx.graph.symbols.len);
     const reached = try gpa.alloc(bool, idx.graph.symbols.len);
     errdefer gpa.free(reached);
     @memset(reached, false);
@@ -2382,18 +2399,18 @@ pub fn testReachable(idx: *const Index, gpa: std.mem.Allocator) ![]bool {
     var wi: usize = 0;
     while (wi < work.items.len) : (wi += 1) {
         for (idx.graph.symbols[work.items[wi]].refs) |ref| {
-            if (ref.target != invalid and !reached[ref.target]) {
-                reached[ref.target] = true;
-                try work.append(gpa, ref.target);
-            }
+            const executable = ref.kind == .call or ref.kind == .route_call;
+            if (!executable or !ref.exact or ref.target == invalid or reached[ref.target]) continue;
+            reached[ref.target] = true;
+            try work.append(gpa, ref.target);
         }
     }
     return reached;
 }
 
 /// `coverage [path]` — for each file, the fraction of its non-test fn/method
-/// symbols reachable in the call graph from at least one test. A dependency-free,
-/// language-agnostic substitute for line coverage (kcov cannot read Zig 0.16's
+/// symbols reachable through exact call/route-call edges from at least one test.
+/// This is a dependency-free, language-agnostic substitute for line coverage
 /// DWARF5). Conservative: only resolved edges are followed, so real coverage is
 /// at least the number reported.
 /// Returns whether any file with fn/method symbols matched (i.e. a non-empty
@@ -2853,19 +2870,9 @@ pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []
 pub fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const u8) !std.process.RunResult {
     std.debug.assert(root.len > 0);
     std.debug.assert(ref.len > 0);
-    var cwd_path = root;
-    var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch |err| dir: {
-        if (err != error.NotDir) return err;
-        cwd_path = std.fs.path.dirname(root) orelse ".";
-        break :dir try std.Io.Dir.cwd().openDir(io, cwd_path, .{});
-    };
-    root_dir.close(io);
-    const argv = [_][]const u8{ "git", "diff", "--unified=0", "--no-color", ref };
-    return std.process.run(gpa, io, .{
-        .argv = &argv,
-        .cwd = .{ .path = cwd_path },
-        .stdout_limit = std.Io.Limit.limited(16 * 1024 * 1024),
-    });
+    if (!gitutil.validRef(ref)) return error.InvalidGitRef;
+    const argv = [_][]const u8{ "git", "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "--no-color", ref, "--" };
+    return gitutil.run(gpa, io, root, &argv);
 }
 
 pub const SourceRange = struct {
@@ -3005,7 +3012,9 @@ pub fn symbolTouched(sym: model.Symbol, source: []const u8, ranges: []const gitd
     const lo = sym.line;
     const hi = sym.endLine(source);
     for (ranges) |r| {
-        if (r.lo <= hi and r.hi >= lo) return true;
+        const range_lo = if (r.empty and r.lo == 0) @as(u32, 1) else r.lo;
+        const range_hi = if (r.empty and r.hi == 0) @as(u32, 1) else r.hi;
+        if (range_lo <= hi and range_hi >= lo) return true;
     }
     return false;
 }
@@ -3115,7 +3124,7 @@ fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, ind
             if (!budget.take(idx, ref.target, opts)) continue;
             const v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
             try render.symbolSite(w, idx, idx.graph.symbols[ref.target], v, indent, true, ref.line, ref.count, ref.lines, ref.exact);
-        } else if (ref.kind == .call or ref.kind == .route_call) {
+        } else if (ref.target == invalid and (ref.kind == .call or ref.kind == .route_call)) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
         }

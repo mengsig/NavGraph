@@ -16,16 +16,23 @@ pub const Command = enum {
     routes,
     events,
     conforms,
+    hierarchy,
+    raises,
+    catches,
     neighbors,
     unused,
     imports,
     importers,
     path,
     flow,
+    taint,
     reaches,
     affected,
     hot,
     diff,
+    history,
+    blame,
+    churn,
     collisions,
     files,
     status,
@@ -91,6 +98,9 @@ const usage_text =
     \\                     cross-language client calls are linked
     \\  conforms <selector> Audit protocol implementations or sibling signature
     \\                     divergence (aliases: impls, implements)
+    \\  hierarchy <Type>   Nominal supertypes/MRO and transitive subtypes; --overrides maps methods
+    \\  raises <symbol>    Direct/transitive exceptions and their nearest handler or unhandled gap
+    \\  catches <Error>    Matching handlers plus handled/unhandled raise sites
     \\  events [filter]    Link bus/broker handlers to emitters; filters common DOM listeners
     \\  neighbors <name>   Callees and callers of <name> in one view
     \\  unused [filter]    Unreferenced definitions (fns/methods & types) nothing calls
@@ -103,10 +113,14 @@ const usage_text =
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
     \\  flow <symbol>      Initializers/writers and readers; warns on ambiguity; --to traces a sink
+    \\  taint <source>     Security source-to-sink reachability (requires --to <sink>)
     \\  reaches <A,B,...>  Transitive reachable set; --from-tests selects exercising tests
     \\  affected [ref]     Tests affected since a git ref (or use --since; default HEAD)
     \\  collisions [pat]   Group duplicate definition names (alias: duplicates)
     \\  diff [ref]         Symbols changed since <ref> (default HEAD) + their callers
+    \\  history <symbol>   Symbol-level git history/signature patches (default: last 10)
+    \\  blame <symbol>     Per-line author/commit provenance for a symbol
+    \\  churn [path]       Rank symbols by historical commits or added/removed lines
     \\  hot [path]         Rank functions by fan-in/out; hints --no-tests when tests dominate
     \\  files [filter]     List every indexed file + its symbol count (index coverage);
     \\                     add --sort symbols to rank biggest-first
@@ -124,12 +138,13 @@ const usage_text =
     \\
     \\FLAGS:
     \\  -v, --verbosity <names|sig|doc|full>   Detail level (default: sig)
-    \\  -d, --depth <N>                        Graph depth for calls/callers (default: 1)
+    \\  -d, --depth <N>                        Graph depth for calls/callers/raises (default: 1)
     \\  -C, --root <path>                      Index root: a directory, or a single
     \\                                         file to scope to it (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  --budget <bytes> / --max-nodes <N>     Bound traversal output; --summary compacts it
-    \\  --since <ref> / --from-tests           Affected/reaches test-impact selectors
+    \\  --since <ref> / --from-tests           Affected/churn history and reaches selectors
+    \\  --last <N>                             history/churn commit bound (default: 10)
     \\  --preview                              rename: emit patch without writing files
     \\  --exact-source                         diff: include source ranges and raw git patch
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
@@ -137,11 +152,12 @@ const usage_text =
     \\  --public, --private, --no-private       Visibility shortcuts
     \\  --sort <key>                         files: path|symbols; outline/search:
     \\                                         line|name|span|callers|callees; hot:
-    \\                                         fan_in|fan_in_exact|fan_out|fan_out_exact|span
+    \\                                         fan_in|fan_in_exact|fan_out|fan_out_exact|span;
+    \\                                         churn: commits|lines
     \\  -w, --writers / --readers             flow/search --refs: access direction
     \\  -u, --unread                          Keep written-but-never-read data
     \\  --on-type <Type>                      Type-scope member flow/reference hits
-    \\  --to <sink>                           flow: trace producer-to-consumer path
+    \\  --to <sink>                           flow/taint: trace to a consumer or security sink
     \\  --duplicates                         search: group duplicate definitions
     \\  --members                            collisions: include class members
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
@@ -154,10 +170,11 @@ const usage_text =
     \\                                         without | only. A test is a Zig `test`
     \\                                         block, a test_* fn, or a test-dir file.
     \\  --no-tests, --tests-only               Shortcuts for --tests without / --tests only.
-    \\  -s, --strict                           Follow only high-confidence edges; drops
-    \\                                         heuristic `?` and structural impl edges
+    \\  -s, --strict                           Follow only exact edges; drops inferred,
+    \\                                         heuristic `?`, and structural impl edges
     \\  -i, --impls                            calls/callers/neighbors/path: cross
     \\                                         protocol/interface implementation edges
+    \\  --overrides                            hierarchy: include per-method override map
     \\  --clients                              routes: show resolved client call sites
     \\  --unhit                                routes: show routes with no client calls
     \\  --orphan-calls, --orphan, --orphans    routes: show calls matching no route
@@ -276,17 +293,23 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "search", Command.search },         .{ "grep", Command.search },
         .{ "routes", Command.routes },         .{ "api", Command.routes },
         .{ "conforms", Command.conforms },     .{ "impls", Command.conforms },
-        .{ "implements", Command.conforms },   .{ "events", Command.events },
+        .{ "implements", Command.conforms },   .{ "hierarchy", Command.hierarchy },
+        .{ "hier", Command.hierarchy },        .{ "raises", Command.raises },
+        .{ "throws", Command.raises },         .{ "catches", Command.catches },
+        .{ "handles", Command.catches },       .{ "events", Command.events },
         .{ "dispatch", Command.events },       .{ "bus", Command.events },
         .{ "neighbors", Command.neighbors },   .{ "near", Command.neighbors },
         .{ "unused", Command.unused },         .{ "dead", Command.unused },
         .{ "imports", Command.imports },       .{ "importers", Command.importers },
         .{ "path", Command.path },             .{ "flow", Command.flow },
-        .{ "dataflow", Command.flow },         .{ "reaches", Command.reaches },
+        .{ "dataflow", Command.flow },         .{ "taint", Command.taint },
+        .{ "security", Command.taint },        .{ "reaches", Command.reaches },
         .{ "reachable", Command.reaches },     .{ "affected", Command.affected },
         .{ "impact", Command.affected },       .{ "collisions", Command.collisions },
         .{ "duplicates", Command.collisions }, .{ "diff", Command.diff },
-        .{ "changed", Command.diff },          .{ "hot", Command.hot },
+        .{ "changed", Command.diff },          .{ "history", Command.history },
+        .{ "hist", Command.history },          .{ "blame", Command.blame },
+        .{ "churn", Command.churn },           .{ "hot", Command.hot },
         .{ "central", Command.hot },           .{ "files", Command.files },
         .{ "manifest", Command.files },        .{ "status", Command.status },
         .{ "snapshot", Command.status },       .{ "read", Command.read },
@@ -310,7 +333,7 @@ fn parseCommand(s: []const u8) ?Command {
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .status, .diff, .coverage, .graph, .collisions, .affected, .todos, .serve => true,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .status, .diff, .churn, .coverage, .graph, .collisions, .affected, .todos, .serve => true,
         .path, .rename => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
@@ -347,10 +370,17 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (std.mem.eql(u8, f.name, "--after")) {
         out.options.after = try parseCursor(try f.value(args, i, f.name));
+        out.options.after_set = true;
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--since")) {
         out.options.since = try f.value(args, i, f.name);
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--last")) {
+        out.options.history_last = try parseUint(try f.value(args, i, f.name), "--last");
+        if (out.options.history_last == 0) return fail(error.BadValue, "--last must be at least 1", .{});
+        out.options.history_last_set = true;
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-C", "--root" })) {
@@ -373,6 +403,9 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         if (out.command == .files) {
             out.options.file_sort = query.FileSort.parse(val) orelse
                 return fail(error.BadValue, "invalid files --sort '{s}' (expected path|symbols)", .{val});
+        } else if (out.command == .churn) {
+            out.options.churn_sort = query.ChurnSort.parse(val) orelse
+                return fail(error.BadValue, "invalid churn --sort '{s}' (expected commits|lines)", .{val});
         } else {
             out.options.sort = query.SortKey.parse(val) orelse
                 return fail(error.BadValue, "invalid ranking --sort '{s}'", .{val});
@@ -429,6 +462,10 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (eqAny(f.name, &.{ "-i", "--impls" })) {
         out.options.impls = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--overrides")) {
+        out.options.hierarchy_overrides = true;
         return i;
     }
     if (eqAny(f.name, &.{ "--public", "--no-private" })) {
@@ -561,6 +598,8 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
     {
         return fail(error.Usage, "-i/--impls applies only to calls, callers, neighbors, path, reaches, and affected", .{});
     }
+    if (opts.hierarchy_overrides and parsed.command != .hierarchy)
+        return fail(error.Usage, "--overrides applies only to hierarchy", .{});
     const route_flags = opts.routes_clients or opts.routes_unhit or opts.routes_orphan_calls or opts.routes_handler.len != 0;
     if (route_flags and parsed.command != .routes)
         return fail(error.Usage, "route view flags apply only to the routes command", .{});
@@ -574,12 +613,16 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
     const flow_filter = opts.writers or opts.readers or opts.unread or opts.on_type.len != 0;
     if (flow_filter and parsed.command != .flow and !(parsed.command == .search and opts.refs))
         return fail(error.Usage, "flow filters apply only to flow or search --refs", .{});
-    if (opts.flow_to.len != 0 and parsed.command != .flow)
-        return fail(error.Usage, "--to applies only to flow", .{});
+    if (opts.flow_to.len != 0 and parsed.command != .flow and parsed.command != .taint)
+        return fail(error.Usage, "--to applies only to flow and taint", .{});
+    if (parsed.command == .taint and opts.flow_to.len == 0)
+        return fail(error.Usage, "taint requires a sink: navgraph taint <source> --to <sink>", .{});
     if (opts.from_tests and parsed.command != .reaches)
         return fail(error.Usage, "--from-tests applies only to reaches", .{});
-    if (opts.since.len != 0 and parsed.command != .affected)
-        return fail(error.Usage, "--since applies only to affected", .{});
+    if (opts.since.len != 0 and parsed.command != .affected and parsed.command != .churn)
+        return fail(error.Usage, "--since applies only to affected and churn", .{});
+    if (opts.history_last_set and parsed.command != .history and parsed.command != .churn)
+        return fail(error.Usage, "--last applies only to history and churn", .{});
     if (opts.preview and parsed.command != .rename)
         return fail(error.Usage, "--preview applies only to rename", .{});
     if (opts.exact_source and parsed.command != .diff)
@@ -595,7 +638,7 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         parsed.command == .status;
     if (opts.format == .jsonl and !jsonl_command)
         return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, edits, and status", .{});
-    if (opts.after != 0 and opts.format != .jsonl)
+    if (opts.after_set and opts.format != .jsonl)
         return fail(error.Usage, "--after requires --jsonl", .{});
     if (opts.duplicates and (parsed.command != .search or opts.refs))
         return fail(error.Usage, "--duplicates applies only to definition search", .{});
@@ -762,6 +805,10 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.callers, parseCommand("callers").?);
     try std.testing.expectEqual(Command.search, parseCommand("search").?);
     try std.testing.expectEqual(Command.routes, parseCommand("routes").?);
+    try std.testing.expectEqual(Command.conforms, parseCommand("conforms").?);
+    try std.testing.expectEqual(Command.hierarchy, parseCommand("hierarchy").?);
+    try std.testing.expectEqual(Command.raises, parseCommand("raises").?);
+    try std.testing.expectEqual(Command.catches, parseCommand("catches").?);
     try std.testing.expectEqual(Command.events, parseCommand("events").?);
     try std.testing.expectEqual(Command.neighbors, parseCommand("neighbors").?);
     try std.testing.expectEqual(Command.unused, parseCommand("unused").?);
@@ -769,10 +816,14 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.importers, parseCommand("importers").?);
     try std.testing.expectEqual(Command.path, parseCommand("path").?);
     try std.testing.expectEqual(Command.flow, parseCommand("flow").?);
+    try std.testing.expectEqual(Command.taint, parseCommand("taint").?);
     try std.testing.expectEqual(Command.reaches, parseCommand("reaches").?);
     try std.testing.expectEqual(Command.affected, parseCommand("affected").?);
     try std.testing.expectEqual(Command.collisions, parseCommand("collisions").?);
     try std.testing.expectEqual(Command.diff, parseCommand("diff").?);
+    try std.testing.expectEqual(Command.history, parseCommand("history").?);
+    try std.testing.expectEqual(Command.blame, parseCommand("blame").?);
+    try std.testing.expectEqual(Command.churn, parseCommand("churn").?);
     try std.testing.expectEqual(Command.hot, parseCommand("hot").?);
     try std.testing.expectEqual(Command.files, parseCommand("files").?);
     try std.testing.expectEqual(Command.status, parseCommand("status").?);
@@ -795,15 +846,22 @@ test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.callers, parseCommand("uses").?);
     try std.testing.expectEqual(Command.search, parseCommand("grep").?);
     try std.testing.expectEqual(Command.routes, parseCommand("api").?);
+    try std.testing.expectEqual(Command.conforms, parseCommand("impls").?);
+    try std.testing.expectEqual(Command.conforms, parseCommand("implements").?);
+    try std.testing.expectEqual(Command.hierarchy, parseCommand("hier").?);
+    try std.testing.expectEqual(Command.raises, parseCommand("throws").?);
+    try std.testing.expectEqual(Command.catches, parseCommand("handles").?);
     try std.testing.expectEqual(Command.events, parseCommand("dispatch").?);
     try std.testing.expectEqual(Command.events, parseCommand("bus").?);
     try std.testing.expectEqual(Command.neighbors, parseCommand("near").?);
     try std.testing.expectEqual(Command.unused, parseCommand("dead").?);
     try std.testing.expectEqual(Command.flow, parseCommand("dataflow").?);
+    try std.testing.expectEqual(Command.taint, parseCommand("security").?);
     try std.testing.expectEqual(Command.reaches, parseCommand("reachable").?);
     try std.testing.expectEqual(Command.affected, parseCommand("impact").?);
     try std.testing.expectEqual(Command.collisions, parseCommand("duplicates").?);
     try std.testing.expectEqual(Command.diff, parseCommand("changed").?);
+    try std.testing.expectEqual(Command.history, parseCommand("hist").?);
     try std.testing.expectEqual(Command.hot, parseCommand("central").?);
     try std.testing.expectEqual(Command.files, parseCommand("manifest").?);
     try std.testing.expectEqual(Command.status, parseCommand("snapshot").?);
@@ -875,10 +933,39 @@ test "phase 3 workflows, compaction, rename, and JSONL flags parse" {
     const stream = try parse(&.{ "search", "parse", "--jsonl", "--after", "v1:25" });
     try std.testing.expectEqual(query.OutputFormat.jsonl, stream.options.format);
     try std.testing.expectEqual(@as(u32, 25), stream.options.after);
+    try std.testing.expect(stream.options.after_set);
+    const first_page = try parse(&.{ "search", "parse", "--jsonl", "--after", "v1:0" });
+    try std.testing.expectEqual(@as(u32, 0), first_page.options.after);
+    try std.testing.expect(first_page.options.after_set);
 
     try std.testing.expectError(error.Usage, parse(&.{ "search", "x", "--since", "HEAD" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "x", "--after", "v1:0" }));
     try std.testing.expectError(error.Usage, parse(&.{ "def", "x", "--jsonl" }));
     try std.testing.expectError(error.BadValue, parse(&.{ "search", "x", "--jsonl", "--after", "25" }));
+}
+
+test "phase 4 depth and history commands parse with scoped options" {
+    const hierarchy_request = try parse(&.{ "hierarchy", "Leaf", "--overrides", "-j" });
+    try std.testing.expect(hierarchy_request.options.hierarchy_overrides);
+    try std.testing.expectEqual(query.OutputFormat.json, hierarchy_request.options.format);
+
+    const raises_request = try parse(&.{ "raises", "submit", "-d3", "--strict" });
+    try std.testing.expectEqual(@as(u32, 3), raises_request.options.depth);
+    try std.testing.expect(raises_request.options.strict);
+    try std.testing.expectEqual(Command.catches, (try parse(&.{ "handles", "OrderError" })).command);
+
+    const taint_request = try parse(&.{ "security", "request.json", "--to", "subprocess.run", "--strict" });
+    try std.testing.expectEqualStrings("subprocess.run", taint_request.options.flow_to);
+    try std.testing.expect(taint_request.options.strict);
+    try std.testing.expectError(error.Usage, parse(&.{ "taint", "request.json" }));
+
+    const history_request = try parse(&.{ "hist", "submit", "--last", "7" });
+    try std.testing.expectEqual(@as(u32, 7), history_request.options.history_last);
+    const churn_request = try parse(&.{ "churn", "src", "--since", "HEAD~5", "--sort", "lines" });
+    try std.testing.expectEqualStrings("HEAD~5", churn_request.options.since);
+    try std.testing.expectEqual(query.ChurnSort.lines, churn_request.options.churn_sort);
+    try std.testing.expectError(error.Usage, parse(&.{ "blame", "submit", "--last", "2" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "raises", "submit", "--overrides" }));
 }
 
 test "parseCommand: unknown and empty return null" {
@@ -956,6 +1043,7 @@ test "hasRequiredArgs: optional-arg commands accept no positional" {
     try std.testing.expect(hasRequiredArgs(.files, empty));
     try std.testing.expect(hasRequiredArgs(.status, empty));
     try std.testing.expect(hasRequiredArgs(.diff, empty));
+    try std.testing.expect(hasRequiredArgs(.churn, empty));
 }
 
 test "hasRequiredArgs: single-arg commands require a positional" {
@@ -970,6 +1058,12 @@ test "hasRequiredArgs: single-arg commands require a positional" {
     try std.testing.expect(!hasRequiredArgs(.importers, empty));
     try std.testing.expect(!hasRequiredArgs(.read, empty));
     try std.testing.expect(!hasRequiredArgs(.strings, empty));
+    try std.testing.expect(!hasRequiredArgs(.hierarchy, empty));
+    try std.testing.expect(!hasRequiredArgs(.raises, empty));
+    try std.testing.expect(!hasRequiredArgs(.catches, empty));
+    try std.testing.expect(!hasRequiredArgs(.taint, empty));
+    try std.testing.expect(!hasRequiredArgs(.history, empty));
+    try std.testing.expect(!hasRequiredArgs(.blame, empty));
 }
 
 test "hasRequiredArgs: path needs exactly two positionals" {
@@ -988,6 +1082,7 @@ test "parse: optional-arg commands succeed with no positional" {
     try std.testing.expectEqual(Command.files, (try parse(&.{"files"})).command);
     try std.testing.expectEqual(Command.status, (try parse(&.{"status"})).command);
     try std.testing.expectEqual(Command.diff, (try parse(&.{"diff"})).command);
+    try std.testing.expectEqual(Command.churn, (try parse(&.{"churn"})).command);
     // ...and with an optional filter/positional.
     try std.testing.expectEqualStrings("src", (try parse(&.{ "outline", "src" })).arg);
     try std.testing.expectEqualStrings("HEAD~2", (try parse(&.{ "diff", "HEAD~2" })).arg);
@@ -1002,6 +1097,12 @@ test "parse: single-arg commands require their positional" {
     try std.testing.expectError(error.Usage, parse(&.{"importers"}));
     try std.testing.expectError(error.Usage, parse(&.{"read"}));
     try std.testing.expectError(error.Usage, parse(&.{"strings"}));
+    try std.testing.expectError(error.Usage, parse(&.{"hierarchy"}));
+    try std.testing.expectError(error.Usage, parse(&.{"raises"}));
+    try std.testing.expectError(error.Usage, parse(&.{"catches"}));
+    try std.testing.expectError(error.Usage, parse(&.{"taint"}));
+    try std.testing.expectError(error.Usage, parse(&.{"history"}));
+    try std.testing.expectError(error.Usage, parse(&.{"blame"}));
     // Provided: fine.
     try std.testing.expectEqualStrings("f.zig", (try parse(&.{ "importers", "f.zig" })).arg);
     try std.testing.expectEqualStrings("x.zig:1-2", (try parse(&.{ "read", "x.zig:1-2" })).arg);
@@ -1183,7 +1284,7 @@ test "usage documents every command and phase flags (drift guard)" {
         "--on-type",    "--to",        "--duplicates",   "--members",
         "--budget",     "--max-nodes", "--summary",      "--since",
         "--from-tests", "--preview",   "--jsonl",        "--after",
-        "parse-health",
+        "--overrides",  "--last",      "parse-health",
         "⇒impl",
     }) |flag| {
         try testing.expect(std.mem.indexOf(u8, out, flag) != null);

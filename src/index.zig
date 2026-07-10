@@ -2711,3 +2711,145 @@ test "parse health and cache snapshot survive a warm cache restore" {
     try testing.expectEqual(@as(?u32, 2), warm.graph.files[0].parse_health.desync_from);
     try testing.expect(warm.graph.files[0].parse_health.desync_to >= 3);
 }
+
+fn expectEquivalentIndexes(expected: *const Index, actual: *const Index) !void {
+    const testing = std.testing;
+    try testing.expectEqual(expected.graph.files.len, actual.graph.files.len);
+    try testing.expectEqual(expected.graph.symbols.len, actual.graph.symbols.len);
+    for (expected.graph.files, actual.graph.files) |left, right| {
+        try testing.expectEqual(left.id, right.id);
+        try testing.expectEqualStrings(left.path, right.path);
+        try testing.expectEqual(left.language, right.language);
+        try testing.expectEqualStrings(left.text, right.text);
+        try testing.expectEqual(left.parse_health.desync_from, right.parse_health.desync_from);
+        try testing.expectEqual(left.parse_health.desync_to, right.parse_health.desync_to);
+        try testing.expectEqual(left.sym_start, right.sym_start);
+        try testing.expectEqual(left.sym_end, right.sym_end);
+    }
+    for (expected.graph.symbols, actual.graph.symbols) |left, right| {
+        try testing.expectEqual(left.id, right.id);
+        try testing.expectEqual(left.file, right.file);
+        try testing.expectEqualStrings(left.name, right.name);
+        try testing.expectEqual(left.kind, right.kind);
+        try testing.expectEqual(left.parent, right.parent);
+        try testing.expectEqual(left.line, right.line);
+        try testing.expectEqual(left.span_start, right.span_start);
+        try testing.expectEqual(left.span_end, right.span_end);
+        try testing.expectEqual(left.sig_end, right.sig_end);
+        try testing.expectEqualStrings(left.doc, right.doc);
+        try testing.expectEqual(left.exported, right.exported);
+        try testing.expectEqual(left.modifiers, right.modifiers);
+        try testing.expectEqualStrings(left.import_path, right.import_path);
+        try expectEquivalentBindings(left.bindings, right.bindings);
+        try expectEquivalentRefs(left.refs, right.refs);
+    }
+    try testing.expectEqual(expected.callers.len, actual.callers.len);
+    for (expected.callers, actual.callers) |left, right| try testing.expectEqualSlices(SymbolId, left, right);
+    try testing.expectEqual(expected.file_imports.len, actual.file_imports.len);
+    for (expected.file_imports, actual.file_imports) |left, right| {
+        try testing.expectEqual(left.len, right.len);
+        for (left, right) |left_import, right_import| {
+            try testing.expectEqualStrings(left_import.binding, right_import.binding);
+            try testing.expectEqual(left_import.target, right_import.target);
+        }
+    }
+}
+
+fn expectEquivalentBindings(expected: []const model.Binding, actual: []const model.Binding) !void {
+    const testing = std.testing;
+    try testing.expectEqual(expected.len, actual.len);
+    try testing.expect(expected.len <= std.math.maxInt(u32));
+    for (expected, actual) |left, right| {
+        try testing.expectEqualStrings(left.name, right.name);
+        try testing.expectEqualStrings(left.type_name, right.type_name);
+    }
+}
+
+fn expectEquivalentRefs(expected: []const model.Reference, actual: []const model.Reference) !void {
+    const testing = std.testing;
+    try testing.expectEqual(expected.len, actual.len);
+    try testing.expect(expected.len <= std.math.maxInt(u32));
+    for (expected, actual) |left, right| {
+        try testing.expectEqualStrings(left.name, right.name);
+        try testing.expectEqualStrings(left.qualifier, right.qualifier);
+        try testing.expectEqual(left.line, right.line);
+        try testing.expectEqual(left.kind, right.kind);
+        try testing.expectEqual(left.write, right.write);
+        try testing.expectEqual(left.count, right.count);
+        try testing.expectEqual(left.target, right.target);
+        try testing.expectEqual(left.exact, right.exact);
+        try testing.expectEqualSlices(u32, left.lines, right.lines);
+        try testing.expectEqualSlices(u32, left.offsets, right.offsets);
+    }
+}
+
+fn expectCachedEqualsClean(io: std.Io, root: []const u8) !void {
+    const testing = std.testing;
+    std.debug.assert(root.len > 0);
+    std.debug.assert(std.fs.path.isAbsolute(root) or std.mem.startsWith(u8, root, ".zig-cache/"));
+    var cached = try build(testing.allocator, io, root, true);
+    defer cached.deinit();
+    var clean = try build(testing.allocator, io, root, false);
+    defer clean.deinit();
+    try expectEquivalentIndexes(&clean, &cached);
+}
+
+fn writeVersionedFile(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8, generation: i96) !void {
+    std.debug.assert(path.len > 0);
+    std.debug.assert(generation > 0);
+    try dir.writeFile(io, .{ .sub_path = path, .data = data });
+    const timestamp = std.Io.Timestamp.fromNanoseconds(generation * std.time.ns_per_s);
+    try dir.setTimestamps(io, path, .{ .modify_timestamp = .{ .new = timestamp } });
+}
+
+test "edit-requery cache stays identical to no-cache across rename add delete and move" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const initial =
+        \\def leaf(): return 1
+        \\def caller(): return leaf()
+        \\class Store:
+        \\    def save(self): return 1
+    ;
+    try writeVersionedFile(io, tmp.dir, "a.py", initial, 1);
+    try writeVersionedFile(io, tmp.dir, "b.py", "", 1);
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try expectCachedEqualsClean(io, root);
+
+    const renamed =
+        \\def twig(): return 1
+        \\def caller(): return twig()
+        \\class Store:
+        \\    def save(self): return 1
+    ;
+    try testing.expectEqual(initial.len, renamed.len);
+    try writeVersionedFile(io, tmp.dir, "a.py", renamed, 2);
+    try expectCachedEqualsClean(io, root);
+
+    try writeVersionedFile(io, tmp.dir, "a.py",
+        \\def twig(value): return value
+        \\def caller(): return twig(1)
+        \\class Store:
+        \\    def save(self): return 1
+    , 3);
+    try expectCachedEqualsClean(io, root);
+    try writeVersionedFile(io, tmp.dir, "a.py",
+        \\def twig(value): return value
+        \\def caller(): return twig(1)
+        \\class Store: pass
+    , 4);
+    try expectCachedEqualsClean(io, root);
+
+    try writeVersionedFile(io, tmp.dir, "a.py", "def caller(): return twig(1)\nclass Store: pass\n", 5);
+    try writeVersionedFile(io, tmp.dir, "b.py", "def twig(value): return value\n", 2);
+    try expectCachedEqualsClean(io, root);
+    var final = try build(testing.allocator, io, root, true);
+    defer final.deinit();
+    try testing.expectEqual(@as(usize, 1), final.lookup("twig").len);
+    try testing.expectEqual(@as(usize, 0), final.lookup("leaf").len);
+    try testing.expectEqual(@as(usize, 0), final.lookup("save").len);
+    try testing.expectEqual(final.lookup("caller")[0], final.callersOf(final.lookup("twig")[0])[0]);
+}

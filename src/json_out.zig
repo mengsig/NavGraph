@@ -224,7 +224,8 @@ pub fn rankedDefinitionsJsonl(w: *Writer, idx: *const Index, ranked: []const que
 /// reference objects (use sites), mirroring the text usages listing. Returns
 /// whether any reference matched.
 pub fn collisions(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
-    std.debug.assert(idx.graph.symbols.len > 0);
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
     const ids = try query.collectCollisionSymbols(idx, pattern, opts);
     defer idx.gpa.free(ids);
     var groups: u32 = 0;
@@ -530,7 +531,7 @@ fn walkCallees(
             if (wrote != 0) try w.writeByte(',');
             try walkNode(w, idx, impl_graph, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, budget);
             wrote += 1;
-        } else if (ref.kind == .call or ref.kind == .route_call) {
+        } else if (ref.target == invalid and (ref.kind == .call or ref.kind == .route_call)) {
             ext += 1;
         }
     }
@@ -544,7 +545,7 @@ fn walkCallees(
         }
     }
     try w.writeByte(']');
-    if (ext != 0) try writeExternals(w, sym, opts.strict);
+    if (ext != 0) try writeExternals(w, sym);
 }
 
 fn implLeafArray(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, id: SymbolId, incoming: bool, strict: bool, opts: Options, budget: *JsonBudget) !void {
@@ -565,12 +566,12 @@ fn implLeafArray(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, i
     if (!first) try w.writeByte(']');
 }
 
-fn writeExternals(w: *Writer, sym: Symbol, strict: bool) !void {
+fn writeExternals(w: *Writer, sym: Symbol) !void {
     try w.writeAll(",\"ext\":[");
     var wrote: u32 = 0;
     for (sym.refs) |ref| {
         if (ref.kind != .call and ref.kind != .route_call) continue;
-        if (ref.target != invalid and (!strict or ref.exact)) continue;
+        if (ref.target != invalid) continue;
         if (wrote != 0) try w.writeByte(',');
         try writeString(w, ref.name);
         wrote += 1;
@@ -1203,6 +1204,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
             try nodeHead(w, idx, idx.graph.symbols[cid]);
             const site = query.callSiteLine(idx, cid, id);
             if (site != 0) try w.print(",\"site\":{d}", .{site});
+            if (!query.hasExactEdge(idx, cid, id)) try w.writeAll(",\"exact\":false");
             try w.writeByte('}');
             wrote += 1;
         }
@@ -1239,10 +1241,12 @@ fn calleeArray(w: *Writer, idx: *const Index, graph: ?*const impls_mod.Graph, sy
     const refs = ordered_refs orelse sym.refs;
     for (refs) |ref| {
         if (ref.target == invalid or (opts.strict and !ref.exact)) continue;
+        if (!opts.refs and query.isDataReadEdge(idx, ref)) continue;
         if (!budget.take(idx, ref.target, opts)) continue;
         if (wrote != 0) try w.writeByte(',');
         try nodeHead(w, idx, idx.graph.symbols[ref.target]);
         if (ref.line != 0) try w.print(",\"site\":{d}", .{ref.line});
+        if (!ref.exact) try w.writeAll(",\"exact\":false");
         try w.writeByte('}');
         wrote += 1;
     }
@@ -1512,36 +1516,93 @@ fn unresolvedObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Refer
     try w.writeByte('}');
 }
 
+pub fn readError(w: *Writer, code: []const u8, value: []const u8) !void {
+    std.debug.assert(code.len > 0);
+    std.debug.assert(value.len > 0);
+    try w.writeAll("{\"error\":");
+    try writeString(w, code);
+    try w.writeAll(",\"value\":");
+    try writeString(w, value);
+    try w.writeAll("}\n");
+}
+
+pub fn sourceLines(w: *Writer, path: []const u8, text: []const u8, ranges: []const query.LineRange) !bool {
+    std.debug.assert(path.len > 0);
+    for (ranges) |range| std.debug.assert(range.lo > 0 and range.hi >= range.lo);
+    const total = query.lineCount(text);
+    try w.writeAll("{\"file\":");
+    try writeString(w, path);
+    try w.print(",\"total_lines\":{d},\"ranges\":[", .{total});
+    for (ranges, 0..) |range, position| {
+        if (position != 0) try w.writeByte(',');
+        try w.print("{{\"start\":{d},\"end\":", .{range.lo});
+        if (range.hi == std.math.maxInt(usize)) try w.writeAll("null") else try w.print("{d}", .{range.hi});
+        try w.writeByte('}');
+    }
+    try w.writeAll("],\"lines\":[");
+    const emitted = try sourceLineObjects(w, text, ranges);
+    try w.writeAll("]}\n");
+    return emitted != 0;
+}
+
+fn sourceLineObjects(w: *Writer, text: []const u8, ranges: []const query.LineRange) !u32 {
+    var start: usize = 0;
+    var line: usize = 1;
+    var emitted: u32 = 0;
+    while (start < text.len) : (line += 1) {
+        const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        if (sourceLineSelected(line, ranges)) {
+            if (emitted != 0) try w.writeByte(',');
+            try w.print("{{\"line\":{d},\"text\":", .{line});
+            try writeString(w, text[start..newline]);
+            try w.writeByte('}');
+            emitted += 1;
+        }
+        start = newline + 1;
+    }
+    return emitted;
+}
+
+fn sourceLineSelected(line: usize, ranges: []const query.LineRange) bool {
+    if (ranges.len == 0) return true;
+    for (ranges) |range| if (line >= range.lo and line <= range.hi) return true;
+    return false;
+}
+
 /// Imports: `{file, imports:[{target, binding}]}` per in-scope file.
 /// Index coverage manifest: `{file, lang, symbols}` per indexed file. Returns
 /// whether any file matched.
 pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    var first = true;
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.files.len <= std.math.maxInt(model.FileId));
+    const ranked = try query.collectFiles(idx, filter, opts);
+    defer idx.gpa.free(ranked);
+    const shown = @min(ranked.len, @as(usize, opts.limit));
     try w.writeByte('[');
-    for (idx.graph.files) |file| {
-        if (!query.matchesFilter(file.path, filter)) continue;
-        if (opts.no_recurse and !query.inDirNonRecursive(file.path, filter)) continue;
-        if (!first) try w.writeByte(',');
-        first = false;
+    for (ranked[0..shown], 0..) |entry, position| {
+        if (position != 0) try w.writeByte(',');
+        const file = idx.graph.files[entry.id];
         try w.writeAll("{\"file\":");
         try writeString(w, file.path);
-        try w.print(",\"lang\":\"{s}\",\"symbols\":{d}", .{ file.language.tag(), query.fileSymbolCount(idx, file) });
+        try w.print(",\"lang\":\"{s}\",\"symbols\":{d}", .{ file.language.tag(), entry.count });
         try writeParseHealthField(w, "parse_health", file.parse_health);
         try w.writeByte('}');
     }
     try w.writeAll("]\n");
-    return !first;
+    return ranked.len != 0;
 }
 
 /// Returns whether any file with fn/method symbols matched (i.e. the coverage
 /// report is non-empty).
 pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    _ = opts;
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
     const reached = try query.testReachable(idx, idx.gpa);
     defer idx.gpa.free(reached);
     var total: u32 = 0;
     var covered: u32 = 0;
-    var first = true;
+    var total_files: u32 = 0;
+    var emitted: u32 = 0;
     try w.writeAll("{\"files\":[");
     for (idx.graph.files) |file| {
         if (!query.matchesFilter(file.path, filter)) continue;
@@ -1556,20 +1617,24 @@ pub fn coverage(w: *Writer, idx: *const Index, filter: []const u8, opts: Options
             if (reached[sym.id]) fc += 1;
         }
         if (ft == 0) continue;
+        total_files += 1;
         total += ft;
         covered += fc;
-        if (!first) try w.writeByte(',');
-        first = false;
+        if (emitted >= opts.limit) continue;
+        if (emitted != 0) try w.writeByte(',');
+        emitted += 1;
         try w.writeAll("{\"file\":");
         try writeString(w, file.path);
         try w.print(",\"covered\":{d},\"total\":{d},\"percent\":{d:.1}}}", .{ fc, ft, covPct(fc, ft) });
     }
-    try w.print("],\"covered\":{d},\"total\":{d},\"percent\":{d:.1}}}\n", .{ covered, total, covPct(covered, total) });
-    return !first;
+    try w.print("],\"covered\":{d},\"total\":{d},\"percent\":{d:.1},\"file_count\":{d},\"emitted\":{d},\"truncated\":{}}}\n", .{
+        covered, total, covPct(covered, total), total_files, emitted, emitted < total_files,
+    });
+    return total_files != 0;
 }
 
 fn covPct(num: u32, den: u32) f64 {
-    if (den == 0) return 100.0;
+    if (den == 0) return 0.0;
     return 100.0 * @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
 }
 

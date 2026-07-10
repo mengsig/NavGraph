@@ -6,6 +6,10 @@ const cli = @import("cli.zig");
 const index_mod = @import("index.zig");
 const query = @import("query.zig");
 const workflow = @import("workflow.zig");
+const hierarchy = @import("hierarchy.zig");
+const exceptions = @import("exceptions.zig");
+const taint = @import("taint.zig");
+const history_mod = @import("history.zig");
 const json_out = @import("json_out.zig");
 const viz = @import("viz.zig");
 
@@ -98,16 +102,23 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .routes => try query.listRoutes(out, idx, parsed.arg, parsed.options),
         .events => try query.events(out, idx, parsed.arg, parsed.options),
         .conforms => try query.conforms(out, idx, parsed.arg, parsed.options),
+        .hierarchy => try hierarchy.run(out, idx, parsed.arg, parsed.options),
+        .raises => try exceptions.raises(out, idx, parsed.arg, parsed.options),
+        .catches => try exceptions.catches(out, idx, parsed.arg, parsed.options),
         .neighbors => try query.neighbors(out, idx, parsed.arg, parsed.options),
         .unused => try query.unused(out, idx, parsed.arg, parsed.options),
         .imports => try query.listImports(out, idx, parsed.arg, parsed.options),
         .importers => try query.listImporters(out, idx, parsed.arg, parsed.options),
         .path => try query.shortestPath(out, idx, parsed.arg, parsed.arg2, parsed.options),
         .flow => try query.flow(out, idx, parsed.arg, parsed.options),
+        .taint => try taint.run(out, idx, parsed.arg, parsed.options),
         .reaches => try workflow.reaches(out, idx, parsed.arg, parsed.options),
         .affected => try workflow.affected(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .hot => try query.hot(out, idx, parsed.arg, parsed.options),
         .diff => try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .history => try history_mod.history(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .blame => try history_mod.blame(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .churn => try history_mod.churn(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .todos => try workflow.todos(out, idx, parsed.arg, parsed.options),
         .edits => try workflow.edits(out, idx, parsed.arg, parsed.options),
         .rename => try workflow.rename(out, io, idx, parsed.root, parsed.arg, parsed.arg2, parsed.options),
@@ -888,6 +899,51 @@ test "cli.parse rejects malformed invocations" {
     try std.testing.expectError(error.Usage, cli.parse(&.{ "path", "onlyone" }));
     // Unknown flag.
     try std.testing.expectError(error.UnknownFlag, cli.parse(&.{ "outline", "--bogus" }));
+}
+
+test "phase 4 hierarchy exceptions and taint dispatch" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "depth.py", .data =
+        \\class AppError(Exception): pass
+        \\class OrderError(AppError): pass
+        \\def fail(): raise OrderError("bad")
+        \\def run(request):
+        \\    try:
+        \\        subprocess.run(request.json)
+        \\    except OrderError:
+        \\        return None
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const hierarchy_out = try dispatchOwned(testing.allocator, io, &idx, .{ .command = .hierarchy, .arg = "AppError", .options = .{ .format = .json, .hierarchy_overrides = true } });
+    defer testing.allocator.free(hierarchy_out);
+    var hierarchy_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, hierarchy_out, .{});
+    defer hierarchy_json.deinit();
+    try testing.expect(has(hierarchy_out, "OrderError"));
+
+    const raises_out = try dispatchOwned(testing.allocator, io, &idx, .{ .command = .raises, .arg = "fail", .options = .{ .format = .json, .depth = 2 } });
+    defer testing.allocator.free(raises_out);
+    var raises_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, raises_out, .{});
+    defer raises_json.deinit();
+    try testing.expect(has(raises_out, "OrderError"));
+
+    const catches_out = try dispatchOwned(testing.allocator, io, &idx, .{ .command = .catches, .arg = "OrderError", .options = .{ .format = .json } });
+    defer testing.allocator.free(catches_out);
+    var catches_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, catches_out, .{});
+    defer catches_json.deinit();
+    try testing.expect(has(catches_out, "handler"));
+
+    const taint_out = try dispatchOwned(testing.allocator, io, &idx, .{ .command = .taint, .arg = "request.json", .options = .{ .flow_to = "subprocess.run", .format = .json } });
+    defer testing.allocator.free(taint_out);
+    var taint_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, taint_out, .{});
+    defer taint_json.deinit();
+    try testing.expect(has(taint_out, "\"status\":\"reachable\""));
 }
 
 test "phase 3 reachability, docs, todos, rename preview, and compaction dispatch" {

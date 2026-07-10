@@ -93,17 +93,22 @@ fn collectChanged(idx: *const Index, changes: []const gitdiff.FileChange) ![]Sym
     defer ids.deinit(idx.gpa);
     for (changes) |change| {
         const file = query.findDiffFile(idx, change.path) orelse continue;
-        var touched_file = false;
+        var touched_reportable = false;
         var id = file.sym_start;
         while (id < file.sym_end) : (id += 1) {
             const sym = idx.graph.symbols[id];
             if (!query.symbolTouched(sym, file.text, change.ranges)) continue;
+            if (sym.kind == .import or sym.kind == .route_mount) continue;
             try appendUnique(idx.gpa, &ids, sym.id);
-            touched_file = true;
+            touched_reportable = true;
         }
-        if (!touched_file) {
+        if (!touched_reportable) {
             id = file.sym_start;
-            while (id < file.sym_end) : (id += 1) try appendUnique(idx.gpa, &ids, id);
+            while (id < file.sym_end) : (id += 1) {
+                const kind = idx.graph.symbols[id].kind;
+                if (kind == .import or kind == .route_mount) continue;
+                try appendUnique(idx.gpa, &ids, id);
+            }
         }
     }
     return ids.toOwnedSlice(idx.gpa);
@@ -143,7 +148,7 @@ fn forwardReachable(idx: *const Index, roots: []const SymbolId, opts: query.Opti
             if (ref.target == invalid or (opts.strict and !ref.exact)) continue;
             try enqueue(idx.gpa, &queue, visited, ref.target);
         }
-        if (impl_graph) |graph| try enqueueImplPeers(idx.gpa, &queue, visited, graph, id);
+        if (impl_graph) |graph| try enqueueImplPeers(idx.gpa, &queue, visited, graph, id, opts.strict);
     }
     return filteredSorted(idx, visited, false, opts.tests);
 }
@@ -166,16 +171,23 @@ fn reverseReachable(idx: *const Index, targets: []const SymbolId, opts: query.Op
             if (opts.strict and !query.hasExactEdge(idx, caller, id)) continue;
             try enqueue(idx.gpa, &queue, visited, caller);
         }
-        if (impl_graph) |graph| try enqueueImplPeers(idx.gpa, &queue, visited, graph, id);
+        if (impl_graph) |graph| try enqueueImplPeers(idx.gpa, &queue, visited, graph, id, opts.strict);
     }
     return filteredSorted(idx, visited, tests_only, opts.tests);
 }
 
-fn enqueueImplPeers(gpa: std.mem.Allocator, queue: *std.ArrayList(SymbolId), visited: []bool, graph: impls_mod.Graph, id: SymbolId) !void {
+fn enqueueImplPeers(
+    gpa: std.mem.Allocator,
+    queue: *std.ArrayList(SymbolId),
+    visited: []bool,
+    graph: impls_mod.Graph,
+    id: SymbolId,
+    strict: bool,
+) !void {
     std.debug.assert(id < visited.len);
     std.debug.assert(queue.items.len <= visited.len);
     for (graph.edges) |edge| {
-        if (!edge.exact) continue;
+        if (strict and !edge.exact) continue;
         if (edge.port_method == id) try enqueue(gpa, queue, visited, edge.implementation_method);
         if (edge.implementation_method == id) try enqueue(gpa, queue, visited, edge.port_method);
     }

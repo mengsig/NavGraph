@@ -206,7 +206,6 @@ test "nested gitignore scoped to its subtree, deeper wins" {
     try std.testing.expect(m.isIgnored("other/a.log", false)); // sub rule doesn't reach
 }
 
-
 // ---------------------------------------------------------------------------
 // Appended tests: parseLine, relativeTo, matchRule, glob, and Matcher.isIgnored
 // ---------------------------------------------------------------------------

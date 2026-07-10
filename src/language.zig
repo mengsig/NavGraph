@@ -247,7 +247,6 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
 }
 
-
 // ---------------------------------------------------------------------------
 // Appended hardening tests for language.zig
 // ---------------------------------------------------------------------------

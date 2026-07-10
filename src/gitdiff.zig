@@ -10,6 +10,8 @@ pub const Range = struct {
     lo: u32,
     hi: u32,
     empty: bool = false,
+    /// Removed/replaced old-side lines. Populated only by `parseWithRemoved`.
+    removed: u32 = 0,
 };
 
 /// The changed line ranges of one file in a diff.
@@ -24,12 +26,26 @@ pub const FileChange = struct {
 /// via `freeChanges`). Recognizes `+++ b/<path>` headers and `@@ … +c,d @@`
 /// hunks, recording the new-file range each hunk covers. `d == 0` (a pure
 /// deletion) is recorded as an empty anchor at line `c`, so the enclosing symbol
-/// still surfaces without claiming current source bytes. Slices into `text`, which
-/// must outlive the result.
+/// still surfaces without claiming current source bytes. Paths and ranges are
+/// allocator-owned and released by `freeChanges`.
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) ![]FileChange {
+    return parseImpl(gpa, text, false);
+}
+
+/// Parse post-image ranges and retain each hunk's old-side removed/replaced line
+/// count for churn metrics. Range mapping remains post-image and heuristic.
+pub fn parseWithRemoved(gpa: std.mem.Allocator, text: []const u8) ![]FileChange {
+    return parseImpl(gpa, text, true);
+}
+
+fn parseImpl(gpa: std.mem.Allocator, text: []const u8, include_removed: bool) ![]FileChange {
     var files: std.ArrayList(FileChange) = .empty;
-    errdefer freeChanges(gpa, files.items);
-    var cur_path: ?[]const u8 = null;
+    errdefer {
+        freeChangeItems(gpa, files.items);
+        files.deinit(gpa);
+    }
+    var cur_path: ?[]u8 = null;
+    errdefer if (cur_path) |path| gpa.free(path);
     var ranges: std.ArrayList(Range) = .empty;
     errdefer ranges.deinit(gpa);
 
@@ -37,10 +53,14 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ![]FileChange {
     while (it.next()) |line| {
         if (std.mem.startsWith(u8, line, "+++ ")) {
             try flush(gpa, &files, &cur_path, &ranges);
-            cur_path = newPath(line[4..]);
+            cur_path = try newPath(gpa, line[4..]);
         } else if (std.mem.startsWith(u8, line, "@@")) {
             if (cur_path == null) continue;
-            if (hunkRange(line)) |r| try ranges.append(gpa, r);
+            if (hunkRange(line)) |parsed| {
+                var range = parsed;
+                if (include_removed) range.removed = oldLength(line) orelse 0;
+                try ranges.append(gpa, range);
+            }
         }
     }
     try flush(gpa, &files, &cur_path, &ranges);
@@ -51,34 +71,130 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ![]FileChange {
 fn flush(
     gpa: std.mem.Allocator,
     files: *std.ArrayList(FileChange),
-    cur_path: *?[]const u8,
+    cur_path: *?[]u8,
     ranges: *std.ArrayList(Range),
 ) !void {
     const path = cur_path.* orelse return;
     cur_path.* = null;
-    if (ranges.items.len == 0) return;
-    try files.append(gpa, .{ .path = path, .ranges = try ranges.toOwnedSlice(gpa) });
+    if (ranges.items.len == 0) {
+        gpa.free(path);
+        return;
+    }
+    errdefer gpa.free(path);
+    const owned_ranges = try ranges.toOwnedSlice(gpa);
+    errdefer gpa.free(owned_ranges);
+    try files.append(gpa, .{ .path = path, .ranges = owned_ranges });
 }
 
 pub fn freeChanges(gpa: std.mem.Allocator, changes: []FileChange) void {
-    for (changes) |c| gpa.free(c.ranges);
+    freeChangeItems(gpa, changes);
     gpa.free(changes);
 }
 
+fn freeChangeItems(gpa: std.mem.Allocator, changes: []const FileChange) void {
+    std.debug.assert(changes.len <= std.math.maxInt(u32));
+    for (changes) |change| {
+        gpa.free(change.path);
+        gpa.free(change.ranges);
+    }
+}
+
 /// The repo-relative new path from a `+++ ` header body, or null for
-/// `/dev/null` (deletion). Strips a leading `b/` and any trailing tab metadata.
-fn newPath(body_in: []const u8) ?[]const u8 {
+/// `/dev/null` (deletion). Decodes Git C quoting, strips `b/`, and owns the result.
+fn newPath(gpa: std.mem.Allocator, body_in: []const u8) !?[]u8 {
+    std.debug.assert(body_in.len <= std.math.maxInt(u32));
+    std.debug.assert(std.mem.indexOfScalar(u8, body_in, '\n') == null);
+    if (std.mem.indexOfScalar(u8, body_in, 0) != null) return error.InvalidGitPath;
+    if (body_in.len != 0 and body_in[0] == '"') {
+        const decoded = try decodeQuotedPath(gpa, body_in);
+        defer gpa.free(decoded);
+        return ownNormalizedPath(gpa, decoded);
+    }
     var body = body_in;
     if (std.mem.indexOfScalar(u8, body, '\t')) |t| body = body[0..t];
     body = std.mem.trimEnd(u8, body, " \r");
+    return ownNormalizedPath(gpa, body);
+}
+
+fn ownNormalizedPath(gpa: std.mem.Allocator, body_in: []const u8) !?[]u8 {
+    std.debug.assert(body_in.len <= std.math.maxInt(u32));
+    std.debug.assert(std.mem.indexOfScalar(u8, body_in, 0) == null);
+    var body = body_in;
     if (std.mem.eql(u8, body, "/dev/null")) return null;
     if (std.mem.startsWith(u8, body, "b/")) body = body[2..];
-    return if (body.len == 0) null else body;
+    return if (body.len == 0) null else try gpa.dupe(u8, body);
+}
+
+fn decodeQuotedPath(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+    std.debug.assert(body.len > 0 and body[0] == '"');
+    std.debug.assert(std.mem.indexOfScalar(u8, body, 0) == null);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var cursor: usize = 1;
+    while (cursor < body.len and body[cursor] != '"') {
+        if (body[cursor] == 0) return error.InvalidGitPath;
+        if (body[cursor] != '\\') {
+            try out.append(gpa, body[cursor]);
+            cursor += 1;
+            continue;
+        }
+        cursor += 1;
+        if (cursor >= body.len) return error.InvalidGitPath;
+        const decoded = try decodeEscape(body, &cursor);
+        if (decoded == 0) return error.InvalidGitPath;
+        try out.append(gpa, decoded);
+    }
+    if (cursor >= body.len or body[cursor] != '"') return error.InvalidGitPath;
+    const trailing = std.mem.trim(u8, body[cursor + 1 ..], " \r");
+    if (trailing.len != 0 and trailing[0] != '\t') return error.InvalidGitPath;
+    return out.toOwnedSlice(gpa);
+}
+
+fn decodeEscape(body: []const u8, cursor: *usize) !u8 {
+    std.debug.assert(cursor.* < body.len);
+    std.debug.assert(body[cursor.*] != 0);
+    const c = body[cursor.*];
+    if (c >= '0' and c <= '7') {
+        var value: u16 = 0;
+        var digits: u2 = 0;
+        while (cursor.* < body.len and digits < 3 and body[cursor.*] >= '0' and body[cursor.*] <= '7') : (digits += 1) {
+            value = value * 8 + body[cursor.*] - '0';
+            cursor.* += 1;
+        }
+        if (value > std.math.maxInt(u8)) return error.InvalidGitPath;
+        return @intCast(value);
+    }
+    cursor.* += 1;
+    return switch (c) {
+        'a' => 0x07,
+        'b' => 0x08,
+        't' => '\t',
+        'n' => '\n',
+        'v' => 0x0b,
+        'f' => 0x0c,
+        'r' => '\r',
+        '\\' => '\\',
+        '"' => '"',
+        else => error.InvalidGitPath,
+    };
 }
 
 /// The new-file range of a hunk header `@@ -a,b +c,d @@`. Returns null when the
 /// header is malformed. `d` defaults to 1 when omitted; `d == 0` yields an empty
 /// anchor at `[c, c]`.
+fn oldLength(line: []const u8) ?u32 {
+    const minus = std.mem.indexOfScalar(u8, line, '-') orelse return null;
+    const plus = std.mem.indexOfScalarPos(u8, line, minus + 1, '+') orelse return null;
+    var rest = line[minus + 1 .. plus];
+    rest = std.mem.trim(u8, rest, " \t");
+    var parts = std.mem.splitScalar(u8, rest, ',');
+    _ = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
+    return if (parts.next()) |len_s|
+        std.fmt.parseInt(u32, len_s, 10) catch null
+    else
+        1;
+}
+
 fn hunkRange(line: []const u8) ?Range {
     const plus = std.mem.indexOfScalar(u8, line, '+') orelse return null;
     var rest = line[plus + 1 ..];
@@ -404,33 +520,46 @@ test "hunkRange picks the new-file range, not a '+' in trailing context" {
 
 // --- newPath direct unit tests ---------------------------------------------
 
-test "newPath strips a leading b/ prefix" {
-    try std.testing.expectEqualStrings("src/foo.zig", newPath("b/src/foo.zig").?);
-    try std.testing.expectEqualStrings("foo.zig", newPath("b/foo.zig").?);
+test "newPath normalizes ordinary path headers" {
+    const testing = std.testing;
+    inline for (.{
+        .{ "b/src/foo.zig", "src/foo.zig" },
+        .{ "b/foo.zig", "foo.zig" },
+        .{ "b/foo.zig\t2024-01-01 12:00:00", "foo.zig" },
+        .{ "b/foo.zig \r", "foo.zig" },
+        .{ "weird.txt", "weird.txt" },
+    }) |case| {
+        const actual = (try newPath(testing.allocator, case[0])).?;
+        defer testing.allocator.free(actual);
+        try testing.expectEqualStrings(case[1], actual);
+    }
+    inline for (.{ "/dev/null", "", "b/", "b/\r" }) |body| {
+        try testing.expect(try newPath(testing.allocator, body) == null);
+    }
 }
 
-test "newPath maps /dev/null to null" {
-    try std.testing.expect(newPath("/dev/null") == null);
+test "parse decodes Git C-quoted UTF-8 and escaped path bytes" {
+    const testing = std.testing;
+    const diff =
+        "+++ \"b/src/\\303\\251 file.zig\"\n" ++
+        "@@ -1,0 +1,1 @@\n" ++
+        "+++ \"b/tab\\tquote\\\"slash\\\\.zig\"\n" ++
+        "@@ -1,0 +1,1 @@\n";
+    const changes = try parse(testing.allocator, diff);
+    defer freeChanges(testing.allocator, changes);
+    try testing.expectEqual(@as(usize, 2), changes.len);
+    try testing.expectEqualStrings("src/é file.zig", changes[0].path);
+    try testing.expectEqualStrings("tab\tquote\"slash\\.zig", changes[1].path);
 }
 
-test "newPath strips trailing tab metadata" {
-    try std.testing.expectEqualStrings("foo.zig", newPath("b/foo.zig\t2024-01-01 12:00:00").?);
-}
-
-test "newPath trims trailing spaces and carriage returns" {
-    try std.testing.expectEqualStrings("foo.zig", newPath("b/foo.zig \r").?);
-    try std.testing.expectEqualStrings("foo.zig", newPath("b/foo.zig\r").?);
-    try std.testing.expectEqualStrings("foo.zig", newPath("b/foo.zig   ").?);
-}
-
-test "newPath returns null for empty or prefix-only bodies" {
-    try std.testing.expect(newPath("") == null);
-    try std.testing.expect(newPath("b/") == null);
-    try std.testing.expect(newPath("b/\r") == null);
-}
-
-test "newPath without a b/ prefix is returned verbatim" {
-    try std.testing.expectEqualStrings("weird.txt", newPath("weird.txt").?);
+test "parse rejects malformed Git C-quoted paths" {
+    const testing = std.testing;
+    const bad_escape = "+++ \"b/bad\\q.zig\"\n@@ -1,0 +1,1 @@\n";
+    const unterminated = "+++ \"b/bad.zig\n@@ -1,0 +1,1 @@\n";
+    const partial = "+++ b/good.zig\n@@ -1,0 +1,1 @@\n+++ \"b/bad\\q.zig\"\n";
+    try testing.expectError(error.InvalidGitPath, parse(testing.allocator, bad_escape));
+    try testing.expectError(error.InvalidGitPath, parse(testing.allocator, unterminated));
+    try testing.expectError(error.InvalidGitPath, parse(testing.allocator, partial));
 }
 
 test "freeChanges releases a multi-range, multi-file result without leaking" {
@@ -447,4 +576,18 @@ test "freeChanges releases a multi-range, multi-file result without leaking" {
     // the testing allocator asserts no leak afterward.
     try std.testing.expectEqual(@as(usize, 2), changes.len);
     freeChanges(gpa, changes);
+}
+
+test "parseWithRemoved retains old-side churn counts" {
+    const gpa = std.testing.allocator;
+    const diff =
+        \\+++ b/x.zig
+        \\@@ -4,7 +4,2 @@
+        \\@@ -1,5 +0,0 @@
+    ;
+    const changes = try parseWithRemoved(gpa, diff);
+    defer freeChanges(gpa, changes);
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(Range{ .lo = 4, .hi = 5, .removed = 7 }, changes[0].ranges[0]);
+    try std.testing.expectEqual(Range{ .lo = 0, .hi = 0, .empty = true, .removed = 5 }, changes[0].ranges[1]);
 }
