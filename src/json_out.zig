@@ -43,6 +43,31 @@ pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Opt
     return shown > 0;
 }
 
+pub fn outlineJsonl(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !bool {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
+    var ids: std.ArrayList(SymbolId) = .empty;
+    defer ids.deinit(idx.gpa);
+    for (idx.graph.symbols) |sym| {
+        const file = idx.graph.files[sym.file];
+        if (!query.matchesFilter(file.path, path_filter)) continue;
+        if (opts.no_recurse and !query.inDirNonRecursive(file.path, path_filter)) continue;
+        if (sym.kind == .import or (!sym.kind.isTopLevelInteresting() and sym.parent == invalid)) continue;
+        if (!query.kindAllowed(sym.kind, opts.kinds) or !query.visAllowed(sym, opts.visibility)) continue;
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
+        try ids.append(idx.gpa, sym.id);
+    }
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    for (ids.items, 0..) |id, ordinal| {
+        if (!page.accepts(@intCast(ordinal))) continue;
+        try jsonlHead(w, page.last);
+        try symbolObject(w, idx, idx.graph.symbols[id], opts.verbosity);
+        try w.writeAll("}\n");
+    }
+    try jsonlFinish(w, page, ids.items.len);
+    return page.emitted != 0;
+}
+
 fn outlineFile(w: *Writer, idx: *const Index, file: model.SourceFile, opts: Options, shown: *u32, sep: bool) !bool {
     std.debug.assert(file.sym_start <= file.sym_end);
     var wrote_any = false;
@@ -103,6 +128,38 @@ pub fn rankedDefinitions(w: *Writer, idx: *const Index, ranked: []const query.Ra
     return shown > 0;
 }
 
+const JsonlPage = struct {
+    after: u32,
+    limit: u32,
+    emitted: u32 = 0,
+    last: u32 = 0,
+
+    fn accepts(self: *JsonlPage, ordinal: u32) bool {
+        std.debug.assert(self.limit > 0);
+        std.debug.assert(ordinal < std.math.maxInt(u32));
+        if (ordinal < self.after or self.emitted >= self.limit) return false;
+        self.emitted += 1;
+        self.last = ordinal + 1;
+        return true;
+    }
+};
+
+fn jsonlHead(w: *Writer, cursor: u32) !void {
+    std.debug.assert(cursor > 0);
+    std.debug.assert(cursor <= std.math.maxInt(u32));
+    try w.print("{{\"cursor\":\"v1:{}\",\"item\":", .{cursor});
+}
+
+fn jsonlFinish(w: *Writer, page: JsonlPage, total: usize) !void {
+    std.debug.assert(page.limit > 0);
+    std.debug.assert(total <= std.math.maxInt(u32));
+    const consumed = if (page.emitted == 0) page.after else page.last;
+    const has_more = consumed < total;
+    try w.print("{{\"page\":{{\"count\":{},\"total\":{},\"has_more\":{},\"next\":", .{ page.emitted, total, has_more });
+    if (has_more) try w.print("\"v1:{}\"", .{consumed}) else try w.writeAll("null");
+    try w.writeAll("}}\n");
+}
+
 pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     var shown: u32 = 0;
@@ -122,6 +179,45 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
     }
     try w.writeAll("]\n");
     return shown > 0;
+}
+
+pub fn searchJsonl(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
+    std.debug.assert(pattern.len > 0);
+    std.debug.assert(opts.limit > 0);
+    var ids: std.ArrayList(SymbolId) = .empty;
+    defer ids.deinit(idx.gpa);
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import or !query.kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!query.visAllowed(sym, opts.visibility)) continue;
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
+        if (opts.exact and !std.mem.eql(u8, sym.name, pattern)) continue;
+        if (!opts.exact and !query.matchesName(pattern, sym.name)) continue;
+        try ids.append(idx.gpa, sym.id);
+    }
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    for (ids.items, 0..) |id, ordinal| {
+        if (!page.accepts(@intCast(ordinal))) continue;
+        try jsonlHead(w, page.last);
+        try symbolObject(w, idx, idx.graph.symbols[id], opts.verbosity);
+        try w.writeAll("}\n");
+    }
+    try jsonlFinish(w, page, ids.items.len);
+    return page.emitted != 0;
+}
+
+pub fn rankedDefinitionsJsonl(w: *Writer, idx: *const Index, ranked: []const query.RankedSym, opts: Options) !bool {
+    std.debug.assert(opts.sort != .default);
+    std.debug.assert(opts.limit > 0);
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    for (ranked, 0..) |entry, ordinal| {
+        if (!page.accepts(@intCast(ordinal))) continue;
+        try jsonlHead(w, page.last);
+        try w.print("{{\"sort\":\"{s}\",\"rank\":{},\"symbol\":", .{ @tagName(opts.sort), entry.metric });
+        try symbolObject(w, idx, idx.graph.symbols[entry.id], opts.verbosity);
+        try w.writeAll("}}\n");
+    }
+    try jsonlFinish(w, page, ranked.len);
+    return page.emitted != 0;
 }
 
 /// `search --refs --json`: array of `{name, file, line, in, qualifier?, target?}`
@@ -203,6 +299,52 @@ pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Opti
     return shown > 0;
 }
 
+const FlatRef = struct { owner: SymbolId, ref_index: u32, line: u32 };
+
+pub fn searchRefsJsonl(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
+    std.debug.assert(pattern.len > 0);
+    std.debug.assert(opts.limit > 0);
+    var pat = query.RefPattern.parse(pattern);
+    pat.exact = opts.exact;
+    var sites: std.ArrayList(FlatRef) = .empty;
+    defer sites.deinit(idx.gpa);
+    for (idx.graph.symbols) |owner| {
+        if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, owner))) continue;
+        for (owner.refs, 0..) |ref, ref_index| {
+            if (!pat.matches(ref) or !query.refSelected(idx, owner, ref, opts)) continue;
+            if (ref.lines.len > 1) {
+                for (ref.lines) |line| try sites.append(idx.gpa, .{ .owner = owner.id, .ref_index = @intCast(ref_index), .line = line });
+            } else try sites.append(idx.gpa, .{ .owner = owner.id, .ref_index = @intCast(ref_index), .line = ref.line });
+        }
+    }
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    for (sites.items, 0..) |site, ordinal| {
+        if (!page.accepts(@intCast(ordinal))) continue;
+        const owner = idx.graph.symbols[site.owner];
+        try jsonlHead(w, page.last);
+        try refObject(w, idx, owner, owner.refs[site.ref_index], site.line);
+        try w.writeAll("}\n");
+    }
+    try jsonlFinish(w, page, sites.items.len);
+    return page.emitted != 0;
+}
+
+pub fn rankedSearchRefsJsonl(w: *Writer, idx: *const Index, sites: []const query.RankedRefSite, opts: Options) !bool {
+    std.debug.assert(opts.sort != .default and opts.sort != .line);
+    std.debug.assert(opts.limit > 0);
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    for (sites, 0..) |site, ordinal| {
+        if (!page.accepts(@intCast(ordinal))) continue;
+        const owner = idx.graph.symbols[site.owner];
+        try jsonlHead(w, page.last);
+        try w.print("{{\"sort\":\"{s}\",\"rank\":{},\"reference\":", .{ @tagName(opts.sort), site.metric });
+        try refObject(w, idx, owner, owner.refs[site.ref_index], site.line);
+        try w.writeAll("}}\n");
+    }
+    try jsonlFinish(w, page, sites.len);
+    return page.emitted != 0;
+}
+
 fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, line: u32) !void {
     try w.writeAll("{\"name\":");
     try writeString(w, ref.name);
@@ -254,6 +396,28 @@ pub fn strings(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options
     return shown > 0;
 }
 
+const JsonBudget = struct {
+    nodes: u32 = 0,
+    estimated_bytes: u32 = 0,
+    pruned: u32 = 0,
+
+    fn take(self: *JsonBudget, idx: *const Index, id: SymbolId, opts: Options) bool {
+        std.debug.assert(id < idx.graph.symbols.len);
+        std.debug.assert(opts.limit > 0);
+        const sym = idx.graph.symbols[id];
+        const estimate: u32 = @intCast(@min(@as(usize, std.math.maxInt(u32)), 64 + sym.name.len + idx.graph.files[sym.file].path.len));
+        if ((opts.max_nodes != 0 and self.nodes >= opts.max_nodes) or
+            (opts.budget != 0 and self.nodes != 0 and self.estimated_bytes + estimate > opts.budget))
+        {
+            self.pruned +|= 1;
+            return false;
+        }
+        self.nodes +|= 1;
+        self.estimated_bytes +|= estimate;
+        return true;
+    }
+};
+
 /// Call-graph walk: a JSON array of tree roots (callees or callers). Returns
 /// whether `name` resolved to at least one root.
 pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !bool {
@@ -264,10 +428,18 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
     defer visited.deinit();
     try w.writeByte('[');
-    for (ids, 0..) |id, k| {
-        if (k != 0) try w.writeByte(',');
+    var budget: JsonBudget = .{};
+    var roots_written: u32 = 0;
+    for (ids) |id| {
+        if (!budget.take(idx, id, opts)) continue;
+        if (roots_written != 0) try w.writeByte(',');
+        roots_written += 1;
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited);
+        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited, &budget);
+    }
+    if (budget.pruned != 0) {
+        if (roots_written != 0) try w.writeByte(',');
+        try w.print("{{\"truncated\":true,\"pruned\":{},\"nodes\":{}}}", .{ budget.pruned, budget.nodes });
     }
     try w.writeAll("]\n");
     return ids.len > 0;
@@ -287,6 +459,7 @@ fn walkNode(
     exact: bool,
     implementation_edge: bool,
     visited: *std.AutoHashMap(SymbolId, void),
+    budget: *JsonBudget,
 ) anyerror!void {
     std.debug.assert(id < idx.graph.symbols.len);
     try nodeHead(w, idx, idx.graph.symbols[id]);
@@ -307,7 +480,7 @@ fn walkNode(
     if ((site != 0 or implementation_edge) and !exact) try w.writeAll(",\"exact\":false");
     if (implementation_edge) try w.writeAll(",\"edge\":\"impl\"");
     if (depth >= opts.depth) {
-        if (impl_graph) |graph| try implLeafArray(w, idx, graph, id, incoming, opts.strict);
+        if (impl_graph) |graph| try implLeafArray(w, idx, graph, id, incoming, opts.strict, opts, budget);
         return try w.writeByte('}');
     }
     if ((try visited.getOrPut(id)).found_existing) {
@@ -315,9 +488,9 @@ fn walkNode(
         return;
     }
     if (incoming) {
-        try walkCallers(w, idx, impl_graph, id, opts, depth, visited);
+        try walkCallers(w, idx, impl_graph, id, opts, depth, visited, budget);
     } else {
-        try walkCallees(w, idx, impl_graph, id, opts, depth, visited);
+        try walkCallees(w, idx, impl_graph, id, opts, depth, visited, budget);
     }
     try w.writeByte('}');
 }
@@ -330,19 +503,25 @@ fn walkCallees(
     opts: Options,
     depth: u32,
     visited: *std.AutoHashMap(SymbolId, void),
+    budget: *JsonBudget,
 ) !void {
     const sym = idx.graph.symbols[id];
     try w.writeAll(",\"callees\":[");
     var wrote: u32 = 0;
     var ext: u32 = 0;
-    for (sym.refs) |ref| {
+    var ordered_refs: ?[]model.Reference = null;
+    defer if (ordered_refs) |refs| idx.gpa.free(refs);
+    if (query.compactEnabled(opts)) ordered_refs = try query.orderedRefs(idx.gpa, idx, sym.refs);
+    const refs = ordered_refs orelse sym.refs;
+    for (refs) |ref| {
         // Every resolved edge is a callee; bare var/const/field reads are hidden
         // unless `--refs` is set (see query.isDataReadEdge). Only unresolved
         // *calls* become externals (see query.walkCallees).
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (!opts.refs and query.isDataReadEdge(idx, ref)) continue;
+            if (!budget.take(idx, ref.target, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, impl_graph, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited);
+            try walkNode(w, idx, impl_graph, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, budget);
             wrote += 1;
         } else if (ref.kind == .call or ref.kind == .route_call) {
             ext += 1;
@@ -351,8 +530,9 @@ fn walkCallees(
     if (impl_graph) |graph| {
         for (graph.edges) |edge| {
             if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
+            if (!budget.take(idx, edge.implementation_method, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited);
+            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited, budget);
             wrote += 1;
         }
     }
@@ -360,14 +540,14 @@ fn walkCallees(
     if (ext != 0) try writeExternals(w, sym, opts.strict);
 }
 
-fn implLeafArray(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, id: SymbolId, incoming: bool, strict: bool) !void {
+fn implLeafArray(w: *Writer, idx: *const Index, graph: *const impls_mod.Graph, id: SymbolId, incoming: bool, strict: bool, opts: Options, budget: *JsonBudget) !void {
     var first = true;
     for (graph.edges) |edge| {
         if (strict and !edge.exact) continue;
         var target: SymbolId = invalid;
         if (edge.port_method == id) target = edge.implementation_method;
         if (incoming and edge.implementation_method == id) target = edge.port_method;
-        if (target == invalid) continue;
+        if (target == invalid or !budget.take(idx, target, opts)) continue;
         if (first) try w.writeAll(",\"implementations\":[") else try w.writeByte(',');
         first = false;
         try nodeHead(w, idx, idx.graph.symbols[target]);
@@ -399,17 +579,23 @@ fn walkCallers(
     opts: Options,
     depth: u32,
     visited: *std.AutoHashMap(SymbolId, void),
+    budget: *JsonBudget,
 ) !void {
     try w.writeAll(",\"callers\":[");
     var wrote: u32 = 0;
     var lines: std.ArrayList(u32) = .empty;
     defer lines.deinit(idx.gpa);
-    for (idx.callersOf(id)) |cid| {
+    var ordered_callers: ?[]SymbolId = null;
+    defer if (ordered_callers) |callers_slice| idx.gpa.free(callers_slice);
+    if (query.compactEnabled(opts)) ordered_callers = try query.orderedCallers(idx.gpa, idx, idx.callersOf(id));
+    const callers_slice = ordered_callers orelse idx.callersOf(id);
+    for (callers_slice) |cid| {
         if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
         if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
+        if (!budget.take(idx, cid, opts)) continue;
         if (wrote != 0) try w.writeByte(',');
         try query.callSiteLines(idx, cid, id, &lines);
-        try walkNode(w, idx, impl_graph, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), false, visited);
+        try walkNode(w, idx, impl_graph, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), false, visited, budget);
         wrote += 1;
     }
     if (impl_graph) |graph| {
@@ -421,8 +607,9 @@ fn walkCallers(
                 edge.port_method
             else
                 continue;
+            if (!budget.take(idx, target, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, impl_graph, target, true, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited);
+            try walkNode(w, idx, impl_graph, target, true, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited, budget);
             wrote += 1;
         }
     }
@@ -535,6 +722,33 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
     }
     try w.writeAll("]\n");
     return shown > 0;
+}
+
+pub fn hotJsonl(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
+    const ranked = try query.collectHot(idx, filter, opts.tests);
+    defer idx.gpa.free(ranked);
+    query.sortHot(idx, ranked, opts.sort);
+    var total: usize = 0;
+    for (ranked) |entry| {
+        if (opts.strict and entry.fan_in_exact == 0 and entry.fan_out_exact == 0) continue;
+        total += 1;
+    }
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    var ordinal: u32 = 0;
+    for (ranked) |entry| {
+        if (opts.strict and entry.fan_in_exact == 0 and entry.fan_out_exact == 0) continue;
+        defer ordinal += 1;
+        if (!page.accepts(ordinal)) continue;
+        const sort = if (opts.sort == .default) query.SortKey.fan_in_exact else opts.sort;
+        try jsonlHead(w, page.last);
+        try w.print("{{\"sort\":\"{s}\",\"rank\":{},\"symbol\":", .{ @tagName(sort), query.hotMetric(idx, entry, sort) });
+        try symbolObject(w, idx, idx.graph.symbols[entry.id], opts.verbosity);
+        try w.writeAll("}}\n");
+    }
+    try jsonlFinish(w, page, total);
+    return page.emitted != 0;
 }
 
 /// Protocol conformance matrix. Structural relationships carry exact=false.
@@ -799,16 +1013,25 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
     var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
     defer if (impl_graph) |*graph| graph.deinit();
     try w.writeByte('[');
-    for (ids, 0..) |id, k| {
-        if (k != 0) try w.writeByte(',');
+    var budget: JsonBudget = .{};
+    var roots_written: u32 = 0;
+    for (ids) |id| {
+        if (!budget.take(idx, id, opts)) continue;
+        if (roots_written != 0) try w.writeByte(',');
+        roots_written += 1;
         const sym = idx.graph.symbols[id];
         try nodeHead(w, idx, sym);
         try w.writeAll(",\"callees\":[");
-        try calleeArray(w, idx, if (impl_graph) |*g| g else null, sym, opts.strict);
+        try calleeArray(w, idx, if (impl_graph) |*g| g else null, sym, opts, &budget);
         try w.writeAll("],\"callers\":[");
         var wrote: usize = 0;
-        for (idx.callersOf(id)) |cid| {
+        var ordered_callers: ?[]SymbolId = null;
+        defer if (ordered_callers) |callers_slice| idx.gpa.free(callers_slice);
+        if (query.compactEnabled(opts)) ordered_callers = try query.orderedCallers(idx.gpa, idx, idx.callersOf(id));
+        const callers_slice = ordered_callers orelse idx.callersOf(id);
+        for (callers_slice) |cid| {
             if (opts.strict and !query.hasExactEdge(idx, cid, id)) continue;
+            if (!budget.take(idx, cid, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
             try nodeHead(w, idx, idx.graph.symbols[cid]);
             const site = query.callSiteLine(idx, cid, id);
@@ -825,6 +1048,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
                     edge.port_method
                 else
                     continue;
+                if (!budget.take(idx, target, opts)) continue;
                 if (wrote != 0) try w.writeByte(',');
                 try implNode(w, idx, target, edge.exact);
                 wrote += 1;
@@ -832,14 +1056,23 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         }
         try w.writeAll("]}");
     }
+    if (budget.pruned != 0) {
+        if (roots_written != 0) try w.writeByte(',');
+        try w.print("{{\"truncated\":true,\"pruned\":{},\"nodes\":{}}}", .{ budget.pruned, budget.nodes });
+    }
     try w.writeAll("]\n");
-    return ids.len > 0;
+    return budget.nodes != 0;
 }
 
-fn calleeArray(w: *Writer, idx: *const Index, graph: ?*const impls_mod.Graph, sym: Symbol, strict: bool) !void {
+fn calleeArray(w: *Writer, idx: *const Index, graph: ?*const impls_mod.Graph, sym: Symbol, opts: Options, budget: *JsonBudget) !void {
     var wrote: u32 = 0;
-    for (sym.refs) |ref| {
-        if (ref.target == invalid or (strict and !ref.exact)) continue;
+    var ordered_refs: ?[]model.Reference = null;
+    defer if (ordered_refs) |refs| idx.gpa.free(refs);
+    if (query.compactEnabled(opts)) ordered_refs = try query.orderedRefs(idx.gpa, idx, sym.refs);
+    const refs = ordered_refs orelse sym.refs;
+    for (refs) |ref| {
+        if (ref.target == invalid or (opts.strict and !ref.exact)) continue;
+        if (!budget.take(idx, ref.target, opts)) continue;
         if (wrote != 0) try w.writeByte(',');
         try nodeHead(w, idx, idx.graph.symbols[ref.target]);
         if (ref.line != 0) try w.print(",\"site\":{d}", .{ref.line});
@@ -848,7 +1081,8 @@ fn calleeArray(w: *Writer, idx: *const Index, graph: ?*const impls_mod.Graph, sy
     }
     if (graph) |impl_graph| {
         for (impl_graph.edges) |edge| {
-            if (edge.port_method != sym.id or (strict and !edge.exact)) continue;
+            if (edge.port_method != sym.id or (opts.strict and !edge.exact)) continue;
+            if (!budget.take(idx, edge.implementation_method, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
             try implNode(w, idx, edge.implementation_method, edge.exact);
             wrote += 1;
@@ -1081,7 +1315,7 @@ fn modItem(w: *Writer, first: *bool, name: []const u8) !void {
 }
 
 /// A full symbol object; fields grow with verbosity (sig, then doc, then body).
-fn symbolObject(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity) !void {
+pub fn symbolObject(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbosity) !void {
     return symbolObjectExtra(w, idx, sym, v, false);
 }
 
@@ -1113,7 +1347,7 @@ fn symbolObjectExtra(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbo
 // ---------------------------------------------------------------------------
 
 /// Write `s` as a quoted, escaped JSON string.
-fn writeString(w: *Writer, s: []const u8) !void {
+pub fn writeString(w: *Writer, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| try writeEscaped(w, c);
     try w.writeByte('"');
@@ -1160,7 +1394,7 @@ test "json output is well-formed and escapes control characters" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "u.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "u.zig", .data =
         \\/// Adds two numbers "safely".
         \\pub fn add(a: i32, b: i32) i32 {
         \\    return a + b;
@@ -1268,7 +1502,6 @@ fn balancedBrackets(s: []const u8) bool {
     }
     return depth == 0 and !in_str;
 }
-
 
 // ===========================================================================
 // Appended tests: JSON rendering of every verb, escaping, and structural checks.
@@ -2069,6 +2302,16 @@ test "neighbors json splits callees and callers with call-site lines" {
     try testing.expectEqual(@as(usize, 1), callers.len);
     try testing.expectEqualStrings("top", callers[0].object.get("name").?.string);
     try testing.expect(callers[0].object.get("site").?.integer >= 1);
+
+    var bounded = tjWriter();
+    defer bounded.deinit();
+    _ = try neighbors(&bounded.writer, &idx, "mid", .{ .format = .json, .max_nodes = 2 });
+    var bounded_json = try tjParse(bounded.written());
+    defer bounded_json.deinit();
+    try testing.expectEqual(@as(usize, 2), bounded_json.value.array.items.len);
+    const truncated = bounded_json.value.array.items[1].object;
+    try testing.expect(truncated.get("truncated").?.bool);
+    try testing.expectEqual(@as(i64, 2), truncated.get("nodes").?.integer);
 }
 
 // --- unused ---------------------------------------------------------------

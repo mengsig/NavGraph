@@ -133,6 +133,9 @@ pub const Reference = struct {
     /// `line`. Lets `callers`/`calls` show *every* call site, not just the first,
     /// when a caller invokes the target on several lines.
     lines: []const u32 = &.{},
+    /// Exact byte offsets of every occurrence in the owning source file. Kept in
+    /// source order and aligned with `count`; rename uses these as edit sites.
+    offsets: []const u32 = &.{},
     target: SymbolId = invalid_symbol,
     /// True when resolution bound `target` via a known receiver type or self,
     /// rather than a heuristic global name match. `--strict` follows only these.
@@ -276,13 +279,21 @@ test "symbol signature and body slice within bounds" {
 test "endLine equals line for a single-line definition" {
     const src = "const x = 1;\n";
     const sym = Symbol{
-        .id = 0, .file = 0, .name = "x", .kind = .constant, .line = 1,
-        .span_start = 0, .span_end = 12, .sig_end = 12, .doc = "",
-        .parent = invalid_symbol, .exported = false, .refs = &.{},
+        .id = 0,
+        .file = 0,
+        .name = "x",
+        .kind = .constant,
+        .line = 1,
+        .span_start = 0,
+        .span_end = 12,
+        .sig_end = 12,
+        .doc = "",
+        .parent = invalid_symbol,
+        .exported = false,
+        .refs = &.{},
     };
     try std.testing.expectEqual(@as(u32, 1), sym.endLine(src));
 }
-
 
 // ---------------------------------------------------------------------------
 // Appended tests for src/model.zig

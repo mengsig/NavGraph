@@ -7,9 +7,36 @@ const render = @import("render.zig");
 const model = @import("model.zig");
 
 pub const Command = enum {
-    outline, def, calls, callers, search, routes, events, conforms,
-    neighbors, unused, imports, importers, path, flow, hot, diff,
-    collisions, files, read, strings, coverage, graph, help,
+    outline,
+    def,
+    docs,
+    calls,
+    callers,
+    search,
+    routes,
+    events,
+    conforms,
+    neighbors,
+    unused,
+    imports,
+    importers,
+    path,
+    flow,
+    reaches,
+    affected,
+    hot,
+    diff,
+    collisions,
+    files,
+    read,
+    strings,
+    todos,
+    edits,
+    rename,
+    coverage,
+    graph,
+    serve,
+    help,
 };
 
 pub const Parsed = struct {
@@ -54,6 +81,7 @@ const usage_text =
     \\COMMANDS:
     \\  outline [path]     Outline symbols in a file/dir (default: whole project)
     \\  def <name>         Show a definition (supports Parent.name, name@path)
+    \\  docs <name>        Show indexed docstrings/leading documentation
     \\  calls <name>       Symbols that <name> calls/uses (callees), as a tree
     \\  callers <name>     Symbols that call/use <name> (callers), as a tree
     \\  search <pattern>   Find symbols by name (or use sites with --refs;
@@ -74,6 +102,8 @@ const usage_text =
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
     \\  flow <symbol>      Writers and readers of a field/value; --to traces a sink
+    \\  reaches <A,B,...>  Transitive reachable set; --from-tests selects exercising tests
+    \\  affected [ref]     Tests affected since a git ref (or use --since; default HEAD)
     \\  collisions [pat]   Group duplicate definition names (alias: duplicates)
     \\  diff [ref]         Symbols changed since <ref> (default HEAD) + their callers
     \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
@@ -81,9 +111,13 @@ const usage_text =
     \\                     add --sort symbols to rank biggest-first
     \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
     \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
+    \\  todos [path]       TODO/FIXME/HACK markers from real comments only
+    \\  edits <symbol>     Exact definition/reference sites for a safe rename
+    \\  rename <sym> <new> Apply a collision-checked rename; --preview emits its patch
     \\  coverage [path]    % of fn/method reachable from a test (call-graph, no instrumentation)
     \\  graph [path]       Interactive HTML visualization of the code graph
     \\                     (redirect stdout to a .html file; -j emits the raw JSON model)
+    \\  serve             Long-lived JSON-RPC/MCP server over stdin/stdout
     \\  help               Show this help
     \\
     \\FLAGS:
@@ -92,6 +126,9 @@ const usage_text =
     \\  -C, --root <path>                      Index root: a directory, or a single
     \\                                         file to scope to it (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
+    \\  --budget <bytes> / --max-nodes <N>     Bound traversal output; --summary compacts it
+    \\  --since <ref> / --from-tests           Affected/reaches test-impact selectors
+    \\  --preview                              rename: emit patch without writing files
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  -p, --vis <public|private|all>          Visibility for outline/search/def (default: all)
     \\  --public, --private, --no-private       Visibility shortcuts
@@ -123,6 +160,7 @@ const usage_text =
     \\  --orphan-calls                         routes: show calls matching no route
     \\  --handler <name>                       routes: select by handler (glob accepted)
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
+    \\  --jsonl [--after v1:N]                 Stream stable, cursor-pageable JSON rows
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\  --no-public                            unused: drop exported symbols (possible public API)
     \\  --follow-imports                       unused: disambiguate same-name symbols by
@@ -165,6 +203,12 @@ const usage_text =
     \\  navgraph routes --unhit                 # endpoints with no resolved client
     \\  navgraph routes --orphan-calls          # calls with no serving route
     \\  navgraph path parse emit
+    \\  navgraph affected --since HEAD~1       # run only impacted tests
+    \\  navgraph reaches parse,emit             # set reachability
+    \\  navgraph calls build -d3 --max-nodes 40 --summary
+    \\  navgraph rename Store.get fetch --preview
+    \\  navgraph todos src
+    \\  navgraph search parse --jsonl --limit 50
     \\
 ;
 
@@ -202,7 +246,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
             i = try parseFlag(args, i, &result);
         } else if (result.arg.len == 0) {
             result.arg = a;
-        } else if (result.arg2.len == 0 and command == .path) {
+        } else if (result.arg2.len == 0 and (command == .path or command == .rename)) {
             result.arg2 = a;
         } else {
             return fail(error.Usage, "unexpected extra argument '{s}'", .{a});
@@ -212,6 +256,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
     if (result.command == .help) return .{ .command = .help };
     if (!hasRequiredArgs(command, result)) {
         if (command == .path) return fail(error.Usage, "path needs two symbol names: navgraph path <A> <B>", .{});
+        if (command == .rename) return fail(error.Usage, "rename needs a selector and new name: navgraph rename <symbol> <new-name> [--preview]", .{});
         return fail(error.Usage, "{s} needs an argument: navgraph {s} <arg> [flags]", .{ @tagName(command), @tagName(command) });
     }
     try validateCommandOptions(result);
@@ -220,34 +265,37 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
 
 fn parseCommand(s: []const u8) ?Command {
     const map = .{
-        .{ "outline", Command.outline }, .{ "o", Command.outline },
-        .{ "def", Command.def },         .{ "show", Command.def },
-        .{ "calls", Command.calls },     .{ "callees", Command.calls },
-        .{ "callers", Command.callers }, .{ "uses", Command.callers },
-        .{ "search", Command.search },   .{ "grep", Command.search },
-        .{ "routes", Command.routes },   .{ "api", Command.routes },
-        .{ "conforms", Command.conforms }, .{ "impls", Command.conforms },
-        .{ "implements", Command.conforms },
-        .{ "events", Command.events },   .{ "dispatch", Command.events },
-        .{ "bus", Command.events },
-        .{ "neighbors", Command.neighbors }, .{ "near", Command.neighbors },
-        .{ "unused", Command.unused },   .{ "dead", Command.unused },
-        .{ "imports", Command.imports }, .{ "importers", Command.importers },
-        .{ "path", Command.path },
-        .{ "flow", Command.flow },       .{ "dataflow", Command.flow },
-        .{ "collisions", Command.collisions }, .{ "duplicates", Command.collisions },
-        .{ "diff", Command.diff },       .{ "changed", Command.diff },
-        .{ "hot", Command.hot },         .{ "central", Command.hot },
-        .{ "files", Command.files },     .{ "manifest", Command.files },
-        .{ "read", Command.read },       .{ "cat", Command.read },
-        .{ "strings", Command.strings }, .{ "str", Command.strings },
-        .{ "literals", Command.strings },
-        .{ "coverage", Command.coverage }, .{ "cov", Command.coverage },
-        .{ "graph", Command.graph },     .{ "viz", Command.graph },
-        .{ "visualize", Command.graph }, .{ "html", Command.graph },
-
-        .{ "help", Command.help },       .{ "--help", Command.help },
-        .{ "-h", Command.help },
+        .{ "outline", Command.outline },       .{ "o", Command.outline },
+        .{ "def", Command.def },               .{ "show", Command.def },
+        .{ "docs", Command.docs },             .{ "doc", Command.docs },
+        .{ "calls", Command.calls },           .{ "callees", Command.calls },
+        .{ "callers", Command.callers },       .{ "uses", Command.callers },
+        .{ "search", Command.search },         .{ "grep", Command.search },
+        .{ "routes", Command.routes },         .{ "api", Command.routes },
+        .{ "conforms", Command.conforms },     .{ "impls", Command.conforms },
+        .{ "implements", Command.conforms },   .{ "events", Command.events },
+        .{ "dispatch", Command.events },       .{ "bus", Command.events },
+        .{ "neighbors", Command.neighbors },   .{ "near", Command.neighbors },
+        .{ "unused", Command.unused },         .{ "dead", Command.unused },
+        .{ "imports", Command.imports },       .{ "importers", Command.importers },
+        .{ "path", Command.path },             .{ "flow", Command.flow },
+        .{ "dataflow", Command.flow },         .{ "reaches", Command.reaches },
+        .{ "reachable", Command.reaches },     .{ "affected", Command.affected },
+        .{ "impact", Command.affected },       .{ "collisions", Command.collisions },
+        .{ "duplicates", Command.collisions }, .{ "diff", Command.diff },
+        .{ "changed", Command.diff },          .{ "hot", Command.hot },
+        .{ "central", Command.hot },           .{ "files", Command.files },
+        .{ "manifest", Command.files },        .{ "read", Command.read },
+        .{ "cat", Command.read },              .{ "strings", Command.strings },
+        .{ "str", Command.strings },           .{ "literals", Command.strings },
+        .{ "todos", Command.todos },           .{ "todo", Command.todos },
+        .{ "edits", Command.edits },           .{ "edit-sites", Command.edits },
+        .{ "rename", Command.rename },         .{ "serve", Command.serve },
+        .{ "mcp", Command.serve },             .{ "coverage", Command.coverage },
+        .{ "cov", Command.coverage },          .{ "graph", Command.graph },
+        .{ "viz", Command.graph },             .{ "visualize", Command.graph },
+        .{ "html", Command.graph },            .{ "help", Command.help },
+        .{ "--help", Command.help },           .{ "-h", Command.help },
     };
     inline for (map) |e| if (std.mem.eql(u8, s, e[0])) return e[1];
     return null;
@@ -258,8 +306,8 @@ fn parseCommand(s: []const u8) ?Command {
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage, .graph, .collisions => true,
-        .path => p.arg.len != 0 and p.arg2.len != 0,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage, .graph, .collisions, .affected, .todos, .serve => true,
+        .path, .rename => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
 }
@@ -287,6 +335,20 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
             return fail(error.BadValue, "-l/--limit must be at least 1", .{});
         return f.next(i);
     }
+    if (eqAny(f.name, &.{ "--budget", "--max-nodes" })) {
+        const value = try parseUint(try f.value(args, i, f.name), f.name);
+        if (value == 0) return fail(error.BadValue, "{s} must be at least 1", .{f.name});
+        if (std.mem.eql(u8, f.name, "--budget")) out.options.budget = value else out.options.max_nodes = value;
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--after")) {
+        out.options.after = try parseCursor(try f.value(args, i, f.name));
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--since")) {
+        out.options.since = try f.value(args, i, f.name);
+        return f.next(i);
+    }
     if (eqAny(f.name, &.{ "-C", "--root" })) {
         out.root = try f.value(args, i, f.name);
         return f.next(i);
@@ -302,7 +364,7 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.kinds = val;
         return f.next(i);
     }
-    if (eqAny(f.name, &.{ "--sort" })) {
+    if (eqAny(f.name, &.{"--sort"})) {
         const val = try f.value(args, i, f.name);
         if (out.command == .files) {
             out.options.file_sort = query.FileSort.parse(val) orelse
@@ -343,6 +405,18 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (eqAny(f.name, &.{"--tests-only"})) {
         out.options.tests = .only;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--summary")) {
+        out.options.summary = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--from-tests")) {
+        out.options.from_tests = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--preview")) {
+        out.options.preview = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-i", "--impls" })) {
@@ -394,7 +468,13 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         return i;
     }
     if (eqAny(f.name, &.{ "-j", "--json" })) {
+        if (out.options.format == .jsonl) return fail(error.Usage, "--json and --jsonl are mutually exclusive", .{});
         out.options.format = .json;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--jsonl")) {
+        if (out.options.format == .json) return fail(error.Usage, "--json and --jsonl are mutually exclusive", .{});
+        out.options.format = .jsonl;
         return i;
     }
     if (eqAny(f.name, &.{ "-r", "--refs" })) {
@@ -469,9 +549,9 @@ fn splitFlag(raw: []const u8) SplitFlag {
 fn validateCommandOptions(parsed: Parsed) ParseError!void {
     const opts = parsed.options;
     if (opts.impls and parsed.command != .calls and parsed.command != .callers and
-        parsed.command != .neighbors and parsed.command != .path)
+        parsed.command != .neighbors and parsed.command != .path and parsed.command != .reaches and parsed.command != .affected)
     {
-        return fail(error.Usage, "-i/--impls applies only to calls, callers, neighbors, and path", .{});
+        return fail(error.Usage, "-i/--impls applies only to calls, callers, neighbors, path, reaches, and affected", .{});
     }
     const route_flags = opts.routes_clients or opts.routes_unhit or opts.routes_orphan_calls or opts.routes_handler.len != 0;
     if (route_flags and parsed.command != .routes)
@@ -488,6 +568,24 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         return fail(error.Usage, "flow filters apply only to flow or search --refs", .{});
     if (opts.flow_to.len != 0 and parsed.command != .flow)
         return fail(error.Usage, "--to applies only to flow", .{});
+    if (opts.from_tests and parsed.command != .reaches)
+        return fail(error.Usage, "--from-tests applies only to reaches", .{});
+    if (opts.since.len != 0 and parsed.command != .affected)
+        return fail(error.Usage, "--since applies only to affected", .{});
+    if (opts.preview and parsed.command != .rename)
+        return fail(error.Usage, "--preview applies only to rename", .{});
+    const compact = opts.budget != 0 or opts.max_nodes != 0 or opts.summary;
+    const compact_command = parsed.command == .calls or parsed.command == .callers or parsed.command == .neighbors or
+        parsed.command == .outline or parsed.command == .search or parsed.command == .hot or
+        parsed.command == .reaches or parsed.command == .affected;
+    if (compact and !compact_command)
+        return fail(error.Usage, "--budget/--max-nodes/--summary require a traversal or ranked listing", .{});
+    const jsonl_command = parsed.command == .outline or parsed.command == .search or parsed.command == .hot or
+        parsed.command == .todos or parsed.command == .reaches or parsed.command == .affected or parsed.command == .edits;
+    if (opts.format == .jsonl and !jsonl_command)
+        return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, and edits", .{});
+    if (opts.after != 0 and opts.format != .jsonl)
+        return fail(error.Usage, "--after requires --jsonl", .{});
     if (opts.duplicates and (parsed.command != .search or opts.refs))
         return fail(error.Usage, "--duplicates applies only to definition search", .{});
     if (opts.collision_members and parsed.command != .collisions)
@@ -500,6 +598,12 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         if (parsed.command != .hot and (opts.sort == .fan_in or opts.sort == .fan_in_exact or opts.sort == .fan_out or opts.sort == .fan_out_exact))
             return fail(error.BadValue, "outline/search --sort expects line|name|span|callers|callees", .{});
     }
+}
+
+fn parseCursor(s: []const u8) ParseError!u32 {
+    if (!std.mem.startsWith(u8, s, "v1:"))
+        return fail(error.BadValue, "invalid cursor '{s}' (expected v1:<ordinal>)", .{s});
+    return parseUint(s[3..], "--after");
 }
 
 fn parseUint(s: []const u8, flag: []const u8) ParseError!u32 {
@@ -635,7 +739,6 @@ test "files --sort accepts path/symbols and rejects garbage" {
     try std.testing.expectError(error.BadValue, parse(&.{ "files", "--sort", "nope" }));
 }
 
-
 // ---------------------------------------------------------------------------
 // Appended hardening tests for src/cli.zig
 // ---------------------------------------------------------------------------
@@ -643,6 +746,7 @@ test "files --sort accepts path/symbols and rejects garbage" {
 test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.outline, parseCommand("outline").?);
     try std.testing.expectEqual(Command.def, parseCommand("def").?);
+    try std.testing.expectEqual(Command.docs, parseCommand("docs").?);
     try std.testing.expectEqual(Command.calls, parseCommand("calls").?);
     try std.testing.expectEqual(Command.callers, parseCommand("callers").?);
     try std.testing.expectEqual(Command.search, parseCommand("search").?);
@@ -654,20 +758,27 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.importers, parseCommand("importers").?);
     try std.testing.expectEqual(Command.path, parseCommand("path").?);
     try std.testing.expectEqual(Command.flow, parseCommand("flow").?);
+    try std.testing.expectEqual(Command.reaches, parseCommand("reaches").?);
+    try std.testing.expectEqual(Command.affected, parseCommand("affected").?);
     try std.testing.expectEqual(Command.collisions, parseCommand("collisions").?);
     try std.testing.expectEqual(Command.diff, parseCommand("diff").?);
     try std.testing.expectEqual(Command.hot, parseCommand("hot").?);
     try std.testing.expectEqual(Command.files, parseCommand("files").?);
     try std.testing.expectEqual(Command.read, parseCommand("read").?);
     try std.testing.expectEqual(Command.strings, parseCommand("strings").?);
+    try std.testing.expectEqual(Command.todos, parseCommand("todos").?);
+    try std.testing.expectEqual(Command.edits, parseCommand("edits").?);
+    try std.testing.expectEqual(Command.rename, parseCommand("rename").?);
     try std.testing.expectEqual(Command.coverage, parseCommand("coverage").?);
     try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
+    try std.testing.expectEqual(Command.serve, parseCommand("serve").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
 }
 
 test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.outline, parseCommand("o").?);
     try std.testing.expectEqual(Command.def, parseCommand("show").?);
+    try std.testing.expectEqual(Command.docs, parseCommand("doc").?);
     try std.testing.expectEqual(Command.calls, parseCommand("callees").?);
     try std.testing.expectEqual(Command.callers, parseCommand("uses").?);
     try std.testing.expectEqual(Command.search, parseCommand("grep").?);
@@ -677,6 +788,8 @@ test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.neighbors, parseCommand("near").?);
     try std.testing.expectEqual(Command.unused, parseCommand("dead").?);
     try std.testing.expectEqual(Command.flow, parseCommand("dataflow").?);
+    try std.testing.expectEqual(Command.reaches, parseCommand("reachable").?);
+    try std.testing.expectEqual(Command.affected, parseCommand("impact").?);
     try std.testing.expectEqual(Command.collisions, parseCommand("duplicates").?);
     try std.testing.expectEqual(Command.diff, parseCommand("changed").?);
     try std.testing.expectEqual(Command.hot, parseCommand("central").?);
@@ -684,6 +797,9 @@ test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.read, parseCommand("cat").?);
     try std.testing.expectEqual(Command.strings, parseCommand("str").?);
     try std.testing.expectEqual(Command.strings, parseCommand("literals").?);
+    try std.testing.expectEqual(Command.todos, parseCommand("todo").?);
+    try std.testing.expectEqual(Command.edits, parseCommand("edit-sites").?);
+    try std.testing.expectEqual(Command.serve, parseCommand("mcp").?);
     try std.testing.expectEqual(Command.graph, parseCommand("viz").?);
     try std.testing.expectEqual(Command.graph, parseCommand("visualize").?);
     try std.testing.expectEqual(Command.coverage, parseCommand("cov").?);
@@ -726,6 +842,28 @@ test "phase 2 commands, ranking, and flow flags parse" {
     try std.testing.expect(groups.options.collision_members);
     try std.testing.expectError(error.Usage, parse(&.{ "flow", "x", "--writers", "--readers" }));
     try std.testing.expectError(error.BadValue, parse(&.{ "hot", "--sort", "callers" }));
+}
+
+test "phase 3 workflows, compaction, rename, and JSONL flags parse" {
+    const affected_cmd = try parse(&.{ "affected", "--since", "HEAD~1", "--max-nodes", "20", "--summary" });
+    try std.testing.expectEqual(Command.affected, affected_cmd.command);
+    try std.testing.expectEqualStrings("HEAD~1", affected_cmd.options.since);
+    try std.testing.expectEqual(@as(u32, 20), affected_cmd.options.max_nodes);
+    try std.testing.expect(affected_cmd.options.summary);
+
+    const reaches_cmd = try parse(&.{ "reaches", "parse,emit", "--from-tests", "--budget=4096" });
+    try std.testing.expect(reaches_cmd.options.from_tests);
+    try std.testing.expectEqual(@as(u32, 4096), reaches_cmd.options.budget);
+    const rename_cmd = try parse(&.{ "rename", "Store.get", "fetch", "--preview" });
+    try std.testing.expectEqualStrings("fetch", rename_cmd.arg2);
+    try std.testing.expect(rename_cmd.options.preview);
+    const stream = try parse(&.{ "search", "parse", "--jsonl", "--after", "v1:25" });
+    try std.testing.expectEqual(query.OutputFormat.jsonl, stream.options.format);
+    try std.testing.expectEqual(@as(u32, 25), stream.options.after);
+
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "x", "--since", "HEAD" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "def", "x", "--jsonl" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "search", "x", "--jsonl", "--after", "25" }));
 }
 
 test "parseCommand: unknown and empty return null" {
@@ -1019,12 +1157,16 @@ test "usage documents every command and phase flags (drift guard)" {
     inline for (@typeInfo(Command).@"enum".fields) |f| {
         try testing.expect(std.mem.indexOf(u8, out, f.name) != null);
     }
-    // Unified test-scope and Phase 1/2 flags are documented.
+    // Unified test-scope and Phase 1/2/3 flags are documented.
     for ([_][]const u8{
-        "--tests", "--no-tests", "--tests-only", "--no-public",
-        "--impls", "--vis", "--public", "--private", "--clients", "--unhit",
-        "--orphan-calls", "--handler", "--writers", "--readers", "--unread",
-        "--on-type", "--to", "--duplicates", "--members", "parse-health", "⇒impl",
+        "--tests",     "--no-tests",   "--tests-only",   "--no-public",
+        "--impls",     "--vis",        "--public",       "--private",
+        "--clients",   "--unhit",      "--orphan-calls", "--handler",
+        "--writers",   "--readers",    "--unread",       "--on-type",
+        "--to",        "--duplicates", "--members",      "--budget",
+        "--max-nodes", "--summary",    "--since",        "--from-tests",
+        "--preview",   "--jsonl",      "--after",        "parse-health",
+        "⇒impl",
     }) |flag| {
         try testing.expect(std.mem.indexOf(u8, out, flag) != null);
     }

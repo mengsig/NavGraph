@@ -30,6 +30,8 @@ you at specific lines may you `read` those exact lines.
 | Finding duplicate names | `navgraph collisions [pattern]` (`--members` includes members) |
 | Guessing what matters | `navgraph hot [path]` |
 | Scoping a branch's changes | `navgraph diff [ref]` (default HEAD, + callers) |
+| Selecting tests for a branch | `navgraph affected --since <ref>` |
+| Set reachability | `navgraph reaches <A,B,...>` (`--from-tests` selects exercising tests) |
 | Finding dead code | `navgraph unused [filter]` (`--no-public` hides API) |
 | Which tests hit a symbol | `navgraph callers <name> --tests-only` |
 | Test reach / coverage | `navgraph coverage [path]` |
@@ -37,10 +39,12 @@ you at specific lines may you `read` those exact lines.
 | Mapping an HTTP endpoint | `navgraph routes [filter] --clients` (mounted prefixes + cross-language callers) |
 | Finding dead/unserved API edges | `navgraph routes --unhit` / `routes --orphan-calls` |
 | Auditing a port or sibling adapters | `navgraph conforms <Protocol|*Glob|Type.method>` |
-| Crossing Protocol/interface dispatch | add `--impls` to `calls`/`callers`/`neighbors`/`path` |
+| Crossing Protocol/interface dispatch | add `--impls` to `calls`/`callers`/`neighbors`/`path`/`reaches`/`affected` |
 | Tracing a bus/WS event | `navgraph events [filter]` (cross-language) |
 | Reading imports | `navgraph imports [filter]` / `importers <file>` |
 | grep inside string literals | `navgraph strings <pattern>` |
+| Reading intent/docs | `navgraph docs <name>` / `todos [path]` |
+| Planning a mechanical rename | `navgraph edits <symbol>` / `rename <symbol> <new> --preview` |
 | Listing indexed files | `navgraph files [filter]` (`--sort symbols`) |
 
 ## Combine with unix tools (pipe, don't substitute)
@@ -53,8 +57,8 @@ to navgraph to understand it.
 ## Escape hatches (the only skips allowed)
 
 1. Unsupported language/filetype.
-2. Non-symbol content (comments, config, docs) — but strings in supported source
-   still → `navgraph strings`.
+2. Non-symbol config content — but strings in supported source still →
+   `navgraph strings`, symbol docs → `docs`, and TODO/FIXME/HACK comments → `todos`.
 3. You're editing and need the exact surrounding lines navgraph already located.
 4. navgraph genuinely can't answer (ran the right command, got nothing useful,
    e.g. a dynamic/reflected call) — say so.
@@ -77,6 +81,14 @@ to navgraph to understand it.
   `--to sink` for the producer-to-consumer chain.
 - Use `outline src -k fn --sort span -l 10` for largest-definition audits and
   `collisions` instead of dumping names through `sort | uniq -d`.
+- On a large hub use `--max-nodes N --summary` or `--budget BYTES`; compact
+  walks retain resolved/exact, high-fan-in branches before lower-value branches.
+- Use `affected --since HEAD~1` rather than manually unioning `diff` with test
+  callers; use `reaches A,B --from-tests` for named target sets.
+- Before a mechanical rename, run `rename Old New --preview` (or `edits Old`).
+  Apply without `--preview` only after collision/review warnings are clear.
+- For pageable automation use `--jsonl -l N`; resume the final page cursor with
+  `--after v1:N`. `serve` exposes the same CLI through one MCP `navgraph` tool.
 - Trust the JSON `parent` field for "which class owns this method".
 - Go: package-qualified calls resolve exactly; pin methods as `Type.method`; a
   shared name prints an N-definitions banner — pin it.
@@ -92,10 +104,15 @@ to navgraph to understand it.
   calls/callers/neighbors/path; structural links are heuristic and `-s` drops them.
 - `-s`/`--strict` — only high-confidence edges (a trailing `?` = heuristic).
 - `-l N`/`--limit` (default 300); `-r`/`--refs` — include use sites/reads.
+- `--budget BYTES`, `--max-nodes N`, `--summary` — bounded, importance-pruned
+  output for calls/callers/neighbors/outline/search/hot and impact sets.
+- `--since REF` (`affected`), `--from-tests` (`reaches`), and `--preview`
+  (`rename`) are Phase-3 workflow controls.
 - `-t`/`--tests <with|without|only>` (aliases `--no-tests`, `--tests-only`) —
   test scope for outline/search/callers/hot/unused; default `with`.
 - `-C <path>` — index root (subtree or a single file).
-- `-j`/`--json` — stable JSON. `files --sort path|symbols`; `outline`/`search`
+- `-j`/`--json` — stable JSON; `--jsonl` streams cursor-pageable rows and
+  `--after v1:N` resumes them. `files --sort path|symbols`; `outline`/`search`
   accept `line|name|span|callers|callees`; `hot` accepts
   `fan_in|fan_in_exact|fan_out|fan_out_exact|span`.
 - Directional references: `-w`/`--writers`, `--readers`, `-u`/`--unread`, and
@@ -136,5 +153,10 @@ handler with the TS call that hits it.
 - `path A B` "no call path" is a real answer, not a failure.
 - Don't gauge "is X indexed?" with `search X | wc -l` — the not-found message is
   one line too; read the actual output.
+- Rename is exact-only: ambiguous selectors, destination collisions, local
+  shadowing, or heuristic/unrecoverable reference sites block application.
+  Strings, comments, reflection, and generated names are never rewritten.
+- A `serve` process uses an in-memory snapshot; restart after external edits.
+  JSONL cursors assume the indexed snapshot and query options are unchanged.
 - Inline non-Zig tests (e.g. Rust `#[cfg(test)] mod tests`) aren't detected as
   tests — treated as production, so `--tests-only`/`coverage` miss them.

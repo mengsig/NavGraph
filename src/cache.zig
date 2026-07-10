@@ -26,7 +26,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE7";
+const magic = "NGCACHE8";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -115,6 +115,7 @@ fn indexEntries(store: *Store) !void {
         const blob = try readBlob(&cur);
         try store.entries.put(store.gpa, path, .{ .stat = stat, .lang = lang, .blob = blob });
     }
+    if (cur.pos != store.bytes.len) return error.TrailingData;
 }
 
 /// Read (and skip past) one file's text+symbols region, returning it as a slice.
@@ -148,6 +149,9 @@ fn skipSymbol(cur: *Cursor) !void {
         const nlines = try cur.getU32(); // distinct call-site lines
         var l: u32 = 0;
         while (l < nlines) : (l += 1) _ = try cur.getU32();
+        const noffsets = try cur.getU32(); // exact occurrence byte offsets
+        var o: u32 = 0;
+        while (o < noffsets) : (o += 1) _ = try cur.getU32();
     }
     const bind_count = try cur.getU32();
     var b: u32 = 0;
@@ -214,6 +218,9 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
         const nlines = try cur.getU32();
         const lines = try arena.alloc(u32, nlines);
         for (lines) |*ln| ln.* = try cur.getU32();
+        const noffsets = try cur.getU32();
+        const offsets = try arena.alloc(u32, noffsets);
+        for (offsets) |*offset| offset.* = try cur.getU32();
         ref.* = .{
             .name = name,
             .qualifier = qualifier,
@@ -222,6 +229,7 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
             .write = is_write,
             .count = count,
             .lines = lines,
+            .offsets = offsets,
         };
     }
     return refs;
@@ -308,6 +316,8 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
         try putU32(gpa, buf, ref.count);
         try putU32(gpa, buf, @intCast(ref.lines.len));
         for (ref.lines) |ln| try putU32(gpa, buf, ln);
+        try putU32(gpa, buf, @intCast(ref.offsets.len));
+        for (ref.offsets) |offset| try putU32(gpa, buf, offset);
     }
     try putU32(gpa, buf, @intCast(sym.bindings.len));
     for (sym.bindings) |b| {
@@ -490,7 +500,6 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
     };
 }
 
-
 // ---------------------------------------------------------------------------
 // Appended tests: exhaustive coverage of cache serialization round-trips,
 // corruption safety, cursor bounds, and enum validation.
@@ -506,6 +515,7 @@ const TestRef = struct {
     write: bool = false,
     count: u32 = 1,
     lines: []const u32 = &[_]u32{},
+    offsets: []const u32 = &[_]u32{},
 };
 
 /// Hand-encode one symbol record in exactly the byte layout `readSymbol`
@@ -544,6 +554,8 @@ fn encSym(
         try putU32(a, buf, r.count);
         try putU32(a, buf, @intCast(r.lines.len));
         for (r.lines) |ln| try putU32(a, buf, ln);
+        try putU32(a, buf, @intCast(r.offsets.len));
+        for (r.offsets) |offset| try putU32(a, buf, offset);
     }
     try putU32(a, buf, @intCast(binds.len));
     for (binds) |b| {
@@ -612,6 +624,7 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
         try t.expectEqual(er.write, gr.write);
         try t.expectEqual(er.count, gr.count);
         try t.expectEqualSlices(u32, er.lines, gr.lines);
+        try t.expectEqualSlices(u32, er.offsets, gr.offsets);
     }
     try t.expectEqual(expected.bindings.len, got.bindings.len);
     for (expected.bindings, got.bindings) |eb, gb| {
@@ -633,15 +646,15 @@ test "full round-trip preserves every field across two files with distinct langu
 
     var no_refs = [_]Reference{};
     var refs1 = [_]Reference{
-        .{ .name = "helper", .qualifier = "", .line = 30, .kind = .call, .count = 3, .lines = &[_]u32{ 30, 33, 40 } },
-        .{ .name = "Widget", .qualifier = "w", .line = 31, .kind = .type_use, .count = 1, .lines = &[_]u32{} },
+        .{ .name = "helper", .qualifier = "", .line = 30, .kind = .call, .count = 3, .lines = &[_]u32{ 30, 33, 40 }, .offsets = &[_]u32{ 2, 7, 12 } },
+        .{ .name = "Widget", .qualifier = "w", .line = 31, .kind = .type_use, .count = 1, .lines = &[_]u32{}, .offsets = &[_]u32{8} },
     };
     const binds1 = [_]Binding{
         .{ .name = "tmp", .type_name = "i32" },
         .{ .name = "w", .type_name = "Widget" },
     };
     var refs3 = [_]Reference{
-        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .write = true, .count = 2, .lines = &[_]u32{ 5, 6 } },
+        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .write = true, .count = 2, .lines = &[_]u32{ 5, 6 }, .offsets = &[_]u32{ 1, 5 } },
     };
 
     var syms = [_]model.Symbol{
@@ -1086,7 +1099,7 @@ test "load rejects empty and sub-magic cache files" {
     try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
 }
 
-test "load ignores a cache truncated by a single trailing byte" {
+test "load ignores cache data with trailing junk or truncation" {
     const testing = std.testing;
     var no_refs = [_]Reference{};
     const binds = [_]Binding{.{ .name = "v", .type_name = "X" }};
@@ -1105,11 +1118,17 @@ test "load ignores a cache truncated by a single trailing byte" {
     const raw = try tmp.dir.readFileAlloc(testing.io, cache_path, testing.allocator, .unlimited);
     defer testing.allocator.free(raw);
     try testing.expect(raw.len > 1);
-    // A valid cache loads; dropping one trailing byte busts the whole thing.
+    // A valid cache loads; trailing or missing bytes bust the whole thing.
     {
         var ok = load(testing.allocator, testing.io, tmp.dir).?;
         ok.deinit();
     }
+    const with_junk = try testing.allocator.alloc(u8, raw.len + 1);
+    defer testing.allocator.free(with_junk);
+    @memcpy(with_junk[0..raw.len], raw);
+    with_junk[raw.len] = 0xff;
+    try writeRawCache(&tmp, with_junk);
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
     try writeRawCache(&tmp, raw[0 .. raw.len - 1]);
     try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
 }

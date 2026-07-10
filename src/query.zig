@@ -22,7 +22,7 @@ const SymbolId = model.SymbolId;
 const invalid = model.invalid_symbol;
 
 /// Output encoding: compact text for agents, or JSON for tooling/MCP.
-pub const OutputFormat = enum { text, json };
+pub const OutputFormat = enum { text, json, jsonl };
 
 /// `files` ordering: `path` (discovery order, the default) or `symbols`
 /// (descending symbol count — biggest files first, the "where's the bulk" view).
@@ -105,10 +105,35 @@ pub fn hotLimit(opts: Options) u32 {
     return if (opts.limit == default_limit) hot_default else opts.limit;
 }
 
+fn compactCap(opts: Options, base: u32, estimated_node_bytes: u32) u32 {
+    std.debug.assert(base > 0);
+    std.debug.assert(estimated_node_bytes > 0);
+    var cap = base;
+    if (opts.max_nodes != 0) cap = @min(cap, opts.max_nodes);
+    if (opts.budget != 0) cap = @min(cap, @max(@as(u32, 1), opts.budget / estimated_node_bytes));
+    return cap;
+}
+
+fn compactOptions(opts: Options, estimated_node_bytes: u32) Options {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(estimated_node_bytes > 0);
+    var bounded = opts;
+    bounded.limit = compactCap(opts, opts.limit, estimated_node_bytes);
+    if (bounded.summary) bounded.verbosity = .names;
+    return bounded;
+}
+
 pub const Options = struct {
     verbosity: render.Verbosity = .sig,
     depth: u32 = 1,
     limit: u32 = default_limit,
+    /// Traversal compaction: exact node cap, approximate output-byte budget,
+    /// and compact rendering for retained/pruned branches.
+    max_nodes: u32 = 0,
+    budget: u32 = 0,
+    summary: bool = false,
+    /// Stable JSONL page offset, decoded from `v1:<ordinal>`.
+    after: u32 = 0,
     /// Follow only high-confidence (type/self-bound or unambiguous) edges.
     strict: bool = false,
     format: OutputFormat = .text,
@@ -151,6 +176,10 @@ pub const Options = struct {
     no_recurse: bool = false,
     /// Add inferred protocol/interface implementation edges to graph walks.
     impls: bool = false,
+    /// Phase 3 workflow selectors and safe-refactor behavior.
+    from_tests: bool = false,
+    since: []const u8 = "",
+    preview: bool = false,
     /// Visibility scope for definition listings.
     visibility: Vis = .all,
     /// Alternate HTTP route views and handler selection.
@@ -260,42 +289,45 @@ pub fn callSiteLines(idx: *const Index, from: SymbolId, to: SymbolId, out: *std.
 /// for the whole project). Symbols are grouped by file and indented by nesting.
 /// Returns whether any symbol was printed.
 pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !bool {
-    if (opts.sort != .default and opts.sort != .line) return rankedDefinitions(w, idx, path_filter, "", opts, true);
-    if (opts.format == .json) return json_out.outline(w, idx, path_filter, opts);
+    const effective = compactOptions(opts, 96);
+    if (effective.sort != .default and effective.sort != .line) return rankedDefinitions(w, idx, path_filter, "", effective, true);
+    if (effective.format == .jsonl) return json_out.outlineJsonl(w, idx, path_filter, effective);
+    if (effective.format == .json) return json_out.outline(w, idx, path_filter, effective);
     var shown: u32 = 0;
     var any = false;
     var summarized: u32 = 0;
     for (idx.graph.files) |file| {
         if (!matchesFilter(file.path, path_filter)) continue;
-        if (opts.no_recurse and !inDirNonRecursive(file.path, path_filter)) continue;
+        if (effective.no_recurse and !inDirNonRecursive(file.path, path_filter)) continue;
         // Skip a file with nothing to show under the active kind/test-scope
         // filters, so `--tests only`/`--no-tests` never print an empty header.
-        if (visibleSymbolCount(idx, file, opts) == 0) continue;
+        if (visibleSymbolCount(idx, file, effective) == 0) continue;
         any = true;
         try w.print("# {s} ({s})\n", .{ file.path, file.language.tag() });
         // Once the symbol budget is spent, keep naming every remaining file (with
         // its symbol count) instead of dropping it off the tail — so an agent
         // never mistakes a truncated-away file for a nonexistent one. Truncation
         // is per-file, not whole-files-vanish.
-        if (shown >= opts.limit) {
-            const n = visibleSymbolCount(idx, file, opts);
+        if (shown >= effective.limit) {
+            const n = visibleSymbolCount(idx, file, effective);
             try w.print("  … {d} symbol{s} here (raise -l to list)\n", .{ n, if (n == 1) "" else "s" });
             summarized += 1;
             continue;
         }
-        shown += try outlineFile(w, idx, file, opts, &shown);
+        _ = try outlineFile(w, idx, file, effective, &shown);
     }
     if (!any) {
         try w.print("(no source symbols under '{s}')\n", .{path_filter});
-        try kindHint(w, idx, path_filter, opts);
+        try kindHint(w, idx, path_filter, effective);
         try outlinePathHint(w, idx, path_filter);
         try skippedNote(w, idx);
     }
-    if (shown >= opts.limit) {
+    if (shown >= effective.limit) {
+        const reason = if (opts.max_nodes != 0) "--max-nodes" else if (opts.budget != 0) "--budget" else "-l";
         if (summarized > 0) {
-            try w.print("… (listed {d} symbols; {d} more file(s) named but not expanded — raise -l)\n", .{ opts.limit, summarized });
+            try w.print("… (listed {d} symbols; {d} more file(s) named but not expanded — raise {s})\n", .{ effective.limit, summarized, reason });
         } else {
-            try w.print("… (stopped at -l {d}; raise -l to see more)\n", .{opts.limit});
+            try w.print("… (stopped at {s} {d}; raise it to see more)\n", .{ reason, effective.limit });
         }
     }
     return shown > 0;
@@ -844,6 +876,69 @@ fn multiMatchNote(w: *Writer, name: []const u8, n: usize, cap: usize) !void {
     });
 }
 
+pub fn compactEnabled(opts: Options) bool {
+    return opts.max_nodes != 0 or opts.budget != 0;
+}
+
+const EdgePriority = struct { idx: *const Index };
+
+pub fn orderedRefs(gpa: std.mem.Allocator, idx: *const Index, refs: []const model.Reference) ![]model.Reference {
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
+    std.debug.assert(refs.len <= std.math.maxInt(u32));
+    const ordered = try gpa.dupe(model.Reference, refs);
+    std.sort.block(model.Reference, ordered, EdgePriority{ .idx = idx }, refPriorityLessThan);
+    return ordered;
+}
+
+fn refPriorityLessThan(ctx: EdgePriority, a: model.Reference, b: model.Reference) bool {
+    const a_resolved = a.target != invalid;
+    const b_resolved = b.target != invalid;
+    if (a_resolved != b_resolved) return a_resolved;
+    if (a.exact != b.exact) return a.exact;
+    const a_fan = if (a_resolved) ctx.idx.callersOf(a.target).len else 0;
+    const b_fan = if (b_resolved) ctx.idx.callersOf(b.target).len else 0;
+    if (a_fan != b_fan) return a_fan > b_fan;
+    if (a.count != b.count) return a.count > b.count;
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+pub fn orderedCallers(gpa: std.mem.Allocator, idx: *const Index, callers: []const SymbolId) ![]SymbolId {
+    std.debug.assert(callers.len <= idx.graph.symbols.len);
+    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(SymbolId));
+    const ordered = try gpa.dupe(SymbolId, callers);
+    std.sort.block(SymbolId, ordered, idx, callerPriorityLessThan);
+    return ordered;
+}
+
+fn callerPriorityLessThan(idx: *const Index, a: SymbolId, b: SymbolId) bool {
+    const a_fan = idx.callersOf(a).len;
+    const b_fan = idx.callersOf(b).len;
+    if (a_fan != b_fan) return a_fan > b_fan;
+    return a < b;
+}
+
+const WalkBudget = struct {
+    nodes: u32 = 0,
+    estimated_bytes: u32 = 0,
+    pruned: u32 = 0,
+
+    fn take(self: *WalkBudget, idx: *const Index, id: SymbolId, opts: Options) bool {
+        std.debug.assert(id < idx.graph.symbols.len);
+        std.debug.assert(opts.limit > 0);
+        const sym = idx.graph.symbols[id];
+        const estimate: u32 = @intCast(@min(@as(usize, std.math.maxInt(u32)), 48 + sym.name.len + idx.graph.files[sym.file].path.len));
+        if ((opts.max_nodes != 0 and self.nodes >= opts.max_nodes) or
+            (opts.budget != 0 and self.nodes != 0 and self.estimated_bytes + estimate > opts.budget))
+        {
+            self.pruned +|= 1;
+            return false;
+        }
+        self.nodes +|= 1;
+        self.estimated_bytes +|= estimate;
+        return true;
+    }
+};
+
 /// Walk the call graph from `name`. `incoming` selects callers vs callees.
 /// Returns whether `name` resolved to at least one symbol.
 pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opts: Options) !bool {
@@ -862,9 +957,10 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
     defer visited.deinit();
     var heuristic: usize = 0;
+    var budget: WalkBudget = .{};
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited, &heuristic);
+        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited, &heuristic, &budget);
     }
     // If any ambiguous name-match (`?`) edges were shown, tell the agent how to
     // drop them rather than making it discover `-s` on its own. Only when they
@@ -874,7 +970,8 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
             heuristic, if (heuristic == 1) "" else "s",
         });
     }
-    return true;
+    if (budget.pruned != 0) try w.print("… {} branch{s} elided (--budget/--max-nodes; {} nodes shown)\n", .{ budget.pruned, if (budget.pruned == 1) "" else "es", budget.nodes });
+    return budget.nodes != 0;
 }
 
 fn walkNode(
@@ -892,8 +989,10 @@ fn walkNode(
     implementation_edge: bool,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
+    budget: *WalkBudget,
 ) anyerror!void {
-    const v = if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
+    if (!budget.take(idx, id, opts)) return;
+    const v = if (opts.summary) .names else if (indent == 0) opts.verbosity else headerVerbosity(opts.verbosity);
     if (implementation_edge) {
         try renderImplSymbol(w, idx, idx.graph.symbols[id], v, indent, exact);
     } else {
@@ -901,7 +1000,7 @@ fn walkNode(
     }
     if (indent > 0 and !exact) heuristic.* += 1;
     if (indent >= opts.depth) {
-        if (impl_graph) |graph| try renderImplLeaves(w, idx, graph, id, incoming, opts, indent, visited, heuristic);
+        if (impl_graph) |graph| try renderImplLeaves(w, idx, graph, id, incoming, opts, indent, visited, heuristic, budget);
         return;
     }
     if ((try visited.getOrPut(id)).found_existing) {
@@ -909,9 +1008,9 @@ fn walkNode(
         return;
     }
     if (incoming) {
-        try walkCallers(w, idx, impl_graph, id, opts, indent, visited, heuristic);
+        try walkCallers(w, idx, impl_graph, id, opts, indent, visited, heuristic, budget);
     } else {
-        try walkCallees(w, idx, impl_graph, id, opts, indent, visited, heuristic);
+        try walkCallees(w, idx, impl_graph, id, opts, indent, visited, heuristic, budget);
     }
 }
 
@@ -938,11 +1037,16 @@ fn walkCallees(
     indent: usize,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
+    budget: *WalkBudget,
 ) !void {
     const sym = idx.graph.symbols[id];
     var externals: std.ArrayList(u8) = .empty;
     defer externals.deinit(idx.gpa);
-    for (sym.refs) |ref| {
+    var ordered_refs: ?[]model.Reference = null;
+    defer if (ordered_refs) |refs| idx.gpa.free(refs);
+    if (compactEnabled(opts)) ordered_refs = try orderedRefs(idx.gpa, idx, sym.refs);
+    const refs = ordered_refs orelse sym.refs;
+    for (refs) |ref| {
         // Follow every *resolved* edge (call, use, type-use). Bare data reads of
         // a var/const/field are dependency noise, hidden unless `--refs` asks for
         // them. Only unresolved *calls* are surfaced as externals; unresolved
@@ -950,7 +1054,7 @@ fn walkCallees(
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (!opts.refs and isDataReadEdge(idx, ref)) continue;
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, impl_graph, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, heuristic);
+            try walkNode(w, idx, impl_graph, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, heuristic, budget);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -959,7 +1063,7 @@ fn walkCallees(
     if (impl_graph) |graph| {
         for (graph.edges) |edge| {
             if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
-            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic);
+            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
         }
     }
     if (externals.items.len != 0) {
@@ -978,25 +1082,30 @@ fn walkCallers(
     indent: usize,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
+    budget: *WalkBudget,
 ) !void {
     var lines: std.ArrayList(u32) = .empty;
     defer lines.deinit(idx.gpa);
-    for (idx.callersOf(id)) |cid| {
+    var ordered_callers: ?[]SymbolId = null;
+    defer if (ordered_callers) |callers_slice| idx.gpa.free(callers_slice);
+    if (compactEnabled(opts)) ordered_callers = try orderedCallers(idx.gpa, idx, idx.callersOf(id));
+    const callers_slice = ordered_callers orelse idx.callersOf(id);
+    for (callers_slice) |cid| {
         if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
         // `--tests only` keeps only test callers ("which tests exercise this");
         // `--no-tests` keeps only production callers.
         if (!inTestScope(opts.tests, isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
         // The edge (caller → this symbol) lives at its call site(s) in the caller.
         try callSiteLines(idx, cid, id, &lines);
-        try walkNode(w, idx, impl_graph, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), false, visited, heuristic);
+        try walkNode(w, idx, impl_graph, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), false, visited, heuristic, budget);
     }
     if (impl_graph) |graph| {
         for (graph.edges) |edge| {
             if (opts.strict and !edge.exact) continue;
             if (edge.port_method == id) {
-                try walkNode(w, idx, impl_graph, edge.implementation_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic);
+                try walkNode(w, idx, impl_graph, edge.implementation_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
             } else if (edge.implementation_method == id) {
-                try walkNode(w, idx, impl_graph, edge.port_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic);
+                try walkNode(w, idx, impl_graph, edge.port_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
             }
         }
     }
@@ -1026,6 +1135,7 @@ fn renderImplLeaves(
     indent: usize,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
+    budget: *WalkBudget,
 ) !void {
     _ = visited;
     for (graph.edges) |edge| {
@@ -1033,8 +1143,9 @@ fn renderImplLeaves(
         var target: SymbolId = invalid;
         if (edge.port_method == id) target = edge.implementation_method;
         if (incoming and edge.implementation_method == id) target = edge.port_method;
-        if (target == invalid) continue;
-        try renderImplSymbol(w, idx, idx.graph.symbols[target], headerVerbosity(opts.verbosity), indent + 1, edge.exact);
+        if (target == invalid or !budget.take(idx, target, opts)) continue;
+        const v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
+        try renderImplSymbol(w, idx, idx.graph.symbols[target], v, indent + 1, edge.exact);
         if (!edge.exact) heuristic.* += 1;
     }
 }
@@ -1055,6 +1166,7 @@ fn rankedDefinitions(w: *Writer, idx: *const Index, path_filter: []const u8, pat
     std.debug.assert(outline_mode or pattern.len > 0);
     const ranked = try collectRankedDefinitions(idx, path_filter, pattern, opts, outline_mode);
     defer idx.gpa.free(ranked);
+    if (opts.format == .jsonl) return json_out.rankedDefinitionsJsonl(w, idx, ranked, opts);
     if (opts.format == .json) return json_out.rankedDefinitions(w, idx, ranked, opts);
     const shown: usize = @min(ranked.len, opts.limit);
     for (ranked[0..shown]) |entry| {
@@ -1141,27 +1253,29 @@ fn printRankBadge(w: *Writer, sort: SortKey, metric: u32) !void {
 /// Returns whether any symbol (or, with `--refs`, any reference) matched.
 pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
-    if (opts.refs) return searchRefs(w, idx, pattern, opts);
-    if (opts.duplicates) return collisions(w, idx, pattern, opts);
-    if (opts.sort != .default and opts.sort != .line) return rankedDefinitions(w, idx, "", pattern, opts, false);
-    if (opts.format == .json) return json_out.search(w, idx, pattern, opts);
+    const effective = compactOptions(opts, 96);
+    if (effective.refs) return searchRefs(w, idx, pattern, effective);
+    if (effective.duplicates) return collisions(w, idx, pattern, effective);
+    if (effective.sort != .default and effective.sort != .line) return rankedDefinitions(w, idx, "", pattern, effective, false);
+    if (effective.format == .jsonl) return json_out.searchJsonl(w, idx, pattern, effective);
+    if (effective.format == .json) return json_out.search(w, idx, pattern, effective);
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (sym.kind == .import) continue;
-        if (!kindAllowed(sym.kind, opts.kinds)) continue;
-        if (!visAllowed(sym, opts.visibility)) continue;
-        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
-        if (opts.exact) {
+        if (!kindAllowed(sym.kind, effective.kinds)) continue;
+        if (!visAllowed(sym, effective.visibility)) continue;
+        if (!inTestScope(effective.tests, isTestSymbol(idx, sym))) continue;
+        if (effective.exact) {
             if (!std.mem.eql(u8, sym.name, pattern)) continue;
         } else if (!matchesName(pattern, sym.name)) continue;
-        try render.symbol(w, idx, sym, opts.verbosity, 0, true);
+        try render.symbol(w, idx, sym, effective.verbosity, 0, true);
         shown += 1;
-        if (shown >= opts.limit) break;
+        if (shown >= effective.limit) break;
     }
     if (shown == 0) {
         try w.print("(no symbol matching '{s}')\n", .{pattern});
         try suggestNear(w, idx, pattern);
-        try kindHint(w, idx, "", opts);
+        try kindHint(w, idx, "", effective);
         // A slash/space never occurs in a symbol name — the query is literal
         // text (a route path, a log message). Point at the right verb.
         if (std.mem.indexOfAny(u8, pattern, "/ ") != null) {
@@ -1169,7 +1283,7 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         }
         try skippedNote(w, idx);
     }
-    try truncationNote(w, opts, shown);
+    try truncationNote(w, effective, shown);
     return shown > 0;
 }
 
@@ -1305,6 +1419,7 @@ fn rankedSearchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Op
     std.debug.assert(opts.sort != .default and opts.sort != .line);
     const sites = try collectRankedRefs(idx, pattern, opts);
     defer idx.gpa.free(sites);
+    if (opts.format == .jsonl) return json_out.rankedSearchRefsJsonl(w, idx, sites, opts);
     if (opts.format == .json) return json_out.rankedSearchRefs(w, idx, sites, opts);
     const shown: usize = @min(sites.len, opts.limit);
     for (sites[0..shown]) |site| {
@@ -1358,6 +1473,7 @@ fn rankedRefLessThan(ctx: RefRankContext, a: RankedRefSite, b: RankedRefSite) bo
 /// `Recv.field`/`.field` patterns pin instance-attribute reads.
 fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     if (opts.sort != .default and opts.sort != .line) return rankedSearchRefs(w, idx, pattern, opts);
+    if (opts.format == .jsonl) return json_out.searchRefsJsonl(w, idx, pattern, opts);
     if (opts.format == .json) return json_out.searchRefs(w, idx, pattern, opts);
     var pat = RefPattern.parse(pattern);
     pat.exact = opts.exact;
@@ -1628,25 +1744,29 @@ fn fanOutExact(sym: model.Symbol) u32 {
 /// fan-out. Honors an optional path `filter` and `-l` for the count.
 /// Returns whether any entry was reported.
 pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    if (opts.format == .json) return json_out.hot(w, idx, filter, opts);
-    const ranked = try collectHot(idx, filter, opts.tests);
+    var effective = opts;
+    effective.limit = compactCap(opts, hotLimit(opts), 96);
+    if (effective.summary) effective.verbosity = .names;
+    if (effective.format == .jsonl) return json_out.hotJsonl(w, idx, filter, effective);
+    if (effective.format == .json) return json_out.hot(w, idx, filter, effective);
+    const ranked = try collectHot(idx, filter, effective.tests);
     defer idx.gpa.free(ranked);
-    sortHot(idx, ranked, opts.sort);
+    sortHot(idx, ranked, effective.sort);
     // `hot` is an orientation view — a short ranked list is the point, so it
     // caps at a small default (raise `-l` for more) via the limit sentinel.
-    const limit = hotLimit(opts);
+    const limit = effective.limit;
     var shown: u32 = 0;
     var eligible: u32 = 0;
     for (ranked) |e| {
         // `--strict` ranks and reports on exact edges only, and hides a symbol
         // whose connectivity is entirely heuristic (a name-collision artifact).
-        if (opts.strict and e.fan_in_exact == 0 and e.fan_out_exact == 0) continue;
+        if (effective.strict and e.fan_in_exact == 0 and e.fan_out_exact == 0) continue;
         eligible += 1;
         if (shown >= limit) continue;
         shown += 1;
         const sym = idx.graph.symbols[e.id];
-        try render.symbol(w, idx, sym, headerVerbosity(opts.verbosity), 0, true);
-        try printHotCounts(w, idx, e, opts);
+        try render.symbol(w, idx, sym, headerVerbosity(effective.verbosity), 0, true);
+        try printHotCounts(w, idx, e, effective);
     }
     if (shown == 0) {
         try w.print("(no functions under '{s}')\n", .{filter});
@@ -1815,17 +1935,17 @@ fn interfaceDispatchHint(idx: *const Index, sym: model.Symbol) ?[]const u8 {
 }
 
 const py_protocol_names = std.StaticStringMap(void).initComptime(.{
-    .{"read"},     .{"write"},    .{"readinto"},  .{"readline"}, .{"readlines"},
-    .{"writelines"}, .{"seek"},   .{"tell"},      .{"flush"},    .{"close"},
-    .{"fileno"},   .{"isatty"},   .{"readable"},  .{"writable"}, .{"seekable"},
-    .{"truncate"}, .{"detach"},
+    .{"read"},       .{"write"},  .{"readinto"}, .{"readline"}, .{"readlines"},
+    .{"writelines"}, .{"seek"},   .{"tell"},     .{"flush"},    .{"close"},
+    .{"fileno"},     .{"isatty"}, .{"readable"}, .{"writable"}, .{"seekable"},
+    .{"truncate"},   .{"detach"},
 });
 
 const go_interface_names = std.StaticStringMap(void).initComptime(.{
-    .{"MarshalJSON"},   .{"UnmarshalJSON"}, .{"MarshalText"},  .{"UnmarshalText"},
-    .{"MarshalBinary"}, .{"UnmarshalBinary"}, .{"String"},     .{"GoString"},
-    .{"Error"},         .{"Len"},           .{"Less"},         .{"Swap"},
-    .{"ServeHTTP"},     .{"Read"},          .{"Write"},        .{"Close"},
+    .{"MarshalJSON"},   .{"UnmarshalJSON"},   .{"MarshalText"}, .{"UnmarshalText"},
+    .{"MarshalBinary"}, .{"UnmarshalBinary"}, .{"String"},      .{"GoString"},
+    .{"Error"},         .{"Len"},             .{"Less"},        .{"Swap"},
+    .{"ServeHTTP"},     .{"Read"},            .{"Write"},       .{"Close"},
 });
 
 /// Caller count with the test scope applied to each *caller* (see collectHot).
@@ -2131,7 +2251,7 @@ fn renderConformancePort(w: *Writer, idx: *const Index, graph: *const impls_mod.
         if (rel.port == port.id and (!opts.strict or rel.exact)) implementations += 1;
     }
     try w.print("# {s}  {s}:{d}  · {d} member{s} · {d} impl{s}\n", .{
-        port.name, idx.graph.files[port.file].path, port.line, methods, if (methods == 1) "" else "s",
+        port.name,       idx.graph.files[port.file].path,       port.line, methods, if (methods == 1) "" else "s",
         implementations, if (implementations == 1) "" else "s",
     });
     for (idx.graph.symbols) |expected| {
@@ -2419,11 +2539,20 @@ pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []
 /// Run `git -C <root> diff --unified=0 --no-color <ref>` and return its result
 /// (caller frees stdout/stderr). `--unified=0` keeps hunks tight so a ripple in
 /// one function isn't attributed to its neighbor via shared context lines.
-fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const u8) !std.process.RunResult {
+pub fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const u8) !std.process.RunResult {
+    std.debug.assert(root.len > 0);
+    std.debug.assert(ref.len > 0);
+    var cwd_path = root;
+    var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch |err| dir: {
+        if (err != error.NotDir) return err;
+        cwd_path = std.fs.path.dirname(root) orelse ".";
+        break :dir try std.Io.Dir.cwd().openDir(io, cwd_path, .{});
+    };
+    root_dir.close(io);
     const argv = [_][]const u8{ "git", "diff", "--unified=0", "--no-color", ref };
     return std.process.run(gpa, io, .{
         .argv = &argv,
-        .cwd = .{ .path = root },
+        .cwd = .{ .path = cwd_path },
         .stdout_limit = std.Io.Limit.limited(16 * 1024 * 1024),
     });
 }
@@ -2492,10 +2621,13 @@ pub fn findDiffFile(idx: *const Index, diff_path: []const u8) ?model.SourceFile 
     for (idx.graph.files) |file| {
         if (std.mem.eql(u8, file.path, diff_path)) return file;
     }
+    var suffix_match: ?model.SourceFile = null;
     for (idx.graph.files) |file| {
-        if (pathSuffixMatch(file.path, diff_path)) return file;
+        if (!pathSuffixMatch(file.path, diff_path)) continue;
+        if (suffix_match != null) return null;
+        suffix_match = file;
     }
-    return null;
+    return suffix_match;
 }
 
 /// Whether `a` and `b` name the same file via a component-aligned suffix
@@ -2523,23 +2655,34 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
     try multiMatchNote(w, name, ids.len, buf.len);
     var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
     defer if (impl_graph) |*graph| graph.deinit();
+    var budget: WalkBudget = .{};
     for (ids) |id| {
-        try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 0, true);
+        if (!budget.take(idx, id, opts)) continue;
+        const v: render.Verbosity = if (opts.summary) .names else opts.verbosity;
+        try render.symbol(w, idx, idx.graph.symbols[id], v, 0, true);
         try w.writeAll("  ↓ calls\n");
-        try renderCallees(w, idx, id, opts, 2);
+        try renderCallees(w, idx, id, opts, 2, &budget);
         if (impl_graph) |*graph| {
             for (graph.edges) |edge| {
                 if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
-                try renderImplSymbol(w, idx, idx.graph.symbols[edge.implementation_method], headerVerbosity(opts.verbosity), 2, edge.exact);
+                if (!budget.take(idx, edge.implementation_method, opts)) continue;
+                const child_v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
+                try renderImplSymbol(w, idx, idx.graph.symbols[edge.implementation_method], child_v, 2, edge.exact);
             }
         }
         try w.writeAll("  ↑ callers\n");
         var lines: std.ArrayList(u32) = .empty;
         defer lines.deinit(idx.gpa);
-        for (idx.callersOf(id)) |cid| {
+        var ordered_callers: ?[]SymbolId = null;
+        defer if (ordered_callers) |callers_slice| idx.gpa.free(callers_slice);
+        if (compactEnabled(opts)) ordered_callers = try orderedCallers(idx.gpa, idx, idx.callersOf(id));
+        const callers_slice = ordered_callers orelse idx.callersOf(id);
+        for (callers_slice) |cid| {
             if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
+            if (!budget.take(idx, cid, opts)) continue;
             try callSiteLines(idx, cid, id, &lines);
-            try render.symbolSite(w, idx, idx.graph.symbols[cid], headerVerbosity(opts.verbosity), 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id));
+            const caller_v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
+            try render.symbolSite(w, idx, idx.graph.symbols[cid], caller_v, 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id));
         }
         if (impl_graph) |*graph| {
             for (graph.edges) |edge| {
@@ -2550,23 +2693,32 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
                     edge.port_method
                 else
                     continue;
-                try renderImplSymbol(w, idx, idx.graph.symbols[target], headerVerbosity(opts.verbosity), 2, edge.exact);
+                if (!budget.take(idx, target, opts)) continue;
+                const peer_v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
+                try renderImplSymbol(w, idx, idx.graph.symbols[target], peer_v, 2, edge.exact);
             }
         }
     }
-    return true;
+    if (budget.pruned != 0) try w.print("… {} branch{s} elided (--budget/--max-nodes; {} nodes shown)\n", .{ budget.pruned, if (budget.pruned == 1) "" else "es", budget.nodes });
+    return budget.nodes != 0;
 }
 
 /// Render the resolved callees of `id` at `indent`, listing unresolved names on
 /// a trailing `~ ext:` line (mirrors the `calls` tree's leaf formatting).
-fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, indent: usize) !void {
+fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, indent: usize, budget: *WalkBudget) !void {
     const sym = idx.graph.symbols[id];
     var externals: std.ArrayList(u8) = .empty;
     defer externals.deinit(idx.gpa);
-    for (sym.refs) |ref| {
+    var ordered_refs: ?[]model.Reference = null;
+    defer if (ordered_refs) |refs| idx.gpa.free(refs);
+    if (compactEnabled(opts)) ordered_refs = try orderedRefs(idx.gpa, idx, sym.refs);
+    const refs = ordered_refs orelse sym.refs;
+    for (refs) |ref| {
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (!opts.refs and isDataReadEdge(idx, ref)) continue;
-            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], headerVerbosity(opts.verbosity), indent, true, ref.line, ref.count, ref.lines, ref.exact);
+            if (!budget.take(idx, ref.target, opts)) continue;
+            const v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
+            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], v, indent, true, ref.line, ref.count, ref.lines, ref.exact);
         } else if (ref.kind == .call or ref.kind == .route_call) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -3662,7 +3814,7 @@ test "shortest path and dead-code detection over a call chain" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "chain.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "chain.zig", .data =
         \\pub fn alpha() void {
         \\    beta();
         \\}
@@ -5057,7 +5209,6 @@ test "dead-code filter skips dunders, tests and fixtures" {
     try std.testing.expect(!isTestPath("src/contest.py"));
 }
 
-
 // ============================================================================
 // APPENDED TESTS — verb coverage: pure helpers, outline/listFiles/readLines,
 // showDef/walk/search not-found + selectors, neighbors, routes, imports,
@@ -5283,6 +5434,16 @@ test "outline truncates per-file and names the unexpanded overflow files under -
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "stopped at -l 1") != null);
         try testing.expect(std.mem.indexOf(u8, out, "more file(s) named") == null);
+    }
+    { // The global limit counts rendered symbols once across file boundaries.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        _ = try outline(&aw.writer, &idx, "", .{ .limit = 3 });
+        const out = aw.written();
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "() void"));
+        try testing.expect(std.mem.indexOf(u8, out, "stopped at -l 3") != null);
     }
 }
 

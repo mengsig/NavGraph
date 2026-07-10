@@ -463,6 +463,16 @@ fn collectDoc(ctx: *const Ctx, def_i: u32) []const u8 {
     return ctx.source[ctx.toks[first].start..ctx.toks[def_i - 1].end];
 }
 
+fn collectPyDoc(ctx: *const Ctx, def_i: u32, body_lo: u32, body_hi: u32) []const u8 {
+    std.debug.assert(body_lo <= body_hi);
+    const leading = collectDoc(ctx, def_i);
+    if (leading.len != 0) return leading;
+    var i = body_lo;
+    while (i < body_hi and isComment(ctx, i)) : (i += 1) {}
+    if (i < body_hi and ctx.toks[i].kind == .string) return ctx.toks[i].text(ctx.source);
+    return "";
+}
+
 /// Line-start offset of the token at index `i` (column 0 of its line).
 fn lineStartOffset(ctx: *const Ctx, i: u32) u32 {
     const t = ctx.toks[i];
@@ -503,6 +513,11 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         for (line_lists.items) |*ll| ll.deinit(ctx.gpa);
         line_lists.deinit(ctx.gpa);
     }
+    var offset_lists: std.ArrayList(std.ArrayList(u32)) = .empty;
+    defer {
+        for (offset_lists.items) |*ol| ol.deinit(ctx.gpa);
+        offset_lists.deinit(ctx.gpa);
+    }
 
     var i = lo;
     while (i < hi) : (i += 1) {
@@ -524,16 +539,18 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (member_qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
         if (assignment.read) {
-            try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call, false);
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, is_call, false);
         }
         if (assignment.write) {
-            try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, false, true);
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, false, true);
         }
     }
     // Keep the distinct-line list only when a ref spans more than one line; a
     // single-site ref falls back to `line` and needs no allocation.
-    for (refs.items, line_lists.items) |*r, ll| {
+    for (refs.items, line_lists.items, offset_lists.items) |*r, ll, ol| {
         if (ll.items.len > 1) r.lines = try ctx.arena.dupe(u32, ll.items);
+        std.debug.assert(ol.items.len == r.count);
+        r.offsets = try ctx.arena.dupe(u32, ol.items);
     }
     return .{
         .refs = try ctx.arena.dupe(Reference, refs.items),
@@ -624,14 +641,17 @@ fn recordRef(
     ctx: *Ctx,
     refs: *std.ArrayList(Reference),
     line_lists: *std.ArrayList(std.ArrayList(u32)),
+    offset_lists: *std.ArrayList(std.ArrayList(u32)),
     seen: *std.StringHashMap(u32),
     name: []const u8,
     qualifier: []const u8,
     line: u32,
+    offset: u32,
     is_call: bool,
     write: bool,
 ) !void {
     std.debug.assert(name.len > 0);
+    std.debug.assert(offset < ctx.source.len);
     std.debug.assert(!is_call or !write);
     // Direction participates in deduplication so a read and write of the same
     // member retain separate source lines and access modes.
@@ -645,6 +665,7 @@ fn recordRef(
         // order, so lines are non-decreasing — compare against the last kept.
         const ll = &line_lists.items[idx];
         if (ll.items.len == 0 or ll.items[ll.items.len - 1] != line) try ll.append(ctx.gpa, line);
+        try offset_lists.items[idx].append(ctx.gpa, offset);
         return;
     }
     try seen.put(try ctx.gpa.dupe(u8, key), @intCast(refs.items.len));
@@ -659,6 +680,9 @@ fn recordRef(
     var ll: std.ArrayList(u32) = .empty;
     try ll.append(ctx.gpa, line);
     try line_lists.append(ctx.gpa, ll);
+    var ol: std.ArrayList(u32) = .empty;
+    try ol.append(ctx.gpa, offset);
+    try offset_lists.append(ctx.gpa, ol);
 }
 
 /// Factory-method names whose receiver is the constructed type: `T.init(...)`.
@@ -816,12 +840,12 @@ fn emit(ctx: *Ctx, sym: ParsedSymbol) !u32 {
 // ---------------------------------------------------------------------------
 
 const zig_keywords = KeywordSet.initComptime(.{
-    .{"const"}, .{"var"},   .{"fn"},     .{"pub"},    .{"return"}, .{"if"},
-    .{"else"},  .{"while"}, .{"for"},    .{"switch"}, .{"struct"}, .{"enum"},
-    .{"union"}, .{"try"},   .{"catch"},  .{"defer"},  .{"errdefer"}, .{"comptime"},
-    .{"inline"},.{"and"},   .{"or"},     .{"orelse"}, .{"test"},   .{"error"},
-    .{"break"}, .{"continue"}, .{"opaque"}, .{"extern"}, .{"export"}, .{"usingnamespace"},
-    .{"anytype"}, .{"void"}, .{"unreachable"},
+    .{"const"},   .{"var"},      .{"fn"},          .{"pub"},    .{"return"},   .{"if"},
+    .{"else"},    .{"while"},    .{"for"},         .{"switch"}, .{"struct"},   .{"enum"},
+    .{"union"},   .{"try"},      .{"catch"},       .{"defer"},  .{"errdefer"}, .{"comptime"},
+    .{"inline"},  .{"and"},      .{"or"},          .{"orelse"}, .{"test"},     .{"error"},
+    .{"break"},   .{"continue"}, .{"opaque"},      .{"extern"}, .{"export"},   .{"usingnamespace"},
+    .{"anytype"}, .{"void"},     .{"unreachable"},
 });
 
 fn parseZigScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
@@ -1133,29 +1157,29 @@ fn tokenAfterOffset(ctx: *const Ctx, offset: u32, hi: u32) u32 {
 // ---------------------------------------------------------------------------
 
 const c_keywords = KeywordSet.initComptime(.{
-    .{"if"},     .{"else"},   .{"for"},    .{"while"},  .{"return"}, .{"switch"},
-    .{"case"},   .{"break"},  .{"continue"}, .{"struct"}, .{"enum"}, .{"union"},
-    .{"typedef"}, .{"static"}, .{"const"},  .{"void"},   .{"int"},   .{"char"},
-    .{"float"},  .{"double"}, .{"unsigned"}, .{"signed"}, .{"long"}, .{"short"},
-    .{"sizeof"}, .{"goto"},   .{"do"},     .{"extern"}, .{"inline"}, .{"register"},
-    .{"volatile"}, .{"class"}, .{"public"}, .{"private"}, .{"namespace"}, .{"template"},
+    .{"if"},       .{"else"},   .{"for"},      .{"while"},   .{"return"},    .{"switch"},
+    .{"case"},     .{"break"},  .{"continue"}, .{"struct"},  .{"enum"},      .{"union"},
+    .{"typedef"},  .{"static"}, .{"const"},    .{"void"},    .{"int"},       .{"char"},
+    .{"float"},    .{"double"}, .{"unsigned"}, .{"signed"},  .{"long"},      .{"short"},
+    .{"sizeof"},   .{"goto"},   .{"do"},       .{"extern"},  .{"inline"},    .{"register"},
+    .{"volatile"}, .{"class"},  .{"public"},   .{"private"}, .{"namespace"}, .{"template"},
 });
 
 /// C# control/type/modifier keywords — kept apart from `c_keywords` so the shared
 /// C-family scanners skip C#-specific keywords when reading a body's references
 /// and detecting member functions.
 const cs_keywords = KeywordSet.initComptime(.{
-    .{"if"},      .{"else"},    .{"for"},      .{"foreach"}, .{"while"},   .{"do"},
-    .{"return"},  .{"switch"},  .{"case"},     .{"break"},   .{"continue"}, .{"goto"},
-    .{"using"},   .{"namespace"}, .{"class"},  .{"struct"},  .{"interface"}, .{"enum"},
-    .{"record"},  .{"public"},  .{"private"},  .{"protected"}, .{"internal"}, .{"static"},
-    .{"readonly"}, .{"const"},  .{"virtual"},  .{"override"}, .{"abstract"}, .{"sealed"},
-    .{"async"},   .{"await"},   .{"new"},      .{"this"},    .{"base"},    .{"var"},
-    .{"void"},    .{"int"},     .{"string"},   .{"bool"},    .{"double"},  .{"float"},
-    .{"long"},    .{"short"},   .{"byte"},     .{"char"},    .{"object"},  .{"decimal"},
-    .{"true"},    .{"false"},   .{"null"},     .{"is"},      .{"as"},      .{"typeof"},
-    .{"try"},     .{"catch"},   .{"finally"},  .{"throw"},   .{"yield"},   .{"ref"},
-    .{"out"},     .{"in"},      .{"where"},    .{"get"},     .{"set"},     .{"partial"},
+    .{"if"},       .{"else"},      .{"for"},     .{"foreach"},   .{"while"},     .{"do"},
+    .{"return"},   .{"switch"},    .{"case"},    .{"break"},     .{"continue"},  .{"goto"},
+    .{"using"},    .{"namespace"}, .{"class"},   .{"struct"},    .{"interface"}, .{"enum"},
+    .{"record"},   .{"public"},    .{"private"}, .{"protected"}, .{"internal"},  .{"static"},
+    .{"readonly"}, .{"const"},     .{"virtual"}, .{"override"},  .{"abstract"},  .{"sealed"},
+    .{"async"},    .{"await"},     .{"new"},     .{"this"},      .{"base"},      .{"var"},
+    .{"void"},     .{"int"},       .{"string"},  .{"bool"},      .{"double"},    .{"float"},
+    .{"long"},     .{"short"},     .{"byte"},    .{"char"},      .{"object"},    .{"decimal"},
+    .{"true"},     .{"false"},     .{"null"},    .{"is"},        .{"as"},        .{"typeof"},
+    .{"try"},      .{"catch"},     .{"finally"}, .{"throw"},     .{"yield"},     .{"ref"},
+    .{"out"},      .{"in"},        .{"where"},   .{"get"},       .{"set"},       .{"partial"},
 });
 
 fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
@@ -1619,14 +1643,14 @@ fn lineEndOffset(ctx: *const Ctx, from: u32) u32 {
 // ---------------------------------------------------------------------------
 
 const js_keywords = KeywordSet.initComptime(.{
-    .{"const"},  .{"let"},    .{"var"},    .{"function"}, .{"return"}, .{"if"},
-    .{"else"},   .{"for"},    .{"while"},  .{"switch"},   .{"case"},   .{"break"},
-    .{"continue"}, .{"class"}, .{"extends"}, .{"new"},    .{"async"},  .{"await"},
-    .{"import"}, .{"export"}, .{"from"},   .{"default"},  .{"typeof"}, .{"instanceof"},
-    .{"this"},   .{"super"},  .{"try"},    .{"catch"},    .{"finally"}, .{"throw"},
-    .{"yield"},  .{"static"}, .{"get"},    .{"set"},      .{"of"},     .{"in"},
-    .{"true"},   .{"false"},  .{"null"},   .{"undefined"}, .{"void"},  .{"delete"},
-    .{"interface"}, .{"type"}, .{"enum"},  .{"public"},   .{"private"}, .{"readonly"},
+    .{"const"},     .{"let"},    .{"var"},     .{"function"},  .{"return"},  .{"if"},
+    .{"else"},      .{"for"},    .{"while"},   .{"switch"},    .{"case"},    .{"break"},
+    .{"continue"},  .{"class"},  .{"extends"}, .{"new"},       .{"async"},   .{"await"},
+    .{"import"},    .{"export"}, .{"from"},    .{"default"},   .{"typeof"},  .{"instanceof"},
+    .{"this"},      .{"super"},  .{"try"},     .{"catch"},     .{"finally"}, .{"throw"},
+    .{"yield"},     .{"static"}, .{"get"},     .{"set"},       .{"of"},      .{"in"},
+    .{"true"},      .{"false"},  .{"null"},    .{"undefined"}, .{"void"},    .{"delete"},
+    .{"interface"}, .{"type"},   .{"enum"},    .{"public"},    .{"private"}, .{"readonly"},
 });
 
 fn parseJsScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
@@ -2133,12 +2157,12 @@ fn stripQuotes(s: []const u8) []const u8 {
 // ---------------------------------------------------------------------------
 
 const py_keywords = KeywordSet.initComptime(.{
-    .{"def"},    .{"class"},  .{"return"}, .{"if"},     .{"elif"},   .{"else"},
-    .{"for"},    .{"while"},  .{"import"}, .{"from"},   .{"as"},     .{"with"},
-    .{"try"},    .{"except"}, .{"finally"}, .{"raise"}, .{"pass"},   .{"break"},
-    .{"continue"}, .{"and"},  .{"or"},     .{"not"},    .{"in"},     .{"is"},
-    .{"lambda"}, .{"yield"},  .{"await"},  .{"async"},  .{"global"}, .{"nonlocal"},
-    .{"True"},   .{"False"},  .{"None"},   .{"self"},   .{"del"},    .{"assert"},
+    .{"def"},      .{"class"},  .{"return"},  .{"if"},    .{"elif"},   .{"else"},
+    .{"for"},      .{"while"},  .{"import"},  .{"from"},  .{"as"},     .{"with"},
+    .{"try"},      .{"except"}, .{"finally"}, .{"raise"}, .{"pass"},   .{"break"},
+    .{"continue"}, .{"and"},    .{"or"},      .{"not"},   .{"in"},     .{"is"},
+    .{"lambda"},   .{"yield"},  .{"await"},   .{"async"}, .{"global"}, .{"nonlocal"},
+    .{"True"},     .{"False"},  .{"None"},    .{"self"},  .{"del"},    .{"assert"},
 });
 
 const PyScope = struct { indent: u32, local_idx: u32, is_class: bool };
@@ -2329,7 +2353,7 @@ fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_met
         .span_start = lineStartOffset(ctx, start_i),
         .span_end = span_end,
         .sig_end = sig_end,
-        .doc = collectDoc(ctx, start_i),
+        .doc = collectPyDoc(ctx, start_i, body_lo, term),
         .exported = ctx.source[ctx.toks[name_i].start] != '_',
         .modifiers = mods,
         .parent_local = parent,
@@ -2347,6 +2371,7 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
     const term = pyBlockEnd(ctx, block_from, indent, hi);
     const span_end = if (term < hi) lineStartTrimEnd(ctx, term) else @as(u32, @intCast(ctx.source.len));
     const sig_end = if (colon != sentinel) ctx.toks[colon].end else ctx.toks[name_i].end;
+    const body_lo = if (colon != sentinel) colon + 1 else name_i + 1;
     return emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = .class,
@@ -2354,7 +2379,7 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
         .span_start = lineStartOffset(ctx, start_i),
         .span_end = span_end,
         .sig_end = sig_end,
-        .doc = collectDoc(ctx, start_i),
+        .doc = collectPyDoc(ctx, start_i, body_lo, term),
         .exported = ctx.source[ctx.toks[name_i].start] != '_',
         .parent_local = parent,
         .refs = &.{},
@@ -2406,10 +2431,10 @@ fn lineStartTrimEnd(ctx: *const Ctx, term: u32) u32 {
 // ---------------------------------------------------------------------------
 
 const lua_keywords = KeywordSet.initComptime(.{
-    .{"and"},   .{"break"}, .{"do"},    .{"else"},   .{"elseif"}, .{"end"},
-    .{"false"}, .{"for"},   .{"function"}, .{"goto"}, .{"if"},    .{"in"},
-    .{"local"}, .{"nil"},   .{"not"},   .{"or"},     .{"repeat"}, .{"return"},
-    .{"then"},  .{"true"},  .{"until"}, .{"while"},  .{"self"},
+    .{"and"},   .{"break"}, .{"do"},       .{"else"},  .{"elseif"}, .{"end"},
+    .{"false"}, .{"for"},   .{"function"}, .{"goto"},  .{"if"},     .{"in"},
+    .{"local"}, .{"nil"},   .{"not"},      .{"or"},    .{"repeat"}, .{"return"},
+    .{"then"},  .{"true"},  .{"until"},    .{"while"}, .{"self"},
 });
 
 /// The name a Lua function definition binds: `function a.b:c(...)` yields the
@@ -2646,11 +2671,11 @@ fn parseLuaTableFields(ctx: *Ctx, open: u32, close: u32, parent: u32) !void {
 // ---------------------------------------------------------------------------
 
 const go_keywords = KeywordSet.initComptime(.{
-    .{"break"},  .{"case"},    .{"chan"},   .{"const"},  .{"continue"}, .{"default"},
-    .{"defer"},  .{"else"},    .{"fallthrough"}, .{"for"}, .{"func"},   .{"go"},
-    .{"goto"},   .{"if"},      .{"import"}, .{"interface"}, .{"map"},    .{"package"},
-    .{"range"},  .{"return"},  .{"select"}, .{"struct"}, .{"switch"},   .{"type"},
-    .{"var"},    .{"nil"},     .{"true"},   .{"false"},
+    .{"break"}, .{"case"},   .{"chan"},        .{"const"},     .{"continue"}, .{"default"},
+    .{"defer"}, .{"else"},   .{"fallthrough"}, .{"for"},       .{"func"},     .{"go"},
+    .{"goto"},  .{"if"},     .{"import"},      .{"interface"}, .{"map"},      .{"package"},
+    .{"range"}, .{"return"}, .{"select"},      .{"struct"},    .{"switch"},   .{"type"},
+    .{"var"},   .{"nil"},    .{"true"},        .{"false"},
 });
 
 /// A Go identifier is exported when its first letter is upper-case.
@@ -3028,13 +3053,13 @@ fn emitGoImport(ctx: *Ctx, str_i: u32) AllocError!void {
 // ---------------------------------------------------------------------------
 
 const rust_keywords = KeywordSet.initComptime(.{
-    .{"as"},     .{"break"},  .{"const"},  .{"continue"}, .{"crate"},  .{"dyn"},
-    .{"else"},   .{"enum"},   .{"extern"}, .{"false"},    .{"fn"},     .{"for"},
-    .{"if"},     .{"impl"},   .{"in"},     .{"let"},      .{"loop"},   .{"match"},
-    .{"mod"},    .{"move"},   .{"mut"},    .{"pub"},      .{"ref"},    .{"return"},
-    .{"self"},   .{"Self"},   .{"static"}, .{"struct"},   .{"super"},  .{"trait"},
-    .{"true"},   .{"type"},   .{"union"},  .{"unsafe"},   .{"use"},    .{"where"},
-    .{"while"},  .{"async"},  .{"await"},
+    .{"as"},    .{"break"}, .{"const"},  .{"continue"}, .{"crate"}, .{"dyn"},
+    .{"else"},  .{"enum"},  .{"extern"}, .{"false"},    .{"fn"},    .{"for"},
+    .{"if"},    .{"impl"},  .{"in"},     .{"let"},      .{"loop"},  .{"match"},
+    .{"mod"},   .{"move"},  .{"mut"},    .{"pub"},      .{"ref"},   .{"return"},
+    .{"self"},  .{"Self"},  .{"static"}, .{"struct"},   .{"super"}, .{"trait"},
+    .{"true"},  .{"type"},  .{"union"},  .{"unsafe"},   .{"use"},   .{"where"},
+    .{"while"}, .{"async"}, .{"await"},
 });
 
 /// Whether `pub` appears as a modifier in [lo, kw_i) — the export marker.
@@ -3468,12 +3493,12 @@ fn parseRustMacro(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) 
 // ---------------------------------------------------------------------------
 
 const ruby_keywords = KeywordSet.initComptime(.{
-    .{"def"},     .{"end"},    .{"if"},     .{"elsif"},  .{"else"},   .{"unless"},
-    .{"while"},   .{"until"},  .{"for"},    .{"in"},     .{"do"},     .{"begin"},
-    .{"rescue"},  .{"ensure"}, .{"retry"},  .{"return"}, .{"yield"},  .{"then"},
-    .{"case"},    .{"when"},   .{"class"},  .{"module"}, .{"self"},   .{"nil"},
-    .{"true"},    .{"false"},  .{"and"},    .{"or"},     .{"not"},    .{"super"},
-    .{"break"},   .{"next"},   .{"redo"},   .{"require"}, .{"require_relative"},
+    .{"def"},    .{"end"},    .{"if"},    .{"elsif"},   .{"else"},             .{"unless"},
+    .{"while"},  .{"until"},  .{"for"},   .{"in"},      .{"do"},               .{"begin"},
+    .{"rescue"}, .{"ensure"}, .{"retry"}, .{"return"},  .{"yield"},            .{"then"},
+    .{"case"},   .{"when"},   .{"class"}, .{"module"},  .{"self"},             .{"nil"},
+    .{"true"},   .{"false"},  .{"and"},   .{"or"},      .{"not"},              .{"super"},
+    .{"break"},  .{"next"},   .{"redo"},  .{"require"}, .{"require_relative"},
 });
 
 /// Whether the `do` at `i` merely re-marks a block already opened by a
@@ -4807,13 +4832,15 @@ fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {
 
 fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     for (out.items) |s| {
-        for (s.refs) |ref| if (ref.lines.len != 0) testing.allocator.free(ref.lines);
+        for (s.refs) |ref| {
+            if (ref.lines.len != 0) testing.allocator.free(ref.lines);
+            if (ref.offsets.len != 0) testing.allocator.free(ref.offsets);
+        }
         if (s.refs.len != 0) testing.allocator.free(s.refs);
         if (s.bindings.len != 0) testing.allocator.free(s.bindings);
     }
     out.deinit(testing.allocator);
 }
-
 
 // ===========================================================================
 // APPENDED TESTS — parser.zig hardening
@@ -4823,12 +4850,12 @@ fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
 
 test "edge: empty source yields no symbols across languages" {
     inline for (.{
-        language.Language.zig,      language.Language.c,
-        language.Language.cpp,      language.Language.csharp,
-        language.Language.python,   language.Language.javascript,
+        language.Language.zig,        language.Language.c,
+        language.Language.cpp,        language.Language.csharp,
+        language.Language.python,     language.Language.javascript,
         language.Language.typescript, language.Language.tsx,
-        language.Language.lua,      language.Language.go,
-        language.Language.rust,     language.Language.ruby,
+        language.Language.lua,        language.Language.go,
+        language.Language.rust,       language.Language.ruby,
     }) |lang| {
         var out = try parseForTest("", lang);
         defer freeRefs(&out);
@@ -5768,4 +5795,34 @@ test "python: kwarg labels are typed writes and loop/context variables stay loca
     }
     try testing.expect(saw_envvar); // `for envvar in …`
     try testing.expect(saw_handle); // `with … as handle`
+}
+
+test "references retain every exact source offset for rename planning" {
+    const src = "function run() { helper(); helper(); }";
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    const run = findSym(out.items, "run").?;
+    const helper = for (run.refs) |ref| {
+        if (std.mem.eql(u8, ref.name, "helper")) break ref;
+    } else unreachable;
+    try testing.expectEqual(helper.count, helper.offsets.len);
+    try testing.expectEqual(@as(usize, 2), helper.offsets.len);
+    for (helper.offsets) |offset| {
+        try testing.expect(offset + helper.name.len <= src.len);
+        try testing.expectEqualStrings("helper", src[offset .. offset + helper.name.len]);
+    }
+}
+
+test "python docstrings attach to function and class symbols" {
+    const src =
+        \\class Service:
+        \\    """Service contract."""
+        \\    def run(self):
+        \\        """Run one request."""
+        \\        return work()
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    try testing.expectEqualStrings("\"\"\"Service contract.\"\"\"", findSym(out.items, "Service").?.doc);
+    try testing.expectEqualStrings("\"\"\"Run one request.\"\"\"", findSym(out.items, "run").?.doc);
 }
