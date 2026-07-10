@@ -8,8 +8,8 @@ const model = @import("model.zig");
 
 pub const Command = enum {
     outline, def, calls, callers, search, routes, events, conforms,
-    neighbors, unused, imports, importers, path, hot, diff,
-    files, read, strings, coverage, graph, help,
+    neighbors, unused, imports, importers, path, flow, hot, diff,
+    collisions, files, read, strings, coverage, graph, help,
 };
 
 pub const Parsed = struct {
@@ -73,6 +73,8 @@ const usage_text =
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
+    \\  flow <symbol>      Writers and readers of a field/value; --to traces a sink
+    \\  collisions [pat]   Group duplicate definition names (alias: duplicates)
     \\  diff [ref]         Symbols changed since <ref> (default HEAD) + their callers
     \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
     \\  files [filter]     List every indexed file + its symbol count (index coverage);
@@ -93,7 +95,15 @@ const usage_text =
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  -p, --vis <public|private|all>          Visibility for outline/search/def (default: all)
     \\  --public, --private, --no-private       Visibility shortcuts
-    \\  --sort <path|symbols>                  files: order by path (default) or symbol count
+    \\  --sort <key>                         files: path|symbols; outline/search:
+    \\                                         line|name|span|callers|callees; hot:
+    \\                                         fan_in|fan_in_exact|fan_out|fan_out_exact|span
+    \\  -w, --writers / --readers             flow/search --refs: access direction
+    \\  -u, --unread                          Keep written-but-never-read data
+    \\  --on-type <Type>                      Type-scope member flow/reference hits
+    \\  --to <sink>                           flow: trace producer-to-consumer path
+    \\  --duplicates                         search: group duplicate definitions
+    \\  --members                            collisions: include class members
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
     \\  -e, --exact                            search: name must equal the pattern
     \\                                         (finds `Order` without every `createOrder`)
@@ -224,6 +234,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "unused", Command.unused },   .{ "dead", Command.unused },
         .{ "imports", Command.imports }, .{ "importers", Command.importers },
         .{ "path", Command.path },
+        .{ "flow", Command.flow },       .{ "dataflow", Command.flow },
+        .{ "collisions", Command.collisions }, .{ "duplicates", Command.collisions },
         .{ "diff", Command.diff },       .{ "changed", Command.diff },
         .{ "hot", Command.hot },         .{ "central", Command.hot },
         .{ "files", Command.files },     .{ "manifest", Command.files },
@@ -246,7 +258,7 @@ fn parseCommand(s: []const u8) ?Command {
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage, .graph => true,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage, .graph, .collisions => true,
         .path => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
@@ -292,8 +304,18 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (eqAny(f.name, &.{ "--sort" })) {
         const val = try f.value(args, i, f.name);
-        out.options.file_sort = query.FileSort.parse(val) orelse
-            return fail(error.BadValue, "invalid value '{s}' for --sort (expected path|symbols)", .{val});
+        if (out.command == .files) {
+            out.options.file_sort = query.FileSort.parse(val) orelse
+                return fail(error.BadValue, "invalid files --sort '{s}' (expected path|symbols)", .{val});
+        } else {
+            out.options.sort = query.SortKey.parse(val) orelse
+                return fail(error.BadValue, "invalid ranking --sort '{s}'", .{val});
+        }
+        return f.next(i);
+    }
+    if (eqAny(f.name, &.{ "--on-type", "--to" })) {
+        const val = try f.value(args, i, f.name);
+        if (std.mem.eql(u8, f.name, "--on-type")) out.options.on_type = val else out.options.flow_to = val;
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-t", "--tests" })) {
@@ -345,6 +367,26 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (std.mem.eql(u8, f.name, "--orphan-calls")) {
         out.options.routes_orphan_calls = true;
+        return i;
+    }
+    if (eqAny(f.name, &.{ "-w", "--writers" })) {
+        out.options.writers = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--readers")) {
+        out.options.readers = true;
+        return i;
+    }
+    if (eqAny(f.name, &.{ "-u", "--unread" })) {
+        out.options.unread = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--duplicates")) {
+        out.options.duplicates = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--members")) {
+        out.options.collision_members = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-s", "--strict" })) {
@@ -437,8 +479,27 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
     if (opts.routes_orphan_calls and (opts.routes_clients or opts.routes_unhit or opts.routes_handler.len != 0))
         return fail(error.Usage, "--orphan-calls cannot be combined with --clients, --unhit, or --handler", .{});
     const vis_set = opts.visibility != .all;
-    if (vis_set and parsed.command != .outline and parsed.command != .search and parsed.command != .def)
-        return fail(error.Usage, "visibility flags apply only to outline, search, and def", .{});
+    if (vis_set and parsed.command != .outline and parsed.command != .search and parsed.command != .def and parsed.command != .collisions)
+        return fail(error.Usage, "visibility flags apply only to outline, search, def, and collisions", .{});
+    if (opts.writers and opts.readers)
+        return fail(error.Usage, "--writers and --readers are mutually exclusive", .{});
+    const flow_filter = opts.writers or opts.readers or opts.unread or opts.on_type.len != 0;
+    if (flow_filter and parsed.command != .flow and !(parsed.command == .search and opts.refs))
+        return fail(error.Usage, "flow filters apply only to flow or search --refs", .{});
+    if (opts.flow_to.len != 0 and parsed.command != .flow)
+        return fail(error.Usage, "--to applies only to flow", .{});
+    if (opts.duplicates and (parsed.command != .search or opts.refs))
+        return fail(error.Usage, "--duplicates applies only to definition search", .{});
+    if (opts.collision_members and parsed.command != .collisions)
+        return fail(error.Usage, "--members applies only to collisions", .{});
+    if (opts.sort != .default) {
+        if (parsed.command != .outline and parsed.command != .search and parsed.command != .hot)
+            return fail(error.Usage, "ranking --sort applies only to outline, search, and hot", .{});
+        if (parsed.command == .hot and (opts.sort == .line or opts.sort == .name or opts.sort == .callers or opts.sort == .callees))
+            return fail(error.BadValue, "hot --sort expects fan_in|fan_in_exact|fan_out|fan_out_exact|span", .{});
+        if (parsed.command != .hot and (opts.sort == .fan_in or opts.sort == .fan_in_exact or opts.sort == .fan_out or opts.sort == .fan_out_exact))
+            return fail(error.BadValue, "outline/search --sort expects line|name|span|callers|callees", .{});
+    }
 }
 
 fn parseUint(s: []const u8, flag: []const u8) ParseError!u32 {
@@ -592,6 +653,8 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.imports, parseCommand("imports").?);
     try std.testing.expectEqual(Command.importers, parseCommand("importers").?);
     try std.testing.expectEqual(Command.path, parseCommand("path").?);
+    try std.testing.expectEqual(Command.flow, parseCommand("flow").?);
+    try std.testing.expectEqual(Command.collisions, parseCommand("collisions").?);
     try std.testing.expectEqual(Command.diff, parseCommand("diff").?);
     try std.testing.expectEqual(Command.hot, parseCommand("hot").?);
     try std.testing.expectEqual(Command.files, parseCommand("files").?);
@@ -613,6 +676,8 @@ test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.events, parseCommand("bus").?);
     try std.testing.expectEqual(Command.neighbors, parseCommand("near").?);
     try std.testing.expectEqual(Command.unused, parseCommand("dead").?);
+    try std.testing.expectEqual(Command.flow, parseCommand("dataflow").?);
+    try std.testing.expectEqual(Command.collisions, parseCommand("duplicates").?);
     try std.testing.expectEqual(Command.diff, parseCommand("changed").?);
     try std.testing.expectEqual(Command.hot, parseCommand("central").?);
     try std.testing.expectEqual(Command.files, parseCommand("manifest").?);
@@ -643,6 +708,24 @@ test "phase 1 commands and scoped flags parse" {
     try testing.expectError(error.Usage, parse(&.{ "search", "x", "--impls" }));
     try testing.expectError(error.Usage, parse(&.{ "calls", "x", "--clients" }));
     try testing.expectError(error.Usage, parse(&.{ "routes", "--orphan-calls", "--unhit" }));
+}
+
+test "phase 2 commands, ranking, and flow flags parse" {
+    const flow_cmd = try parse(&.{ "flow", "Record.value", "--writers", "--on-type", "Record", "--to", "sink" });
+    try std.testing.expectEqual(Command.flow, flow_cmd.command);
+    try std.testing.expect(flow_cmd.options.writers);
+    try std.testing.expectEqualStrings("Record", flow_cmd.options.on_type);
+    try std.testing.expectEqualStrings("sink", flow_cmd.options.flow_to);
+
+    const ranked = try parse(&.{ "outline", "src", "--sort", "span" });
+    try std.testing.expectEqual(query.SortKey.span, ranked.options.sort);
+    const duplicates = try parse(&.{ "search", "Graph", "--duplicates" });
+    try std.testing.expect(duplicates.options.duplicates);
+    const groups = try parse(&.{ "collisions", "Graph", "--members" });
+    try std.testing.expectEqual(Command.collisions, groups.command);
+    try std.testing.expect(groups.options.collision_members);
+    try std.testing.expectError(error.Usage, parse(&.{ "flow", "x", "--writers", "--readers" }));
+    try std.testing.expectError(error.BadValue, parse(&.{ "hot", "--sort", "callers" }));
 }
 
 test "parseCommand: unknown and empty return null" {
@@ -936,11 +1019,12 @@ test "usage documents every command and phase flags (drift guard)" {
     inline for (@typeInfo(Command).@"enum".fields) |f| {
         try testing.expect(std.mem.indexOf(u8, out, f.name) != null);
     }
-    // Unified test-scope and Phase 1 flags are documented.
+    // Unified test-scope and Phase 1/2 flags are documented.
     for ([_][]const u8{
         "--tests", "--no-tests", "--tests-only", "--no-public",
         "--impls", "--vis", "--public", "--private", "--clients", "--unhit",
-        "--orphan-calls", "--handler", "parse-health", "⇒impl",
+        "--orphan-calls", "--handler", "--writers", "--readers", "--unread",
+        "--on-type", "--to", "--duplicates", "--members", "parse-health", "⇒impl",
     }) |flag| {
         try testing.expect(std.mem.indexOf(u8, out, flag) != null);
     }

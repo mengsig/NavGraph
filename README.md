@@ -100,6 +100,8 @@ navgraph <command> [arg] [flags]
 | `imports [filter]` | Modules each file imports (local dependency edges).           |
 | `importers <file>` | Files that import `<file>`.                                    |
 | `path <A> <B>`     | Shortest call path from `<A>` to `<B>`.                        |
+| `flow <symbol>`    | Directional data view: writers/producers and readers/consumers; `--to <sink>` traces through value handoffs. Alias: `dataflow`. |
+| `collisions [pattern]` | Group duplicate definition names and locations; `--members` includes methods/fields. Alias: `duplicates`. |
 | `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
 | `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
@@ -120,7 +122,13 @@ navgraph <command> [arg] [flags]
 | `-k, --kind <k1,k2>`          | Restrict `outline`/`search` to kinds (`fn`, `struct`, …). |
 | `-p, --vis <scope>`            | Visibility for `outline`/`search`/`def`: `public`, `private`, or `all` (default). Shortcuts: `--public`, `--private`, `--no-private`. |
 | `-t, --tests <with\|without\|only>` | Unified test-scope for `outline`/`search`/`callers`/`hot`/`unused`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
-| `-r, --refs`                  | `search`: match use sites; `calls`/`neighbors`: include var/const/field reads. |
+| `-r, --refs`                  | `search`: match use sites with `[w]`/`[r]` access tags; `calls`/`neighbors`: include var/const/field reads. |
+| `-w, --writers` / `--readers` | Filter `flow` or `search --refs` by access direction. |
+| `-u, --unread`                | Keep values that are written but never read. |
+| `--on-type <Type>`            | Type-scope member hits using receiver bindings or constructor context. |
+| `--to <sink>`                 | `flow`: trace a producer through a data node to a consuming sink. |
+| `--duplicates`                | `search`: group duplicate definitions instead of listing individual matches. |
+| `--members`                   | `collisions`: include class/container members. |
 | `-e, --exact`                 | `search`: name must equal the pattern (no substring hits). |
 | `--no-recurse`                | `outline`/`files`: only files directly in the given dir, not subtrees. |
 | `-s, --strict`                | Follow only high-confidence edges (drop heuristic `?` edges, including structural implementation edges). |
@@ -130,7 +138,7 @@ navgraph <command> [arg] [flags]
 | `--orphan-calls`              | `routes`: show client calls that match no indexed route. |
 | `--handler <glob>`            | `routes`: select routes by handler name. |
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
-| `--sort <path\|symbols>`      | `files`: order by path (default) or symbol count. |
+| `--sort <key>`                | `files`: `path|symbols`; `outline`/`search`: `line|name|span|callers|callees`; `hot`: `fan_in|fan_in_exact|fan_out|fan_out_exact|span`. Numeric metrics rank descending with stable path/line ties. |
 | `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild.  |
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
 | `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
@@ -156,6 +164,29 @@ prints how many definitions matched and the `Parent.name` / `name@path` pin
 syntax.
 
 ## Examples
+
+Find who writes and reads a field, or trace the handoff to a sink:
+
+```sh
+navgraph flow Record.value
+navgraph flow Record.value --to serialize
+navgraph search value --refs --on-type Record --writers
+```
+
+Flow direction is captured per reference site. Direct assignments and constructor
+keyword labels are writes, augmented assignments are both read and write, and
+constructor calls are producers for type symbols. Receiver type scoping uses
+existing annotations and local bindings; dynamic/reflected receivers remain
+best-effort and unresolved edges are never promoted to exact matches.
+
+Rank the largest definitions and audit ambiguous names without shell pipelines:
+
+```sh
+navgraph outline src -k fn --sort span -l 10
+navgraph hot src --sort fan_out_exact
+navgraph collisions -k struct,fn
+navgraph search Graph --duplicates
+```
 
 Outline a file at signature detail:
 

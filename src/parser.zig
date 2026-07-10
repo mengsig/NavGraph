@@ -510,24 +510,25 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (t.kind != .identifier) continue;
         const name = t.text(ctx.source);
         if (name.len < 2 or kw.has(name)) continue;
-        const qualifier = memberQualifier(ctx, i, lo);
+        const member_qualifier = memberQualifier(ctx, i, lo);
+        const assignment = assignmentAccess(ctx, i, hi);
+        const qualifier = if (assignment.write and member_qualifier.len == 0)
+            enclosingCallQualifier(ctx, i, lo)
+        else
+            member_qualifier;
         // Skip only a *bare* self-reference (recursion noise). A qualified call
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
         // A JS/TS object-literal property key (`{ count: ... }`) names a field,
         // not a reference to a same-named binding — don't emit an edge for it.
-        if (qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
-        // A Python identifier directly before `=` (and not `==`) is a keyword-
-        // argument label (`f(envvar="X")`) or an assignment target — a name
-        // being *bound*, not read. Emitting it as a ref let kwargs bind
-        // cross-file to any same-named global (a trial's false-arrow report).
-        if (qualifier.len == 0 and ctx.cfg.language.family() == .python and
-            ctx.isPunct(i + 1, '=') and !ctx.isPunct(i + 2, '='))
-        {
-            continue;
-        }
+        if (member_qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
         const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
-        try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call);
+        if (assignment.read) {
+            try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call, false);
+        }
+        if (assignment.write) {
+            try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, false, true);
+        }
     }
     // Keep the distinct-line list only when a ref spans more than one line; a
     // single-site ref falls back to `line` and needs no allocation.
@@ -540,10 +541,56 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     };
 }
 
+/// Classify a direct assignment target. Augmented assignment is both a read and
+/// a write; comparisons remain reads.
+fn assignmentAccess(ctx: *const Ctx, i: u32, hi: u32) struct { read: bool, write: bool } {
+    std.debug.assert(i < hi);
+    std.debug.assert(hi <= ctx.toks.len);
+    if (i + 1 >= hi) return .{ .read = true, .write = false };
+    if (ctx.isPunct(i + 1, '=') and (i + 2 >= hi or !ctx.isPunct(i + 2, '=')))
+        return .{ .read = false, .write = true };
+    if (i + 2 < hi and ctx.cfg.language.family() == .go and ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, '='))
+        return .{ .read = false, .write = true };
+    if (i + 2 < hi and ((ctx.isPunct(i + 1, '+') and ctx.isPunct(i + 2, '+')) or
+        (ctx.isPunct(i + 1, '-') and ctx.isPunct(i + 2, '-'))))
+    {
+        return .{ .read = true, .write = true };
+    }
+    const compound = ctx.isPunct(i + 1, '+') or ctx.isPunct(i + 1, '-') or
+        ctx.isPunct(i + 1, '*') or ctx.isPunct(i + 1, '/') or ctx.isPunct(i + 1, '%') or
+        ctx.isPunct(i + 1, '&') or ctx.isPunct(i + 1, '|') or ctx.isPunct(i + 1, '^');
+    if (i + 2 < hi and compound and ctx.isPunct(i + 2, '=')) return .{ .read = true, .write = true };
+    if (i + 3 < hi and compound and ctx.ch(i + 1) == ctx.ch(i + 2) and ctx.isPunct(i + 3, '='))
+        return .{ .read = true, .write = true };
+    return .{ .read = true, .write = false };
+}
+
+fn enclosingCallQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+    std.debug.assert(lo <= i);
+    std.debug.assert(i < ctx.toks.len);
+    var depth: u32 = 0;
+    var j = i;
+    while (j > lo) {
+        j -= 1;
+        if (ctx.isPunct(j, ')') or ctx.isPunct(j, ']') or ctx.isPunct(j, '}')) {
+            depth += 1;
+            continue;
+        }
+        const opening = ctx.isPunct(j, '(') or ctx.isPunct(j, '[') or ctx.isPunct(j, '{');
+        if (!opening) continue;
+        if (depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        if (!ctx.isPunct(j, '(')) return "";
+        if (j > lo and ctx.toks[j - 1].kind == .identifier) return ctx.textOf(j - 1);
+        return "";
+    }
+    return "";
+}
+
 /// If token `i` is the trailing member of a member access, return the receiver
-/// identifier; otherwise "". Recognizes `recv.name` (all languages) and the
-/// C/C++ two-punct operators `recv->name` and `Scope::name`, so instance and
-/// static dispatch there is visible to resolution. `lo` bounds the body start.
+/// identifier; otherwise "".
 fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     // `recv.name`
     if (i >= lo + 2 and ctx.isPunct(i - 1, '.') and ctx.toks[i - 2].kind == .identifier)
@@ -582,10 +629,14 @@ fn recordRef(
     qualifier: []const u8,
     line: u32,
     is_call: bool,
+    write: bool,
 ) !void {
-    // Dedup on (qualifier, name) so `a.foo()` and `b.foo()` stay distinct.
+    std.debug.assert(name.len > 0);
+    std.debug.assert(!is_call or !write);
+    // Direction participates in deduplication so a read and write of the same
+    // member retain separate source lines and access modes.
     var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ qualifier, name }) catch name;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}\x00{c}", .{ qualifier, name, if (write) @as(u8, 'w') else 'r' }) catch name;
     if (seen.get(key)) |idx| {
         var r = &refs.items[idx];
         r.count += 1;
@@ -602,6 +653,7 @@ fn recordRef(
         .qualifier = qualifier,
         .line = line,
         .kind = if (is_call) .call else .read,
+        .write = write,
         .count = 1,
     });
     var ll: std.ArrayList(u32) = .empty;
@@ -5664,7 +5716,30 @@ test "go: a /vN module import binds the real package name, not the version segme
     try testing.expect(findSym(out.items, "v2") == null);
 }
 
-test "python: kwarg labels and loop/context variables are not references" {
+test "write classification covers direct, augmented, increment, and Go declaration assignment" {
+    var js = try parseForTest("function run(obj) { obj.value = 1; obj.value += 2; obj.value++; }", .javascript);
+    defer freeRefs(&js);
+    const run = findSym(js.items, "run").?;
+    var reads: u32 = 0;
+    var writes: u32 = 0;
+    for (run.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "value")) continue;
+        if (ref.write) writes += ref.count else reads += ref.count;
+    }
+    try testing.expectEqual(@as(u32, 3), writes);
+    try testing.expectEqual(@as(u32, 2), reads);
+
+    var go = try parseForTest("package p\nfunc run() { value := 1; _ = value }\n", .go);
+    defer freeRefs(&go);
+    const go_run = findSym(go.items, "run").?;
+    var saw_declaration_write = false;
+    for (go_run.refs) |ref| if (std.mem.eql(u8, ref.name, "value") and ref.write) {
+        saw_declaration_write = true;
+    };
+    try testing.expect(saw_declaration_write);
+}
+
+test "python: kwarg labels are typed writes and loop/context variables stay local" {
     const src =
         \\def use(envvar, done):
         \\    configure(envvar="PATH")
@@ -5676,14 +5751,15 @@ test "python: kwarg labels and loop/context variables are not references" {
     var out = try parseForTest(src, .python);
     defer freeRefs(&out);
     const use = findSym(out.items, "use").?;
-    // The kwarg label on line 2 is skipped at collection; the only remaining
-    // `envvar` mentions are the loop sites, and the loop variable is a recorded
-    // local binding — so resolution will never bind them cross-file.
+    var saw_kwarg_write = false;
     for (use.refs) |r| {
-        if (std.mem.eql(u8, r.name, "envvar")) {
-            try testing.expect(r.line != 2); // never the kwarg site
+        if (std.mem.eql(u8, r.name, "envvar") and r.line == 2) {
+            try testing.expect(r.write);
+            try testing.expectEqualStrings("configure", r.qualifier);
+            saw_kwarg_write = true;
         }
     }
+    try testing.expect(saw_kwarg_write);
     var saw_envvar = false;
     var saw_handle = false;
     for (use.bindings) |b| {

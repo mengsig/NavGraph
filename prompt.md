@@ -26,6 +26,8 @@ you at specific lines may you `read` those exact lines.
 | Tracing what a function does | `navgraph calls <name>` (`-d2` deeper) |
 | A function + its callers | `navgraph neighbors <name>` |
 | How A reaches B | `navgraph path <A> <B>` |
+| Who writes/reads a value | `navgraph flow <symbol>` (`--to <sink>` traces the handoff) |
+| Finding duplicate names | `navgraph collisions [pattern]` (`--members` includes members) |
 | Guessing what matters | `navgraph hot [path]` |
 | Scoping a branch's changes | `navgraph diff [ref]` (default HEAD, + callers) |
 | Finding dead code | `navgraph unused [filter]` (`--no-public` hides API) |
@@ -70,7 +72,11 @@ to navgraph to understand it.
   structural matches.
 - Use `conforms Port` instead of outlining every adapter and diffing signatures;
   use a class/method glob for a sibling divergence matrix.
-- `path A B` beats `calls A -d3` for "how does A reach B".
+- `path A B` beats `calls A -d3` for "how does A reach B". Use `flow field`
+  when the missing link is a write/read handoff rather than a call; add
+  `--to sink` for the producer-to-consumer chain.
+- Use `outline src -k fn --sort span -l 10` for largest-definition audits and
+  `collisions` instead of dumping names through `sort | uniq -d`.
 - Trust the JSON `parent` field for "which class owns this method".
 - Go: package-qualified calls resolve exactly; pin methods as `Type.method`; a
   shared name prints an N-definitions banner — pin it.
@@ -89,7 +95,13 @@ to navgraph to understand it.
 - `-t`/`--tests <with|without|only>` (aliases `--no-tests`, `--tests-only`) —
   test scope for outline/search/callers/hot/unused; default `with`.
 - `-C <path>` — index root (subtree or a single file).
-- `-j`/`--json` — stable JSON. `--sort path|symbols` (files).
+- `-j`/`--json` — stable JSON. `files --sort path|symbols`; `outline`/`search`
+  accept `line|name|span|callers|callees`; `hot` accepts
+  `fan_in|fan_in_exact|fan_out|fan_out_exact|span`.
+- Directional references: `-w`/`--writers`, `--readers`, `-u`/`--unread`, and
+  `--on-type Type` apply to `flow` or `search --refs`; rows are tagged `[w]`/`[r]`.
+- Duplicate audit: `search PAT --duplicates`; `collisions --members` includes
+  methods and fields.
 - Route views: `--clients`, `--unhit`, `--orphan-calls`, and
   `--handler <glob>`. Literal imported FastAPI `include_router` prefixes are
   applied automatically before route/client matching.

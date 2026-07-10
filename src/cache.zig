@@ -26,7 +26,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE6";
+const magic = "NGCACHE7";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -143,6 +143,7 @@ fn skipSymbol(cur: *Cursor) !void {
         _ = try cur.getStr(); // qualifier
         _ = try cur.getU32(); // line
         _ = try cur.getU8(); // kind
+        _ = try cur.getU8(); // write
         _ = try cur.getU32(); // count
         const nlines = try cur.getU32(); // distinct call-site lines
         var l: u32 = 0;
@@ -208,6 +209,7 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
         const qualifier = try arena.dupe(u8, try cur.getStr());
         const line = try cur.getU32();
         const kind = try cur.getRefKind();
+        const is_write = try cur.getU8() != 0;
         const count = try cur.getU32();
         const nlines = try cur.getU32();
         const lines = try arena.alloc(u32, nlines);
@@ -217,6 +219,7 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
             .qualifier = qualifier,
             .line = line,
             .kind = kind,
+            .write = is_write,
             .count = count,
             .lines = lines,
         };
@@ -301,6 +304,7 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
         try putStr(gpa, buf, ref.qualifier);
         try putU32(gpa, buf, ref.line);
         try buf.append(gpa, @intFromEnum(ref.kind));
+        try buf.append(gpa, @intFromBool(ref.write));
         try putU32(gpa, buf, ref.count);
         try putU32(gpa, buf, @intCast(ref.lines.len));
         for (ref.lines) |ln| try putU32(gpa, buf, ln);
@@ -499,6 +503,7 @@ const TestRef = struct {
     qualifier: []const u8 = "",
     line: u32 = 1,
     kind: u8 = 0,
+    write: bool = false,
     count: u32 = 1,
     lines: []const u32 = &[_]u32{},
 };
@@ -535,6 +540,7 @@ fn encSym(
         try putStr(a, buf, r.qualifier);
         try putU32(a, buf, r.line);
         try putU8(a, buf, r.kind);
+        try putU8(a, buf, @intFromBool(r.write));
         try putU32(a, buf, r.count);
         try putU32(a, buf, @intCast(r.lines.len));
         for (r.lines) |ln| try putU32(a, buf, ln);
@@ -603,6 +609,7 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
         try t.expectEqualStrings(er.qualifier, gr.qualifier);
         try t.expectEqual(er.line, gr.line);
         try t.expectEqual(er.kind, gr.kind);
+        try t.expectEqual(er.write, gr.write);
         try t.expectEqual(er.count, gr.count);
         try t.expectEqualSlices(u32, er.lines, gr.lines);
     }
@@ -634,7 +641,7 @@ test "full round-trip preserves every field across two files with distinct langu
         .{ .name = "w", .type_name = "Widget" },
     };
     var refs3 = [_]Reference{
-        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .count = 2, .lines = &[_]u32{ 5, 6 } },
+        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .write = true, .count = 2, .lines = &[_]u32{ 5, 6 } },
     };
 
     var syms = [_]model.Symbol{

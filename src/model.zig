@@ -122,6 +122,9 @@ pub const Reference = struct {
     /// First line (1-based) where this name is referenced in the body.
     line: u32,
     kind: RefKind,
+    /// Access direction at this site. Calls and ordinary uses read; assignment
+    /// targets and constructor keyword labels write.
+    write: bool = false,
     /// Number of times this name is referenced within the owning symbol's body.
     count: u32 = 1,
     /// The distinct 1-based lines this name is referenced on, in source order

@@ -622,6 +622,15 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         }
         // Known receiver but no such member here (an inherited/mixin method, or
         // an external type): fall through to the heuristic call match below.
+    } else if (ref.write) {
+        // Constructor keyword writes carry the constructed type as qualifier.
+        // Resolve only against a member of that type; never global-name guess.
+        const m = memberOfType(idx, from.file, ref.qualifier, ref.name);
+        if (m.id != invalid) {
+            ref.target = m.id;
+            ref.exact = m.unambiguous;
+            return;
+        }
     } else if (importTarget(idx, from.file, ref.qualifier)) |file_id| {
         ref.target = topLevelIn(idx, file_id, ref.name);
         if (ref.target != invalid) {

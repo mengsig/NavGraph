@@ -88,6 +88,21 @@ pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !
 
 /// Substring search: a JSON array of matching symbol objects. Returns whether
 /// any symbol matched.
+pub fn rankedDefinitions(w: *Writer, idx: *const Index, ranked: []const query.RankedSym, opts: Options) !bool {
+    std.debug.assert(opts.sort != .default);
+    std.debug.assert(ranked.len <= idx.graph.symbols.len);
+    const shown: usize = @min(ranked.len, opts.limit);
+    try w.writeByte('[');
+    for (ranked[0..shown], 0..) |entry, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("{{\"sort\":\"{s}\",\"rank\":{d},\"symbol\":", .{ @tagName(opts.sort), entry.metric });
+        try symbolObject(w, idx, idx.graph.symbols[entry.id], opts.verbosity);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]\n");
+    return shown > 0;
+}
+
 pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     var shown: u32 = 0;
@@ -112,6 +127,51 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 /// `search --refs --json`: array of `{name, file, line, in, qualifier?, target?}`
 /// reference objects (use sites), mirroring the text usages listing. Returns
 /// whether any reference matched.
+pub fn collisions(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
+    std.debug.assert(idx.graph.symbols.len > 0);
+    const ids = try query.collectCollisionSymbols(idx, pattern, opts);
+    defer idx.gpa.free(ids);
+    var groups: u32 = 0;
+    var i: usize = 0;
+    try w.writeByte('[');
+    while (i < ids.len and groups < opts.limit) {
+        var end = i + 1;
+        const name = idx.graph.symbols[ids[i]].name;
+        while (end < ids.len and std.mem.eql(u8, idx.graph.symbols[ids[end]].name, name)) end += 1;
+        if (end - i > 1) {
+            if (groups != 0) try w.writeByte(',');
+            groups += 1;
+            try w.writeAll("{\"name\":");
+            try writeString(w, name);
+            try w.print(",\"count\":{d},\"definitions\":[", .{end - i});
+            for (ids[i..end], 0..) |id, member_i| {
+                if (member_i != 0) try w.writeByte(',');
+                try symbolObject(w, idx, idx.graph.symbols[id], opts.verbosity);
+            }
+            try w.writeAll("]}");
+        }
+        i = end;
+    }
+    try w.writeAll("]\n");
+    return groups > 0;
+}
+
+pub fn rankedSearchRefs(w: *Writer, idx: *const Index, sites: []const query.RankedRefSite, opts: Options) !bool {
+    std.debug.assert(opts.sort != .default and opts.sort != .line);
+    std.debug.assert(sites.len <= opts.limit or opts.limit > 0);
+    const shown: usize = @min(sites.len, opts.limit);
+    try w.writeByte('[');
+    for (sites[0..shown], 0..) |site, i| {
+        if (i != 0) try w.writeByte(',');
+        const owner = idx.graph.symbols[site.owner];
+        try w.print("{{\"sort\":\"{s}\",\"rank\":{d},\"reference\":", .{ @tagName(opts.sort), site.metric });
+        try refObject(w, idx, owner, owner.refs[site.ref_index], site.line);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]\n");
+    return shown > 0;
+}
+
 pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     var pat = query.RefPattern.parse(pattern);
@@ -122,7 +182,7 @@ pub fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Opti
         // Test scope applies to the referencing symbol (mirrors the text path).
         if (!query.inTestScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
         for (sym.refs) |ref| {
-            if (!pat.matches(ref)) continue;
+            if (!pat.matches(ref) or !query.refSelected(idx, sym, ref, opts)) continue;
             // One object per distinct use-site line (mirrors the text renderer).
             if (ref.lines.len > 1) {
                 for (ref.lines) |ln| {
@@ -148,7 +208,7 @@ fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, l
     try writeString(w, ref.name);
     try w.writeAll(",\"file\":");
     try writeString(w, idx.graph.files[sym.file].path);
-    try w.print(",\"line\":{d},\"in\":", .{line});
+    try w.print(",\"line\":{d},\"mode\":\"{s}\",\"in\":", .{ line, if (ref.write) "write" else "read" });
     try writeString(w, sym.name);
     if (ref.qualifier.len != 0) {
         try w.writeAll(",\"qualifier\":");
@@ -157,6 +217,7 @@ fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, l
     if (ref.target != invalid) {
         try w.writeAll(",\"target\":");
         try writeString(w, idx.graph.files[idx.graph.symbols[ref.target].file].path);
+        try w.print(",\"exact\":{}", .{ref.exact});
     }
     try w.writeByte('}');
 }
@@ -372,9 +433,89 @@ fn walkCallers(
 /// ranked by connectivity. `*_exact` exclude heuristic `?` edges; `fan_in_test`
 /// is the share of callers in test files; `--strict` drops entries whose
 /// connectivity is entirely heuristic.
+pub fn flow(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
+    std.debug.assert(name.len > 0);
+    std.debug.assert(idx.graph.symbols.len > 0);
+    var buf: [64]SymbolId = undefined;
+    const ids = query.resolveIds(idx, name, &buf);
+    if (ids.len == 0) {
+        try w.writeAll("{\"producers\":[],\"consumers\":[]}\n");
+        return false;
+    }
+    if (opts.flow_to.len != 0) {
+        const chain = try query.flowPathIds(idx, ids, opts.flow_to, opts.strict);
+        defer idx.gpa.free(chain);
+        try w.writeByte('[');
+        for (chain, 0..) |id, i| {
+            if (i != 0) try w.writeByte(',');
+            try nodeHead(w, idx, idx.graph.symbols[id]);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]\n");
+        return chain.len > 0;
+    }
+    try w.writeAll("{\"symbol\":");
+    try nodeHead(w, idx, idx.graph.symbols[ids[0]]);
+    try w.writeAll("},\"producers\":[");
+    var writers: u32 = 0;
+    try flowSites(w, idx, ids, opts, true, &writers);
+    try w.writeAll("],\"consumers\":[");
+    var readers: u32 = 0;
+    try flowSites(w, idx, ids, opts, false, &readers);
+    if (!opts.writers and !opts.unread) try typeConsumerSites(w, idx, ids, opts, &readers);
+    try w.print("],\"counts\":{{\"producers\":{d},\"consumers\":{d}}}}}\n", .{ writers, readers });
+    return writers + readers > 0;
+}
+
+fn flowSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, write: bool, count: *u32) !void {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(count.* == 0);
+    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+        const producer = query.flowProducer(idx, ids, ref);
+        if (producer != write or !idIn(ids, ref.target) or !query.flowRefSelected(idx, owner, ref, producer, opts)) continue;
+        if (ref.lines.len > 1) {
+            for (ref.lines) |line| {
+                if (count.* >= opts.limit) return;
+                if (count.* != 0) try w.writeByte(',');
+                var directed = ref;
+                directed.write = write;
+                try refObject(w, idx, owner, directed, line);
+                count.* += 1;
+            }
+        } else {
+            if (count.* >= opts.limit) return;
+            if (count.* != 0) try w.writeByte(',');
+            var directed = ref;
+            directed.write = write;
+            try refObject(w, idx, owner, directed, ref.line);
+            count.* += 1;
+        }
+    };
+}
+
+fn typeConsumerSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, count: *u32) !void {
+    const target = query.flowTypeTarget(idx, ids) orelse return;
+    std.debug.assert(target < idx.graph.symbols.len);
+    std.debug.assert(count.* <= opts.limit);
+    for (idx.graph.symbols) |owner| {
+        if (count.* >= opts.limit) return;
+        const consumer = query.typeConsumerBinding(idx, ids, owner) orelse continue;
+        if (count.* != 0) try w.writeByte(',');
+        const ref: model.Reference = .{ .name = idx.graph.symbols[target].name, .qualifier = consumer.binding, .line = consumer.line, .kind = .type_use, .target = target, .exact = true };
+        try refObject(w, idx, owner, ref, consumer.line);
+        count.* += 1;
+    }
+}
+
+fn idIn(ids: []const SymbolId, target: SymbolId) bool {
+    for (ids) |id| if (id == target) return true;
+    return false;
+}
+
 pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     const ranked = try query.collectHot(idx, filter, opts.tests);
     defer idx.gpa.free(ranked);
+    query.sortHot(idx, ranked, opts.sort);
     const limit = query.hotLimit(opts);
     try w.writeByte('[');
     var shown: u32 = 0;
@@ -387,8 +528,9 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
         try nodeHead(w, idx, sym);
         try w.writeAll(",\"sig\":");
         try writeCollapsedString(w, sym.signature(idx.graph.files[sym.file].text), max_sig_len);
-        try w.print(",\"fan_in\":{d},\"fan_in_exact\":{d},\"fan_in_test\":{d},\"fan_out\":{d},\"fan_out_exact\":{d}}}", .{
-            e.fan_in, e.fan_in_exact, e.fan_in_test, e.fan_out, e.fan_out_exact,
+        const sort = if (opts.sort == .default) query.SortKey.fan_in_exact else opts.sort;
+        try w.print(",\"fan_in\":{d},\"fan_in_exact\":{d},\"fan_in_test\":{d},\"fan_out\":{d},\"fan_out_exact\":{d},\"sort\":\"{s}\",\"rank\":{d}}}", .{
+            e.fan_in, e.fan_in_exact, e.fan_in_test, e.fan_out, e.fan_out_exact, @tagName(sort), query.hotMetric(idx, e, sort),
         });
     }
     try w.writeAll("]\n");

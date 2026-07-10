@@ -26,6 +26,27 @@ pub const OutputFormat = enum { text, json };
 
 /// `files` ordering: `path` (discovery order, the default) or `symbols`
 /// (descending symbol count — biggest files first, the "where's the bulk" view).
+pub const SortKey = enum {
+    default,
+    line,
+    name,
+    span,
+    callers,
+    callees,
+    fan_in,
+    fan_in_exact,
+    fan_out,
+    fan_out_exact,
+
+    pub fn parse(s: []const u8) ?SortKey {
+        inline for (std.meta.fields(SortKey)) |field| {
+            if (field.value != @intFromEnum(SortKey.default) and std.mem.eql(u8, s, field.name))
+                return @enumFromInt(field.value);
+        }
+        return null;
+    }
+};
+
 pub const FileSort = enum {
     path,
     symbols,
@@ -107,6 +128,17 @@ pub const Options = struct {
     unused_follow_imports: bool = false,
     /// `files`: result ordering (discovery order or descending symbol count).
     file_sort: FileSort = .path,
+    /// Ranking for outline/search/hot. `.default` preserves existing output.
+    sort: SortKey = .default,
+    /// Directional reference filtering and flow type scope.
+    writers: bool = false,
+    readers: bool = false,
+    unread: bool = false,
+    on_type: []const u8 = "",
+    flow_to: []const u8 = "",
+    /// Duplicate-name aggregation controls.
+    duplicates: bool = false,
+    collision_members: bool = false,
     /// Unified test-scope selector: include test code (default), exclude it
     /// (`--no-tests`), or restrict to it (`--tests-only`). Applies to
     /// `outline`/`search`/`callers`/`hot`.
@@ -228,6 +260,7 @@ pub fn callSiteLines(idx: *const Index, from: SymbolId, to: SymbolId, out: *std.
 /// for the whole project). Symbols are grouped by file and indented by nesting.
 /// Returns whether any symbol was printed.
 pub fn outline(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !bool {
+    if (opts.sort != .default and opts.sort != .line) return rankedDefinitions(w, idx, path_filter, "", opts, true);
     if (opts.format == .json) return json_out.outline(w, idx, path_filter, opts);
     var shown: u32 = 0;
     var any = false;
@@ -889,7 +922,7 @@ fn walkNode(
 /// callback passed by name) is a real dependency and stays. The graph itself is
 /// unchanged — `callers`/`hot`/`unused` still count every resolved reference.
 pub fn isDataReadEdge(idx: *const Index, ref: model.Reference) bool {
-    if (ref.kind != .read) return false;
+    if (ref.kind != .read or ref.write) return false;
     return switch (idx.graph.symbols[ref.target].kind) {
         .variable, .constant, .field => true,
         else => false,
@@ -1014,6 +1047,94 @@ pub fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
     return false;
 }
 
+pub const RankedSym = struct { id: SymbolId, metric: u32 };
+const RankContext = struct { idx: *const Index, sort: SortKey };
+
+fn rankedDefinitions(w: *Writer, idx: *const Index, path_filter: []const u8, pattern: []const u8, opts: Options, outline_mode: bool) !bool {
+    std.debug.assert(opts.sort != .default);
+    std.debug.assert(outline_mode or pattern.len > 0);
+    const ranked = try collectRankedDefinitions(idx, path_filter, pattern, opts, outline_mode);
+    defer idx.gpa.free(ranked);
+    if (opts.format == .json) return json_out.rankedDefinitions(w, idx, ranked, opts);
+    const shown: usize = @min(ranked.len, opts.limit);
+    for (ranked[0..shown]) |entry| {
+        try render.symbol(w, idx, idx.graph.symbols[entry.id], opts.verbosity, 0, true);
+        try printRankBadge(w, opts.sort, entry.metric);
+    }
+    if (shown == 0) {
+        try w.writeAll("(no matching symbols)\n");
+        return false;
+    }
+    if (ranked.len > shown) try w.print("… (stopped at -l {d}; {d} more)\n", .{ opts.limit, ranked.len - shown });
+    return true;
+}
+
+pub fn collectRankedDefinitions(idx: *const Index, path_filter: []const u8, pattern: []const u8, opts: Options, outline_mode: bool) ![]RankedSym {
+    std.debug.assert(opts.sort != .default);
+    std.debug.assert(outline_mode or pattern.len > 0);
+    var list: std.ArrayList(RankedSym) = .empty;
+    errdefer list.deinit(idx.gpa);
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import) continue;
+        if (outline_mode and !sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
+        const path = idx.graph.files[sym.file].path;
+        if (path_filter.len != 0 and !matchesFilter(path, path_filter)) continue;
+        if (opts.no_recurse and !inDirNonRecursive(path, path_filter)) continue;
+        if (!kindAllowed(sym.kind, opts.kinds) or !visAllowed(sym, opts.visibility)) continue;
+        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
+        if (pattern.len != 0 and !(if (opts.exact) std.mem.eql(u8, sym.name, pattern) else matchesName(pattern, sym.name))) continue;
+        try list.append(idx.gpa, .{ .id = sym.id, .metric = rankMetric(idx, sym, opts.sort, opts.tests) });
+    }
+    const items = try list.toOwnedSlice(idx.gpa);
+    std.mem.sort(RankedSym, items, RankContext{ .idx = idx, .sort = opts.sort }, rankedLessThan);
+    return items;
+}
+
+fn rankMetric(idx: *const Index, sym: model.Symbol, sort: SortKey, scope: TestScope) u32 {
+    return switch (sort) {
+        .span => sym.endLine(idx.graph.files[sym.file].text) - sym.line + 1,
+        .callers, .fan_in_exact => exactCallerCount(idx, sym.id, scope),
+        .callees, .fan_out_exact => fanOutExact(sym),
+        .fan_in => scopedCallerCount(idx, sym.id, scope),
+        .fan_out => fanOut(sym),
+        else => 0,
+    };
+}
+
+fn exactCallerCount(idx: *const Index, target: SymbolId, scope: TestScope) u32 {
+    std.debug.assert(target < idx.graph.symbols.len);
+    var count: u32 = 0;
+    for (idx.graph.symbols) |owner| {
+        if (!inTestScope(scope, isTestSymbol(idx, owner))) continue;
+        for (owner.refs) |ref| {
+            if (ref.target == target and ref.exact) count += 1;
+        }
+    }
+    return count;
+}
+
+fn rankedLessThan(ctx: RankContext, a: RankedSym, b: RankedSym) bool {
+    const sa = ctx.idx.graph.symbols[a.id];
+    const sb = ctx.idx.graph.symbols[b.id];
+    if (ctx.sort == .name) {
+        const order = std.mem.order(u8, sa.name, sb.name);
+        if (order != .eq) return order == .lt;
+    } else if (ctx.sort != .line and a.metric != b.metric) return a.metric > b.metric;
+    const path_order = std.mem.order(u8, ctx.idx.graph.files[sa.file].path, ctx.idx.graph.files[sb.file].path);
+    if (path_order != .eq) return path_order == .lt;
+    if (sa.line != sb.line) return sa.line < sb.line;
+    return sa.id < sb.id;
+}
+
+fn printRankBadge(w: *Writer, sort: SortKey, metric: u32) !void {
+    switch (sort) {
+        .span => try w.print("    ⟨{d} ln⟩\n", .{metric}),
+        .callers => try w.print("    ⟨←{d}⟩\n", .{metric}),
+        .callees => try w.print("    ⟨→{d}⟩\n", .{metric}),
+        else => {},
+    }
+}
+
 /// Substring search over symbol names; prints matches like `def`. With
 /// `--refs`, searches *use sites* (references) instead — a resolved-graph grep
 /// that answers "where is this used", which name-only search cannot.
@@ -1021,6 +1142,8 @@ pub fn hasExactEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
 pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
     std.debug.assert(pattern.len > 0);
     if (opts.refs) return searchRefs(w, idx, pattern, opts);
+    if (opts.duplicates) return collisions(w, idx, pattern, opts);
+    if (opts.sort != .default and opts.sort != .line) return rankedDefinitions(w, idx, "", pattern, opts, false);
     if (opts.format == .json) return json_out.search(w, idx, pattern, opts);
     var shown: u32 = 0;
     for (idx.graph.symbols) |sym| {
@@ -1053,6 +1176,58 @@ pub fn search(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 /// When a `-k` filter produced zero results, list the kinds that DO exist in
 /// scope — so `-k struct` on a Python repo says "kinds here: class, fn,
 /// method…" instead of a bare miss (a trial burned a call on exactly that).
+pub fn collisions(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
+    std.debug.assert(idx.graph.symbols.len > 0);
+    if (opts.format == .json) return json_out.collisions(w, idx, pattern, opts);
+    const ids = try collectCollisionSymbols(idx, pattern, opts);
+    defer idx.gpa.free(ids);
+    var groups: u32 = 0;
+    var i: usize = 0;
+    while (i < ids.len and groups < opts.limit) {
+        var end = i + 1;
+        const name = idx.graph.symbols[ids[i]].name;
+        while (end < ids.len and std.mem.eql(u8, idx.graph.symbols[ids[end]].name, name)) end += 1;
+        if (end - i > 1) {
+            groups += 1;
+            try w.print("# {s} ×{d}\n", .{ name, end - i });
+            for (ids[i..end]) |id| try render.symbol(w, idx, idx.graph.symbols[id], opts.verbosity, 1, true);
+        }
+        i = end;
+    }
+    if (groups == 0) {
+        try w.writeAll("(no symbol-name collisions)\n");
+        return false;
+    }
+    return true;
+}
+
+pub fn collectCollisionSymbols(idx: *const Index, pattern: []const u8, opts: Options) ![]SymbolId {
+    std.debug.assert(idx.graph.symbols.len > 0);
+    var list: std.ArrayList(SymbolId) = .empty;
+    errdefer list.deinit(idx.gpa);
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind == .import or (!opts.collision_members and sym.parent != invalid)) continue;
+        if (!kindAllowed(sym.kind, opts.kinds) or !visAllowed(sym, opts.visibility)) continue;
+        if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
+        if (pattern.len != 0 and !matchesName(pattern, sym.name)) continue;
+        try list.append(idx.gpa, sym.id);
+    }
+    const ids = try list.toOwnedSlice(idx.gpa);
+    std.mem.sort(SymbolId, ids, idx, collisionLessThan);
+    return ids;
+}
+
+fn collisionLessThan(idx: *const Index, a: SymbolId, b: SymbolId) bool {
+    const sa = idx.graph.symbols[a];
+    const sb = idx.graph.symbols[b];
+    const name_order = std.mem.order(u8, sa.name, sb.name);
+    if (name_order != .eq) return name_order == .lt;
+    const path_order = std.mem.order(u8, idx.graph.files[sa.file].path, idx.graph.files[sb.file].path);
+    if (path_order != .eq) return path_order == .lt;
+    if (sa.line != sb.line) return sa.line < sb.line;
+    return a < b;
+}
+
 fn kindHint(w: *Writer, idx: *const Index, path_filter: []const u8, opts: Options) !void {
     if (opts.kinds.len == 0) return;
     var present = std.StaticBitSet(@typeInfo(model.SymbolKind).@"enum".fields.len).initEmpty();
@@ -1122,11 +1297,67 @@ pub const RefPattern = struct {
     const partMatches = exactOrGlob;
 };
 
+pub const RankedRefSite = struct { owner: SymbolId, ref_index: u32, line: u32, metric: u32 };
+const RefRankContext = struct { idx: *const Index, sort: SortKey };
+
+fn rankedSearchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
+    std.debug.assert(pattern.len > 0);
+    std.debug.assert(opts.sort != .default and opts.sort != .line);
+    const sites = try collectRankedRefs(idx, pattern, opts);
+    defer idx.gpa.free(sites);
+    if (opts.format == .json) return json_out.rankedSearchRefs(w, idx, sites, opts);
+    const shown: usize = @min(sites.len, opts.limit);
+    for (sites[0..shown]) |site| {
+        const owner = idx.graph.symbols[site.owner];
+        try printRefRow(w, idx, owner, owner.refs[site.ref_index], site.line, opts.verbosity);
+        try printRankBadge(w, opts.sort, site.metric);
+    }
+    if (shown == 0) try w.print("(no reference matching '{s}')\n", .{pattern});
+    if (sites.len > shown) try w.print("… (stopped at -l {d}; {d} more)\n", .{ opts.limit, sites.len - shown });
+    return shown > 0;
+}
+
+pub fn collectRankedRefs(idx: *const Index, pattern: []const u8, opts: Options) ![]RankedRefSite {
+    std.debug.assert(pattern.len > 0);
+    std.debug.assert(opts.sort != .default and opts.sort != .line);
+    var pat = RefPattern.parse(pattern);
+    pat.exact = opts.exact;
+    var list: std.ArrayList(RankedRefSite) = .empty;
+    errdefer list.deinit(idx.gpa);
+    for (idx.graph.symbols) |owner| {
+        if (!inTestScope(opts.tests, isTestSymbol(idx, owner))) continue;
+        for (owner.refs, 0..) |ref, ref_index| {
+            if (!pat.matches(ref) or !refSelected(idx, owner, ref, opts)) continue;
+            const metric = rankMetric(idx, owner, opts.sort, opts.tests);
+            if (ref.lines.len > 1) {
+                for (ref.lines) |line| try list.append(idx.gpa, .{ .owner = owner.id, .ref_index = @intCast(ref_index), .line = line, .metric = metric });
+            } else try list.append(idx.gpa, .{ .owner = owner.id, .ref_index = @intCast(ref_index), .line = ref.line, .metric = metric });
+        }
+    }
+    const sites = try list.toOwnedSlice(idx.gpa);
+    std.mem.sort(RankedRefSite, sites, RefRankContext{ .idx = idx, .sort = opts.sort }, rankedRefLessThan);
+    return sites;
+}
+
+fn rankedRefLessThan(ctx: RefRankContext, a: RankedRefSite, b: RankedRefSite) bool {
+    const ao = ctx.idx.graph.symbols[a.owner];
+    const bo = ctx.idx.graph.symbols[b.owner];
+    if (ctx.sort == .name) {
+        const order = std.mem.order(u8, ao.refs[a.ref_index].name, bo.refs[b.ref_index].name);
+        if (order != .eq) return order == .lt;
+    } else if (a.metric != b.metric) return a.metric > b.metric;
+    const path_order = std.mem.order(u8, ctx.idx.graph.files[ao.file].path, ctx.idx.graph.files[bo.file].path);
+    if (path_order != .eq) return path_order == .lt;
+    if (a.line != b.line) return a.line < b.line;
+    return a.owner < b.owner;
+}
+
 /// List every reference (use site) whose name contains `pattern`, grouped by the
 /// enclosing symbol, with the call-site line and whether it resolved. This is the
 /// "find usages" verb — structured, comment/string-free, resolution-aware.
 /// `Recv.field`/`.field` patterns pin instance-attribute reads.
 fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options) !bool {
+    if (opts.sort != .default and opts.sort != .line) return rankedSearchRefs(w, idx, pattern, opts);
     if (opts.format == .json) return json_out.searchRefs(w, idx, pattern, opts);
     var pat = RefPattern.parse(pattern);
     pat.exact = opts.exact;
@@ -1136,7 +1367,7 @@ fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
         // hides use sites inside tests (the "who uses X in production" view).
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         for (sym.refs) |ref| {
-            if (!pat.matches(ref)) continue;
+            if (!pat.matches(ref) or !refSelected(idx, sym, ref, opts)) continue;
             // One row per *distinct* use-site line. A name referenced on several
             // lines within one caller is deduped into a single ref carrying a
             // `lines` list — expand it so every site is listed, not just the
@@ -1165,7 +1396,7 @@ fn searchRefs(w: *Writer, idx: *const Index, pattern: []const u8, opts: Options)
 /// Print one `search --refs` row: `path:line  name [(on recv)]  in owner [→ …]`.
 fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Reference, line: u32, verbosity: render.Verbosity) !void {
     const file = idx.graph.files[sym.file];
-    try w.print("{s}:{d}  {s}", .{ file.path, line, ref.name });
+    try w.print("{s}:{d}  [{c}] {s}", .{ file.path, line, if (ref.write) @as(u8, 'w') else 'r', ref.name });
     if (ref.qualifier.len != 0) try w.print(" (on {s})", .{ref.qualifier});
     try w.print("  in {s}", .{sym.name});
     if (ref.target != invalid) {
@@ -1188,6 +1419,189 @@ fn printRefRow(w: *Writer, idx: *const Index, sym: model.Symbol, ref: model.Refe
         }
     }
     try w.writeByte('\n');
+}
+
+pub fn refSelected(idx: *const Index, owner: model.Symbol, ref: model.Reference, opts: Options) bool {
+    std.debug.assert(owner.id < idx.graph.symbols.len);
+    if (opts.writers and !ref.write) return false;
+    if (opts.readers and ref.write) return false;
+    if (opts.unread and (!ref.write or ref.target == invalid or !targetUnread(idx, ref.target))) return false;
+    if (opts.on_type.len == 0) return true;
+    if (matchesName(opts.on_type, ref.qualifier)) return true;
+    for (owner.bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, ref.qualifier) and matchesName(opts.on_type, binding.type_name)) return true;
+    }
+    return false;
+}
+
+fn targetUnread(idx: *const Index, target: SymbolId) bool {
+    std.debug.assert(target < idx.graph.symbols.len);
+    var wrote = false;
+    for (idx.graph.symbols) |owner| {
+        for (owner.refs) |ref| {
+            if (ref.target != target) continue;
+            if (ref.write) wrote = true else return false;
+        }
+    }
+    return wrote;
+}
+
+pub fn flow(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
+    std.debug.assert(name.len > 0);
+    std.debug.assert(idx.graph.symbols.len > 0);
+    if (opts.format == .json) return json_out.flow(w, idx, name, opts);
+    var buf: [64]SymbolId = undefined;
+    const ids = resolveIds(idx, name, &buf);
+    if (ids.len == 0) {
+        try w.print("(no symbol named '{s}')\n", .{name});
+        return false;
+    }
+    if (opts.flow_to.len != 0) return flowPath(w, idx, ids, opts.flow_to, opts);
+    var writers: u32 = 0;
+    var readers: u32 = 0;
+    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+        const producer = flowProducer(idx, ids, ref);
+        if (!contains(ids, ref.target) or !flowRefSelected(idx, owner, ref, producer, opts)) continue;
+        if (producer) writers += siteCount(ref) else readers += siteCount(ref);
+    };
+    if (!opts.writers and !opts.unread and flowTypeTarget(idx, ids) != null) {
+        for (idx.graph.symbols) |owner| {
+            if (typeConsumerBinding(idx, ids, owner) != null) readers += 1;
+        }
+    }
+    if (opts.unread and (writers == 0 or readers != 0)) {
+        try w.print("(no unread flow for '{s}')\n", .{name});
+        return false;
+    }
+    try render.symbol(w, idx, idx.graph.symbols[ids[0]], headerVerbosity(opts.verbosity), 0, true);
+    try w.print("\nWRITERS ↳:{d}\n", .{writers});
+    var shown: u32 = 0;
+    try renderFlowGroup(w, idx, ids, opts, true, &shown);
+    try w.print("\nREADERS ↳:{d}\n", .{readers});
+    try renderFlowGroup(w, idx, ids, opts, false, &shown);
+    if (!opts.writers and !opts.unread) try renderTypeConsumers(w, idx, ids, opts, &shown);
+    if (shown >= opts.limit and writers + readers > shown)
+        try w.print("… ({d} more; raise -l to see them)\n", .{writers + readers - shown});
+    return writers + readers > 0;
+}
+
+fn siteCount(ref: model.Reference) u32 {
+    return if (ref.lines.len > 1) @intCast(ref.lines.len) else 1;
+}
+
+fn renderFlowGroup(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, write: bool, shown: *u32) !void {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(shown.* <= opts.limit);
+    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+        if (shown.* >= opts.limit) return;
+        const producer = flowProducer(idx, ids, ref);
+        if (producer != write or !contains(ids, ref.target) or !flowRefSelected(idx, owner, ref, producer, opts)) continue;
+        if (ref.lines.len > 1) {
+            for (ref.lines) |line| {
+                if (shown.* >= opts.limit) return;
+                var directed = ref;
+                directed.write = write;
+                try printRefRow(w, idx, owner, directed, line, opts.verbosity);
+                shown.* += 1;
+            }
+        } else {
+            var directed = ref;
+            directed.write = write;
+            try printRefRow(w, idx, owner, directed, ref.line, opts.verbosity);
+            shown.* += 1;
+        }
+    };
+}
+
+pub fn flowTypeTarget(idx: *const Index, ids: []const SymbolId) ?SymbolId {
+    for (ids) |id| switch (idx.graph.symbols[id].kind) {
+        .class, .@"struct", .interface, .type, .@"enum" => return id,
+        else => {},
+    };
+    return null;
+}
+
+pub const TypeConsumer = struct { binding: []const u8, line: u32 };
+
+pub fn typeConsumerBinding(idx: *const Index, ids: []const SymbolId, owner: model.Symbol) ?TypeConsumer {
+    const target = flowTypeTarget(idx, ids) orelse return null;
+    const type_name = idx.graph.symbols[target].name;
+    for (owner.bindings) |binding| {
+        if (!std.mem.eql(u8, binding.type_name, type_name)) continue;
+        for (owner.refs) |ref| {
+            if (!ref.write and std.mem.eql(u8, ref.qualifier, binding.name)) return .{ .binding = binding.name, .line = ref.line };
+        }
+        const signature = owner.signature(idx.graph.files[owner.file].text);
+        if (std.mem.indexOf(u8, signature, binding.name) != null and std.mem.indexOf(u8, signature, type_name) != null)
+            return .{ .binding = binding.name, .line = owner.line };
+    }
+    return null;
+}
+
+fn renderTypeConsumers(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, shown: *u32) !void {
+    const target = flowTypeTarget(idx, ids) orelse return;
+    std.debug.assert(target < idx.graph.symbols.len);
+    std.debug.assert(shown.* <= opts.limit);
+    for (idx.graph.symbols) |owner| {
+        if (shown.* >= opts.limit) return;
+        const consumer = typeConsumerBinding(idx, ids, owner) orelse continue;
+        const ref: model.Reference = .{ .name = idx.graph.symbols[target].name, .qualifier = consumer.binding, .line = consumer.line, .kind = .type_use, .target = target, .exact = true };
+        try printRefRow(w, idx, owner, ref, consumer.line, opts.verbosity);
+        shown.* += 1;
+    }
+}
+
+pub fn flowProducer(idx: *const Index, ids: []const SymbolId, ref: model.Reference) bool {
+    if (ref.write) return true;
+    if (ref.kind != .call or !contains(ids, ref.target)) return false;
+    return switch (idx.graph.symbols[ref.target].kind) {
+        .class, .@"struct", .interface, .type, .@"enum" => true,
+        else => false,
+    };
+}
+
+pub fn flowRefSelected(idx: *const Index, owner: model.Symbol, ref: model.Reference, producer: bool, opts: Options) bool {
+    if (opts.writers and !producer) return false;
+    if (opts.readers and producer) return false;
+    var scoped = opts;
+    scoped.writers = false;
+    scoped.readers = false;
+    return refSelected(idx, owner, ref, scoped);
+}
+
+fn flowPath(w: *Writer, idx: *const Index, ids: []const SymbolId, sink: []const u8, opts: Options) !bool {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(sink.len > 0);
+    const chain = try flowPathIds(idx, ids, sink, opts.strict);
+    defer idx.gpa.free(chain);
+    if (chain.len == 0) {
+        try w.print("(no data-flow path to '{s}')\n", .{sink});
+        return false;
+    }
+    for (chain, 0..) |id, indent| try render.symbol(w, idx, idx.graph.symbols[id], headerVerbosity(opts.verbosity), indent, true);
+    return true;
+}
+
+pub fn flowPathIds(idx: *const Index, ids: []const SymbolId, sink: []const u8, strict: bool) ![]SymbolId {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(sink.len > 0);
+    var sources: [256]SymbolId = undefined;
+    var source_count: usize = 0;
+    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+        if (flowProducer(idx, ids, ref) and source_count < sources.len) {
+            sources[source_count] = owner.id;
+            source_count += 1;
+        }
+    };
+    var sink_buf: [64]SymbolId = undefined;
+    const sinks = resolveIds(idx, sink, &sink_buf);
+    if (source_count == 0 or sinks.len == 0) return idx.gpa.alloc(SymbolId, 0);
+    const prev = try bfsFlow(idx, sources[0..source_count], sinks, strict);
+    defer idx.gpa.free(prev);
+    for (sinks) |end| if (prev[end] != invalid) {
+        return reconstruct(idx.gpa, prev, end);
+    };
+    return idx.gpa.alloc(SymbolId, 0);
 }
 
 /// The number of distinct resolved callees (outgoing edges) of `sym`.
@@ -1217,6 +1631,7 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
     if (opts.format == .json) return json_out.hot(w, idx, filter, opts);
     const ranked = try collectHot(idx, filter, opts.tests);
     defer idx.gpa.free(ranked);
+    sortHot(idx, ranked, opts.sort);
     // `hot` is an orientation view — a short ranked list is the point, so it
     // caps at a small default (raise `-l` for more) via the limit sentinel.
     const limit = hotLimit(opts);
@@ -1231,7 +1646,7 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
         shown += 1;
         const sym = idx.graph.symbols[e.id];
         try render.symbol(w, idx, sym, headerVerbosity(opts.verbosity), 0, true);
-        try printHotCounts(w, e, opts.strict);
+        try printHotCounts(w, idx, e, opts);
     }
     if (shown == 0) {
         try w.print("(no functions under '{s}')\n", .{filter});
@@ -1249,17 +1664,18 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
 /// the exact-only counts. A `⟨N test⟩` note splits out test-only callers so a
 /// symbol that is load-bearing only in the test harness isn't mistaken for a
 /// production hub.
-fn printHotCounts(w: *Writer, e: HotEntry, strict: bool) !void {
-    if (strict) {
-        try w.print("    ←{d} callers  →{d} callees\n", .{ e.fan_in_exact, e.fan_out_exact });
-        return;
+fn printHotCounts(w: *Writer, idx: *const Index, e: HotEntry, opts: Options) !void {
+    if (opts.strict) {
+        try w.print("    ←{d} callers  →{d} callees", .{ e.fan_in_exact, e.fan_out_exact });
+    } else {
+        try w.print("    ←{d} callers", .{e.fan_in});
+        if (e.fan_in > e.fan_in_exact) try w.print(" ({d} ?)", .{e.fan_in - e.fan_in_exact});
+        try printTestShare(w, e.fan_in, e.fan_in_test);
+        try w.print("  →{d} callees", .{e.fan_out});
+        if (e.fan_out > e.fan_out_exact) try w.print(" ({d} ?)", .{e.fan_out - e.fan_out_exact});
     }
-    try w.print("    ←{d} callers", .{e.fan_in});
-    if (e.fan_in > e.fan_in_exact) try w.print(" ({d} ?)", .{e.fan_in - e.fan_in_exact});
-    try printTestShare(w, e.fan_in, e.fan_in_test);
-    try w.print("  →{d} callees", .{e.fan_out});
-    if (e.fan_out > e.fan_out_exact) try w.print(" ({d} ?)", .{e.fan_out - e.fan_out_exact});
-    try w.writeByte('\n');
+    const key = if (opts.sort == .default) SortKey.fan_in_exact else opts.sort;
+    try w.print("  ⟨rank {s}={d}⟩\n", .{ @tagName(key), hotMetric(idx, e, key) });
 }
 
 /// Append ` [N prod / M test]` when some callers are tests, so an agent can tell
@@ -1478,6 +1894,40 @@ pub fn collectHot(idx: *const Index, filter: []const u8, scope: TestScope) ![]Ho
 /// Descending: exact fan-in, then exact fan-out, then total fan-in/out, then id.
 /// Exact-first keeps a symbol whose fan-in is only heuristic guesses from
 /// outranking one with real, verifiable callers.
+pub fn hotMetric(idx: *const Index, entry: HotEntry, sort: SortKey) u32 {
+    return switch (sort) {
+        .fan_in => entry.fan_in,
+        .fan_in_exact, .default => entry.fan_in_exact,
+        .fan_out => entry.fan_out,
+        .fan_out_exact => entry.fan_out_exact,
+        .span => blk: {
+            const sym = idx.graph.symbols[entry.id];
+            break :blk sym.endLine(idx.graph.files[sym.file].text) - sym.line + 1;
+        },
+        else => entry.fan_in_exact,
+    };
+}
+
+const HotSortContext = struct { idx: *const Index, sort: SortKey };
+
+pub fn sortHot(idx: *const Index, entries: []HotEntry, requested: SortKey) void {
+    std.debug.assert(entries.len <= idx.graph.symbols.len);
+    const sort = if (requested == .default) SortKey.fan_in_exact else requested;
+    std.mem.sort(HotEntry, entries, HotSortContext{ .idx = idx, .sort = sort }, hotRankLessThan);
+}
+
+fn hotRankLessThan(ctx: HotSortContext, a: HotEntry, b: HotEntry) bool {
+    const am = hotMetric(ctx.idx, a, ctx.sort);
+    const bm = hotMetric(ctx.idx, b, ctx.sort);
+    if (am != bm) return am > bm;
+    const sa = ctx.idx.graph.symbols[a.id];
+    const sb = ctx.idx.graph.symbols[b.id];
+    const path_order = std.mem.order(u8, ctx.idx.graph.files[sa.file].path, ctx.idx.graph.files[sb.file].path);
+    if (path_order != .eq) return path_order == .lt;
+    if (sa.line != sb.line) return sa.line < sb.line;
+    return a.id < b.id;
+}
+
 fn hotLessThan(_: void, a: HotEntry, b: HotEntry) bool {
     if (a.fan_in_exact != b.fan_in_exact) return a.fan_in_exact > b.fan_in_exact;
     if (a.fan_out_exact != b.fan_out_exact) return a.fan_out_exact > b.fan_out_exact;
@@ -3008,6 +3458,39 @@ pub fn shortestPathIdsWithOptions(
 }
 
 /// Walk `prev` from `end` back to its source, returning the path source-first.
+fn bfsFlow(idx: *const Index, from_ids: []const SymbolId, to_ids: []const SymbolId, strict: bool) ![]SymbolId {
+    std.debug.assert(from_ids.len > 0);
+    std.debug.assert(to_ids.len > 0);
+    const n = idx.graph.symbols.len;
+    var prev = try idx.gpa.alloc(SymbolId, n);
+    errdefer idx.gpa.free(prev);
+    @memset(prev, invalid);
+    var queue = std.array_list.Managed(SymbolId).init(idx.gpa);
+    defer queue.deinit();
+    for (from_ids) |source| {
+        prev[source] = source;
+        try queue.append(source);
+    }
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        if (contains(to_ids, cur) and !contains(from_ids, cur)) break;
+        for (idx.graph.symbols[cur].refs) |ref| {
+            if (ref.target == invalid or (strict and !ref.exact) or prev[ref.target] != invalid) continue;
+            prev[ref.target] = cur;
+            try queue.append(ref.target);
+        }
+        const kind = idx.graph.symbols[cur].kind;
+        if (kind != .field and kind != .variable and kind != .constant) continue;
+        for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+            if (ref.write or ref.target != cur or (strict and !ref.exact) or prev[owner.id] != invalid) continue;
+            prev[owner.id] = cur;
+            try queue.append(owner.id);
+        };
+    }
+    return prev;
+}
+
 fn reconstruct(gpa: std.mem.Allocator, prev: []const SymbolId, end: SymbolId) ![]SymbolId {
     var chain: std.ArrayList(SymbolId) = .empty;
     defer chain.deinit(gpa);
@@ -5483,6 +5966,84 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         _ = try hot(&aw.writer, &idx, "missing", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no functions under 'missing'") != null);
     }
+}
+
+test "phase 2 flow classifies constructor, member, and augmented accesses" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "data.py", .data =
+        \\class Record:
+        \\    value = 0
+        \\def make():
+        \\    item = Record(value=1)
+        \\    item.value += 2
+        \\def use(item: Record):
+        \\    return item.value
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try flow(&aw.writer, &idx, "Record.value", .{}));
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "WRITERS ↳:2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "READERS ↳:2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[w] value (on Record)") != null);
+
+    var type_buf: std.ArrayList(u8) = .empty;
+    defer type_buf.deinit(testing.allocator);
+    var type_aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &type_buf);
+    defer type_aw.deinit();
+    try testing.expect(try flow(&type_aw.writer, &idx, "Record", .{}));
+    try testing.expect(std.mem.indexOf(u8, type_aw.written(), "WRITERS ↳:1") != null);
+    try testing.expect(std.mem.indexOf(u8, type_aw.written(), "READERS ↳:2") != null);
+}
+
+test "phase 2 span ranking is global and biggest first" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "rank.py", .data =
+        \\def small(): return 1
+        \\def large():
+        \\    x = 1
+        \\    y = 2
+        \\    return x + y
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    const ranked = try collectRankedDefinitions(&idx, "", "", .{ .sort = .span, .kinds = "fn" }, true);
+    defer testing.allocator.free(ranked);
+    try testing.expect(ranked.len >= 2);
+    try testing.expectEqualStrings("large", idx.graph.symbols[ranked[0].id].name);
+    try testing.expect(ranked[0].metric > ranked[1].metric);
+}
+
+test "phase 2 collisions groups duplicate top-level names deterministically" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.py", .data = "class Store:\n    pass\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.py", .data = "class Store:\n    pass\nclass Unique:\n    pass\n" });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try collisions(&aw.writer, &idx, "", .{ .kinds = "class" }));
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "# Store ×2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "# Unique") == null);
 }
 
 test "TestScope.parse accepts aliases and rejects garbage" {
