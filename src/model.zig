@@ -221,6 +221,17 @@ pub const Symbol = struct {
     }
 };
 
+/// File-level parser reliability. A desync means an unterminated literal may
+/// have swallowed the reported line range, so missing symbols/edges are suspect.
+pub const ParseHealth = struct {
+    desync_from: ?u32 = null,
+    desync_to: u32 = 0,
+
+    pub fn reliable(self: ParseHealth) bool {
+        return self.desync_from == null;
+    }
+};
+
 pub const SourceFile = struct {
     id: FileId,
     /// Path relative to the project root.
@@ -228,6 +239,8 @@ pub const SourceFile = struct {
     language: language.Language,
     /// Owned source text (kept alive for the graph's lifetime).
     text: []const u8,
+    /// Parser reliability captured on both fresh parses and cache restores.
+    parse_health: ParseHealth = .{},
     /// Half-open range into `Graph.symbols` for this file's symbols.
     sym_start: u32,
     sym_end: u32,

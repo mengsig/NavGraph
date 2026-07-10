@@ -58,7 +58,9 @@ pub fn main(init: std.process.Init) !void {
     defer idx.deinit();
 
     if (parsed.command == .serve) {
-        try serve(out, io, &idx, parsed.root);
+        var session = try ServerSession.init(gpa, io, &idx, parsed.root, parsed.use_cache);
+        defer session.deinit();
+        try serve(out, &session);
         try out.flush();
         return;
     }
@@ -84,6 +86,7 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
     return switch (parsed.command) {
         .outline => try query.outline(out, idx, parsed.arg, parsed.options),
         .files => try query.listFiles(out, idx, parsed.arg, parsed.options),
+        .status => try query.status(out, io, idx, parsed.arg, parsed.options),
         .read => try query.readLines(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .strings => try query.strings(out, idx, parsed.arg, parsed.options),
         .def => try query.showDef(out, idx, parsed.arg, parsed.options),
@@ -117,25 +120,60 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
     };
 }
 
-fn serve(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: []const u8) !void {
-    std.debug.assert(root.len > 0);
-    std.debug.assert(idx.graph.files.len > 0 or idx.graph.symbols.len == 0);
+const ServerSession = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    idx: *index_mod.Index,
+    root: []u8,
+    use_cache: bool,
+
+    fn init(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        idx: *index_mod.Index,
+        root: []const u8,
+        use_cache: bool,
+    ) !ServerSession {
+        std.debug.assert(root.len > 0);
+        std.debug.assert(idx.gpa.ptr == gpa.ptr);
+        return .{ .gpa = gpa, .io = io, .idx = idx, .root = try gpa.dupe(u8, root), .use_cache = use_cache };
+    }
+
+    fn deinit(self: *ServerSession) void {
+        self.gpa.free(self.root);
+        self.* = undefined;
+    }
+
+    fn reload(self: *ServerSession, use_cache: bool) !void {
+        std.debug.assert(self.root.len > 0);
+        std.debug.assert(self.idx.gpa.ptr == self.gpa.ptr);
+        var fresh = try index_mod.build(self.gpa, self.io, self.root, use_cache);
+        const old = self.idx.*;
+        self.idx.* = fresh;
+        fresh = old;
+        fresh.deinit();
+    }
+};
+
+fn serve(out: *std.Io.Writer, session: *ServerSession) !void {
+    std.debug.assert(session.root.len > 0);
+    std.debug.assert(session.idx.graph.files.len > 0 or session.idx.graph.symbols.len == 0);
     var input_buffer: [64 * 1024]u8 = undefined;
-    var stdin_file: std.Io.File.Reader = .initStreaming(.stdin(), io, &input_buffer);
+    var stdin_file: std.Io.File.Reader = .initStreaming(.stdin(), session.io, &input_buffer);
     const input = &stdin_file.interface;
     while (try input.takeDelimiter('\n')) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r\n");
         if (line.len == 0) continue;
-        const keep_going = try handleServerRequest(out, io, idx, root, line);
+        const keep_going = try handleServerRequest(out, session, line);
         try out.flush();
         if (!keep_going) return;
     }
 }
 
-fn handleServerRequest(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: []const u8, line: []const u8) !bool {
-    std.debug.assert(root.len > 0);
+fn handleServerRequest(out: *std.Io.Writer, session: *ServerSession, line: []const u8) !bool {
+    std.debug.assert(session.root.len > 0);
     std.debug.assert(line.len > 0);
-    var parsed = std.json.parseFromSlice(std.json.Value, idx.gpa, line, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, session.gpa, line, .{}) catch {
         try rpcError(out, null, -32700, "invalid JSON");
         return true;
     };
@@ -163,11 +201,12 @@ fn handleServerRequest(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, r
         return true;
     }
     const method = method_value.string;
+    if (std.mem.eql(u8, method, "workspace/reload")) return rpcReload(out, session, id, obj.get("params"));
     if (std.mem.startsWith(u8, method, "notifications/")) return true;
     if (id == null) return true;
     if (std.mem.eql(u8, method, "initialize")) return rpcInitialize(out, id);
     if (std.mem.eql(u8, method, "tools/list")) return rpcTools(out, id);
-    if (std.mem.eql(u8, method, "tools/call")) return rpcToolCall(out, io, idx, root, id, obj.get("params"));
+    if (std.mem.eql(u8, method, "tools/call")) return rpcToolCall(out, session, id, obj.get("params"));
     if (std.mem.eql(u8, method, "ping")) {
         try rpcResultPrefix(out, id);
         try out.writeAll("{} }\n");
@@ -192,12 +231,75 @@ fn rpcInitialize(out: *std.Io.Writer, id: ?std.json.Value) !bool {
 fn rpcTools(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     std.debug.assert(id != null);
     try rpcResultPrefix(out, id);
-    try out.writeAll("{\"tools\":[{\"name\":\"navgraph\",\"description\":\"Run a NavGraph command against the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"]}}]}}\n");
+    try out.writeAll("{\"tools\":[");
+    try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Run a NavGraph command against the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"]}},");
+    try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}}]}}\n");
     return true;
 }
 
-fn rpcToolCall(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: []const u8, id: ?std.json.Value, params_value: ?std.json.Value) !bool {
-    std.debug.assert(root.len > 0);
+fn rpcReload(
+    out: *std.Io.Writer,
+    session: *ServerSession,
+    id: ?std.json.Value,
+    params: ?std.json.Value,
+) !bool {
+    reloadFromValue(session, params) catch |err| {
+        if (id) |_| try rpcError(out, id, reloadErrorCode(err), @errorName(err));
+        return true;
+    };
+    if (id == null) return true;
+    try rpcResultPrefix(out, id);
+    try writeReloadMetadata(out, session);
+    try out.writeAll("}\n");
+    return true;
+}
+
+fn rpcReloadTool(
+    out: *std.Io.Writer,
+    session: *ServerSession,
+    id: ?std.json.Value,
+    arguments: std.json.Value,
+) !bool {
+    std.debug.assert(id != null);
+    reloadFromValue(session, arguments) catch |err| {
+        try rpcError(out, id, reloadErrorCode(err), @errorName(err));
+        return true;
+    };
+    try rpcResultPrefix(out, id);
+    try out.writeAll("{\"content\":[{\"type\":\"text\",\"text\":\"index reloaded\"}],\"isError\":false,\"index\":");
+    try writeReloadMetadata(out, session);
+    try out.writeAll("}}\n");
+    return true;
+}
+
+fn reloadFromValue(session: *ServerSession, value: ?std.json.Value) !void {
+    var no_cache = false;
+    if (value) |params| {
+        if (params != .object) return error.InvalidReloadArguments;
+        const field_count = params.object.count();
+        const raw = params.object.get("noCache");
+        if (field_count > @as(usize, @intFromBool(raw != null))) return error.InvalidReloadArguments;
+        if (raw) |flag| {
+            if (flag != .bool) return error.InvalidReloadArguments;
+            no_cache = flag.bool;
+        }
+    }
+    try session.reload(if (no_cache) false else session.use_cache);
+}
+
+fn reloadErrorCode(err: anyerror) i32 {
+    return if (err == error.InvalidReloadArguments) -32602 else -32603;
+}
+
+fn writeReloadMetadata(out: *std.Io.Writer, session: *const ServerSession) !void {
+    const snapshot = session.idx.cache_snapshot;
+    try out.print("{{\"files\":{},\"symbols\":{},\"cache_hits\":{},\"cache_rewrite\":\"{s}\"}}", .{
+        session.idx.graph.files.len, session.idx.graph.symbols.len, snapshot.hits, @tagName(snapshot.rewrite),
+    });
+}
+
+fn rpcToolCall(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, params_value: ?std.json.Value) !bool {
+    std.debug.assert(session.root.len > 0);
     std.debug.assert(id != null);
     if (params_value == null or params_value.? != .object) {
         try rpcError(out, id, -32602, "tools/call requires params");
@@ -208,8 +310,8 @@ fn rpcToolCall(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: []c
         try rpcError(out, id, -32602, "missing tool name");
         return true;
     };
-    if (name != .string or !std.mem.eql(u8, name.string, "navgraph")) {
-        try rpcError(out, id, -32602, "unknown tool");
+    if (name != .string) {
+        try rpcError(out, id, -32602, "tool name must be a string");
         return true;
     }
     const arguments = params.get("arguments") orelse {
@@ -220,17 +322,22 @@ fn rpcToolCall(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: []c
         try rpcError(out, id, -32602, "arguments must be an object");
         return true;
     }
-    return runServerTool(out, io, idx, root, id, arguments.object.get("args"));
+    if (std.mem.eql(u8, name.string, "navgraph"))
+        return runServerTool(out, session, id, arguments.object.get("args"));
+    if (std.mem.eql(u8, name.string, "navgraph.reload"))
+        return rpcReloadTool(out, session, id, arguments);
+    try rpcError(out, id, -32602, "unknown tool");
+    return true;
 }
 
-fn runServerTool(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: []const u8, id: ?std.json.Value, args_value: ?std.json.Value) !bool {
-    std.debug.assert(root.len > 0);
-    std.debug.assert(idx.graph.symbols.len <= std.math.maxInt(model.SymbolId));
+fn runServerTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, args_value: ?std.json.Value) !bool {
+    std.debug.assert(session.root.len > 0);
+    std.debug.assert(session.idx.graph.symbols.len <= std.math.maxInt(model.SymbolId));
     if (args_value == null or args_value.? != .array or args_value.?.array.items.len == 0) {
         try rpcError(out, id, -32602, "args must be a non-empty string array");
         return true;
     }
-    var arena_state = std.heap.ArenaAllocator.init(idx.gpa);
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const args = try arena.alloc([:0]const u8, args_value.?.array.items.len);
@@ -245,26 +352,35 @@ fn runServerTool(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, root: [
         try rpcError(out, id, -32602, if (cli.diag().len != 0) cli.diag() else "invalid navgraph arguments");
         return true;
     };
-    if (request.command == .serve or !std.mem.eql(u8, request.root, ".")) {
-        try rpcError(out, id, -32602, "serve and -C are not allowed inside a server request");
+    if (request.command == .serve or request.command == .help or !std.mem.eql(u8, request.root, ".")) {
+        try rpcError(out, id, -32602, "serve, help, and -C are not allowed inside a server request");
         return true;
     }
-    request.root = root;
-    try dispatchServerResult(out, io, idx, id, request);
+    request.root = session.root;
+    try dispatchServerResult(out, session, id, request);
     return true;
 }
 
-fn dispatchServerResult(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, id: ?std.json.Value, request: cli.Parsed) !void {
+fn dispatchServerResult(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, request: cli.Parsed) !void {
     std.debug.assert(request.command != .serve and request.command != .help);
     std.debug.assert(request.root.len > 0);
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(idx.gpa);
-    var aw: std.Io.Writer.Allocating = .fromArrayList(idx.gpa, &buf);
+    defer buf.deinit(session.gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(session.gpa, &buf);
     defer aw.deinit();
-    const found = dispatch(&aw.writer, io, idx, request) catch |err| {
+    const found = dispatch(&aw.writer, session.io, session.idx, request) catch |err| {
         try rpcError(out, id, -32603, @errorName(err));
         return;
     };
+    if (found and request.command == .rename and !request.options.preview) {
+        session.reload(session.use_cache) catch |err| {
+            var message_buf: [192]u8 = undefined;
+            const message = std.fmt.bufPrint(&message_buf, "rename was applied, but index reload failed: {s}", .{@errorName(err)}) catch
+                "rename was applied, but index reload failed";
+            try rpcError(out, id, -32603, message);
+            return;
+        };
+    }
     try rpcResultPrefix(out, id);
     try out.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
     try json_out.writeString(out, aw.written());
@@ -833,16 +949,18 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
 
-    try testing.expect(try handleServerRequest(&aw.writer, io, &fx.idx, ".", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
-    try testing.expect(try handleServerRequest(&aw.writer, io, &fx.idx, ".", "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph\",\"arguments\":{\"args\":[\"search\",\"leaf\",\"-j\"]}}}"));
-    try testing.expect(try handleServerRequest(&aw.writer, io, &fx.idx, ".", "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"unknown\"}"));
-    try testing.expect(try handleServerRequest(&aw.writer, io, &fx.idx, ".", "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph\",\"arguments\":{\"args\":[\"search\",\"missing_symbol\",\"-j\"]}}}"));
-    try testing.expect(try handleServerRequest(&aw.writer, io, &fx.idx, ".", "{\"jsonrpc\":\"1.0\",\"id\":5,\"method\":\"ping\"}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph\",\"arguments\":{\"args\":[\"search\",\"leaf\",\"-j\"]}}}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"unknown\"}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph\",\"arguments\":{\"args\":[\"search\",\"missing_symbol\",\"-j\"]}}}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"1.0\",\"id\":5,\"method\":\"ping\"}"));
     var lines = std.mem.tokenizeScalar(u8, aw.written(), '\n');
     var count: u32 = 0;
     while (lines.next()) |line| {
@@ -856,4 +974,67 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32601"));
     try testing.expect(has(aw.written(), "\"isError\":false,\"found\":false"));
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32600"));
+}
+
+test "server reload atomically refreshes requests and notifications" {
+    const testing = std.testing;
+    const io = testing.io;
+    var fx = try sampleFixture(io);
+    defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    defer session.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"));
+    try testing.expect(has(aw.written(), "navgraph.reload"));
+    try testing.expectEqual(@as(usize, 0), session.idx.lookup("freshAfterReload").len);
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data = "pub fn freshAfterReload() void {}\n" });
+
+    const before_notification = aw.written().len;
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/reload\",\"params\":{\"noCache\":true}}"));
+    try testing.expectEqual(before_notification, aw.written().len);
+    try testing.expectEqual(@as(usize, 1), session.idx.lookup("freshAfterReload").len);
+
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data = "pub fn freshFromTool() void {}\n" });
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.reload\",\"arguments\":{\"noCache\":true}}}"));
+    try testing.expectEqual(@as(usize, 1), session.idx.lookup("freshFromTool").len);
+    try testing.expectEqual(@as(usize, 0), session.idx.lookup("freshAfterReload").len);
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.reload\",\"arguments\":{\"unknown\":true}}}"));
+    try testing.expectEqual(@as(usize, 1), session.idx.lookup("freshFromTool").len);
+
+    var lines = std.mem.tokenizeScalar(u8, aw.written(), '\n');
+    var responses: u32 = 0;
+    while (lines.next()) |line| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer parsed.deinit();
+        try testing.expect(parsed.value == .object);
+        responses += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), responses);
+    try testing.expect(has(aw.written(), "index reloaded"));
+    try testing.expect(has(aw.written(), "\"error\":{\"code\":-32602"));
+}
+
+test "failed server reload preserves the previous index" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "only.zig", .data = "pub fn stillIndexed() void {}\n" });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/only.zig", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &idx, root, false);
+    defer session.deinit();
+    try testing.expectEqual(@as(usize, 1), idx.lookup("stillIndexed").len);
+    try tmp.dir.deleteFile(io, "only.zig");
+
+    if (session.reload(false)) |_| return error.ReloadOfMissingRootSucceeded else |err| {
+        try testing.expect(@errorName(err).len > 0);
+    }
+    try testing.expectEqual(@as(usize, 1), idx.lookup("stillIndexed").len);
 }

@@ -28,6 +28,7 @@ pub const Command = enum {
     diff,
     collisions,
     files,
+    status,
     read,
     strings,
     todos,
@@ -109,6 +110,7 @@ const usage_text =
     \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
     \\  files [filter]     List every indexed file + its symbol count (index coverage);
     \\                     add --sort symbols to rank biggest-first
+    \\  status [filter]    Index/cache snapshot, freshness, skipped paths, and diagnostics
     \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
     \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
     \\  todos [path]       TODO/FIXME/HACK markers from real comments only
@@ -129,6 +131,7 @@ const usage_text =
     \\  --budget <bytes> / --max-nodes <N>     Bound traversal output; --summary compacts it
     \\  --since <ref> / --from-tests           Affected/reaches test-impact selectors
     \\  --preview                              rename: emit patch without writing files
+    \\  --exact-source                         diff: include source ranges and raw git patch
     \\  -k, --kind <k1,k2>                     Restrict outline/search to kinds (fn,struct,…)
     \\  -p, --vis <public|private|all>          Visibility for outline/search/def (default: all)
     \\  --public, --private, --no-private       Visibility shortcuts
@@ -144,7 +147,7 @@ const usage_text =
     \\  -r, --refs                             search: match use sites; calls/neighbors: include var/const/field reads
     \\  -e, --exact                            search: name must equal the pattern
     \\                                         (finds `Order` without every `createOrder`)
-    \\  --no-recurse                           outline/files: only files directly in the
+    \\  --no-recurse                           outline/files/status: only files directly in the
     \\                                         given dir, not its subtrees
     \\  -t, --tests <with|without|only>        Unified test-scope for outline/search/
     \\                                         callers/hot/unused: with (default) |
@@ -285,7 +288,8 @@ fn parseCommand(s: []const u8) ?Command {
         .{ "duplicates", Command.collisions }, .{ "diff", Command.diff },
         .{ "changed", Command.diff },          .{ "hot", Command.hot },
         .{ "central", Command.hot },           .{ "files", Command.files },
-        .{ "manifest", Command.files },        .{ "read", Command.read },
+        .{ "manifest", Command.files },        .{ "status", Command.status },
+        .{ "snapshot", Command.status },       .{ "read", Command.read },
         .{ "cat", Command.read },              .{ "strings", Command.strings },
         .{ "str", Command.strings },           .{ "literals", Command.strings },
         .{ "todos", Command.todos },           .{ "todo", Command.todos },
@@ -306,7 +310,7 @@ fn parseCommand(s: []const u8) ?Command {
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
     return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .diff, .coverage, .graph, .collisions, .affected, .todos, .serve => true,
+        .outline, .routes, .events, .unused, .imports, .hot, .files, .status, .diff, .coverage, .graph, .collisions, .affected, .todos, .serve => true,
         .path, .rename => p.arg.len != 0 and p.arg2.len != 0,
         else => p.arg.len != 0,
     };
@@ -417,6 +421,10 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     }
     if (std.mem.eql(u8, f.name, "--preview")) {
         out.options.preview = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--exact-source")) {
+        out.options.exact_source = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-i", "--impls" })) {
@@ -574,6 +582,8 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         return fail(error.Usage, "--since applies only to affected", .{});
     if (opts.preview and parsed.command != .rename)
         return fail(error.Usage, "--preview applies only to rename", .{});
+    if (opts.exact_source and parsed.command != .diff)
+        return fail(error.Usage, "--exact-source applies only to diff", .{});
     const compact = opts.budget != 0 or opts.max_nodes != 0 or opts.summary;
     const compact_command = parsed.command == .calls or parsed.command == .callers or parsed.command == .neighbors or
         parsed.command == .outline or parsed.command == .search or parsed.command == .hot or
@@ -581,9 +591,10 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
     if (compact and !compact_command)
         return fail(error.Usage, "--budget/--max-nodes/--summary require a traversal or ranked listing", .{});
     const jsonl_command = parsed.command == .outline or parsed.command == .search or parsed.command == .hot or
-        parsed.command == .todos or parsed.command == .reaches or parsed.command == .affected or parsed.command == .edits;
+        parsed.command == .todos or parsed.command == .reaches or parsed.command == .affected or parsed.command == .edits or
+        parsed.command == .status;
     if (opts.format == .jsonl and !jsonl_command)
-        return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, and edits", .{});
+        return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, edits, and status", .{});
     if (opts.after != 0 and opts.format != .jsonl)
         return fail(error.Usage, "--after requires --jsonl", .{});
     if (opts.duplicates and (parsed.command != .search or opts.refs))
@@ -764,6 +775,7 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.diff, parseCommand("diff").?);
     try std.testing.expectEqual(Command.hot, parseCommand("hot").?);
     try std.testing.expectEqual(Command.files, parseCommand("files").?);
+    try std.testing.expectEqual(Command.status, parseCommand("status").?);
     try std.testing.expectEqual(Command.read, parseCommand("read").?);
     try std.testing.expectEqual(Command.strings, parseCommand("strings").?);
     try std.testing.expectEqual(Command.todos, parseCommand("todos").?);
@@ -794,6 +806,7 @@ test "parseCommand: every alias maps to its command" {
     try std.testing.expectEqual(Command.diff, parseCommand("changed").?);
     try std.testing.expectEqual(Command.hot, parseCommand("central").?);
     try std.testing.expectEqual(Command.files, parseCommand("manifest").?);
+    try std.testing.expectEqual(Command.status, parseCommand("snapshot").?);
     try std.testing.expectEqual(Command.read, parseCommand("cat").?);
     try std.testing.expectEqual(Command.strings, parseCommand("str").?);
     try std.testing.expectEqual(Command.strings, parseCommand("literals").?);
@@ -939,6 +952,7 @@ test "hasRequiredArgs: optional-arg commands accept no positional" {
     try std.testing.expect(hasRequiredArgs(.imports, empty));
     try std.testing.expect(hasRequiredArgs(.hot, empty));
     try std.testing.expect(hasRequiredArgs(.files, empty));
+    try std.testing.expect(hasRequiredArgs(.status, empty));
     try std.testing.expect(hasRequiredArgs(.diff, empty));
 }
 
@@ -970,6 +984,7 @@ test "parse: optional-arg commands succeed with no positional" {
     try std.testing.expectEqual(Command.imports, (try parse(&.{"imports"})).command);
     try std.testing.expectEqual(Command.hot, (try parse(&.{"hot"})).command);
     try std.testing.expectEqual(Command.files, (try parse(&.{"files"})).command);
+    try std.testing.expectEqual(Command.status, (try parse(&.{"status"})).command);
     try std.testing.expectEqual(Command.diff, (try parse(&.{"diff"})).command);
     // ...and with an optional filter/positional.
     try std.testing.expectEqualStrings("src", (try parse(&.{ "outline", "src" })).arg);
@@ -1292,4 +1307,16 @@ test "coverage command and unified --tests scope selector" {
     // default is `with`
     try t.expectEqual(query.TestScope.with, (try parse(&.{"outline"})).options.tests);
     try t.expectError(error.BadValue, parse(&.{ "outline", "--tests", "nope" }));
+}
+
+test "status and exact-source options are scoped and structured-output aware" {
+    const status_request = try parse(&.{ "status", "src", "--jsonl", "-l2" });
+    try std.testing.expectEqual(Command.status, status_request.command);
+    try std.testing.expectEqualStrings("src", status_request.arg);
+    try std.testing.expectEqual(query.OutputFormat.jsonl, status_request.options.format);
+
+    const diff_request = try parse(&.{ "diff", "HEAD~1", "--exact-source", "-j" });
+    try std.testing.expect(diff_request.options.exact_source);
+    try std.testing.expectEqual(query.OutputFormat.json, diff_request.options.format);
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "x", "--exact-source" }));
 }

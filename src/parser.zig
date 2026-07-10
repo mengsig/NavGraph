@@ -89,10 +89,7 @@ const Ctx = struct {
 /// Parse-health signal for one file. `desync_from` is set when the tokenizer
 /// likely lost sync — an unterminated string/char literal ran to end-of-file,
 /// swallowing the code after it — with the 1-based line range that was lost.
-pub const ParseHealth = struct {
-    desync_from: ?u32 = null,
-    desync_to: u32 = 0,
-};
+pub const ParseHealth = model.ParseHealth;
 
 /// Parse `source` for `lang`, appending discovered symbols to `out`. Returns a
 /// `ParseHealth` so callers can warn about a tokenizer desync (a confidently

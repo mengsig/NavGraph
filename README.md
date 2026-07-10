@@ -29,8 +29,8 @@ signature detail") and get exactly the information needed — nothing more.
 - **Cross-language APIs.** Link HTTP routes to client calls, including mounted
   FastAPI router prefixes, and expose unhit routes and orphan calls.
 - **Trust signals.** Type-scoped member resolution avoids global same-name guesses;
-  tokenizer desynchronization produces a parse-health warning instead of silently
-  presenting a partial index as complete.
+  `status` reports snapshot freshness, skipped paths, parse health, and unresolved
+  or external graph references; structured symbol/ref output distinguishes locals.
 - **Agent workflow.** Select affected tests, page stable JSONL, compact deep walks
   to a node/byte budget, inspect exact edit sites, and preview or apply safe renames.
 - **Fast.** A ~550-file project indexes and answers a query in ~0.2s. The default
@@ -108,9 +108,10 @@ navgraph <command> [arg] [flags]
 | `reaches <A,B,...>` | Deduplicated transitive closure from several roots; `--from-tests` instead selects tests that can reach any target. |
 | `affected [ref]`   | Tests transitively affected by symbols changed since a git ref (`--since`, default `HEAD`). |
 | `collisions [pattern]` | Group duplicate definition names and locations; `--members` includes methods/fields. Alias: `duplicates`. |
-| `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers — the blast radius of a change. |
+| `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers; `--exact-source` adds post-image byte ranges and the complete raw git patch. |
 | `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
+| `status [filter]`  | Index/cache snapshot, changed-since-build files, skipped paths, parse health, and unresolved/external graph-reference diagnostics. |
 | `read <file[:A-B]>`| Print raw source lines (numbered); batch ranges: `file:A-B,C-D`. |
 | `strings <pattern>`| Search inside string literals (URLs, log/error text, regexes). |
 | `todos [path]`     | Find `TODO`/`FIXME`/`HACK` markers in real comment tokens. |
@@ -118,7 +119,7 @@ navgraph <command> [arg] [flags]
 | `rename <sym> <new>` | Apply a collision-checked exact rename; `--preview` emits a unified patch without writing. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges}` JSON. Respects `--tests`. |
-| `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP on stdin/stdout. Alias: `mcp`. |
+| `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. |
 | `help`             | Show help.                                                    |
 
 **Flags**
@@ -134,6 +135,7 @@ navgraph <command> [arg] [flags]
 | `--since <ref>`               | `affected`: git comparison ref (default `HEAD`). |
 | `--from-tests`                | `reaches`: return tests that transitively reach any named target. |
 | `--preview`                   | `rename`: emit warnings and unified patch without writing files. |
+| `--exact-source`              | `diff`: include exact current-source byte ranges and the complete raw git patch. |
 | `-k, --kind <k1,k2>`          | Restrict `outline`/`search` to kinds (`fn`, `struct`, …). |
 | `-p, --vis <scope>`            | Visibility for `outline`/`search`/`def`: `public`, `private`, or `all` (default). Shortcuts: `--public`, `--private`, `--no-private`. |
 | `-t, --tests <with\|without\|only>` | Unified test-scope for `outline`/`search`/`callers`/`hot`/`unused`: include tests (default), exclude (`--no-tests`), or only tests (`--tests-only`). A *test* is a Zig `test` block, a `test_*` function, or a file under a test dir. |
@@ -145,7 +147,7 @@ navgraph <command> [arg] [flags]
 | `--duplicates`                | `search`: group duplicate definitions instead of listing individual matches. |
 | `--members`                   | `collisions`: include class/container members. |
 | `-e, --exact`                 | `search`: name must equal the pattern (no substring hits). |
-| `--no-recurse`                | `outline`/`files`: only files directly in the given dir, not subtrees. |
+| `--no-recurse`                | `outline`/`files`/`status`: only files directly in the given dir, not subtrees. |
 | `-s, --strict`                | Follow only high-confidence edges (drop heuristic `?` edges, including structural implementation edges). |
 | `-i, --impls`                 | On `calls`/`callers`/`neighbors`/`path`/`reaches`/`affected`, cross Protocol/interface ↔ implementation edges (`⇒impl`). |
 | `--clients`                   | `routes`: show resolved client call sites, tagged by source language. |
@@ -153,7 +155,7 @@ navgraph <command> [arg] [flags]
 | `--orphan-calls`              | `routes`: show client calls that match no indexed route. |
 | `--handler <glob>`            | `routes`: select routes by handler name. |
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
-| `--jsonl`                     | Stream one item per JSON line plus a page record. `--after v1:N` resumes from its stable ordinal cursor. Supported by `outline`, `search`, `hot`, `todos`, `reaches`, `affected`, and `edits`. |
+| `--jsonl`                     | Stream one item per JSON line plus a page record. `--after v1:N` resumes from its stable ordinal cursor. Supported by `outline`, `search`, `hot`, `todos`, `reaches`, `affected`, `edits`, and `status`. |
 | `--sort <key>`                | `files`: `path|symbols`; `outline`/`search`: `line|name|span|callers|callees`; `hot`: `fan_in|fan_in_exact|fan_out|fan_out_exact|span`. Numeric metrics rank descending with stable path/line ties. |
 | `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild.  |
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
@@ -185,9 +187,15 @@ Find the tests affected by a branch, or compute reachability from several roots:
 
 ```sh
 navgraph affected --since HEAD~1
+navgraph diff HEAD~1 --exact-source
 navgraph reaches place_order,cancel
 navgraph reaches place_order,cancel --from-tests --impls
 ```
+
+With `diff --exact-source -j`, the legacy file array becomes `{files, patch}`.
+Each post-image range carries exact `start`/`end` bytes and `source`; a
+pure-deletion anchor has `empty: true`, equal byte offsets, and empty source,
+while the raw patch preserves deleted files and removed text.
 
 Bound a deep walk to agent context, then page a large result without losing your
 place:
@@ -197,6 +205,7 @@ navgraph calls negotiate -d 3 --max-nodes 40 --summary
 navgraph outline packages --budget 4000
 navgraph search Handler --jsonl -l 100
 navgraph search Handler --jsonl -l 100 --after v1:100
+navgraph status --jsonl -l 100             # freshness + diagnostics
 ```
 
 Preview a mechanical rename before applying it, and inspect intent comments:
@@ -221,9 +230,12 @@ Run the long-lived MCP surface over stdio:
 navgraph serve -C .
 ```
 
-It implements `initialize`, `tools/list`, and `tools/call` using one JSON-RPC 2.0
-object per line. The `navgraph` tool's `arguments` object accepts
-`{"args":["search","Foo","-j"]}` and reuses the in-memory index.
+It implements `initialize`, `tools/list`, `tools/call`, and
+`workspace/reload` using one JSON-RPC 2.0 object per line. The `navgraph` tool's
+`arguments` object accepts `{"args":["search","Foo","-j"]}`. The separate
+`navgraph.reload` tool accepts `{"noCache":true}` and atomically swaps in a
+fresh index only after the rebuild succeeds. A no-id `workspace/reload`
+notification refreshes the snapshot without emitting a response.
 
 Find who writes and reads a field, or trace the handoff to a sink:
 
@@ -357,8 +369,8 @@ method Server.start (self):  app/server.py:15
    a directory the built-in skip set would prune.
 2. **Tokenize** each file with a shared, language-configured lexer that
    correctly skips strings, comments, JavaScript regex literals, and JSX closing
-   tags. If an unterminated string still consumes the rest of a file, NavGraph
-   prints a `parse-health` warning with the affected line range.
+   tags. If an unterminated string consumes the rest of a file, its parse-health
+   range is cached, printed as a warning, and exposed in JSON/JSONL diagnostics.
 3. **Extract** definitions and their in-body references with per-language
    heuristic scanners (no per-language grammar required).
 4. **Resolve** references to definitions by name, with exact receiver-aware
@@ -386,9 +398,10 @@ Everything for one run lives in a single arena that is freed on exit.
   heuristic/unrecoverable use sites. It does not rewrite strings, comments,
   reflected names, or generated code. Project-wide writes are per-file rather
   than transactional, so use `--preview` and version control for multi-file edits.
-- `serve` keeps a snapshot in memory; restart it after external edits to refresh
-  the index. JSONL cursors are stable while that indexed snapshot and query
-  options remain unchanged.
+- `serve` keeps a snapshot in memory. Use the `navgraph.reload` MCP tool or
+  `workspace/reload` JSON-RPC method after external edits; rebuild failure leaves
+  the previous index intact. JSONL cursors are stable only while that snapshot
+  and the query options remain unchanged.
 - Repeat runs are fast via an on-disk cache under `.navgraph/cache` (path +
   mtime + ctime + size keyed); `--no-cache` forces a clean rebuild.
 - **Cross-language linking** covers HTTP routes (`navgraph routes`, e.g. a TS

@@ -29,7 +29,7 @@ you at specific lines may you `read` those exact lines.
 | Who writes/reads a value | `navgraph flow <symbol>` (`--to <sink>` traces the handoff) |
 | Finding duplicate names | `navgraph collisions [pattern]` (`--members` includes members) |
 | Guessing what matters | `navgraph hot [path]` |
-| Scoping a branch's changes | `navgraph diff [ref]` (default HEAD, + callers) |
+| Scoping a branch's changes | `navgraph diff [ref]` (+ callers); add `--exact-source` for byte ranges + raw patch |
 | Selecting tests for a branch | `navgraph affected --since <ref>` |
 | Set reachability | `navgraph reaches <A,B,...>` (`--from-tests` selects exercising tests) |
 | Finding dead code | `navgraph unused [filter]` (`--no-public` hides API) |
@@ -46,6 +46,7 @@ you at specific lines may you `read` those exact lines.
 | Reading intent/docs | `navgraph docs <name>` / `todos [path]` |
 | Planning a mechanical rename | `navgraph edits <symbol>` / `rename <symbol> <new> --preview` |
 | Listing indexed files | `navgraph files [filter]` (`--sort symbols`) |
+| Checking index trust/freshness | `navgraph status [filter]` (`-j`/`--jsonl` for diagnostics) |
 
 ## Combine with unix tools (pipe, don't substitute)
 
@@ -84,11 +85,13 @@ to navgraph to understand it.
 - On a large hub use `--max-nodes N --summary` or `--budget BYTES`; compact
   walks retain resolved/exact, high-fan-in branches before lower-value branches.
 - Use `affected --since HEAD~1` rather than manually unioning `diff` with test
-  callers; use `reaches A,B --from-tests` for named target sets.
+  callers; use `reaches A,B --from-tests` for named target sets. Add
+  `diff --exact-source` when review also needs exact hunks and non-symbol edits.
 - Before a mechanical rename, run `rename Old New --preview` (or `edits Old`).
   Apply without `--preview` only after collision/review warnings are clear.
 - For pageable automation use `--jsonl -l N`; resume the final page cursor with
-  `--after v1:N`. `serve` exposes the same CLI through one MCP `navgraph` tool.
+  `--after v1:N`. `serve` exposes CLI queries through `navgraph`; call the
+  separate `navgraph.reload` tool after edits (or send `workspace/reload`).
 - Trust the JSON `parent` field for "which class owns this method".
 - Go: package-qualified calls resolve exactly; pin methods as `Type.method`; a
   shared name prints an N-definitions banner — pin it.
@@ -106,8 +109,8 @@ to navgraph to understand it.
 - `-l N`/`--limit` (default 300); `-r`/`--refs` — include use sites/reads.
 - `--budget BYTES`, `--max-nodes N`, `--summary` — bounded, importance-pruned
   output for calls/callers/neighbors/outline/search/hot and impact sets.
-- `--since REF` (`affected`), `--from-tests` (`reaches`), and `--preview`
-  (`rename`) are Phase-3 workflow controls.
+- `--since REF` (`affected`), `--from-tests` (`reaches`), `--preview`
+  (`rename`), and `--exact-source` (`diff`) are workflow controls.
 - `-t`/`--tests <with|without|only>` (aliases `--no-tests`, `--tests-only`) —
   test scope for outline/search/callers/hot/unused; default `with`.
 - `-C <path>` — index root (subtree or a single file).
@@ -150,13 +153,16 @@ handler with the TS call that hits it.
   single-method ports, and are removed by `--strict`.
 - A `navgraph: parse-health:` stderr warning means an unterminated string caused
   tokenizer desynchronization; symbols in the named line range may be missing.
+  `status -j`/`--jsonl` exposes this and unresolved/external graph refs structurally; JSON
+  reference rows distinguish local values from unresolved/external targets.
 - `path A B` "no call path" is a real answer, not a failure.
 - Don't gauge "is X indexed?" with `search X | wc -l` — the not-found message is
   one line too; read the actual output.
 - Rename is exact-only: ambiguous selectors, destination collisions, local
   shadowing, or heuristic/unrecoverable reference sites block application.
   Strings, comments, reflection, and generated names are never rewritten.
-- A `serve` process uses an in-memory snapshot; restart after external edits.
-  JSONL cursors assume the indexed snapshot and query options are unchanged.
+- A `serve` process uses an in-memory snapshot. Refresh it atomically with the
+  `navgraph.reload` MCP tool or `workspace/reload`; failed rebuilds preserve the
+  old index. JSONL cursors assume the snapshot and query options are unchanged.
 - Inline non-Zig tests (e.g. Rust `#[cfg(test)] mod tests`) aren't detected as
   tests — treated as production, so `--tests-only`/`coverage` miss them.

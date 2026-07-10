@@ -360,7 +360,14 @@ fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, l
         try w.writeAll(",\"target\":");
         try writeString(w, idx.graph.files[idx.graph.symbols[ref.target].file].path);
         try w.print(",\"exact\":{}", .{ref.exact});
+    } else if (query.referenceIsLocal(sym, ref)) {
+        try w.writeAll(",\"resolved\":false,\"resolution\":\"local\"");
+    } else if (query.referenceNeedsDiagnostic(sym, ref)) {
+        try w.writeAll(",\"resolved\":false,\"resolution\":\"unresolved_or_external\",\"diagnostic\":\"unresolved_reference\"");
+    } else {
+        try w.writeAll(",\"resolved\":false,\"resolution\":\"external_or_unmodeled\"");
     }
+    try writeParseHealthField(w, "owner_parse_health", idx.graph.files[sym.file].parse_health);
     try w.writeByte('}');
 }
 
@@ -919,45 +926,118 @@ fn orphanRouteCalls(w: *Writer, idx: *const Index, filter: []const u8, opts: Opt
     return shown > 0;
 }
 
-/// Diff: array of `{file, symbols:[{...symbol, callers:[...]}]}` — changed symbols
-/// and their direct callers (blast radius) per file. Returns whether any changed
-/// symbol was reported.
-pub fn diff(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !bool {
-    _ = opts;
+/// Diff: default output is an array of changed symbols and direct callers. With
+/// `--exact-source`, the same semantic files are wrapped with post-image byte
+/// ranges and the exact raw git patch (including deletions and non-symbol edits).
+pub fn diff(
+    w: *Writer,
+    idx: *const Index,
+    changes: []const gitdiff.FileChange,
+    patch: []const u8,
+    opts: Options,
+) !bool {
+    if (opts.exact_source) try w.writeAll("{\"files\":");
+    const any_symbol = try writeDiffFiles(w, idx, changes, opts);
+    if (opts.exact_source) {
+        try w.writeAll(",\"patch\":");
+        try writeString(w, patch);
+        try w.writeAll("}\n");
+        return any_symbol or patch.len != 0;
+    }
+    try w.writeByte('\n');
+    return any_symbol;
+}
+
+fn writeDiffFiles(w: *Writer, idx: *const Index, changes: []const gitdiff.FileChange, opts: Options) !bool {
+    std.debug.assert(opts.limit > 0);
     var any_symbol = false;
-    try w.writeByte('[');
     var first_file = true;
+    var shown: u32 = 0;
+    try w.writeByte('[');
     for (changes) |change| {
         const file = query.findDiffFile(idx, change.path) orelse continue;
-        var opened = false;
+        if (!opts.exact_source and !diffFileTouched(idx, file, change.ranges)) continue;
+        if (!first_file) try w.writeByte(',');
+        first_file = false;
+        try w.writeAll("{\"file\":");
+        try writeString(w, change.path);
+        if (opts.exact_source) try writeChangedRanges(w, file, change.ranges);
+        try w.writeAll(",\"symbols\":[");
+        var first_symbol = true;
         var i = file.sym_start;
-        while (i < file.sym_end) : (i += 1) {
+        while (i < file.sym_end and shown < opts.limit) : (i += 1) {
             const sym = idx.graph.symbols[i];
-            if (sym.kind == .import) continue;
-            if (!query.symbolTouched(sym, idx.graph.files[sym.file].text, change.ranges)) continue;
-            if (!opened) {
-                if (!first_file) try w.writeByte(',');
-                first_file = false;
-                try w.writeAll("{\"file\":");
-                try writeString(w, change.path);
-                try w.writeAll(",\"symbols\":[");
-                opened = true;
-            } else {
-                try w.writeByte(',');
-            }
+            if (sym.kind == .import or !query.symbolTouched(sym, file.text, change.ranges)) continue;
+            if (!first_symbol) try w.writeByte(',');
+            first_symbol = false;
             any_symbol = true;
-            try nodeHead(w, idx, sym);
-            try w.writeAll(",\"callers\":[");
-            for (idx.callersOf(sym.id), 0..) |cid, k| {
-                if (k != 0) try w.writeByte(',');
-                try symbolObject(w, idx, idx.graph.symbols[cid], .names);
-            }
-            try w.writeAll("]}");
+            shown += 1;
+            try writeDiffSymbol(w, idx, sym, opts.exact_source);
         }
-        if (opened) try w.writeAll("]}");
+        try w.writeAll("]}");
+        if (shown >= opts.limit and !opts.exact_source) break;
     }
-    try w.writeAll("]\n");
+    try w.writeByte(']');
     return any_symbol;
+}
+
+fn diffFileTouched(idx: *const Index, file: model.SourceFile, ranges: []const gitdiff.Range) bool {
+    std.debug.assert(file.sym_start <= file.sym_end);
+    std.debug.assert(file.sym_end <= idx.graph.symbols.len);
+    for (idx.graph.symbols[file.sym_start..file.sym_end]) |sym| {
+        if (sym.kind != .import and query.symbolTouched(sym, file.text, ranges)) return true;
+    }
+    return false;
+}
+
+fn writeChangedRanges(w: *Writer, file: model.SourceFile, ranges: []const gitdiff.Range) !void {
+    try w.writeAll(",\"changes\":[");
+    for (ranges, 0..) |range, i| {
+        if (i != 0) try w.writeByte(',');
+        const mapped = query.sourceRange(file.text, range);
+        try w.print("{{\"line\":{},\"line_end\":{},\"start\":{},\"end\":{},\"empty\":{},\"source\":", .{
+            mapped.line, mapped.line_end, mapped.start, mapped.end, mapped.empty,
+        });
+        try writeString(w, mapped.text);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+fn writeDiffSymbol(w: *Writer, idx: *const Index, sym: Symbol, exact_source: bool) !void {
+    std.debug.assert(sym.id < idx.graph.symbols.len);
+    try nodeHead(w, idx, sym);
+    try w.writeAll(",\"callers\":[");
+    var seen = std.AutoHashMap(SymbolId, void).init(idx.gpa);
+    defer seen.deinit();
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
+    var first = true;
+    for (idx.callersOf(sym.id)) |cid| {
+        std.debug.assert(cid < idx.graph.symbols.len);
+        if ((try seen.getOrPut(cid)).found_existing) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        const caller = idx.graph.symbols[cid];
+        if (!exact_source) {
+            try symbolObject(w, idx, caller, .names);
+            continue;
+        }
+        try query.callSiteLines(idx, cid, sym.id, &lines);
+        std.debug.assert(lines.items.len > 0);
+        try nodeHead(w, idx, caller);
+        try w.print(",\"site\":{},\"site_count\":{}", .{ lines.items[0], query.callSiteCount(idx, cid, sym.id) });
+        if (lines.items.len > 1) {
+            try w.writeAll(",\"lines\":[");
+            for (lines.items, 0..) |line, i| {
+                if (i != 0) try w.writeByte(',');
+                try w.print("{}", .{line});
+            }
+            try w.writeByte(']');
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
 }
 
 /// Events: array of `{key, sites:[{role, verb, file, line, in}]}` grouped by
@@ -1119,6 +1199,232 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     return shown > 0;
 }
 
+pub fn status(
+    w: *Writer,
+    idx: *const Index,
+    filter: []const u8,
+    report: query.StatusReport,
+    opts: Options,
+) !bool {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(report.scope_files <= idx.graph.files.len);
+    try w.writeAll("{\"root\":");
+    try writeString(w, idx.root);
+    try w.print(",\"snapshot\":{{\"files\":{},\"symbols\":{}}}", .{ idx.graph.files.len, idx.graph.symbols.len });
+    try w.writeAll(",\"scope\":{\"filter\":");
+    try writeString(w, filter);
+    try w.print(",\"files\":{},\"symbols\":{}}}", .{ report.scope_files, report.scope_symbols });
+    try writeCacheSnapshot(w, idx);
+    try writeFreshness(w, idx, report);
+    try writeSkippedStatus(w, idx, filter, report);
+    try writeParseStatus(w, idx, filter, report, opts);
+    try writeUnresolvedStatus(w, idx, filter, report, opts);
+    try w.writeAll("}\n");
+    return true;
+}
+
+pub fn statusJsonl(
+    w: *Writer,
+    idx: *const Index,
+    filter: []const u8,
+    report: query.StatusReport,
+    opts: Options,
+) !bool {
+    std.debug.assert(opts.limit > 0);
+    const total: usize = 1 + report.changes.len + report.skipped + report.parse_warnings + report.unresolved_refs;
+    var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
+    var ordinal: u32 = 0;
+    if (page.accepts(ordinal)) {
+        try jsonlHead(w, page.last);
+        try statusSummaryItem(w, idx, filter, report);
+        try w.writeAll("}\n");
+    }
+    ordinal += 1;
+    for (report.changes) |change| {
+        if (page.accepts(ordinal)) {
+            try jsonlHead(w, page.last);
+            try statusChangeObject(w, idx, change);
+            try w.writeAll("}\n");
+        }
+        ordinal += 1;
+    }
+    for (idx.skipped_dirs) |path| {
+        if (filter.len != 0 and !query.matchesFilter(path, filter)) continue;
+        if (page.accepts(ordinal)) {
+            try jsonlHead(w, page.last);
+            try w.writeAll("{\"kind\":\"skipped\",\"path\":");
+            try writeString(w, path);
+            try w.writeAll("}}\n");
+        }
+        ordinal += 1;
+    }
+    ordinal = try statusJsonlHealth(w, idx, filter, opts, &page, ordinal);
+    ordinal = try statusJsonlUnresolved(w, idx, filter, opts, &page, ordinal);
+    std.debug.assert(ordinal == total);
+    try jsonlFinish(w, page, total);
+    return page.emitted != 0;
+}
+
+fn statusSummaryItem(w: *Writer, idx: *const Index, filter: []const u8, report: query.StatusReport) !void {
+    try w.writeAll("{\"kind\":\"summary\",\"root\":");
+    try writeString(w, idx.root);
+    try w.print(",\"files\":{},\"symbols\":{},\"scope_files\":{},\"scope_symbols\":{}", .{
+        idx.graph.files.len, idx.graph.symbols.len, report.scope_files, report.scope_symbols,
+    });
+    if (filter.len != 0) {
+        try w.writeAll(",\"filter\":");
+        try writeString(w, filter);
+    }
+    try writeCacheSnapshot(w, idx);
+    const freshness_current = report.root_error.len == 0 and report.changes.len == 0;
+    try w.print(",\"freshness_current\":{},\"parse_warnings\":{},\"unresolved_references\":{},\"changed_files\":{},\"skipped\":{}", .{
+        freshness_current, report.parse_warnings, report.unresolved_refs, report.changes.len, report.skipped,
+    });
+    if (report.root_error.len != 0) {
+        try w.writeAll(",\"root_error\":");
+        try writeString(w, report.root_error);
+    }
+    try w.writeByte('}');
+}
+
+fn writeCacheSnapshot(w: *Writer, idx: *const Index) !void {
+    const state = idx.cache_snapshot;
+    try w.print(",\"cache\":{{\"enabled\":{},\"loaded\":{},\"loaded_entries\":{},\"hits\":{},\"rewrite\":\"{s}\"}}", .{
+        state.enabled, state.loaded, state.loaded_entries, state.hits, @tagName(state.rewrite),
+    });
+}
+
+fn writeFreshness(w: *Writer, idx: *const Index, report: query.StatusReport) !void {
+    const current = report.root_error.len == 0 and report.changes.len == 0;
+    try w.print(",\"freshness\":{{\"current\":{},\"changes\":[", .{current});
+    for (report.changes, 0..) |change, i| {
+        if (i != 0) try w.writeByte(',');
+        try statusChangeObject(w, idx, change);
+    }
+    try w.writeByte(']');
+    if (report.root_error.len != 0) {
+        try w.writeAll(",\"root_error\":");
+        try writeString(w, report.root_error);
+    }
+    try w.writeByte('}');
+}
+
+fn statusChangeObject(w: *Writer, idx: *const Index, change: query.StatusChange) !void {
+    std.debug.assert(change.file < idx.graph.files.len);
+    try w.writeAll("{\"kind\":\"freshness\",\"file\":");
+    try writeString(w, idx.graph.files[change.file].path);
+    try w.print(",\"state\":\"{s}\"", .{@tagName(change.kind)});
+    if (change.error_name.len != 0) {
+        try w.writeAll(",\"error\":");
+        try writeString(w, change.error_name);
+    }
+    try w.writeByte('}');
+}
+
+fn writeSkippedStatus(w: *Writer, idx: *const Index, filter: []const u8, report: query.StatusReport) !void {
+    try w.print(",\"skipped\":{{\"count\":{},\"paths\":[", .{report.skipped});
+    var first = true;
+    for (idx.skipped_dirs) |path| {
+        if (filter.len != 0 and !query.matchesFilter(path, filter)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try writeString(w, path);
+    }
+    try w.writeAll("]}");
+}
+
+fn writeParseStatus(w: *Writer, idx: *const Index, filter: []const u8, report: query.StatusReport, opts: Options) !void {
+    try w.print(",\"parse_health\":{{\"count\":{},\"items\":[", .{report.parse_warnings});
+    var first = true;
+    for (idx.graph.files) |file| {
+        if (!query.statusFileSelected(file, filter, opts) or file.parse_health.reliable()) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try parseHealthObject(w, file);
+    }
+    try w.writeAll("]}");
+}
+
+fn writeUnresolvedStatus(
+    w: *Writer,
+    idx: *const Index,
+    filter: []const u8,
+    report: query.StatusReport,
+    opts: Options,
+) !void {
+    try w.print(",\"unresolved_references\":{{\"count\":{},\"scope\":\"call_type_import_edges\",\"items\":[", .{report.unresolved_refs});
+    var shown: u32 = 0;
+    outer: for (idx.graph.symbols) |sym| {
+        const file = idx.graph.files[sym.file];
+        if (!query.statusFileSelected(file, filter, opts)) continue;
+        for (sym.refs) |ref| {
+            if (!query.referenceNeedsDiagnostic(sym, ref)) continue;
+            if (shown != 0) try w.writeByte(',');
+            try unresolvedObject(w, idx, sym, ref);
+            shown += 1;
+            if (shown >= opts.limit) break :outer;
+        }
+    }
+    try w.print("],\"shown\":{},\"truncated\":{}}}", .{ shown, shown < report.unresolved_refs });
+}
+
+fn statusJsonlHealth(w: *Writer, idx: *const Index, filter: []const u8, opts: Options, page: *JsonlPage, start: u32) !u32 {
+    var ordinal = start;
+    for (idx.graph.files) |file| {
+        if (!query.statusFileSelected(file, filter, opts) or file.parse_health.reliable()) continue;
+        if (page.accepts(ordinal)) {
+            try jsonlHead(w, page.last);
+            try parseHealthObject(w, file);
+            try w.writeAll("}\n");
+        }
+        ordinal += 1;
+    }
+    return ordinal;
+}
+
+fn statusJsonlUnresolved(w: *Writer, idx: *const Index, filter: []const u8, opts: Options, page: *JsonlPage, start: u32) !u32 {
+    var ordinal = start;
+    for (idx.graph.symbols) |sym| {
+        const file = idx.graph.files[sym.file];
+        if (!query.statusFileSelected(file, filter, opts)) continue;
+        for (sym.refs) |ref| {
+            if (!query.referenceNeedsDiagnostic(sym, ref)) continue;
+            if (page.accepts(ordinal)) {
+                try jsonlHead(w, page.last);
+                try unresolvedObject(w, idx, sym, ref);
+                try w.writeAll("}\n");
+            }
+            ordinal += 1;
+        }
+    }
+    return ordinal;
+}
+
+fn parseHealthObject(w: *Writer, file: model.SourceFile) !void {
+    const from = file.parse_health.desync_from orelse unreachable;
+    std.debug.assert(file.parse_health.desync_to >= from);
+    try w.writeAll("{\"kind\":\"parse_health\",\"file\":");
+    try writeString(w, file.path);
+    try w.print(",\"diagnostic\":\"tokenizer_desync\",\"from_line\":{},\"to_line\":{}}}", .{ from, file.parse_health.desync_to });
+}
+
+fn unresolvedObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference) !void {
+    const file = idx.graph.files[sym.file];
+    std.debug.assert(query.referenceNeedsDiagnostic(sym, ref));
+    try w.writeAll("{\"kind\":\"unresolved_reference\",\"resolution\":\"unresolved_or_external\",\"name\":");
+    try writeString(w, ref.name);
+    try w.print(",\"reference_kind\":\"{s}\",\"mode\":\"{s}\",\"file\":", .{ @tagName(ref.kind), if (ref.write) "write" else "read" });
+    try writeString(w, file.path);
+    try w.print(",\"line\":{},\"in\":", .{ref.line});
+    try writeString(w, sym.name);
+    if (ref.qualifier.len != 0) {
+        try w.writeAll(",\"qualifier\":");
+        try writeString(w, ref.qualifier);
+    }
+    if (!file.parse_health.reliable()) try w.writeAll(",\"parse_unreliable\":true");
+    try w.writeByte('}');
+}
+
 /// Imports: `{file, imports:[{target, binding}]}` per in-scope file.
 /// Index coverage manifest: `{file, lang, symbols}` per indexed file. Returns
 /// whether any file matched.
@@ -1132,7 +1438,9 @@ pub fn listFiles(w: *Writer, idx: *const Index, filter: []const u8, opts: Option
         first = false;
         try w.writeAll("{\"file\":");
         try writeString(w, file.path);
-        try w.print(",\"lang\":\"{s}\",\"symbols\":{d}}}", .{ file.language.tag(), query.fileSymbolCount(idx, file) });
+        try w.print(",\"lang\":\"{s}\",\"symbols\":{d}", .{ file.language.tag(), query.fileSymbolCount(idx, file) });
+        try writeParseHealthField(w, "parse_health", file.parse_health);
+        try w.writeByte('}');
     }
     try w.writeAll("]\n");
     return !first;
@@ -1285,13 +1593,22 @@ fn nodeHead(w: *Writer, idx: *const Index, sym: Symbol) !void {
     }
     try w.print(",\"file\":", .{});
     try writeString(w, idx.graph.files[sym.file].path);
-    const source = idx.graph.files[sym.file].text;
-    try w.print(",\"line\":{d},\"line_end\":{d}", .{ sym.line, sym.endLine(source) });
+    const file = idx.graph.files[sym.file];
+    try w.print(",\"line\":{d},\"line_end\":{d}", .{ sym.line, sym.endLine(file.text) });
+    try writeParseHealthField(w, "parse_health", file.parse_health);
     try writeModifiers(w, sym);
 }
 
-/// Emit `,"modifiers":[...]` (accessor/dispatch/async) when any are set; the
-/// `kind` field stays the base kind so consumers can rely on it.
+/// Emit a named parse-health field only when tokenization was unreliable.
+fn writeParseHealthField(w: *Writer, name: []const u8, health: model.ParseHealth) !void {
+    const from = health.desync_from orelse return;
+    std.debug.assert(name.len > 0);
+    std.debug.assert(health.desync_to >= from);
+    try w.writeAll(",\"");
+    try w.writeAll(name);
+    try w.print("\":{{\"kind\":\"tokenizer_desync\",\"from_line\":{},\"to_line\":{}}}", .{ from, health.desync_to });
+}
+
 fn writeModifiers(w: *Writer, sym: Symbol) !void {
     const m = sym.modifiers;
     if (!m.any()) return;
@@ -2150,7 +2467,7 @@ test "diff json reports changed symbols and their callers (blast radius)" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    _ = try diff(&aw.writer, &idx, &changes, .{ .format = .json });
+    _ = try diff(&aw.writer, &idx, &changes, "", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 1), p.value.array.items.len);
@@ -2164,6 +2481,45 @@ test "diff json reports changed symbols and their callers (blast radius)" {
     const callers = changed.get("callers").?.array.items;
     try testing.expectEqual(@as(usize, 1), callers.len);
     try testing.expectEqualStrings("run", callers[0].object.get("name").?.string);
+}
+
+test "diff exact-source json includes byte ranges, caller sites, and raw patch" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.zig", .data =
+        \\pub fn helper() u32 {
+        \\    return 2;
+        \\}
+        \\pub fn run() u32 {
+        \\    const first = helper();
+        \\    return first + helper();
+        \\}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+    var ranges = [_]gitdiff.Range{.{ .lo = 2, .hi = 2 }};
+    var changes = [_]gitdiff.FileChange{.{ .path = "d.zig", .ranges = &ranges }};
+    const patch = "@@ -2 +2 @@\n-    return 1;\n+    return 2;\n";
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try testing.expect(try diff(&aw.writer, &idx, &changes, patch, .{ .format = .json, .exact_source = true }));
+    var parsed = try tjParse(aw.written());
+    defer parsed.deinit();
+    try testing.expectEqualStrings(patch, parsed.value.object.get("patch").?.string);
+    const file = parsed.value.object.get("files").?.array.items[0].object;
+    const change = file.get("changes").?.array.items[0].object;
+    try testing.expectEqualStrings("    return 2;", change.get("source").?.string);
+    try testing.expect(change.get("start").?.integer < change.get("end").?.integer);
+    try testing.expect(!change.get("empty").?.bool);
+    const callers = file.get("symbols").?.array.items[0].object.get("callers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    const caller = callers[0].object;
+    try testing.expectEqual(@as(i64, 5), caller.get("site").?.integer);
+    try testing.expectEqual(@as(i64, 2), caller.get("site_count").?.integer);
+    try testing.expectEqual(@as(usize, 2), caller.get("lines").?.array.items.len);
 }
 
 test "diff json is an empty array when no changed file is indexed" {
@@ -2182,7 +2538,7 @@ test "diff json is an empty array when no changed file is indexed" {
 
     var aw = tjWriter();
     defer aw.deinit();
-    _ = try diff(&aw.writer, &idx, &changes, .{ .format = .json });
+    _ = try diff(&aw.writer, &idx, &changes, "", .{ .format = .json });
     var p = try tjParse(aw.written());
     defer p.deinit();
     try testing.expectEqual(@as(usize, 0), p.value.array.items.len);

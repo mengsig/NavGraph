@@ -26,6 +26,16 @@ const max_gitignore_bytes: usize = 1024 * 1024;
 /// (named/`from` imports), which still populate the import dependency graph.
 pub const FileImport = struct { binding: []const u8, target: FileId };
 
+pub const CacheRewrite = enum { disabled, current, written, failed };
+
+pub const CacheSnapshot = struct {
+    enabled: bool = false,
+    loaded: bool = false,
+    loaded_entries: u32 = 0,
+    hits: u32 = 0,
+    rewrite: CacheRewrite = .disabled,
+};
+
 pub const Index = struct {
     gpa: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
@@ -35,6 +45,9 @@ pub const Index = struct {
     /// Per-file resolved imports (arena-owned), indexed by `FileId`.
     file_imports: [][]const FileImport,
     root: []const u8,
+    /// Filesystem stats captured while this in-memory snapshot was built.
+    file_stats: []const cache.FileStat = &.{},
+    cache_snapshot: CacheSnapshot = .{},
     /// Unique names of directories the walker pruned (build/vendor/fixture dirs
     /// from `ignored_dirs`). Surfaced on empty results so a skipped subtree reads
     /// as "not indexed" rather than "absent". Arena-owned.
@@ -144,6 +157,10 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         try collectDir(&b, root_dir, &path_buf);
     }
 
+    std.debug.assert(b.stats.items.len == b.files.items.len);
+    std.debug.assert(b.cache_hits <= b.files.items.len);
+    const loaded_entries: u32 = if (b.store) |*store| @intCast(store.entries.count()) else 0;
+    const rewrite_cache = use_cache and cacheStale(&b);
     const graph = model.Graph{
         .files = try gpa.dupe(model.SourceFile, b.files.items),
         .symbols = try gpa.dupe(model.Symbol, b.symbols.items),
@@ -156,6 +173,14 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .callers = &.{},
         .file_imports = &.{},
         .root = try arena.dupe(u8, root_path),
+        .file_stats = try arena.dupe(cache.FileStat, b.stats.items),
+        .cache_snapshot = .{
+            .enabled = use_cache,
+            .loaded = b.store != null,
+            .loaded_entries = loaded_entries,
+            .hits = b.cache_hits,
+            .rewrite = if (use_cache) .current else .disabled,
+        },
         .skipped_dirs = try arena.dupe([]const u8, b.skipped.items),
     };
     try buildNameIndex(&idx);
@@ -166,7 +191,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     // symbol names in place (prepending the mount prefix), and those rewritten
     // names must not reach the per-file cache — the mount lives in a different
     // file, so caching the prefixed name would double-prefix on the next build.
-    if (use_cache and cacheStale(&b)) persistCache(&b, &idx);
+    if (rewrite_cache) idx.cache_snapshot.rewrite = if (persistCache(&b, &idx)) .written else .failed;
     applyRouterMounts(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
@@ -186,20 +211,23 @@ fn cacheStale(b: *const Builder) bool {
 /// Best-effort cache write. A failure here (e.g. a read-only tree) must never
 /// fail the query, so it is reported on stderr and swallowed — the cache is a
 /// pure optimization, not required for correctness.
-fn persistCache(b: *const Builder, idx: *const Index) void {
+fn persistCache(b: *const Builder, idx: *const Index) bool {
     std.debug.assert(idx.graph.files.len == b.stats.items.len);
+    std.debug.assert(idx.cache_snapshot.enabled);
     cache.write(b.gpa, b.io, b.root_dir, idx.graph.files, b.stats.items, idx.graph.symbols) catch |err| {
         std.debug.print("navgraph: cache write skipped: {s}\n", .{@errorName(err)});
+        return false;
     };
+    return true;
 }
 
 const ignored_dirs = std.StaticStringMap(void).initComptime(.{
-    .{".git"},        .{"node_modules"},  .{"zig-out"},       .{".zig-cache"},
-    .{"zig-cache"},   .{"__pycache__"},   .{".venv"},         .{"venv"},
-    .{"dist"},        .{"build"},         .{".next"},         .{"target"},
-    .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},        .{".advantage"},
-    .{".nvime"},      .{".idea"},         .{".vscode"},       .{"coverage"},
-    .{".navgraph"},   .{"site-packages"}, .{".tox"},          .{".ruff_cache"},
+    .{".git"},        .{"node_modules"},  .{"zig-out"}, .{".zig-cache"},
+    .{"zig-cache"},   .{"__pycache__"},   .{".venv"},   .{"venv"},
+    .{"dist"},        .{"build"},         .{".next"},   .{"target"},
+    .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},  .{".advantage"},
+    .{".nvime"},      .{".idea"},         .{".vscode"}, .{"coverage"},
+    .{".navgraph"},   .{"site-packages"}, .{".tox"},    .{".ruff_cache"},
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
@@ -268,7 +296,7 @@ const soft_ignore = std.StaticStringMap(void).initComptime(.{
 /// Conventional source-container directory names. A `soft_ignore` dir with any of
 /// these as an ancestor is treated as source, not build output.
 const source_roots = std.StaticStringMap(void).initComptime(.{
-    .{"src"},    .{"lib"},      .{"app"}, .{"source"},
+    .{"src"},     .{"lib"},      .{"app"}, .{"source"},
     .{"sources"}, .{"packages"}, .{"pkg"},
 });
 
@@ -287,12 +315,12 @@ fn underSourceRoot(path: []const u8) bool {
 /// (e.g. `vendor`) can plausibly hold real source, so its skip is reported to
 /// avoid the silent-failure trap.
 const silent_skip = std.StaticStringMap(void).initComptime(.{
-    .{".git"},        .{"node_modules"},  .{"zig-out"},    .{".zig-cache"},
-    .{"zig-cache"},   .{"__pycache__"},   .{".venv"},      .{"venv"},
-    .{"dist"},        .{"build"},         .{".next"},      .{"target"},
-    .{".mypy_cache"}, .{".pytest_cache"}, .{".idea"},      .{".vscode"},
-    .{"coverage"},    .{".navgraph"},     .{".advantage"}, .{".nvime"},
-    .{"site-packages"}, .{".tox"},        .{".ruff_cache"},
+    .{".git"},          .{"node_modules"},  .{"zig-out"},     .{".zig-cache"},
+    .{"zig-cache"},     .{"__pycache__"},   .{".venv"},       .{"venv"},
+    .{"dist"},          .{"build"},         .{".next"},       .{"target"},
+    .{".mypy_cache"},   .{".pytest_cache"}, .{".idea"},       .{".vscode"},
+    .{"coverage"},      .{".navgraph"},     .{".advantage"},  .{".nvime"},
+    .{"site-packages"}, .{".tox"},          .{".ruff_cache"},
 });
 
 /// Record a pruned, potentially-source directory's name once (deduped) for the
@@ -305,8 +333,8 @@ fn noteSkipped(b: *Builder, name: []const u8) !void {
 
 /// Record a skipped minified/bundled file for the skipped-note, annotated so it
 /// reads as a file judgement rather than a pruned directory.
-fn noteSkippedMinified(b: *Builder, basename: []const u8) !void {
-    const label = try std.fmt.allocPrint(b.arena, "{s} (minified)", .{basename});
+fn noteSkippedMinified(b: *Builder, path: []const u8) !void {
+    const label = try std.fmt.allocPrint(b.arena, "{s} (minified)", .{path});
     for (b.skipped.items) |s| if (std.mem.eql(u8, s, label)) return;
     try b.skipped.append(b.gpa, label);
 }
@@ -315,13 +343,13 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     const lang = language.detect(rel_path);
     if (lang == .unknown) return;
     if (b.ignore.isIgnored(rel_path, false)) return;
-    if (isMinifiedName(rel_path)) return noteSkippedMinified(b, basenameOf(rel_path));
+    if (isMinifiedName(rel_path)) return noteSkippedMinified(b, rel_path);
     const stat = statOf(b, rel_path) orelse return;
 
     if (b.store) |*s| {
         if (s.restore(b.arena, rel_path, stat)) |hit| {
             std.debug.assert(hit.text.len == stat.size);
-            try appendFile(b, rel_path, lang, hit.text, hit.symbols, stat);
+            try appendFile(b, rel_path, lang, hit.text, hit.symbols, hit.parse_health, stat);
             b.cache_hits += 1;
             return;
         }
@@ -332,9 +360,9 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     // meaningless one-letter symbols that pollute `hot`/`unused`/`search` — a
     // real trial hit this with a vendored asciinema player under `testdata/`.
     // Skip it and record the basename for the skipped-note.
-    if (isMinifiedText(text)) return noteSkippedMinified(b, basenameOf(rel_path));
-    const parsed = try parseFile(b, rel_path, text, lang);
-    try appendFile(b, rel_path, lang, text, parsed, stat);
+    if (isMinifiedText(text)) return noteSkippedMinified(b, rel_path);
+    const parsed = try parseFile(b, text, lang);
+    try appendFile(b, rel_path, lang, text, parsed.symbols, parsed.health, stat);
 }
 
 fn basenameOf(path: []const u8) []const u8 {
@@ -364,17 +392,28 @@ fn statOf(b: *Builder, rel_path: []const u8) ?cache.FileStat {
     return .{ .mtime_ns = st.mtime.nanoseconds, .ctime_ns = st.ctime.nanoseconds, .size = st.size };
 }
 
-fn parseFile(b: *Builder, rel_path: []const u8, text: []const u8, lang: language.Language) ![]parser.ParsedSymbol {
+const ParsedFile = struct {
+    symbols: []const parser.ParsedSymbol,
+    health: model.ParseHealth,
+};
+
+fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile {
+    std.debug.assert(text.len <= std.math.maxInt(u32));
+    std.debug.assert(lang != .unknown);
     var parsed: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer parsed.deinit(b.gpa);
     const health = try parser.parse(b.gpa, b.arena, text, lang, &parsed);
-    if (health.desync_from) |from| {
-        std.debug.print(
-            "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
-            .{ rel_path, from, health.desync_to },
-        );
-    }
-    return b.arena.dupe(parser.ParsedSymbol, parsed.items);
+    return .{ .symbols = try b.arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
+}
+
+fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
+    const from = health.desync_from orelse return;
+    std.debug.assert(rel_path.len > 0);
+    std.debug.assert(health.desync_to >= from);
+    std.debug.print(
+        "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
+        .{ rel_path, from, health.desync_to },
+    );
 }
 
 /// Assign global ids to `parsed`, append its symbols and the owning `SourceFile`
@@ -385,9 +424,12 @@ fn appendFile(
     lang: language.Language,
     text: []const u8,
     parsed: []const parser.ParsedSymbol,
+    health: model.ParseHealth,
     stat: cache.FileStat,
 ) !void {
     std.debug.assert(text.len <= std.math.maxInt(u32));
+    std.debug.assert((health.desync_from == null) == (health.desync_to == 0));
+    warnParseHealth(rel_path, health);
     const base: u32 = @intCast(b.symbols.items.len);
     const file_id: FileId = @intCast(b.files.items.len);
     for (parsed, 0..) |p, local| {
@@ -415,6 +457,7 @@ fn appendFile(
         .path = try b.arena.dupe(u8, rel_path),
         .language = lang,
         .text = text,
+        .parse_health = health,
         .sym_start = base,
         .sym_end = @intCast(b.symbols.items.len),
     });
@@ -952,12 +995,12 @@ test "module-qualified calls resolve through imports" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data =
         \\pub fn helper(x: i32) i32 {
         \\    return x;
         \\}
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data =
         \\const util = @import("util.zig");
         \\pub fn run() i32 {
         \\    return util.helper(41);
@@ -992,12 +1035,12 @@ test "qualified call to a same-named function in another module resolves" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data =
         \\pub fn run() i32 {
         \\    return 1;
         \\}
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data =
         \\const util = @import("util.zig");
         \\pub fn run() i32 {
         \\    return util.run();
@@ -1036,18 +1079,18 @@ test "src-layout package imports resolve by unique suffix, no cross-language edg
     try tmp.dir.createDirPath(io, "libs/pkg/src/pkg");
     try tmp.dir.createDirPath(io, "app");
     try tmp.dir.createDirPath(io, "web");
-    try tmp.dir.writeFile(io, .{ .sub_path = "libs/pkg/src/pkg/ship.py", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "libs/pkg/src/pkg/ship.py", .data =
         \\class Ship:
         \\    def sail(self):
         \\        return 1
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "app/main.py", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "app/main.py", .data =
         \\from pkg.ship import Ship
         \\def run():
         \\    return Ship()
     });
     // A TS component that only mentions the name "Ship" — must not become an edge.
-    try tmp.dir.writeFile(io, .{ .sub_path = "web/editor.ts", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "web/editor.ts", .data =
         \\export function ShipEditor() {
         \\    return Ship;
         \\}
@@ -1118,7 +1161,7 @@ test "incremental cache: second build restores identical symbols from disk" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
         \\pub fn alpha(x: i32) i32 {
         \\    return beta(x);
         \\}
@@ -1168,13 +1211,13 @@ test "links a frontend HTTP client call to a backend route across languages" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "api.py", .data =
         \\app = FastAPI()
         \\@app.get("/users/{id}")
         \\def get_user(id):
         \\    return id
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
         \\function loadUser(id) {
         \\  return fetch(`/users/${id}`);
         \\}
@@ -1308,7 +1351,7 @@ test "member calls: typed receiver is exact; unknown receiver is a heuristic gue
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
         \\pub const Foo = struct {
         \\    pub fn stop(self: *Foo) void {}
         \\};
@@ -1463,12 +1506,12 @@ test "build index over a temp project resolves cross-file calls" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data =
         \\pub fn helper(x: i32) i32 {
         \\    return x + 1;
         \\}
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data =
         \\const util = @import("util.zig");
         \\pub fn run() i32 {
         \\    return helper(41);
@@ -1666,11 +1709,11 @@ test "go: a call resolves across files within the Go family" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "store.go", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "store.go", .data =
         \\package app
         \\func Save(x int) int { return x }
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "handler.go", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "handler.go", .data =
         \\package app
         \\func Handle() int { return Save(1) }
     });
@@ -1692,10 +1735,10 @@ test "rust: a call resolves by name across files within the Rust family" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "util.rs", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.rs", .data =
         \\pub fn parse(s: &str) -> u32 { 0 }
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "main.rs", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.rs", .data =
         \\mod util;
         \\pub fn run() -> u32 { parse("x") }
     });
@@ -1719,12 +1762,12 @@ test "ruby: require_relative resolves and a cross-file call links within the Rub
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "util.rb", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.rb", .data =
         \\def helper(x)
         \\  x + 1
         \\end
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "main.rb", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.rb", .data =
         \\require_relative "util"
         \\def run
         \\  helper(1)
@@ -1751,12 +1794,12 @@ test "cross-language: a Go and a Python function sharing a name stay isolated" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "svc.go", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.go", .data =
         \\package app
         \\func Process() int { return 1 }
         \\func Run() int { return Process() }
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data =
         \\def Process():
         \\    return 2
     });
@@ -1783,11 +1826,11 @@ test "cross-language: Rust and Go definitions with the same name do not cross-li
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "lib.rs", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.rs", .data =
         \\pub fn encode() -> u32 { helper() }
         \\pub fn helper() -> u32 { 1 }
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "enc.go", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "enc.go", .data =
         \\package app
         \\func helper() int { return 2 }
     });
@@ -1812,16 +1855,16 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
     defer tmp.cleanup();
 
     // Each language defines and calls its own `compute`; none may bleed.
-    try tmp.dir.writeFile(io, .{ .sub_path = "a.go", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.go", .data =
         \\package app
         \\func compute() int { return 1 }
         \\func GoRun() int { return compute() }
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "b.rs", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.rs", .data =
         \\fn compute() -> u32 { 1 }
         \\pub fn rs_run() -> u32 { compute() }
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "c.rb", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.rb", .data =
         \\def compute
         \\  1
         \\end
@@ -1829,7 +1872,7 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
         \\  compute()
         \\end
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "d.py", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.py", .data =
         \\def compute():
         \\    return 1
         \\def py_run():
@@ -1856,7 +1899,6 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
         try testing.expectEqualStrings(c[1], idx.graph.symbols[callers[0]].name);
     }
 }
-
 
 // ===========================================================================
 // APPENDED HARDENING TESTS (build + resolution)
@@ -2530,4 +2572,30 @@ test "build indexes a single file when the root path names a file, not a directo
     try testing.expectEqual(@as(usize, 1), idx.graph.files.len);
     try testing.expectEqual(@as(usize, 1), idx.lookup("one").len);
     try testing.expectEqual(@as(usize, 0), idx.lookup("two").len);
+}
+
+test "parse health and cache snapshot survive a warm cache restore" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "broken.js", .data =
+        \\function ok() { return 1; }
+        \\const bad = "never closed
+        \\function hidden() { return 2; }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var cold = try build(testing.allocator, io, root, true);
+    try testing.expectEqual(@as(?u32, 2), cold.graph.files[0].parse_health.desync_from);
+    try testing.expectEqual(CacheRewrite.written, cold.cache_snapshot.rewrite);
+    cold.deinit();
+
+    var warm = try build(testing.allocator, io, root, true);
+    defer warm.deinit();
+    try testing.expectEqual(@as(u32, 1), warm.cache_snapshot.hits);
+    try testing.expectEqual(CacheRewrite.current, warm.cache_snapshot.rewrite);
+    try testing.expectEqual(@as(?u32, 2), warm.graph.files[0].parse_health.desync_from);
+    try testing.expect(warm.graph.files[0].parse_health.desync_to >= 3);
 }

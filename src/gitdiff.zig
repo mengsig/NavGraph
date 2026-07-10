@@ -4,8 +4,13 @@
 
 const std = @import("std");
 
-/// A closed range of 1-based line numbers in the new file.
-pub const Range = struct { lo: u32, hi: u32 };
+/// A closed range of 1-based line numbers in the new file. A deletion-only
+/// hunk keeps its post-image anchor in `lo`/`hi` and sets `empty`.
+pub const Range = struct {
+    lo: u32,
+    hi: u32,
+    empty: bool = false,
+};
 
 /// The changed line ranges of one file in a diff.
 pub const FileChange = struct {
@@ -18,8 +23,9 @@ pub const FileChange = struct {
 /// Parse unified-diff `text` into a list of `FileChange` (gpa-owned; caller frees
 /// via `freeChanges`). Recognizes `+++ b/<path>` headers and `@@ … +c,d @@`
 /// hunks, recording the new-file range each hunk covers. `d == 0` (a pure
-/// deletion) is recorded as the single anchor line `c` so the enclosing symbol
-/// still surfaces. Slices into `text`, which must outlive the result.
+/// deletion) is recorded as an empty anchor at line `c`, so the enclosing symbol
+/// still surfaces without claiming current source bytes. Slices into `text`, which
+/// must outlive the result.
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) ![]FileChange {
     var files: std.ArrayList(FileChange) = .empty;
     errdefer freeChanges(gpa, files.items);
@@ -71,7 +77,8 @@ fn newPath(body_in: []const u8) ?[]const u8 {
 }
 
 /// The new-file range of a hunk header `@@ -a,b +c,d @@`. Returns null when the
-/// header is malformed. `d` defaults to 1 when omitted; `d == 0` yields `[c, c]`.
+/// header is malformed. `d` defaults to 1 when omitted; `d == 0` yields an empty
+/// anchor at `[c, c]`.
 fn hunkRange(line: []const u8) ?Range {
     const plus = std.mem.indexOfScalar(u8, line, '+') orelse return null;
     var rest = line[plus + 1 ..];
@@ -84,8 +91,10 @@ fn hunkRange(line: []const u8) ?Range {
         std.fmt.parseInt(u32, len_s, 10) catch return null
     else
         1;
-    if (len == 0) return .{ .lo = start, .hi = start };
-    return .{ .lo = start, .hi = start + len - 1 };
+    if (len == 0) return .{ .lo = start, .hi = start, .empty = true };
+    const tail = len - 1;
+    if (tail > std.math.maxInt(u32) - start) return null;
+    return .{ .lo = start, .hi = start + tail };
 }
 
 test "parse extracts per-file new-line ranges, skipping deletions" {
@@ -110,7 +119,7 @@ test "parse extracts per-file new-line ranges, skipping deletions" {
     try std.testing.expectEqual(@as(usize, 2), changes[0].ranges.len);
     // `+10,3` → lines 10..12; `+41,0` (deletion) → anchor line 41.
     try std.testing.expectEqual(Range{ .lo = 10, .hi = 12 }, changes[0].ranges[0]);
-    try std.testing.expectEqual(Range{ .lo = 41, .hi = 41 }, changes[0].ranges[1]);
+    try std.testing.expectEqual(Range{ .lo = 41, .hi = 41, .empty = true }, changes[0].ranges[1]);
 }
 
 test "hunkRange defaults length to 1 when omitted" {
@@ -118,7 +127,6 @@ test "hunkRange defaults length to 1 when omitted" {
     try std.testing.expectEqual(Range{ .lo = 3, .hi = 4 }, hunkRange("@@ -1,1 +3,2 @@ ctx").?);
     try std.testing.expectEqual(@as(?Range, null), hunkRange("@@ garbage"));
 }
-
 
 // ---------------------------------------------------------------------------
 // Appended hardening tests for gitdiff.zig
@@ -186,8 +194,8 @@ test "parse records a zero-length (deletion) hunk as its anchor line" {
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqualStrings("edit.zig", changes[0].path);
     try std.testing.expectEqual(@as(usize, 2), changes[0].ranges.len);
-    try std.testing.expectEqual(Range{ .lo = 9, .hi = 9 }, changes[0].ranges[0]);
-    try std.testing.expectEqual(Range{ .lo = 18, .hi = 18 }, changes[0].ranges[1]);
+    try std.testing.expectEqual(Range{ .lo = 9, .hi = 9, .empty = true }, changes[0].ranges[0]);
+    try std.testing.expectEqual(Range{ .lo = 18, .hi = 18, .empty = true }, changes[0].ranges[1]);
 }
 
 test "parse ignores hunks that appear before any file header" {
@@ -368,9 +376,9 @@ test "hunkRange defaults omitted length to a single line" {
     try std.testing.expectEqual(Range{ .lo = 42, .hi = 42 }, hunkRange("@@ -42 +42 @@ fn foo").?);
 }
 
-test "hunkRange anchors a zero-length hunk to its start line" {
-    try std.testing.expectEqual(Range{ .lo = 41, .hi = 41 }, hunkRange("@@ -40 +41,0 @@").?);
-    try std.testing.expectEqual(Range{ .lo = 0, .hi = 0 }, hunkRange("@@ -1,5 +0,0 @@").?);
+test "hunkRange preserves a zero-length hunk at its start line" {
+    try std.testing.expectEqual(Range{ .lo = 41, .hi = 41, .empty = true }, hunkRange("@@ -40 +41,0 @@").?);
+    try std.testing.expectEqual(Range{ .lo = 0, .hi = 0, .empty = true }, hunkRange("@@ -1,5 +0,0 @@").?);
 }
 
 test "hunkRange returns null on malformed headers" {
@@ -384,6 +392,8 @@ test "hunkRange returns null on malformed headers" {
     try std.testing.expectEqual(@as(?Range, null), hunkRange("@@ -1 + @@"));
     // Trailing comma with empty length.
     try std.testing.expectEqual(@as(?Range, null), hunkRange("@@ -1 +5, @@"));
+    // The closed end would overflow u32.
+    try std.testing.expectEqual(@as(?Range, null), hunkRange("@@ -1 +4294967295,2 @@"));
 }
 
 test "hunkRange picks the new-file range, not a '+' in trailing context" {

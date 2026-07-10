@@ -26,7 +26,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE8";
+const magic = "NGCACHE9";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -51,6 +51,7 @@ pub const FileStat = struct { mtime_ns: i128, ctime_ns: i128, size: u64 };
 pub const Restored = struct {
     text: []const u8,
     symbols: []ParsedSymbol,
+    parse_health: model.ParseHealth,
 };
 
 /// One file's entry located within a loaded cache buffer, not yet materialized.
@@ -121,6 +122,7 @@ fn indexEntries(store: *Store) !void {
 /// Read (and skip past) one file's text+symbols region, returning it as a slice.
 fn readBlob(cur: *Cursor) ![]const u8 {
     const start = cur.pos;
+    _ = try readHealth(cur);
     _ = try cur.getStr(); // text
     const sym_count = try cur.getU32();
     var s: u32 = 0;
@@ -167,12 +169,24 @@ fn skipSymbol(cur: *Cursor) !void {
 
 fn materialize(arena: std.mem.Allocator, blob: []const u8) !Restored {
     var cur = Cursor{ .bytes = blob };
+    const parse_health = try readHealth(&cur);
     const text = try arena.dupe(u8, try cur.getStr());
     const sym_count = try cur.getU32();
     const symbols = try arena.alloc(ParsedSymbol, sym_count);
     for (symbols) |*sym| sym.* = try readSymbol(arena, &cur);
-    std.debug.assert(cur.pos == blob.len);
-    return .{ .text = text, .symbols = symbols };
+    if (cur.pos != blob.len) return error.TrailingData;
+    return .{ .text = text, .symbols = symbols, .parse_health = parse_health };
+}
+
+fn readHealth(cur: *Cursor) !model.ParseHealth {
+    const from_raw = try cur.getU32();
+    const to = try cur.getU32();
+    if (from_raw == 0) {
+        if (to != 0) return error.BadParseHealth;
+        return .{};
+    }
+    if (to < from_raw) return error.BadParseHealth;
+    return .{ .desync_from = from_raw, .desync_to = to };
 }
 
 fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
@@ -288,6 +302,7 @@ fn writeFile(
     try putU64(gpa, buf, stat.size);
     try putStr(gpa, buf, file.path);
     try buf.append(gpa, @intFromEnum(file.language));
+    try putHealth(gpa, buf, file.parse_health);
     try putStr(gpa, buf, file.text);
     try putU32(gpa, buf, file.sym_end - file.sym_start);
     var i = file.sym_start;
@@ -337,6 +352,13 @@ fn localParent(sym: model.Symbol, base: u32) u32 {
 // ---------------------------------------------------------------------------
 // Low-level encode helpers
 // ---------------------------------------------------------------------------
+
+fn putHealth(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), health: model.ParseHealth) !void {
+    const from = health.desync_from orelse 0;
+    std.debug.assert((from == 0) == (health.desync_to == 0));
+    try putU32(gpa, buf, from);
+    try putU32(gpa, buf, health.desync_to);
+}
 
 fn putU8(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: u8) !void {
     try buf.append(gpa, v);
@@ -437,6 +459,7 @@ test "cache round-trips a file's parsed symbols" {
         .path = "m.zig",
         .language = .zig,
         .text = source,
+        .parse_health = .{ .desync_from = 3, .desync_to = 5 },
         .sym_start = 0,
         .sym_end = @intCast(syms.items.len),
     }};
@@ -450,6 +473,8 @@ test "cache round-trips a file's parsed symbols" {
     defer store.deinit();
     const hit = store.restore(arena, "m.zig", stats[0]).?;
     try testing.expectEqualStrings(source, hit.text);
+    try testing.expectEqual(@as(?u32, 3), hit.parse_health.desync_from);
+    try testing.expectEqual(@as(u32, 5), hit.parse_health.desync_to);
     try testing.expectEqual(parsed.items.len, hit.symbols.len);
     try testing.expectEqualStrings(parsed.items[0].name, hit.symbols[0].name);
     // A changed mtime misses; a changed ctime misses; an absent path misses.
@@ -584,6 +609,7 @@ fn buildOneEntryCache(
     try putU64(a, &buf, @intCast(text.len)); // size
     try putStr(a, &buf, path);
     try putU8(a, &buf, lang_byte);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, text); // blob: text
     try putU32(a, &buf, 0); // blob: sym_count
     return buf;
@@ -668,7 +694,7 @@ test "full round-trip preserves every field across two files with distinct langu
 
     const files = [_]model.SourceFile{
         .{ .id = 0, .path = "a.zig", .language = .zig, .text = textA, .sym_start = 0, .sym_end = 2 },
-        .{ .id = 1, .path = "b.py", .language = .python, .text = textB, .sym_start = 2, .sym_end = 4 },
+        .{ .id = 1, .path = "b.py", .language = .python, .text = textB, .parse_health = .{ .desync_from = 2, .desync_to = 4 }, .sym_start = 2, .sym_end = 4 },
     };
     const stats = [_]FileStat{
         .{ .mtime_ns = 1000, .ctime_ns = 2000, .size = textA.len },
@@ -693,6 +719,8 @@ test "full round-trip preserves every field across two files with distinct langu
 
     const hitB = store.restore(arena, "b.py", stats[1]).?;
     try testing.expectEqualStrings(textB, hitB.text);
+    try testing.expectEqual(@as(?u32, 2), hitB.parse_health.desync_from);
+    try testing.expectEqual(@as(u32, 4), hitB.parse_health.desync_to);
     try testing.expectEqual(@as(usize, 2), hitB.symbols.len);
     try expectSymEq(2, syms[2], hitB.symbols[0]);
     try expectSymEq(2, syms[3], hitB.symbols[1]);
@@ -867,6 +895,7 @@ test "materialize reconstructs all scalar, string, ref and binding fields" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{ .desync_from = 7, .desync_to = 9 });
     try putStr(a, &buf, "the text"); // blob text
     try putU32(a, &buf, 2); // sym_count
 
@@ -887,6 +916,8 @@ test "materialize reconstructs all scalar, string, ref and binding fields" {
 
     const r = try materialize(arena, buf.items);
     try testing.expectEqualStrings("the text", r.text);
+    try testing.expectEqual(@as(?u32, 7), r.parse_health.desync_from);
+    try testing.expectEqual(@as(u32, 9), r.parse_health.desync_to);
     try testing.expectEqual(@as(usize, 2), r.symbols.len);
 
     const s0 = r.symbols[0];
@@ -927,6 +958,7 @@ test "materialize decodes every SymbolKind value" {
     inline for (@typeInfo(model.SymbolKind).@"enum".fields) |f| {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
+        try putHealth(a, &buf, .{});
         try putStr(a, &buf, "t");
         try putU32(a, &buf, 1);
         try encSym(a, &buf, "s", @intCast(f.value), invalid_local, 0, 0, "", "", &.{}, &.{});
@@ -944,6 +976,7 @@ test "materialize decodes every RefKind value" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "t");
     try putU32(a, &buf, 1);
     var refs: [@typeInfo(model.RefKind).@"enum".fields.len]TestRef = undefined;
@@ -965,6 +998,7 @@ test "materialize rejects an out-of-range symbol kind" {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "t");
     try putU32(a, &buf, 1);
     try encSym(a, &buf, "s", 250, invalid_local, 0, 0, "", "", &.{}, &.{});
@@ -979,6 +1013,7 @@ test "materialize rejects an out-of-range ref kind" {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "t");
     try putU32(a, &buf, 1);
     const refs = [_]TestRef{.{ .name = "r", .kind = 250, .line = 1 }};
@@ -994,11 +1029,30 @@ test "materialize rejects a truncated blob" {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "text");
     try putU32(a, &buf, 1);
     try encSym(a, &buf, "s", @intFromEnum(model.SymbolKind.function), invalid_local, 0, 0, "", "", &.{}, &.{});
-    // Chop it down so the very first getStr (blob text) truncates.
+    // Chop it down before the parse-health header is complete.
     try testing.expectError(error.Truncated, materialize(arena, buf.items[0..3]));
+}
+
+test "materialize rejects inconsistent parse health" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    try putU32(testing.allocator, &buf, 0);
+    try putU32(testing.allocator, &buf, 3);
+    try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
+
+    buf.clearRetainingCapacity();
+    try putU32(testing.allocator, &buf, 7);
+    try putU32(testing.allocator, &buf, 6);
+    try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
 }
 
 test "write emits the versioned magic and build key header" {

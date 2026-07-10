@@ -13,6 +13,7 @@ const lexer = @import("lexer.zig");
 const language = @import("language.zig");
 const events_mod = @import("events.zig");
 const gitdiff = @import("gitdiff.zig");
+const cache = @import("cache.zig");
 const gitignore = @import("gitignore.zig");
 const impls_mod = @import("impls.zig");
 
@@ -180,6 +181,8 @@ pub const Options = struct {
     from_tests: bool = false,
     since: []const u8 = "",
     preview: bool = false,
+    /// `diff`: include current-source byte ranges and the exact raw git patch.
+    exact_source: bool = false,
     /// Visibility scope for definition listings.
     visibility: Vis = .all,
     /// Alternate HTTP route views and handler selection.
@@ -472,6 +475,201 @@ pub fn matchesString(wrapped_or_plain: []const u8, is_glob: bool, s: []const u8)
 pub fn wrapStringPattern(gpa: std.mem.Allocator, pattern: []const u8) ![]const u8 {
     if (!isGlobPattern(pattern)) return pattern;
     return std.fmt.allocPrint(gpa, "**{s}**", .{pattern});
+}
+
+pub const StatusChangeKind = enum { changed, unavailable };
+
+pub const StatusChange = struct {
+    file: model.FileId,
+    kind: StatusChangeKind,
+    error_name: []const u8 = "",
+};
+
+pub const StatusReport = struct {
+    changes: []StatusChange,
+    root_error: []const u8 = "",
+    scope_files: u32 = 0,
+    scope_symbols: u32 = 0,
+    parse_warnings: u32 = 0,
+    unresolved_refs: u32 = 0,
+    skipped: u32 = 0,
+
+    pub fn deinit(self: *StatusReport, gpa: std.mem.Allocator) void {
+        gpa.free(self.changes);
+        self.* = undefined;
+    }
+};
+
+/// Report the in-memory index snapshot, cache use, filesystem freshness, and
+/// diagnostics that can make an apparently missing symbol or edge unreliable.
+pub fn status(w: *Writer, io: std.Io, idx: *const Index, filter: []const u8, opts: Options) !bool {
+    var report = try collectStatus(idx, io, filter, opts);
+    defer report.deinit(idx.gpa);
+    if (opts.format == .json) return json_out.status(w, idx, filter, report, opts);
+    if (opts.format == .jsonl) return json_out.statusJsonl(w, idx, filter, report, opts);
+    try renderStatusSummary(w, idx, filter, report);
+    try renderStatusFreshness(w, idx, report);
+    try renderStatusDiagnostics(w, idx, filter, report, opts);
+    return true;
+}
+
+fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Options) !StatusReport {
+    std.debug.assert(idx.graph.files.len == idx.file_stats.len);
+    std.debug.assert(opts.limit > 0);
+    var report = StatusReport{ .changes = &.{} };
+    for (idx.graph.files) |file| {
+        if (!statusFileSelected(file, filter, opts)) continue;
+        report.scope_files += 1;
+        report.scope_symbols += file.sym_end - file.sym_start;
+        if (!file.parse_health.reliable()) report.parse_warnings += 1;
+        report.unresolved_refs += unresolvedInFile(idx, file);
+    }
+    for (idx.skipped_dirs) |path| {
+        if (filter.len == 0 or matchesFilter(path, filter)) report.skipped += 1;
+    }
+    report.changes = try collectStatusChanges(idx, io, filter, opts, &report.root_error);
+    return report;
+}
+
+pub fn statusFileSelected(file: model.SourceFile, filter: []const u8, opts: Options) bool {
+    if (!matchesFilter(file.path, filter)) return false;
+    return !opts.no_recurse or inDirNonRecursive(file.path, filter);
+}
+
+fn unresolvedInFile(idx: *const Index, file: model.SourceFile) u32 {
+    std.debug.assert(file.sym_start <= file.sym_end);
+    std.debug.assert(file.sym_end <= idx.graph.symbols.len);
+    var count: u32 = 0;
+    for (idx.graph.symbols[file.sym_start..file.sym_end]) |sym| {
+        for (sym.refs) |ref| if (referenceNeedsDiagnostic(sym, ref)) {
+            count += 1;
+        };
+    }
+    return count;
+}
+
+/// A bare parameter/local intentionally has no graph target; do not diagnose it
+/// as unresolved merely because its value is outside the symbol graph.
+pub fn referenceIsLocal(sym: model.Symbol, ref: model.Reference) bool {
+    if (ref.qualifier.len != 0) return false;
+    for (sym.bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, ref.name)) return true;
+    }
+    return false;
+}
+
+pub fn referenceIsUnresolved(sym: model.Symbol, ref: model.Reference) bool {
+    return ref.target == invalid and !referenceIsLocal(sym, ref);
+}
+
+/// Only unresolved call/type/import edges are graph diagnostics. Plain reads and
+/// writes can be external fields, literals, or values NavGraph does not model.
+pub fn referenceNeedsDiagnostic(sym: model.Symbol, ref: model.Reference) bool {
+    if (!referenceIsUnresolved(sym, ref)) return false;
+    return ref.kind != .read;
+}
+
+fn collectStatusChanges(
+    idx: *const Index,
+    io: std.Io,
+    filter: []const u8,
+    opts: Options,
+    root_error: *[]const u8,
+) ![]StatusChange {
+    var changes: std.ArrayList(StatusChange) = .empty;
+    errdefer changes.deinit(idx.gpa);
+    var dir = openSnapshotRoot(io, idx.root) catch |err| {
+        root_error.* = @errorName(err);
+        return changes.toOwnedSlice(idx.gpa);
+    };
+    defer dir.close(io);
+    for (idx.graph.files, idx.file_stats) |file, snapshot| {
+        if (!statusFileSelected(file, filter, opts)) continue;
+        const current = dir.statFile(io, file.path, .{}) catch |err| {
+            try changes.append(idx.gpa, .{ .file = file.id, .kind = .unavailable, .error_name = @errorName(err) });
+            continue;
+        };
+        if (statChanged(snapshot, current)) try changes.append(idx.gpa, .{ .file = file.id, .kind = .changed });
+    }
+    return changes.toOwnedSlice(idx.gpa);
+}
+
+fn openSnapshotRoot(io: std.Io, root: []const u8) !std.Io.Dir {
+    std.debug.assert(root.len > 0);
+    return std.Io.Dir.cwd().openDir(io, root, .{}) catch |err| {
+        if (err != error.NotDir) return err;
+        const parent = std.fs.path.dirname(root) orelse ".";
+        return std.Io.Dir.cwd().openDir(io, parent, .{});
+    };
+}
+
+fn statChanged(snapshot: cache.FileStat, current: std.Io.File.Stat) bool {
+    return snapshot.mtime_ns != current.mtime.nanoseconds or
+        snapshot.ctime_ns != current.ctime.nanoseconds or snapshot.size != current.size;
+}
+
+fn renderStatusSummary(w: *Writer, idx: *const Index, filter: []const u8, report: StatusReport) !void {
+    try w.print("index root: {s}\n", .{idx.root});
+    try w.print("snapshot: {d} files, {d} symbols", .{ idx.graph.files.len, idx.graph.symbols.len });
+    if (filter.len != 0) try w.print("; scope '{s}': {d} files, {d} symbols", .{ filter, report.scope_files, report.scope_symbols });
+    try w.writeByte('\n');
+    const state = idx.cache_snapshot;
+    if (!state.enabled) {
+        try w.writeAll("cache: disabled\n");
+    } else {
+        try w.print("cache: loaded={}, entries={d}, hits={d}/{d}, rewrite={s}\n", .{
+            state.loaded, state.loaded_entries, state.hits, idx.graph.files.len, @tagName(state.rewrite),
+        });
+    }
+}
+
+fn renderStatusFreshness(w: *Writer, idx: *const Index, report: StatusReport) !void {
+    if (report.root_error.len != 0) {
+        try w.print("freshness: unavailable ({s})\n", .{report.root_error});
+        return;
+    }
+    if (report.changes.len == 0) {
+        try w.writeAll("freshness: current\n");
+        return;
+    }
+    try w.print("freshness: {d} indexed file{s} changed since build\n", .{ report.changes.len, if (report.changes.len == 1) "" else "s" });
+    for (report.changes) |change| {
+        const file = idx.graph.files[change.file];
+        if (change.kind == .changed) try w.print("  changed {s}\n", .{file.path}) else try w.print("  unavailable {s} ({s})\n", .{ file.path, change.error_name });
+    }
+}
+
+fn renderStatusDiagnostics(w: *Writer, idx: *const Index, filter: []const u8, report: StatusReport, opts: Options) !void {
+    try w.print("parse health: {d} warning{s}\n", .{ report.parse_warnings, if (report.parse_warnings == 1) "" else "s" });
+    for (idx.graph.files) |file| {
+        if (!statusFileSelected(file, filter, opts)) continue;
+        const from = file.parse_health.desync_from orelse continue;
+        try w.print("  {s}:{d}-{d} tokenizer_desync\n", .{ file.path, from, file.parse_health.desync_to });
+    }
+    try w.print("skipped: {d}\n", .{report.skipped});
+    for (idx.skipped_dirs) |path| if (filter.len == 0 or matchesFilter(path, filter)) try w.print("  {s}\n", .{path});
+    try renderUnresolvedStatus(w, idx, filter, report.unresolved_refs, opts);
+}
+
+fn renderUnresolvedStatus(w: *Writer, idx: *const Index, filter: []const u8, total: u32, opts: Options) !void {
+    try w.print("unresolved/external graph edges: {d}\n", .{total});
+    var shown: u32 = 0;
+    outer: for (idx.graph.symbols) |sym| {
+        const file = idx.graph.files[sym.file];
+        if (!statusFileSelected(file, filter, opts)) continue;
+        for (sym.refs) |ref| {
+            if (!referenceNeedsDiagnostic(sym, ref)) continue;
+            const qualifier = if (ref.qualifier.len == 0) "" else ref.qualifier;
+            try w.print("  {s}:{d} {s}{s}{s} in {s}", .{
+                file.path, ref.line, qualifier, if (qualifier.len == 0) "" else ".", ref.name, sym.name,
+            });
+            if (!file.parse_health.reliable()) try w.writeAll(" (parse unreliable)");
+            try w.writeByte('\n');
+            shown += 1;
+            if (shown >= opts.limit) break :outer;
+        }
+    }
+    if (shown < total) try w.print("  … {d} graph edges elided (-l {d})\n", .{ total - shown, opts.limit });
 }
 
 /// The index's coverage manifest: every indexed file with its language and
@@ -2532,8 +2730,11 @@ pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []
     }
     const changes = try gitdiff.parse(idx.gpa, result.stdout);
     defer gitdiff.freeChanges(idx.gpa, changes);
-    if (opts.format == .json) return json_out.diff(w, idx, changes, opts);
-    return renderDiff(w, idx, changes, opts);
+    if (opts.format == .json) return json_out.diff(w, idx, changes, result.stdout, opts);
+    const found = try renderDiff(w, idx, changes, opts);
+    if (!opts.exact_source) return found;
+    const source_found = try renderExactSource(w, idx, changes, result.stdout);
+    return found or source_found;
 }
 
 /// Run `git -C <root> diff --unified=0 --no-color <ref>` and return its result
@@ -2555,6 +2756,91 @@ pub fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []c
         .cwd = .{ .path = cwd_path },
         .stdout_limit = std.Io.Limit.limited(16 * 1024 * 1024),
     });
+}
+
+pub const SourceRange = struct {
+    line: u32,
+    line_end: u32,
+    start: u32,
+    end: u32,
+    text: []const u8,
+    empty: bool,
+};
+
+/// Map a git hunk's post-image line range to exact bytes in the indexed source.
+pub fn sourceRange(text: []const u8, range: gitdiff.Range) SourceRange {
+    std.debug.assert(range.lo <= range.hi);
+    std.debug.assert(!range.empty or range.lo == range.hi);
+    std.debug.assert(text.len <= std.math.maxInt(u32));
+    const line = @max(range.lo, 1);
+    const line_end = @max(range.hi, line);
+    const start = sourceLineStart(text, line);
+    if (range.empty) return .{
+        .line = range.lo,
+        .line_end = range.hi,
+        .start = @intCast(start),
+        .end = @intCast(start),
+        .text = text[start..start],
+        .empty = true,
+    };
+    var end = sourceLineEnd(text, line_end);
+    while (end > start and text[end - 1] == '\r') end -= 1;
+    std.debug.assert(start <= end and end <= text.len);
+    return .{
+        .line = range.lo,
+        .line_end = range.hi,
+        .start = @intCast(start),
+        .end = @intCast(end),
+        .text = text[start..end],
+        .empty = false,
+    };
+}
+
+fn sourceLineStart(text: []const u8, target: u32) usize {
+    std.debug.assert(target > 0);
+    var line: u32 = 1;
+    var i: usize = 0;
+    while (i < text.len and line < target) : (i += 1) {
+        if (text[i] == '\n') line += 1;
+    }
+    return i;
+}
+
+fn sourceLineEnd(text: []const u8, target: u32) usize {
+    std.debug.assert(target > 0);
+    const start = sourceLineStart(text, target);
+    if (start == text.len) return start;
+    const tail = text[start..];
+    return start + (std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len);
+}
+
+fn renderExactSource(
+    w: *Writer,
+    idx: *const Index,
+    changes: []const gitdiff.FileChange,
+    patch: []const u8,
+) !bool {
+    std.debug.assert(idx.graph.files.len == idx.file_stats.len);
+    if (patch.len == 0) return false;
+    try w.writeAll("\n# exact current-source ranges\n");
+    for (changes) |change| {
+        const file = findDiffFile(idx, change.path) orelse continue;
+        try w.print("## {s}\n", .{change.path});
+        for (change.ranges) |range| {
+            const mapped = sourceRange(file.text, range);
+            try w.print("@@ lines {d}-{d}, bytes {d}-{d}, empty={} @@\n", .{
+                mapped.line, mapped.line_end, mapped.start, mapped.end, mapped.empty,
+            });
+            if (mapped.text.len != 0) {
+                try w.writeAll(mapped.text);
+                try w.writeByte('\n');
+            }
+        }
+    }
+    try w.writeAll("\n# exact git patch\n");
+    try w.writeAll(patch);
+    if (patch[patch.len - 1] != '\n') try w.writeByte('\n');
+    return true;
 }
 
 /// Render each changed file, its touched symbols, and their direct callers.
@@ -6315,4 +6601,88 @@ test "unused: a dead @dataclass class is reported (decorated classes are not fra
     const live = idx.graph.symbols[idx.lookup("LiveRow")[0]];
     try testing.expect(try isDeadCandidateScoped(&idx, dead, "", &refs, .without)); // dead dataclass surfaces
     try testing.expect(!try isDeadCandidateScoped(&idx, live, "", &refs, .without)); // used one does not
+}
+
+test "status exposes changed files, parse health, and unresolved diagnostics" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok.js", .data = "function caller(localValue) { const assigned = localValue; missingCall(); return assigned; }\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.js", .data =
+        \\function beforeBad() { return 1; }
+        \\const bad = "never closed
+        \\function hidden() { return 2; }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok.js", .data = "function caller(localValue) { missingCall(); anotherMissing(); return localValue; }\n" });
+
+    var json_buf: std.ArrayList(u8) = .empty;
+    defer json_buf.deinit(testing.allocator);
+    var json_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &json_buf);
+    defer json_writer.deinit();
+    try testing.expect(try status(&json_writer.writer, io, &idx, "", .{ .format = .json, .limit = 4 }));
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_writer.written(), .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try testing.expect(!root_obj.get("freshness").?.object.get("current").?.bool);
+    try testing.expectEqual(@as(usize, 1), root_obj.get("freshness").?.object.get("changes").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1), root_obj.get("parse_health").?.object.get("count").?.integer);
+    try testing.expectEqual(@as(i64, 1), root_obj.get("unresolved_references").?.object.get("count").?.integer);
+
+    var local_buf: std.ArrayList(u8) = .empty;
+    defer local_buf.deinit(testing.allocator);
+    var local_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &local_buf);
+    defer local_writer.deinit();
+    _ = try search(&local_writer.writer, &idx, "localValue", .{ .format = .json, .refs = true, .exact = true });
+    try testing.expect(std.mem.indexOf(u8, local_writer.written(), "\"resolution\":\"local\"") != null);
+    try testing.expect(std.mem.indexOf(u8, local_writer.written(), "unresolved_reference") == null);
+
+    var ref_buf: std.ArrayList(u8) = .empty;
+    defer ref_buf.deinit(testing.allocator);
+    var ref_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &ref_buf);
+    defer ref_writer.deinit();
+    _ = try search(&ref_writer.writer, &idx, "missingCall", .{ .format = .json, .refs = true, .exact = true });
+    try testing.expect(std.mem.indexOf(u8, ref_writer.written(), "\"diagnostic\":\"unresolved_reference\"") != null);
+
+    var def_buf: std.ArrayList(u8) = .empty;
+    defer def_buf.deinit(testing.allocator);
+    var def_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &def_buf);
+    defer def_writer.deinit();
+    _ = try showDef(&def_writer.writer, &idx, "beforeBad", .{ .format = .json });
+    try testing.expect(std.mem.indexOf(u8, def_writer.written(), "\"parse_health\"") != null);
+
+    var jsonl_buf: std.ArrayList(u8) = .empty;
+    defer jsonl_buf.deinit(testing.allocator);
+    var jsonl_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &jsonl_buf);
+    defer jsonl_writer.deinit();
+    _ = try status(&jsonl_writer.writer, io, &idx, "", .{ .format = .jsonl, .limit = 2 });
+    var lines = std.mem.tokenizeScalar(u8, jsonl_writer.written(), '\n');
+    var line_count: u32 = 0;
+    while (lines.next()) |line| {
+        var row = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer row.deinit();
+        try testing.expect(row.value == .object);
+        line_count += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), line_count);
+    try testing.expect(std.mem.indexOf(u8, jsonl_writer.written(), "\"cache\":") != null);
+    try testing.expect(std.mem.indexOf(u8, jsonl_writer.written(), "\"freshness_current\":false") != null);
+}
+
+test "sourceRange maps post-image lines to exact indexed bytes" {
+    const text = "one\ntwo\nthree\nfour\n";
+    const mapped = sourceRange(text, .{ .lo = 2, .hi = 3 });
+    try std.testing.expectEqual(@as(u32, 4), mapped.start);
+    try std.testing.expectEqual(@as(u32, 13), mapped.end);
+    try std.testing.expectEqualStrings("two\nthree", mapped.text);
+
+    const deletion_anchor = sourceRange(text, .{ .lo = 0, .hi = 0, .empty = true });
+    try std.testing.expectEqual(@as(u32, 0), deletion_anchor.start);
+    try std.testing.expectEqual(deletion_anchor.start, deletion_anchor.end);
+    try std.testing.expect(deletion_anchor.empty);
+    try std.testing.expectEqualStrings("", deletion_anchor.text);
 }
