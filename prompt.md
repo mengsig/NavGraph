@@ -26,7 +26,7 @@ you at specific lines may you `read` those exact lines.
 | Tracing what a function does | `navgraph calls <name>` (`-d2` deeper) |
 | A function + its callers | `navgraph neighbors <name>` |
 | How A reaches B | `navgraph path <A> <B>` |
-| Who writes/reads a value | `navgraph flow <symbol>` (`--to <sink>` traces the handoff) |
+| Who writes/reads a value | `navgraph flow <symbol>` (includes definition initializers; `--to <sink>` traces the handoff) |
 | Finding duplicate names | `navgraph collisions [pattern]` (`--members` includes members) |
 | Guessing what matters | `navgraph hot [path]` |
 | Scoping a branch's changes | `navgraph diff [ref]` (+ callers); add `--exact-source` for byte ranges + raw patch |
@@ -37,10 +37,10 @@ you at specific lines may you `read` those exact lines.
 | Test reach / coverage | `navgraph coverage [path]` |
 | Visual codebase map | `navgraph graph [path] > graph.html` (offline interactive) |
 | Mapping an HTTP endpoint | `navgraph routes [filter] --clients` (mounted prefixes + cross-language callers) |
-| Finding dead/unserved API edges | `navgraph routes --unhit` / `routes --orphan-calls` |
+| Finding dead/unserved API edges | `navgraph routes --unhit` / `routes --orphan-calls` (`--orphan`/`--orphans`) |
 | Auditing a port or sibling adapters | `navgraph conforms <Protocol|*Glob|Type.method>` |
 | Crossing Protocol/interface dispatch | add `--impls` to `calls`/`callers`/`neighbors`/`path`/`reaches`/`affected` |
-| Tracing a bus/WS event | `navgraph events [filter]` (cross-language) |
+| Tracing a bus/broker event | `navgraph events [filter]` (cross-language; Kafka topics recognized, common DOM listeners filtered) |
 | Reading imports | `navgraph imports [filter]` / `importers <file>` |
 | grep inside string literals | `navgraph strings <pattern>` |
 | Reading intent/docs | `navgraph docs <name>` / `todos [path]` |
@@ -78,10 +78,13 @@ to navgraph to understand it.
 - Use `conforms Port` instead of outlining every adapter and diffing signatures;
   use a class/method glob for a sibling divergence matrix.
 - `path A B` beats `calls A -d3` for "how does A reach B". Use `flow field`
-  when the missing link is a write/read handoff rather than a call; add
-  `--to sink` for the producer-to-consumer chain.
+  when the missing link is a write/read handoff rather than a call; definition
+  initializers count as producers. Ambiguous flow selectors report the exact
+  match count and the `Parent.name` / `name@path` pin syntax; JSON includes every
+  candidate. Add `--to sink` for a chain and endpoint ambiguity metadata.
 - Use `outline src -k fn --sort span -l 10` for largest-definition audits and
-  `collisions` instead of dumping names through `sort | uniq -d`.
+  `collisions` instead of dumping names through `sort | uniq -d`. If `hot` is
+  test-dominated, use `hot --no-tests` (the text view prints this hint).
 - On a large hub use `--max-nodes N --summary` or `--budget BYTES`; compact
   walks retain resolved/exact, high-fan-in branches before lower-value branches.
 - Use `affected --since HEAD~1` rather than manually unioning `diff` with test
@@ -122,9 +125,9 @@ to navgraph to understand it.
   `--on-type Type` apply to `flow` or `search --refs`; rows are tagged `[w]`/`[r]`.
 - Duplicate audit: `search PAT --duplicates`; `collisions --members` includes
   methods and fields.
-- Route views: `--clients`, `--unhit`, `--orphan-calls`, and
-  `--handler <glob>`. Literal imported FastAPI `include_router` prefixes are
-  applied automatically before route/client matching.
+- Route views: `--clients`, `--unhit`, `--orphan-calls` (aliases `--orphan`,
+  `--orphans`), and `--handler <glob>`. Stacked FastAPI `APIRouter` and aliased
+  `include_router` prefixes are applied before route/client matching.
 - `--no-cache` — rebuild (`.navgraph/cache`); run after updating navgraph or big
   refactors. `--follow-imports` (unused) — disambiguate same-name symbols.
 
@@ -140,7 +143,8 @@ handler with the TS call that hits it.
 ## Gotchas
 
 - Respects `.gitignore` + a fixed skip set (node_modules, .git, dist, build,
-  target, vendor, .venv, __pycache__, .next, zig-out, coverage, site-packages).
+  target, vendor, .venv, __pycache__, .next, zig-out, coverage, site-packages,
+  `.codeflow`).
   `.navgraphignore` adds navgraph-only ignores; `!vendor/` re-includes.
 - `*` = globs (`def 'Ba*'`, `files '*_test.py'`); anchored on the whole name;
   no `*` = substring match; quote them. `search -e` demands exact name equality.

@@ -192,7 +192,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     // names must not reach the per-file cache — the mount lives in a different
     // file, so caching the prefixed name would double-prefix on the next build.
     if (rewrite_cache) idx.cache_snapshot.rewrite = if (persistCache(&b, &idx)) .written else .failed;
-    applyRouterMounts(&idx);
+    if (applyRouterMounts(&idx)) try rebuildNameIndex(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
     return idx;
@@ -228,6 +228,7 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
     .{".mypy_cache"}, .{".pytest_cache"}, .{"vendor"},  .{".advantage"},
     .{".nvime"},      .{".idea"},         .{".vscode"}, .{"coverage"},
     .{".navgraph"},   .{"site-packages"}, .{".tox"},    .{".ruff_cache"},
+    .{".codeflow"},
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
@@ -320,7 +321,7 @@ const silent_skip = std.StaticStringMap(void).initComptime(.{
     .{"dist"},          .{"build"},         .{".next"},       .{"target"},
     .{".mypy_cache"},   .{".pytest_cache"}, .{".idea"},       .{".vscode"},
     .{"coverage"},      .{".navgraph"},     .{".advantage"},  .{".nvime"},
-    .{"site-packages"}, .{".tox"},          .{".ruff_cache"},
+    .{"site-packages"}, .{".tox"},          .{".ruff_cache"}, .{".codeflow"},
 });
 
 /// Record a pruned, potentially-source directory's name once (deduped) for the
@@ -462,6 +463,14 @@ fn appendFile(
         .sym_end = @intCast(b.symbols.items.len),
     });
     try b.stats.append(b.gpa, stat);
+}
+
+fn rebuildNameIndex(idx: *Index) !void {
+    std.debug.assert(idx.graph.symbols.len != 0);
+    std.debug.assert(idx.by_name.count() != 0);
+    idx.by_name.deinit(idx.gpa);
+    idx.by_name = .empty;
+    try buildNameIndex(idx);
 }
 
 fn buildNameIndex(idx: *Index) !void {
@@ -767,24 +776,23 @@ fn linkRoutes(idx: *Index) void {
     }
 }
 
-/// Apply `include_router(mod.router, prefix="/v1")` mounts across files: for
-/// each `.route_mount` symbol, find the mounted module's file and prepend the
-/// prefix to every `route` symbol defined there. Runs before `linkRoutes` so a
-/// client call to `/v1/orders` matches the now-prefixed route. Each target file
-/// is prefixed at most once (a route cannot be mounted twice).
-fn applyRouterMounts(idx: *Index) void {
+/// Apply one cross-file prefix per mounted route file before client linking.
+/// Returns whether any route name changed, so the name index can be rebuilt.
+fn applyRouterMounts(idx: *Index) bool {
     const arena = idx.arena.allocator();
-    const done = idx.gpa.alloc(bool, idx.graph.files.len) catch return;
+    const done = idx.gpa.alloc(bool, idx.graph.files.len) catch return false;
     defer idx.gpa.free(done);
     @memset(done, false);
+    var changed = false;
     for (idx.graph.symbols) |mount| {
         if (mount.kind != .route_mount) continue;
         std.debug.assert(mount.file < idx.graph.files.len);
         const target = mountTargetFile(idx, mount.file, mount.import_path) orelse continue;
         if (done[target]) continue;
         done[target] = true;
-        prefixRoutesIn(idx, arena, target, mount.name);
+        changed = prefixRoutesIn(idx, arena, target, mount.name) or changed;
     }
+    return changed;
 }
 
 /// The file whose routes a mount in `from_file` prefixes. A dotted router arg
@@ -793,20 +801,32 @@ fn applyRouterMounts(idx: *Index) void {
 /// (import edges often resolve only to the package, not the submodule). A bare
 /// arg falls back to the sole imported route-file. Null when ambiguous/absent.
 fn mountTargetFile(idx: *const Index, from_file: FileId, module: []const u8) ?FileId {
+    const stem = moduleStem(module);
+    const imports_for_file = idx.importsOf(from_file);
     var single: FileId = invalid;
     var route_files: u32 = 0;
-    var last: FileId = invalid;
-    for (idx.importsOf(from_file)) |imp| {
-        if (imp.target == last) continue; // collapse repeated edges to one file
-        last = imp.target;
+    for (imports_for_file, 0..) |imp, pos| {
         if (!fileHasRoutes(idx, imp.target)) continue;
-        if (module.len != 0 and pathStemEquals(idx.graph.files[imp.target].path, module)) return imp.target;
+        if (module.len != 0 and std.mem.eql(u8, imp.binding, module)) return imp.target;
+        if (stem.len != 0 and pathStemEquals(idx.graph.files[imp.target].path, stem)) return imp.target;
+        var duplicate = false;
+        for (imports_for_file[0..pos]) |prior| duplicate = duplicate or prior.target == imp.target;
+        if (duplicate) continue;
         route_files += 1;
         single = imp.target;
     }
-    if (module.len != 0) return uniqueRouteFileWithStem(idx, module);
+    if (stem.len != 0) return uniqueRouteFileWithStem(idx, stem);
     if (route_files == 1) return single;
     return null;
+}
+
+fn moduleStem(module: []const u8) []const u8 {
+    if (module.len == 0) return module;
+    const slash = std.mem.lastIndexOfScalar(u8, module, '/');
+    const dot = std.mem.lastIndexOfScalar(u8, module, '.');
+    const cut = if (slash) |s| if (dot) |d| @max(s, d) else s else dot orelse return module;
+    if (cut + 1 >= module.len) return "";
+    return module[cut + 1 ..];
 }
 
 /// The single project file that both defines routes and has path stem `stem`
@@ -847,8 +867,9 @@ fn pathStemEquals(path: []const u8, stem: []const u8) bool {
 
 /// Prepend `prefix` to the path of every `route` symbol in file `fid`. A route
 /// name is "METHOD /path"; the method and any construction prefix are preserved.
-fn prefixRoutesIn(idx: *Index, arena: std.mem.Allocator, fid: FileId, prefix: []const u8) void {
+fn prefixRoutesIn(idx: *Index, arena: std.mem.Allocator, fid: FileId, prefix: []const u8) bool {
     const f = idx.graph.files[fid];
+    var changed = false;
     var i = f.sym_start;
     while (i < f.sym_end) : (i += 1) {
         var sym = &idx.graph.symbols[i];
@@ -859,7 +880,9 @@ fn prefixRoutesIn(idx: *Index, arena: std.mem.Allocator, fid: FileId, prefix: []
         else
             std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, ep.path }) catch continue;
         sym.name = std.fmt.allocPrint(arena, "{s} {s}", .{ ep.method, new_path }) catch continue;
+        changed = true;
     }
+    return changed;
 }
 
 fn matchRoute(idx: *const Index, client_key: []const u8) SymbolId {
@@ -1252,6 +1275,11 @@ fn routeId(idx: *const Index) ?SymbolId {
     return null;
 }
 
+fn routeCallRef(sym: model.Symbol) ?model.Reference {
+    for (sym.refs) |ref| if (ref.kind == .route_call) return ref;
+    return null;
+}
+
 test "include_router prefix is applied across files and links a prefixed client" {
     const testing = std.testing;
     const io = testing.io;
@@ -1300,6 +1328,84 @@ test "include_router prefix is applied across files and links a prefixed client"
         linked = true;
     }
     try testing.expect(linked);
+}
+
+test "aliased from-import mount stacks with an APIRouter prefix" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "backend/app/routes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "backend/app/routes/aoi_library.py", .data =
+        \\from fastapi import APIRouter
+        \\router = APIRouter(prefix="/aoi-library")
+        \\@router.get("")
+        \\def list_aois():
+        \\    return []
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "backend/app/routes/health.py", .data =
+        \\from fastapi import APIRouter
+        \\router = APIRouter()
+        \\@router.get("/health")
+        \\def health(): return 1
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "backend/app/main.py", .data =
+        \\from .routes.aoi_library import router as aoi_library_router
+        \\from .routes.health import router as health_router
+        \\app.include_router(aoi_library_router, prefix="/api/v1")
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "module_app.py", .data =
+        \\import backend.app.routes.health as health_routes
+        \\app.include_router(health_routes.router, prefix="/api/v2")
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function listLibraryAois(query: string) {
+        \\  return fetch(`/api/v1/aoi-library${query ? `?${query}` : ""}`);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const route_id = routeByName(&idx, "GET /api/v1/aoi-library").?;
+    try testing.expectEqualStrings("GET /api/v1/aoi-library", idx.graph.symbols[route_id].name);
+    try testing.expectEqual(@as(usize, 1), idx.lookup("GET /api/v1/aoi-library").len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("GET /aoi-library").len);
+    try testing.expect(routeByName(&idx, "GET /api/v2/health") != null);
+    const client = idx.graph.symbols[idx.lookup("listLibraryAois")[0]];
+    const route_ref = routeCallRef(client).?;
+    try testing.expectEqual(route_id, route_ref.target);
+    try testing.expect(route_ref.exact);
+}
+
+test "trailing conditional client path does not wildcard-match the first route" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "routes.py", .data =
+        \\@app.get("/health")
+        \\def health(): return 1
+        \\@app.get("/aoi-library")
+        \\def list_aois(): return []
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function listLibraryAois(query: string) {
+        \\  return fetch(`/aoi-library${query ? `?${query}` : ""}`);
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    const client = idx.graph.symbols[idx.lookup("listLibraryAois")[0]];
+    const route_ref = routeCallRef(client).?;
+    const target = idx.graph.symbols[route_ref.target];
+    try testing.expectEqualStrings("GET /aoi-library", target.name);
+    try testing.expect(!std.mem.eql(u8, target.name, "GET /health"));
 }
 
 test "links a frontend call through a request() wrapper to a backend route" {
@@ -2383,6 +2489,7 @@ test "skipped_dirs: a pruned vendor tree is reported once; a build/dep dir is si
     try tmp.dir.createDirPath(io, "vendor");
     try tmp.dir.createDirPath(io, "deep/vendor");
     try tmp.dir.createDirPath(io, "node_modules");
+    try tmp.dir.createDirPath(io, ".codeflow/artifacts");
     try tmp.dir.writeFile(io, .{ .sub_path = "vendor/a.zig", .data =
         \\pub fn vendored() u32 { return 1; }
     });
@@ -2391,6 +2498,9 @@ test "skipped_dirs: a pruned vendor tree is reported once; a build/dep dir is si
     });
     try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/c.zig", .data =
         \\pub fn nodedep() u32 { return 3; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".codeflow/artifacts/probe.py", .data =
+        \\def generated_probe(): return 3
     });
     try tmp.dir.writeFile(io, .{ .sub_path = "real.zig", .data =
         \\pub fn realfn() u32 { return 4; }
@@ -2406,10 +2516,12 @@ test "skipped_dirs: a pruned vendor tree is reported once; a build/dep dir is si
     try testing.expectEqual(@as(usize, 0), idx.lookup("vendored").len);
     try testing.expectEqual(@as(usize, 0), idx.lookup("vendored2").len);
     try testing.expectEqual(@as(usize, 0), idx.lookup("nodedep").len);
+    try testing.expectEqual(@as(usize, 0), idx.lookup("generated_probe").len);
 
-    // `vendor` is reported exactly once; `node_modules` is a silent skip.
+    // `vendor` is reported exactly once; generated/dependency trees are silent.
     try testing.expectEqual(@as(usize, 1), countStr(idx.skipped_dirs, "vendor"));
     try testing.expectEqual(@as(usize, 0), countStr(idx.skipped_dirs, "node_modules"));
+    try testing.expectEqual(@as(usize, 0), countStr(idx.skipped_dirs, ".codeflow"));
 }
 
 test "skipped_dirs is empty when nothing potentially-source is pruned" {

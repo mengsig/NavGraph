@@ -96,20 +96,20 @@ navgraph <command> [arg] [flags]
 | `calls <name>`     | Tree of what `<name>` calls/uses (callees).                   |
 | `callers <name>`   | Tree of who calls/uses `<name>` (callers).                    |
 | `search <pattern>` | Symbols whose name contains `<pattern>` (`--refs` for use sites; `Recv.field`/`.field` pins attribute reads). |
-| `routes [filter]`  | HTTP routes and cross-language client calls. Views: `--clients`, `--unhit`, `--orphan-calls`, `--handler <glob>`. Mounted FastAPI router prefixes are applied automatically. |
-| `conforms <selector>` | Audit Protocol/interface implementations or compare sibling classes/methods for missing, signature, and async divergence. Aliases: `impls`, `implements`. |
-| `events [filter]`  | Link message-bus handlers (`register`/`on`) to emitters (`send`/`emit`) by shared string key. |
+| `routes [filter]`  | HTTP routes and cross-language client calls. Views: `--clients`, `--unhit`, `--orphan-calls` (`--orphan`/`--orphans`), `--handler <glob>`. Stacked and aliased FastAPI router prefixes are applied automatically. |
+| `conforms <selector>` | Audit Protocol/interface implementations or compare sibling classes/methods for missing, signature, and async divergence; every sibling verdict names its class and file. Aliases: `impls`, `implements`. |
+| `events [filter]`  | Link message-bus handlers to emitters by shared key, including Kafka consumer/producer topic expressions; common DOM/Leaflet `.on()` listeners are filtered. |
 | `neighbors <name>` | Callees and callers of `<name>` in one view.                  |
 | `unused [filter]`  | Unreferenced definitions (fns/methods & types) — removal candidates nothing calls or uses (**not** "broken" code). Default: truly unused (no caller in app or test code). `--no-tests` also lists code used only by tests (annotated); `--tests-only` lists unused test helpers; `--no-public` drops exported (maybe public API); `--follow-imports` disambiguates same-name symbols across packages by import reachability. |
 | `imports [filter]` | Modules each file imports (local dependency edges).           |
 | `importers <file>` | Files that import `<file>`.                                    |
 | `path <A> <B>`     | Shortest call path from `<A>` to `<B>`.                        |
-| `flow <symbol>`    | Directional data view: writers/producers and readers/consumers; `--to <sink>` traces through value handoffs. Alias: `dataflow`. |
+| `flow <symbol>`    | Directional data view: definition initializers and writers/producers versus readers/consumers; ambiguous selectors list the pinning syntax, and `--to <sink>` traces value handoffs. Alias: `dataflow`. |
 | `reaches <A,B,...>` | Deduplicated transitive closure from several roots; `--from-tests` instead selects tests that can reach any target. |
 | `affected [ref]`   | Tests transitively affected by symbols changed since a git ref (`--since`, default `HEAD`). |
 | `collisions [pattern]` | Group duplicate definition names and locations; `--members` includes methods/fields. Alias: `duplicates`. |
 | `diff [ref]`       | Symbols changed since `<ref>` (default `HEAD`) plus their callers; `--exact-source` adds post-image byte ranges and the complete raw git patch. |
-| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols. |
+| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
 | `status [filter]`  | Index/cache snapshot, changed-since-build files, skipped paths, parse health, and unresolved/external graph-reference diagnostics. |
 | `read <file[:A-B]>`| Print raw source lines (numbered); batch ranges: `file:A-B,C-D`. |
@@ -152,7 +152,7 @@ navgraph <command> [arg] [flags]
 | `-i, --impls`                 | On `calls`/`callers`/`neighbors`/`path`/`reaches`/`affected`, cross Protocol/interface ↔ implementation edges (`⇒impl`). |
 | `--clients`                   | `routes`: show resolved client call sites, tagged by source language. |
 | `--unhit`                     | `routes`: show only routes with no resolved client calls. |
-| `--orphan-calls`              | `routes`: show client calls that match no indexed route. |
+| `--orphan-calls`              | `routes`: show client calls that match no indexed route. Aliases: `--orphan`, `--orphans`. |
 | `--handler <glob>`            | `routes`: select routes by handler name. |
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
 | `--jsonl`                     | Stream one item per JSON line plus a page record. `--after v1:N` resumes from its stable ordinal cursor. Supported by `outline`, `search`, `hot`, `todos`, `reaches`, `affected`, `edits`, and `status`. |
@@ -171,9 +171,9 @@ gitignore-style — `files '*_test.py'` matches basenames at any depth,
 **Ignores.** `.gitignore` is respected everywhere. A `.navgraphignore`
 (same syntax, per-directory) adds navgraph-only rules — scratch dirs, vendored
 code, fixtures — without touching git; a negated rule (`!vendor/`) re-includes
-a directory the built-in skip set would prune. Minified/bundled artifacts
-(`*.min.*`, one-enormous-line files) are skipped automatically and named in
-the skipped-note.
+a directory the built-in skip set would prune. Generated `.codeflow/` probe
+artifacts are pruned by default. Minified/bundled artifacts (`*.min.*`,
+one-enormous-line files) are skipped automatically and named in the skipped-note.
 
 **Exit codes.** `0` = found results, `1` = the query ran but found nothing
 (grep convention), `2` = usage error. Piping into `head` exits quietly (141).
@@ -245,11 +245,17 @@ navgraph flow Record.value --to serialize
 navgraph search value --refs --on-type Record --writers
 ```
 
-Flow direction is captured per reference site. Direct assignments and constructor
-keyword labels are writes, augmented assignments are both read and write, and
-constructor calls are producers for type symbols. Receiver type scoping uses
-existing annotations and local bindings; dynamic/reflected receivers remain
-best-effort and unresolved edges are never promoted to exact matches.
+Flow direction is captured per reference site. Module-level constant/variable
+initializers are explicit producers, direct assignments and constructor keyword
+labels are writes, augmented assignments are both read and write, and constructor
+calls are producers for type symbols. If a selector matches several definitions,
+the text view reports the exact match count and pin syntax; JSON includes every
+candidate. Pin with `Parent.name` or `name@path`. For JSON, `--to` reports source
+and sink candidates alongside `path`; `counts` are uncapped totals while
+`emitted` and `truncated` describe the single global `-l` output budget.
+Receiver type scoping uses existing annotations and local bindings;
+dynamic/reflected receivers remain best-effort and unresolved edges are never
+promoted to exact matches.
 
 Rank the largest definitions and audit ambiguous names without shell pipelines:
 
@@ -318,14 +324,15 @@ navgraph conforms '*Runner' -j
 `conforms` reports `OK`, `MISSING`, `SIG-DIFF`, and `ASYNC-DIFF`. A Protocol
 selector compares its methods with discovered implementations; a selector that
 matches multiple ordinary classes or methods produces a sibling divergence
-matrix.
+matrix. Sibling rows identify the inspected class and file, and the expected
+header definition is not repeated as an `ok` implementation row.
 
 Inspect HTTP client coverage after mounted router prefixes are applied:
 
 ```
 navgraph routes /v1/orders --clients
 navgraph routes --unhit
-navgraph routes --orphan-calls
+navgraph routes --orphan-calls             # aliases: --orphan, --orphans
 navgraph routes --handler 'place_*'
 ```
 

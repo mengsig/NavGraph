@@ -278,7 +278,13 @@ fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32, prefixes: *const std.StringHas
 fn emitMount(ctx: *Ctx, m: api.RouterMount, recv_i: u32) !void {
     const span_start = lineStartOffset(ctx, recv_i);
     const span_end = ctx.toks[recv_i].end;
+    const inferred = if (m.module.len == 0 and ctx.cfg.language == .python)
+        pythonMountModule(ctx, m.router)
+    else
+        null;
+    const module = inferred orelse m.module;
     std.debug.assert(span_start <= span_end);
+    std.debug.assert(module.len != 0 or m.router.len != 0);
     _ = try emit(ctx, .{
         .name = try ctx.arena.dupe(u8, m.prefix),
         .kind = .route_mount,
@@ -290,8 +296,42 @@ fn emitMount(ctx: *Ctx, m: api.RouterMount, recv_i: u32) !void {
         .exported = false,
         .parent_local = null,
         .refs = &.{},
-        .import_path = try ctx.arena.dupe(u8, m.module),
+        .import_path = try ctx.arena.dupe(u8, module),
     });
+}
+
+/// Resolve `from pkg.routes.health import router as health_router` for a bare
+/// `include_router(health_router, ...)` argument.
+fn pythonMountModule(ctx: *const Ctx, alias: []const u8) ?[]const u8 {
+    std.debug.assert(alias.len != 0);
+    std.debug.assert(ctx.toks.len != 0);
+    var i: u32 = 0;
+    while (i + 2 < ctx.toks.len) : (i += 1) {
+        if (!ctx.identEql(i, "from")) continue;
+        const line = ctx.toks[i].line;
+        var import_i = i + 1;
+        while (import_i < ctx.toks.len and ctx.toks[import_i].line == line and !ctx.identEql(import_i, "import")) : (import_i += 1) {}
+        if (import_i >= ctx.toks.len or ctx.toks[import_i].line != line or import_i == i + 1) continue;
+        const module = ctx.source[ctx.toks[i + 1].start..ctx.toks[import_i - 1].end];
+        var end = import_i + 1;
+        if (end < ctx.toks.len and ctx.isPunct(end, '(')) {
+            const close = ctx.close[end];
+            end = if (close == sentinel) end else close + 1;
+        } else {
+            while (end < ctx.toks.len and ctx.toks[end].line == line) : (end += 1) {}
+        }
+        var j = import_i + 1;
+        while (j < end) : (j += 1) {
+            if (ctx.toks[j].kind != .identifier or ctx.identEql(j, "as")) continue;
+            var bound = ctx.textOf(j);
+            if (j + 2 < end and ctx.identEql(j + 1, "as") and ctx.toks[j + 2].kind == .identifier) {
+                bound = ctx.textOf(j + 2);
+                j += 2;
+            }
+            if (std.mem.eql(u8, bound, alias)) return module;
+        }
+    }
+    return null;
 }
 
 /// The handler name a route dispatches to: an Express identifier argument after

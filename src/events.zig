@@ -35,15 +35,15 @@ const max_key_len = 64;
 /// to unambiguous dispatch verbs — generic ones (`handle`, `bind`, `event`, DOM
 /// `addEventListener`) matched HTTP/DOM calls that `routes` already covers.
 const handler_verbs = std.StaticStringMap(void).initComptime(.{
-    .{"register"},    .{"on"},     .{"subscribe"},
-    .{"listen"},      .{"addlistener"},
+    .{"register"}, .{"on"},          .{"subscribe"},
+    .{"listen"},   .{"addlistener"},
 });
 
 /// Verbs that fire/emit a key (the sending side). `post`/`call`/`invoke` were
 /// dropped: they matched HTTP client calls and generic invocations, not the bus.
 const emitter_verbs = std.StaticStringMap(void).initComptime(.{
-    .{"emit"},      .{"send"},   .{"dispatch"},  .{"publish"},
-    .{"trigger"},   .{"fire"},   .{"broadcast"}, .{"notify"},
+    .{"emit"},        .{"send"}, .{"dispatch"},  .{"publish"},
+    .{"trigger"},     .{"fire"}, .{"broadcast"}, .{"notify"},
     .{"sendmessage"},
 });
 
@@ -65,32 +65,151 @@ fn roleOf(verb_raw: []const u8) ?Role {
 /// immediately before the `(`. Only identifier-like keys are kept.
 pub fn collect(toks: []const Token, source: []const u8, out: *std.ArrayList(EventRef), gpa: std.mem.Allocator) !void {
     std.debug.assert(source.len == 0 or toks.len != 0);
+    std.debug.assert(source.len <= std.math.maxInt(u32));
     if (toks.len < 3) return;
+    var aliases: std.ArrayList(TopicAlias) = .empty;
+    defer aliases.deinit(gpa);
+    try collectTopicAliases(toks, source, &aliases, gpa);
     var i: usize = 1;
     while (i + 1 < toks.len) : (i += 1) {
-        if (!isPunct(toks, source, i, '(')) continue;
-        const verb_tok = toks[i - 1];
-        const key_tok = toks[i + 1];
-        if (verb_tok.kind != .identifier or key_tok.kind != .string) continue;
-        const role = roleOf(verb_tok.text(source)) orelse continue;
-        const key = eventKey(key_tok.text(source)) orelse continue;
-        std.debug.assert(key.len != 0 and key.len <= max_key_len);
-        try out.append(gpa, .{
-            .key = key,
-            .role = role,
-            .verb = verb_tok.text(source),
-            .line = key_tok.line,
-            .offset = key_tok.start,
-        });
+        if (!isPunct(toks, source, i, '(') or toks[i - 1].kind != .identifier) continue;
+        const verb = toks[i - 1].text(source);
+        const receiver = callReceiver(toks, source, i);
+        const role = brokerRole(verb, receiver) orelse roleOf(verb) orelse continue;
+        if (toks[i + 1].kind == .string) {
+            const key = eventKey(toks[i + 1].text(source)) orelse continue;
+            if (isDomListener(verb, receiver, key)) continue;
+            try appendRef(out, gpa, key, role, verb, toks[i + 1]);
+        } else if (brokerRole(verb, receiver) != null) {
+            try appendBrokerRefs(toks, source, i, aliases.items, role, out, gpa);
+        }
     }
 }
 
-/// The event key inside a (possibly prefixed) string literal, or null when the
-/// literal is not a plausible key: empty, too long, whitespace/prose, a URL path
-/// (`/`-bearing — that is `routes`' domain), or an interpolated/dynamic fragment.
-/// An f-string key like `f"start"` reads as `start`; a cut f-string fragment such
-/// as `f"/api/jobs/` (the lexer stops at the first `{`) has no closing quote and
-/// is dropped as dynamic.
+const TopicAlias = struct { name: []const u8, key: []const u8 };
+
+fn appendRef(out: *std.ArrayList(EventRef), gpa: std.mem.Allocator, key: []const u8, role: Role, verb: []const u8, site: Token) !void {
+    std.debug.assert(key.len != 0 and key.len <= max_key_len);
+    std.debug.assert(site.start <= site.end);
+    try out.append(gpa, .{ .key = key, .role = role, .verb = verb, .line = site.line, .offset = site.start });
+}
+
+fn callReceiver(toks: []const Token, source: []const u8, open: usize) []const u8 {
+    if (open < 3 or !isPunct(toks, source, open - 2, '.') or toks[open - 3].kind != .identifier) return "";
+    return toks[open - 3].text(source);
+}
+
+fn brokerRole(verb: []const u8, receiver: []const u8) ?Role {
+    const consumer = containsIgnoreCase(receiver, "consumer") or containsIgnoreCase(receiver, "kafka") or containsIgnoreCase(receiver, "broker");
+    const producer = containsIgnoreCase(receiver, "producer") or containsIgnoreCase(receiver, "kafka") or containsIgnoreCase(receiver, "broker");
+    if (consumer and std.ascii.eqlIgnoreCase(verb, "subscribe")) return .handler;
+    if (!producer) return null;
+    if (std.ascii.eqlIgnoreCase(verb, "produce") or std.ascii.eqlIgnoreCase(verb, "publish") or
+        std.ascii.eqlIgnoreCase(verb, "send") or std.ascii.eqlIgnoreCase(verb, "send_and_wait")) return .emitter;
+    return null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    std.debug.assert(needle.len != 0);
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Suppress known browser/Leaflet listeners only when the receiver also looks
+/// DOM/map-like; application buses using the same key remain visible.
+fn isDomListener(verb: []const u8, receiver: []const u8, key: []const u8) bool {
+    std.debug.assert(verb.len != 0);
+    std.debug.assert(key.len != 0);
+    if (!std.ascii.eqlIgnoreCase(verb, "on") and !std.ascii.eqlIgnoreCase(verb, "listen") and
+        !std.ascii.eqlIgnoreCase(verb, "addlistener")) return false;
+    const dom_receiver = [_][]const u8{
+        "map",     "marker",  "layer",   "tile",     "polygon",  "polyline", "circle",  "rectangle",
+        "popup",   "tooltip", "control", "domevent", "document", "window",   "element", "canvas",
+        "leaflet",
+    };
+    var receiver_matches = false;
+    for (dom_receiver) |hint| receiver_matches = receiver_matches or containsIgnoreCase(receiver, hint);
+    if (!receiver_matches) return false;
+    const dom_events = [_][]const u8{
+        "click",     "dblclick",    "move",      "movestart", "moveend",    "mousemove", "mouseenter", "mouseleave",
+        "mousedown", "mouseup",     "mouseover", "mouseout",  "zoom",       "zoomstart", "zoomend",    "tileload",
+        "tileerror", "keydown",     "keyup",     "keypress",  "resize",     "scroll",    "load",       "focus",
+        "blur",      "change",      "input",     "submit",    "touchstart", "touchmove", "touchend",   "pointerdown",
+        "pointerup", "pointermove",
+    };
+    for (dom_events) |event| if (std.ascii.eqlIgnoreCase(key, event)) return true;
+    return false;
+}
+
+fn collectTopicAliases(toks: []const Token, source: []const u8, out: *std.ArrayList(TopicAlias), gpa: std.mem.Allocator) !void {
+    std.debug.assert(source.len == 0 or toks.len != 0);
+    std.debug.assert(source.len <= std.math.maxInt(u32));
+    var i: usize = 0;
+    while (i + 2 < toks.len) : (i += 1) {
+        if (toks[i].kind != .identifier or !isPunct(toks, source, i + 1, '=')) continue;
+        const name = toks[i].text(source);
+        var depth: i32 = 0;
+        var j = i + 2;
+        while (j < toks.len and j < i + 66) : (j += 1) {
+            if (j > i + 2 and depth == 0 and toks[j].line != toks[i].line) break;
+            if (isPunct(toks, source, j, '[') or isPunct(toks, source, j, '(') or isPunct(toks, source, j, '{')) depth += 1;
+            if (isPunct(toks, source, j, ']') or isPunct(toks, source, j, ')') or isPunct(toks, source, j, '}')) depth -= 1;
+            const key = topicTokenKey(toks[j], source) orelse continue;
+            try out.append(gpa, .{ .name = name, .key = key });
+        }
+    }
+}
+
+fn topicTokenKey(tok: Token, source: []const u8) ?[]const u8 {
+    if (tok.kind == .string) return eventKey(tok.text(source));
+    if (tok.kind != .identifier) return null;
+    const name = tok.text(source);
+    if (std.ascii.eqlIgnoreCase(name, "topic") or std.ascii.eqlIgnoreCase(name, "topics")) return name;
+    if (endsWithIgnoreCase(name, "_topic") or endsWithIgnoreCase(name, "_topics")) return name;
+    return null;
+}
+
+fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    if (value.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
+}
+
+fn appendBrokerRefs(toks: []const Token, source: []const u8, open: usize, aliases: []const TopicAlias, role: Role, out: *std.ArrayList(EventRef), gpa: std.mem.Allocator) !void {
+    std.debug.assert(open + 1 < toks.len);
+    std.debug.assert(toks[open].kind == .punct);
+    const verb = toks[open - 1].text(source);
+    const before = out.items.len;
+    var depth: i32 = 1;
+    var i = open + 1;
+    while (i < toks.len and i < open + 66) : (i += 1) {
+        if (depth == 1 and isPunct(toks, source, i, ',')) break;
+        if (isPunct(toks, source, i, '(') or isPunct(toks, source, i, '[') or isPunct(toks, source, i, '{')) depth += 1;
+        if (isPunct(toks, source, i, ')') or isPunct(toks, source, i, ']') or isPunct(toks, source, i, '}')) {
+            depth -= 1;
+            if (depth == 0) break;
+        }
+        if (toks[i].kind == .identifier and i + 1 < toks.len and isPunct(toks, source, i + 1, '=')) continue;
+        const token_key = topicTokenKey(toks[i], source) orelse continue;
+        var aliased = false;
+        for (aliases) |alias| if (std.mem.eql(u8, alias.name, token_key)) {
+            try appendUniqueBrokerRef(out, before, gpa, alias.key, role, verb, toks[i]);
+            aliased = true;
+        };
+        if (!aliased) try appendUniqueBrokerRef(out, before, gpa, token_key, role, verb, toks[i]);
+    }
+}
+
+fn appendUniqueBrokerRef(out: *std.ArrayList(EventRef), start: usize, gpa: std.mem.Allocator, key: []const u8, role: Role, verb: []const u8, site: Token) !void {
+    for (out.items[start..]) |ref| if (std.mem.eql(u8, ref.key, key)) return;
+    try appendRef(out, gpa, key, role, verb, site);
+}
+
+/// Return an identifier-like key from a quoted literal; reject prose, URLs,
+/// oversized values, and interpolated fragments.
 fn eventKey(raw: []const u8) ?[]const u8 {
     const lit = stripStringPrefix(raw);
     if (lit.len < 2) return null;
@@ -161,7 +280,6 @@ test "roleOf classifies verbs case-insensitively and strips a decorator @" {
     try std.testing.expectEqual(@as(?Role, null), roleOf("computeTotal"));
 }
 
-
 // ---------------------------------------------------------------------------
 // Appended hardening tests for src/events.zig
 // ---------------------------------------------------------------------------
@@ -187,8 +305,8 @@ test "roleOf maps every handler verb to .handler" {
 
 test "roleOf maps every emitter verb to .emitter" {
     const emitters = [_][]const u8{
-        "emit", "send", "dispatch", "publish", "trigger",
-        "fire", "broadcast", "notify", "sendmessage",
+        "emit", "send",      "dispatch", "publish",     "trigger",
+        "fire", "broadcast", "notify",   "sendmessage",
     };
     for (emitters) |v| {
         try std.testing.expectEqual(Role.emitter, roleOf(v).?);
@@ -230,8 +348,9 @@ test "roleOf returns null for unknown verbs" {
 test "roleOf returns null for the deliberately-excluded generic verbs" {
     // Documented exclusions: generic invocations / HTTP-ish verbs / DOM listener.
     const excluded = [_][]const u8{
-        "handle", "bind", "event", "addeventlistener",
-        "post", "call", "invoke", "get", "put",
+        "handle", "bind", "event",  "addeventlistener",
+        "post",   "call", "invoke", "get",
+        "put",
     };
     for (excluded) |v| {
         try std.testing.expectEqual(@as(?Role, null), roleOf(v));
@@ -486,4 +605,40 @@ test "collectSource pairs multiple distinct keys independently" {
     try std.testing.expectEqual(Role.emitter, out.items[1].role);
     try std.testing.expectEqualStrings("gamma", out.items[2].key);
     try std.testing.expectEqual(Role.handler, out.items[2].role);
+}
+
+test "DOM and Leaflet on-handlers are filtered without hiding an application bus" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\map.on("mousemove", draw)
+        \\feature_layer.on("mouseleave", leave)
+        \\polygon.on("move", pan)
+        \\bus.on("mousemove", handle)
+        \\bus.emit("mousemove")
+    ;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("mousemove", out.items[0].key);
+    try std.testing.expectEqual(Role.handler, out.items[0].role);
+    try std.testing.expectEqual(Role.emitter, out.items[1].role);
+}
+
+test "Kafka subscription aliases pair with producer topic expressions" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\topics = [config.detections_topic]
+        \\consumer.subscribe(topics)
+        \\producer.produce(topic=config.detections_topic, value=payload)
+        \\observable.subscribe(callback)
+    ;
+    var out: std.ArrayList(EventRef) = .empty;
+    defer out.deinit(gpa);
+    try collectSource(gpa, src, &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("detections_topic", out.items[0].key);
+    try std.testing.expectEqual(Role.handler, out.items[0].role);
+    try std.testing.expectEqualStrings("detections_topic", out.items[1].key);
+    try std.testing.expectEqual(Role.emitter, out.items[1].role);
 }

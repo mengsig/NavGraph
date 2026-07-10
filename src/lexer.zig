@@ -385,6 +385,7 @@ fn lexLineString(lx: *Lexer, out: *std.ArrayList(Token)) !void {
 }
 
 fn lexString(lx: *Lexer, out: *std.ArrayList(Token), quote: u8) !void {
+    if (quote == '`') return lexTemplateString(lx, out);
     const start = lx.pos;
     const line = lx.line;
     const col = lx.col;
@@ -401,12 +402,49 @@ fn lexString(lx: *Lexer, out: *std.ArrayList(Token), quote: u8) !void {
             lx.advance();
         }
     } else {
-        while (lx.pos < lx.source.len and lx.peek() != quote) {
-            if (lx.peek() == '\\') lx.advance();
-            if (lx.pos < lx.source.len) lx.advance();
-        }
+        skipQuotedBody(lx, quote);
+    }
+    try out.append(lx.gpa, .{ .kind = .string, .start = start, .end = lx.pos, .line = line, .col = col });
+}
+
+fn skipQuotedBody(lx: *Lexer, quote: u8) void {
+    std.debug.assert(quote == '"' or quote == '\'');
+    std.debug.assert(lx.pos > 0 and lx.source[lx.pos - 1] == quote);
+    while (lx.pos < lx.source.len and lx.peek() != quote) {
+        if (lx.peek() == '\\') lx.advance();
         if (lx.pos < lx.source.len) lx.advance();
     }
+    if (lx.pos < lx.source.len) lx.advance();
+}
+
+/// Consume a complete JS template literal as one string token. Interpolation
+/// code is tokenized into scratch storage so nested strings/comments stay opaque.
+fn lexTemplateString(lx: *Lexer, out: *std.ArrayList(Token)) !void {
+    std.debug.assert(lx.peek() == '`');
+    const start = lx.pos;
+    const line = lx.line;
+    const col = lx.col;
+    var inner: std.ArrayList(Token) = .empty;
+    defer inner.deinit(lx.gpa);
+    lx.advance();
+    while (lx.pos < lx.source.len) {
+        const c = lx.peek();
+        if (c == '\\') {
+            lx.advance();
+            if (lx.pos < lx.source.len) lx.advance();
+        } else if (c == '`') {
+            lx.advance();
+            break;
+        } else if (c == '$' and lx.at(1) == '{') {
+            lx.advance();
+            lx.advance();
+            inner.clearRetainingCapacity();
+            try lexInterpHole(lx, &inner);
+        } else {
+            lx.advance();
+        }
+    }
+    std.debug.assert(lx.pos >= start + 1);
     try out.append(lx.gpa, .{ .kind = .string, .start = start, .end = lx.pos, .line = line, .col = col });
 }
 
@@ -440,8 +478,8 @@ fn regexAllowedHere(toks: []const Token, source: []const u8) bool {
 /// division.
 fn regexKeyword(name: []const u8) bool {
     const kws = [_][]const u8{
-        "return", "typeof", "instanceof", "in",   "of",     "new",   "delete",
-        "void",   "do",     "else",       "yield", "case",   "throw", "await",
+        "return", "typeof", "instanceof", "in",    "of",   "new",   "delete",
+        "void",   "do",     "else",       "yield", "case", "throw", "await",
     };
     for (kws) |k| if (std.mem.eql(u8, name, k)) return true;
     return false;
@@ -745,6 +783,32 @@ test "a `/` after a value is division, not a regex" {
     try std.testing.expect(saw_tail);
 }
 
+test "nested JS template interpolation stays in one string token" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const path = `/aoi-library${query ? `?${query}` : ""}`;
+        \\function tail() { return path; }
+    ;
+    var toks = try lexAll(gpa, src, .typescript);
+    defer toks.deinit(gpa);
+    const string = firstOfKind(toks.items, .string).?;
+    try std.testing.expectEqualStrings("`/aoi-library${query ? `?${query}` : \"\"}`", string.text(src));
+    try std.testing.expect(hasIdent(toks.items, src, "tail"));
+}
+
+test "JS template interpolation keeps regex and comment delimiters opaque" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const regexValue = `${/`}/.test(input)}`;
+        \\const commentValue = `${input /* ` } */ + 1}`;
+        \\function afterTemplates() { return regexValue + commentValue; }
+    ;
+    var toks = try lexAll(gpa, src, .typescript);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), countKind(toks.items, .string));
+    try std.testing.expect(hasIdent(toks.items, src, "afterTemplates"));
+}
+
 test "JSX closing tag is not mistaken for a regex" {
     const gpa = std.testing.allocator;
     const cfg = language.configFor(.tsx);
@@ -763,7 +827,6 @@ test "JSX closing tag is not mistaken for a regex" {
     }
     try std.testing.expect(saw_sibling);
 }
-
 
 // ===================================================================
 // Appended hardening tests for lexer.zig

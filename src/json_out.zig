@@ -629,75 +629,150 @@ fn walkCallers(
 /// connectivity is entirely heuristic.
 pub fn flow(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     std.debug.assert(name.len > 0);
-    std.debug.assert(idx.graph.symbols.len > 0);
-    var buf: [64]SymbolId = undefined;
-    const ids = query.resolveIds(idx, name, &buf);
-    if (ids.len == 0) {
-        try w.writeAll("{\"producers\":[],\"consumers\":[]}\n");
-        return false;
-    }
-    if (opts.flow_to.len != 0) {
-        const chain = try query.flowPathIds(idx, ids, opts.flow_to, opts.strict);
-        defer idx.gpa.free(chain);
-        try w.writeByte('[');
-        for (chain, 0..) |id, i| {
-            if (i != 0) try w.writeByte(',');
-            try nodeHead(w, idx, idx.graph.symbols[id]);
-            try w.writeByte('}');
-        }
-        try w.writeAll("]\n");
-        return chain.len > 0;
-    }
+    if (idx.graph.symbols.len == 0) return flowMissing(w, idx, name, opts);
+    const storage = try idx.gpa.alloc(SymbolId, idx.graph.symbols.len);
+    defer idx.gpa.free(storage);
+    const ids = query.resolveIds(idx, name, storage);
+    if (ids.len == 0) return flowMissing(w, idx, name, opts);
+    if (opts.flow_to.len != 0) return flowPath(w, idx, name, ids, opts);
+    const totals = query.flowCounts(idx, ids, opts);
     try w.writeAll("{\"symbol\":");
     try nodeHead(w, idx, idx.graph.symbols[ids[0]]);
-    try w.writeAll("},\"producers\":[");
-    var writers: u32 = 0;
-    try flowSites(w, idx, ids, opts, true, &writers);
+    try w.writeByte('}');
+    if (ids.len > 1) try flowCandidates(w, idx, ids);
+    try w.writeAll(",\"producers\":[");
+    var emitted: FlowEmitState = .{};
+    try flowInitializerSites(w, idx, ids, opts, &emitted);
+    try flowSites(w, idx, ids, opts, true, &emitted);
     try w.writeAll("],\"consumers\":[");
-    var readers: u32 = 0;
-    try flowSites(w, idx, ids, opts, false, &readers);
-    if (!opts.writers and !opts.unread) try typeConsumerSites(w, idx, ids, opts, &readers);
-    try w.print("],\"counts\":{{\"producers\":{d},\"consumers\":{d}}}}}\n", .{ writers, readers });
-    return writers + readers > 0;
+    try flowSites(w, idx, ids, opts, false, &emitted);
+    if (!opts.writers and !opts.unread) try typeConsumerSites(w, idx, ids, opts, &emitted);
+    const total = totals.producers + totals.consumers;
+    try w.print("],\"counts\":{{\"producers\":{d},\"consumers\":{d}}},", .{ totals.producers, totals.consumers });
+    try w.print("\"emitted\":{{\"producers\":{d},\"consumers\":{d}}},\"truncated\":{s}}}\n", .{
+        emitted.producers, emitted.consumers, if (emitted.shown < total) "true" else "false",
+    });
+    return total > 0;
 }
 
-fn flowSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, write: bool, count: *u32) !void {
+fn flowMissing(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
+    std.debug.assert(name.len > 0);
+    std.debug.assert(opts.limit > 0);
+    if (opts.flow_to.len == 0) {
+        try w.writeAll("{\"match_count\":0,\"candidates\":[],\"producers\":[],\"consumers\":[],");
+        try w.writeAll("\"counts\":{\"producers\":0,\"consumers\":0},\"emitted\":{\"producers\":0,\"consumers\":0},\"truncated\":false}\n");
+        return false;
+    }
+    const storage = try idx.gpa.alloc(SymbolId, idx.graph.symbols.len);
+    defer idx.gpa.free(storage);
+    const sinks: []const SymbolId = if (storage.len == 0) &.{} else query.resolveIds(idx, opts.flow_to, storage);
+    try w.writeAll("{\"source\":");
+    try flowEndpoint(w, idx, name, &.{});
+    try w.writeAll(",\"sink\":");
+    try flowEndpoint(w, idx, opts.flow_to, sinks);
+    try w.writeAll(",\"path\":[]}\n");
+    return false;
+}
+
+fn flowPath(w: *Writer, idx: *const Index, name: []const u8, ids: []const SymbolId, opts: Options) !bool {
     std.debug.assert(ids.len > 0);
-    std.debug.assert(count.* == 0);
+    std.debug.assert(opts.flow_to.len > 0);
+    const storage = try idx.gpa.alloc(SymbolId, idx.graph.symbols.len);
+    defer idx.gpa.free(storage);
+    const sinks = query.resolveIds(idx, opts.flow_to, storage);
+    const chain = if (sinks.len == 0)
+        try idx.gpa.alloc(SymbolId, 0)
+    else
+        try query.flowPathBetweenIds(idx, ids, sinks, opts);
+    defer idx.gpa.free(chain);
+    try w.writeAll("{\"source\":");
+    try flowEndpoint(w, idx, name, ids);
+    try w.writeAll(",\"sink\":");
+    try flowEndpoint(w, idx, opts.flow_to, sinks);
+    try w.writeAll(",\"path\":[");
+    for (chain, 0..) |id, i| {
+        if (i != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[id]);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}\n");
+    return chain.len > 0;
+}
+
+fn flowEndpoint(w: *Writer, idx: *const Index, selector: []const u8, ids: []const SymbolId) !void {
+    std.debug.assert(selector.len > 0);
+    std.debug.assert(ids.len <= idx.graph.symbols.len);
+    try w.writeAll("{\"selector\":");
+    try writeString(w, selector);
+    try w.print(",\"match_count\":{d},\"candidates\":[", .{ids.len});
+    for (ids, 0..) |id, i| {
+        if (i != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[id]);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+}
+
+fn flowCandidates(w: *Writer, idx: *const Index, ids: []const SymbolId) !void {
+    std.debug.assert(ids.len > 1);
+    std.debug.assert(ids[0] < idx.graph.symbols.len);
+    try w.print(",\"match_count\":{d},\"candidates\":[", .{ids.len});
+    for (ids, 0..) |id, i| {
+        if (i != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[id]);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+const FlowEmitState = struct { shown: u32 = 0, producers: u32 = 0, consumers: u32 = 0 };
+
+fn flowInitializerSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, state: *FlowEmitState) !void {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(state.shown == state.producers + state.consumers);
+    for (ids) |id| {
+        if (state.shown >= opts.limit) return;
+        if (!query.flowInitializerSelected(idx, id, opts)) continue;
+        if (state.producers != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[id]);
+        try w.writeAll(",\"mode\":\"initializer\"}");
+        state.producers += 1;
+        state.shown += 1;
+    }
+}
+
+fn flowSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, write: bool, state: *FlowEmitState) !void {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(state.shown == state.producers + state.consumers);
+    const group_count = if (write) &state.producers else &state.consumers;
     for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
         const producer = query.flowProducer(idx, ids, ref);
         if (producer != write or !idIn(ids, ref.target) or !query.flowRefSelected(idx, owner, ref, producer, opts)) continue;
-        if (ref.lines.len > 1) {
-            for (ref.lines) |line| {
-                if (count.* >= opts.limit) return;
-                if (count.* != 0) try w.writeByte(',');
-                var directed = ref;
-                directed.write = write;
-                try refObject(w, idx, owner, directed, line);
-                count.* += 1;
-            }
-        } else {
-            if (count.* >= opts.limit) return;
-            if (count.* != 0) try w.writeByte(',');
+        const lines = if (ref.lines.len > 1) ref.lines else &[_]u32{ref.line};
+        for (lines) |line| {
+            if (state.shown >= opts.limit) return;
+            if (group_count.* != 0) try w.writeByte(',');
             var directed = ref;
             directed.write = write;
-            try refObject(w, idx, owner, directed, ref.line);
-            count.* += 1;
+            try refObject(w, idx, owner, directed, line);
+            group_count.* += 1;
+            state.shown += 1;
         }
     };
 }
 
-fn typeConsumerSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, count: *u32) !void {
+fn typeConsumerSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, state: *FlowEmitState) !void {
     const target = query.flowTypeTarget(idx, ids) orelse return;
     std.debug.assert(target < idx.graph.symbols.len);
-    std.debug.assert(count.* <= opts.limit);
+    std.debug.assert(state.shown == state.producers + state.consumers);
     for (idx.graph.symbols) |owner| {
-        if (count.* >= opts.limit) return;
+        if (state.shown >= opts.limit) return;
         const consumer = query.typeConsumerBinding(idx, ids, owner) orelse continue;
-        if (count.* != 0) try w.writeByte(',');
+        if (state.consumers != 0) try w.writeByte(',');
         const ref: model.Reference = .{ .name = idx.graph.symbols[target].name, .qualifier = consumer.binding, .line = consumer.line, .kind = .type_use, .target = target, .exact = true };
         try refObject(w, idx, owner, ref, consumer.line);
-        count.* += 1;
+        state.consumers += 1;
+        state.shown += 1;
     }
 }
 
@@ -775,12 +850,14 @@ pub fn conforms(w: *Writer, idx: *const Index, selector: []const u8, opts: Optio
         shown += 1;
         if (shown >= opts.limit) break;
     }
-    if (shown == 0 and !opts.strict and try siblingConformanceObject(w, idx, ids)) shown = 1;
+    if (shown == 0 and try siblingConformanceObject(w, idx, ids, opts.limit)) shown = 1;
     try w.writeAll("]\n");
     return shown > 0;
 }
 
-fn siblingConformanceObject(w: *Writer, idx: *const Index, ids: []const SymbolId) !bool {
+fn siblingConformanceObject(w: *Writer, idx: *const Index, ids: []const SymbolId, limit: u32) !bool {
+    std.debug.assert(ids.len <= idx.graph.symbols.len);
+    std.debug.assert(limit > 0);
     var parents: [64]SymbolId = undefined;
     const count = query.collectConformanceParents(idx, ids, &parents);
     if (count < 2) return false;
@@ -793,12 +870,15 @@ fn siblingConformanceObject(w: *Writer, idx: *const Index, ids: []const SymbolId
     var names = std.StringHashMap(void).init(idx.gpa);
     defer names.deinit();
     var first = true;
+    var shown: u32 = 0;
     for (idx.graph.symbols) |expected| {
+        if (shown >= limit) break;
         if (expected.kind != .method or !query.contains(parents[0..count], expected.parent)) continue;
         if (query.idsContainMethods(idx, ids) and !query.contains(ids, expected.id)) continue;
         if ((try names.getOrPut(expected.name)).found_existing) continue;
         if (!first) try w.writeByte(',');
         first = false;
+        shown += 1;
         try siblingMemberObject(w, idx, parents[0..count], expected);
     }
     try w.writeAll("]}");
@@ -806,14 +886,21 @@ fn siblingConformanceObject(w: *Writer, idx: *const Index, ids: []const SymbolId
 }
 
 fn siblingMemberObject(w: *Writer, idx: *const Index, parents: []const SymbolId, expected: Symbol) !void {
+    std.debug.assert(expected.kind == .method);
+    std.debug.assert(expected.parent != invalid);
     try w.writeAll("{\"expected\":");
     try symbolObject(w, idx, expected, .sig);
     try w.writeAll(",\"implementations\":[");
-    for (parents, 0..) |parent, k| {
-        if (k != 0) try w.writeByte(',');
+    var written: u32 = 0;
+    for (parents) |parent| {
+        if (parent == expected.parent) continue;
+        if (written != 0) try w.writeByte(',');
+        written += 1;
         const actual_id = impls_mod.methodOf(idx, parent, expected.name);
         const actual = if (actual_id) |id| idx.graph.symbols[id] else null;
-        try w.writeAll("{\"verdict\":");
+        try w.writeAll("{\"parent\":");
+        try symbolObject(w, idx, idx.graph.symbols[parent], .names);
+        try w.writeAll(",\"verdict\":");
         try writeString(w, @tagName(query.conformanceVerdict(idx, expected, actual)));
         try w.writeAll(",\"symbol\":");
         if (actual) |sym| try symbolObject(w, idx, sym, .sig) else try w.writeAll("null");
@@ -2721,6 +2808,156 @@ test "unused json flags a test-only symbol with test_only:true" {
     try testing.expect(dead_plain);
     // A production-used symbol is not reported at all.
     try testing.expect(!found_prod);
+}
+
+test "flow json reports ambiguous candidates and definition initializers" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\VALUE = 1
+        \\def read_value(): return VALUE
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.py", .data = "VALUE = 2\n" });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    _ = try flow(&aw.writer, &idx, "VALUE", .{ .format = .json, .limit = 1 });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const object = p.value.object;
+    try testing.expectEqual(@as(i64, 2), object.get("match_count").?.integer);
+    try testing.expectEqual(@as(usize, 2), object.get("candidates").?.array.items.len);
+    const producers = object.get("producers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), producers.len);
+    try testing.expectEqualStrings("initializer", producers[0].object.get("mode").?.string);
+    try testing.expectEqual(@as(usize, 0), object.get("consumers").?.array.items.len);
+    try testing.expectEqual(@as(i64, 2), object.get("counts").?.object.get("producers").?.integer);
+    try testing.expectEqual(@as(i64, 1), object.get("counts").?.object.get("consumers").?.integer);
+    try testing.expectEqual(@as(i64, 1), object.get("emitted").?.object.get("producers").?.integer);
+    try testing.expect(object.get("truncated").?.bool);
+}
+
+test "flow json --to reports all ambiguous endpoints" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const body =
+        \\VALUE = 0
+        \\def forward():
+        \\    sink()
+        \\    return VALUE
+        \\def sink(): pass
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data = body });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.py", .data = body });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    _ = try flow(&aw.writer, &idx, "VALUE", .{ .format = .json, .flow_to = "sink" });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const object = p.value.object;
+    try testing.expectEqual(@as(i64, 2), object.get("source").?.object.get("match_count").?.integer);
+    try testing.expectEqual(@as(i64, 2), object.get("sink").?.object.get("match_count").?.integer);
+    try testing.expectEqual(@as(usize, 2), object.get("source").?.object.get("candidates").?.array.items.len);
+    try testing.expect(object.get("path").? == .array);
+    try testing.expect(object.get("path").?.array.items.len > 0);
+}
+
+test "flow json resolves and reports more than 64 definitions" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var n: usize = 0;
+    while (n < 65) : (n += 1) {
+        var path_buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "f{d}.py", .{n});
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "VALUE = 1\n" });
+    }
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    _ = try flow(&aw.writer, &idx, "VALUE", .{ .format = .json });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 65), p.value.object.get("match_count").?.integer);
+    try testing.expectEqual(@as(usize, 65), p.value.object.get("candidates").?.array.items.len);
+
+    aw.clearRetainingCapacity();
+    _ = try flow(&aw.writer, &idx, "VALUE@f64.py", .{ .format = .json });
+    var pinned = try tjParse(aw.written());
+    defer pinned.deinit();
+    try testing.expect(pinned.value.object.get("match_count") == null);
+    try testing.expectEqual(@as(i64, 1), pinned.value.object.get("counts").?.object.get("producers").?.integer);
+}
+
+test "sibling conformance json attributes every verdict to its parent" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "siblings.py", .data =
+        \\class AlphaRequest:
+        \\    def run(self, value: str): return value
+        \\    def stop(self): return None
+        \\class BetaRequest:
+        \\    pass
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    _ = try conforms(&aw.writer, &idx, "*Request", .{ .format = .json, .strict = true, .limit = 1 });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    const members = p.value.array.items[0].object.get("members").?.array.items;
+    try testing.expectEqual(@as(usize, 1), members.len);
+    const implementations = members[0].object.get("implementations").?.array.items;
+    try testing.expectEqual(@as(usize, 1), implementations.len);
+    const verdict = implementations[0].object;
+    try testing.expectEqualStrings("BetaRequest", verdict.get("parent").?.object.get("name").?.string);
+    try testing.expectEqualStrings("missing", verdict.get("verdict").?.string);
+    try testing.expect(verdict.get("symbol").? == .null);
+}
+
+test "conformance json handles an empty index" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try testing.expect(!try conforms(&aw.writer, &idx, "Missing", .{ .format = .json }));
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 0), p.value.array.items.len);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(!try flow(&aw.writer, &idx, "VALUE", .{ .format = .json }));
+    var missing = try tjParse(aw.written());
+    defer missing.deinit();
+    try testing.expectEqual(@as(i64, 0), missing.value.object.get("match_count").?.integer);
+    try testing.expectEqual(@as(i64, 0), missing.value.object.get("counts").?.object.get("producers").?.integer);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(!try flow(&aw.writer, &idx, "VALUE", .{ .format = .json, .flow_to = "sink" }));
+    var path = try tjParse(aw.written());
+    defer path.deinit();
+    try testing.expectEqual(@as(i64, 0), path.value.object.get("source").?.object.get("match_count").?.integer);
+    try testing.expect(path.value.object.get("path").? == .array);
 }
 
 // --- files / imports / importers -----------------------------------------

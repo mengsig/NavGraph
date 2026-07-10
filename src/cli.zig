@@ -91,7 +91,7 @@ const usage_text =
     \\                     cross-language client calls are linked
     \\  conforms <selector> Audit protocol implementations or sibling signature
     \\                     divergence (aliases: impls, implements)
-    \\  events [filter]    Link message-bus handlers (register/on) to emitters (send/emit)
+    \\  events [filter]    Link bus/broker handlers to emitters; filters common DOM listeners
     \\  neighbors <name>   Callees and callers of <name> in one view
     \\  unused [filter]    Unreferenced definitions (fns/methods & types) nothing calls
     \\                     or uses — i.e. removal candidates, NOT broken code. Default
@@ -102,12 +102,12 @@ const usage_text =
     \\  imports [filter]   Modules each file imports (local dependency edges)
     \\  importers <file>   Files that import <file>
     \\  path <A> <B>       Shortest call path from <A> to <B>
-    \\  flow <symbol>      Writers and readers of a field/value; --to traces a sink
+    \\  flow <symbol>      Initializers/writers and readers; warns on ambiguity; --to traces a sink
     \\  reaches <A,B,...>  Transitive reachable set; --from-tests selects exercising tests
     \\  affected [ref]     Tests affected since a git ref (or use --since; default HEAD)
     \\  collisions [pat]   Group duplicate definition names (alias: duplicates)
     \\  diff [ref]         Symbols changed since <ref> (default HEAD) + their callers
-    \\  hot [path]         Rank functions by fan-in/out — the load-bearing symbols
+    \\  hot [path]         Rank functions by fan-in/out; hints --no-tests when tests dominate
     \\  files [filter]     List every indexed file + its symbol count (index coverage);
     \\                     add --sort symbols to rank biggest-first
     \\  status [filter]    Index/cache snapshot, freshness, skipped paths, and diagnostics
@@ -160,7 +160,7 @@ const usage_text =
     \\                                         protocol/interface implementation edges
     \\  --clients                              routes: show resolved client call sites
     \\  --unhit                                routes: show routes with no client calls
-    \\  --orphan-calls                         routes: show calls matching no route
+    \\  --orphan-calls, --orphan, --orphans    routes: show calls matching no route
     \\  --handler <name>                       routes: select by handler (glob accepted)
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
     \\  --jsonl [--after v1:N]                 Stream stable, cursor-pageable JSON rows
@@ -447,7 +447,7 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.options.routes_unhit = true;
         return i;
     }
-    if (std.mem.eql(u8, f.name, "--orphan-calls")) {
+    if (eqAny(f.name, &.{ "--orphan-calls", "--orphan", "--orphans" })) {
         out.options.routes_orphan_calls = true;
         return i;
     }
@@ -833,6 +833,8 @@ test "phase 1 commands and scoped flags parse" {
     const routes_cmd = try parse(&.{ "routes", "--clients", "--handler", "place_*" });
     try testing.expect(routes_cmd.options.routes_clients);
     try testing.expectEqualStrings("place_*", routes_cmd.options.routes_handler);
+    try testing.expect((try parse(&.{ "routes", "--orphan" })).options.routes_orphan_calls);
+    try testing.expect((try parse(&.{ "routes", "--orphans" })).options.routes_orphan_calls);
 
     try testing.expectError(error.Usage, parse(&.{ "search", "x", "--impls" }));
     try testing.expectError(error.Usage, parse(&.{ "calls", "x", "--clients" }));
@@ -1174,13 +1176,14 @@ test "usage documents every command and phase flags (drift guard)" {
     }
     // Unified test-scope and Phase 1/2/3 flags are documented.
     for ([_][]const u8{
-        "--tests",     "--no-tests",   "--tests-only",   "--no-public",
-        "--impls",     "--vis",        "--public",       "--private",
-        "--clients",   "--unhit",      "--orphan-calls", "--handler",
-        "--writers",   "--readers",    "--unread",       "--on-type",
-        "--to",        "--duplicates", "--members",      "--budget",
-        "--max-nodes", "--summary",    "--since",        "--from-tests",
-        "--preview",   "--jsonl",      "--after",        "parse-health",
+        "--tests",      "--no-tests",  "--tests-only",   "--no-public",
+        "--impls",      "--vis",       "--public",       "--private",
+        "--clients",    "--unhit",     "--orphan-calls", "--orphans",
+        "--handler",    "--writers",   "--readers",      "--unread",
+        "--on-type",    "--to",        "--duplicates",   "--members",
+        "--budget",     "--max-nodes", "--summary",      "--since",
+        "--from-tests", "--preview",   "--jsonl",        "--after",
+        "parse-health",
         "⇒impl",
     }) |flag| {
         try testing.expect(std.mem.indexOf(u8, out, flag) != null);

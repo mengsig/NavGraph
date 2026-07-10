@@ -950,7 +950,7 @@ pub fn showDef(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !
         try suggestNear(w, idx, name);
         return false;
     }
-    try multiMatchNote(w, name, ids.len, buf.len);
+    try multiMatchNote(w, name, ids.len, ids.len == buf.len);
     var shown: usize = 0;
     for (ids) |id| {
         const sym = idx.graph.symbols[id];
@@ -1067,10 +1067,10 @@ fn withinEditDistance2(a: []const u8, b: []const u8) bool {
 /// One-line banner when a name resolves to several definitions, so two
 /// concatenated bodies are never misread as one and the pin syntax is
 /// discoverable at the moment it's needed (a trial misread exactly this).
-fn multiMatchNote(w: *Writer, name: []const u8, n: usize, cap: usize) !void {
+fn multiMatchNote(w: *Writer, name: []const u8, n: usize, truncated: bool) !void {
     if (n <= 1) return;
     try w.print("({d}{s} definitions match '{s}' — pin one with Parent.name or name@path)\n", .{
-        n, if (n == cap) "+" else "", name,
+        n, if (truncated) "+" else "", name,
     });
 }
 
@@ -1149,7 +1149,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
         try skippedNote(w, idx);
         return false;
     }
-    try multiMatchNote(w, name, ids.len, buf.len);
+    try multiMatchNote(w, name, ids.len, ids.len == buf.len);
     var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
     defer if (impl_graph) |*graph| graph.deinit();
     var visited = std.AutoHashMap(SymbolId, void).init(idx.gpa);
@@ -1518,7 +1518,7 @@ pub fn collectCollisionSymbols(idx: *const Index, pattern: []const u8, opts: Opt
     var list: std.ArrayList(SymbolId) = .empty;
     errdefer list.deinit(idx.gpa);
     for (idx.graph.symbols) |sym| {
-        if (sym.kind == .import or (!opts.collision_members and sym.parent != invalid)) continue;
+        if (sym.kind == .import or sym.kind == .route_mount or (!opts.collision_members and sym.parent != invalid)) continue;
         if (!kindAllowed(sym.kind, opts.kinds) or !visAllowed(sym, opts.visibility)) continue;
         if (!inTestScope(opts.tests, isTestSymbol(idx, sym))) continue;
         if (pattern.len != 0 and !matchesName(pattern, sym.name)) continue;
@@ -1762,45 +1762,81 @@ fn targetUnread(idx: *const Index, target: SymbolId) bool {
 
 pub fn flow(w: *Writer, idx: *const Index, name: []const u8, opts: Options) !bool {
     std.debug.assert(name.len > 0);
-    std.debug.assert(idx.graph.symbols.len > 0);
     if (opts.format == .json) return json_out.flow(w, idx, name, opts);
-    var buf: [64]SymbolId = undefined;
-    const ids = resolveIds(idx, name, &buf);
+    if (idx.graph.symbols.len == 0) {
+        try w.print("(no symbol named '{s}')\n", .{name});
+        return false;
+    }
+    const storage = try idx.gpa.alloc(SymbolId, idx.graph.symbols.len);
+    defer idx.gpa.free(storage);
+    const ids = resolveIds(idx, name, storage);
     if (ids.len == 0) {
         try w.print("(no symbol named '{s}')\n", .{name});
         return false;
     }
+    try multiMatchNote(w, name, ids.len, false);
     if (opts.flow_to.len != 0) return flowPath(w, idx, ids, opts.flow_to, opts);
-    var writers: u32 = 0;
-    var readers: u32 = 0;
-    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
-        const producer = flowProducer(idx, ids, ref);
-        if (!contains(ids, ref.target) or !flowRefSelected(idx, owner, ref, producer, opts)) continue;
-        if (producer) writers += siteCount(ref) else readers += siteCount(ref);
-    };
-    if (!opts.writers and !opts.unread and flowTypeTarget(idx, ids) != null) {
-        for (idx.graph.symbols) |owner| {
-            if (typeConsumerBinding(idx, ids, owner) != null) readers += 1;
-        }
-    }
-    if (opts.unread and (writers == 0 or readers != 0)) {
+    const counts = flowCounts(idx, ids, opts);
+    if (opts.unread and (counts.producers == 0 or counts.consumers != 0)) {
         try w.print("(no unread flow for '{s}')\n", .{name});
         return false;
     }
     try render.symbol(w, idx, idx.graph.symbols[ids[0]], headerVerbosity(opts.verbosity), 0, true);
-    try w.print("\nWRITERS ↳:{d}\n", .{writers});
+    try w.print("\nWRITERS ↳:{d}\n", .{counts.producers});
     var shown: u32 = 0;
+    try renderFlowInitializers(w, idx, ids, opts, &shown);
     try renderFlowGroup(w, idx, ids, opts, true, &shown);
-    try w.print("\nREADERS ↳:{d}\n", .{readers});
+    try w.print("\nREADERS ↳:{d}\n", .{counts.consumers});
     try renderFlowGroup(w, idx, ids, opts, false, &shown);
     if (!opts.writers and !opts.unread) try renderTypeConsumers(w, idx, ids, opts, &shown);
-    if (shown >= opts.limit and writers + readers > shown)
-        try w.print("… ({d} more; raise -l to see them)\n", .{writers + readers - shown});
-    return writers + readers > 0;
+    const total = counts.producers + counts.consumers;
+    if (shown >= opts.limit and total > shown)
+        try w.print("… ({d} more; raise -l to see them)\n", .{total - shown});
+    return total > 0;
+}
+
+pub const FlowCounts = struct { producers: u32 = 0, consumers: u32 = 0 };
+
+pub fn flowCounts(idx: *const Index, ids: []const SymbolId, opts: Options) FlowCounts {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(ids[0] < idx.graph.symbols.len);
+    var counts: FlowCounts = .{ .producers = flowInitializerCount(idx, ids, opts) };
+    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+        const producer = flowProducer(idx, ids, ref);
+        if (!contains(ids, ref.target) or !flowRefSelected(idx, owner, ref, producer, opts)) continue;
+        if (producer) counts.producers += siteCount(ref) else counts.consumers += siteCount(ref);
+    };
+    if (!opts.writers and !opts.unread and flowTypeTarget(idx, ids) != null) {
+        for (idx.graph.symbols) |owner| {
+            if (typeConsumerBinding(idx, ids, owner) != null) counts.consumers += 1;
+        }
+    }
+    return counts;
 }
 
 fn siteCount(ref: model.Reference) u32 {
     return if (ref.lines.len > 1) @intCast(ref.lines.len) else 1;
+}
+
+fn renderFlowInitializers(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, shown: *u32) !void {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(shown.* <= opts.limit);
+    for (ids) |id| {
+        if (shown.* >= opts.limit) return;
+        if (!flowInitializerSelected(idx, id, opts)) continue;
+        const sym = idx.graph.symbols[id];
+        const file = idx.graph.files[sym.file];
+        try w.print("{s}:{d}  [w:init] {s}  at definition", .{ file.path, sym.line, sym.name });
+        if (opts.verbosity != .names) {
+            const src_line = render.sourceLine(file.text, sym.line);
+            if (src_line.len != 0) {
+                try w.writeAll("\n      | ");
+                try render.writeCollapsed(w, src_line, 140);
+            }
+        }
+        try w.writeByte('\n');
+        shown.* += 1;
+    }
 }
 
 fn renderFlowGroup(w: *Writer, idx: *const Index, ids: []const SymbolId, opts: Options, write: bool, shown: *u32) !void {
@@ -1865,6 +1901,31 @@ fn renderTypeConsumers(w: *Writer, idx: *const Index, ids: []const SymbolId, opt
     }
 }
 
+pub fn flowInitializerSelected(idx: *const Index, id: SymbolId, opts: Options) bool {
+    std.debug.assert(id < idx.graph.symbols.len);
+    const sym = idx.graph.symbols[id];
+    std.debug.assert(sym.file < idx.graph.files.len);
+    if (sym.parent != invalid or (sym.kind != .constant and sym.kind != .variable)) return false;
+    if (opts.readers or opts.on_type.len != 0) return false;
+    const signature = sym.signature(idx.graph.files[sym.file].text);
+    if (std.mem.indexOfScalar(u8, signature, '=') == null) return false;
+    if (!opts.unread) return true;
+    for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
+        if (ref.target == id and !ref.write) return false;
+    };
+    return true;
+}
+
+fn flowInitializerCount(idx: *const Index, ids: []const SymbolId, opts: Options) u32 {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(idx.graph.symbols.len > 0);
+    var count: u32 = 0;
+    for (ids) |id| if (flowInitializerSelected(idx, id, opts)) {
+        count += 1;
+    };
+    return count;
+}
+
 pub fn flowProducer(idx: *const Index, ids: []const SymbolId, ref: model.Reference) bool {
     if (ref.write) return true;
     if (ref.kind != .call or !contains(ids, ref.target)) return false;
@@ -1875,6 +1936,9 @@ pub fn flowProducer(idx: *const Index, ids: []const SymbolId, ref: model.Referen
 }
 
 pub fn flowRefSelected(idx: *const Index, owner: model.Symbol, ref: model.Reference, producer: bool, opts: Options) bool {
+    std.debug.assert(owner.id < idx.graph.symbols.len);
+    std.debug.assert(ref.target == invalid or ref.target < idx.graph.symbols.len);
+    if (opts.strict and !ref.exact) return false;
     if (opts.writers and !producer) return false;
     if (opts.readers and producer) return false;
     var scoped = opts;
@@ -1886,7 +1950,15 @@ pub fn flowRefSelected(idx: *const Index, owner: model.Symbol, ref: model.Refere
 fn flowPath(w: *Writer, idx: *const Index, ids: []const SymbolId, sink: []const u8, opts: Options) !bool {
     std.debug.assert(ids.len > 0);
     std.debug.assert(sink.len > 0);
-    const chain = try flowPathIds(idx, ids, sink, opts.strict);
+    const storage = try idx.gpa.alloc(SymbolId, idx.graph.symbols.len);
+    defer idx.gpa.free(storage);
+    const sinks = resolveIds(idx, sink, storage);
+    try multiMatchNote(w, sink, sinks.len, false);
+    if (sinks.len == 0) {
+        try w.print("(no data-flow path to '{s}')\n", .{sink});
+        return false;
+    }
+    const chain = try flowPathBetweenIds(idx, ids, sinks, opts);
     defer idx.gpa.free(chain);
     if (chain.len == 0) {
         try w.print("(no data-flow path to '{s}')\n", .{sink});
@@ -1899,23 +1971,38 @@ fn flowPath(w: *Writer, idx: *const Index, ids: []const SymbolId, sink: []const 
 pub fn flowPathIds(idx: *const Index, ids: []const SymbolId, sink: []const u8, strict: bool) ![]SymbolId {
     std.debug.assert(ids.len > 0);
     std.debug.assert(sink.len > 0);
-    var sources: [256]SymbolId = undefined;
-    var source_count: usize = 0;
+    const storage = try idx.gpa.alloc(SymbolId, idx.graph.symbols.len);
+    defer idx.gpa.free(storage);
+    const sinks = resolveIds(idx, sink, storage);
+    if (sinks.len == 0) return idx.gpa.alloc(SymbolId, 0);
+    return flowPathBetweenIds(idx, ids, sinks, .{ .strict = strict });
+}
+
+pub fn flowPathBetweenIds(idx: *const Index, ids: []const SymbolId, sinks: []const SymbolId, opts: Options) ![]SymbolId {
+    std.debug.assert(ids.len > 0);
+    std.debug.assert(sinks.len > 0);
+    var sources: std.ArrayList(SymbolId) = .empty;
+    defer sources.deinit(idx.gpa);
+    const seen = try idx.gpa.alloc(bool, idx.graph.symbols.len);
+    defer idx.gpa.free(seen);
+    @memset(seen, false);
+    for (ids) |id| {
+        if (!flowInitializerSelected(idx, id, opts)) continue;
+        seen[id] = true;
+        try sources.append(idx.gpa, id);
+    }
     for (idx.graph.symbols) |owner| for (owner.refs) |ref| {
-        if (flowProducer(idx, ids, ref) and source_count < sources.len) {
-            sources[source_count] = owner.id;
-            source_count += 1;
-        }
+        const producer = flowProducer(idx, ids, ref);
+        if (!contains(ids, ref.target) or !flowRefSelected(idx, owner, ref, producer, opts)) continue;
+        if (!producer or seen[owner.id]) continue;
+        seen[owner.id] = true;
+        try sources.append(idx.gpa, owner.id);
     };
-    var sink_buf: [64]SymbolId = undefined;
-    const sinks = resolveIds(idx, sink, &sink_buf);
-    if (source_count == 0 or sinks.len == 0) return idx.gpa.alloc(SymbolId, 0);
-    const prev = try bfsFlow(idx, sources[0..source_count], sinks, strict);
-    defer idx.gpa.free(prev);
-    for (sinks) |end| if (prev[end] != invalid) {
-        return reconstruct(idx.gpa, prev, end);
-    };
-    return idx.gpa.alloc(SymbolId, 0);
+    if (sources.items.len == 0) return idx.gpa.alloc(SymbolId, 0);
+    const traversal = try bfsFlow(idx, sources.items, sinks, opts.strict);
+    defer idx.gpa.free(traversal.prev);
+    const end = traversal.reached orelse return idx.gpa.alloc(SymbolId, 0);
+    return reconstruct(idx.gpa, traversal.prev, end);
 }
 
 /// The number of distinct resolved callees (outgoing edges) of `sym`.
@@ -1974,7 +2061,25 @@ pub fn hot(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bo
     if (eligible > shown) {
         try w.print("… ({d} more; raise -l to see them)\n", .{eligible - shown});
     }
+    if (effective.tests == .with and hotTestDominated(ranked, effective)) {
+        try w.writeAll("hint: test callers dominate this ranking; use --no-tests (-t without) for production fan-in\n");
+    }
     return true;
+}
+
+fn hotTestDominated(ranked: []const HotEntry, opts: Options) bool {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(opts.tests == .with);
+    var shown: u32 = 0;
+    var dominated: u32 = 0;
+    for (ranked) |entry| {
+        if (opts.strict and entry.fan_in_exact == 0 and entry.fan_out_exact == 0) continue;
+        if (shown >= opts.limit) break;
+        shown += 1;
+        const test_share = @min(entry.fan_in_test, entry.fan_in);
+        if (test_share > entry.fan_in - test_share) dominated += 1;
+    }
+    return shown >= 3 and dominated * 2 >= shown;
 }
 
 /// Fan-in/out suffix for a `hot` row. Default surfaces the heuristic share as a
@@ -2009,7 +2114,7 @@ fn printTestShare(w: *Writer, fan_in: u32, fan_in_test: u32) !void {
 fn testCallerCount(idx: *const Index, id: SymbolId) u32 {
     var n: u32 = 0;
     for (idx.callersOf(id)) |cid| {
-        if (isTestPath(idx.graph.files[idx.graph.symbols[cid].file].path)) n += 1;
+        if (isTestSymbol(idx, idx.graph.symbols[cid])) n += 1;
     }
     return n;
 }
@@ -2383,9 +2488,7 @@ pub fn conforms(w: *Writer, idx: *const Index, selector: []const u8, opts: Optio
         shown += 1;
         if (shown >= opts.limit) break;
     }
-    if (shown == 0 and !opts.strict) {
-        shown = if (try renderSiblingConformance(w, idx, ids, opts)) 1 else 0;
-    }
+    if (shown == 0) shown = if (try renderSiblingConformance(w, idx, ids, opts)) 1 else 0;
     if (shown == 0) try w.print("(no protocol/interface or sibling set matching '{s}')\n", .{selector});
     return shown > 0;
 }
@@ -2397,18 +2500,21 @@ fn renderSiblingConformance(w: *Writer, idx: *const Index, ids: []const SymbolId
     try w.print("# sibling conformance · {d} classes\n", .{parent_count});
     var rendered_names = std.StringHashMap(void).init(idx.gpa);
     defer rendered_names.deinit();
+    var rendered: u32 = 0;
     for (idx.graph.symbols) |method| {
+        if (rendered >= opts.limit) break;
         if (method.kind != .method or !contains(parents[0..parent_count], method.parent)) continue;
         if (idsContainMethods(idx, ids) and !contains(ids, method.id)) continue;
         if ((try rendered_names.getOrPut(method.name)).found_existing) continue;
         try render.symbol(w, idx, method, .sig, 1, true);
+        rendered += 1;
         for (parents[0..parent_count]) |parent| {
+            if (parent == method.parent) continue; // the header already shows this definition
             const actual_id = impls_mod.methodOf(idx, parent, method.name);
             try renderSiblingCell(w, idx, method, parent, actual_id);
         }
     }
-    _ = opts;
-    return rendered_names.count() > 0;
+    return rendered > 0;
 }
 
 pub fn collectConformanceParents(idx: *const Index, ids: []const SymbolId, out: []SymbolId) usize {
@@ -2431,14 +2537,18 @@ pub fn idsContainMethods(idx: *const Index, ids: []const SymbolId) bool {
 }
 
 fn renderSiblingCell(w: *Writer, idx: *const Index, expected: model.Symbol, parent: SymbolId, actual_id: ?SymbolId) !void {
+    std.debug.assert(parent < idx.graph.symbols.len);
+    std.debug.assert(expected.parent != invalid);
+    const container = idx.graph.symbols[parent];
+    const file = idx.graph.files[container.file];
     const actual = if (actual_id) |id| idx.graph.symbols[id] else null;
     const verdict = conformanceVerdict(idx, expected, actual);
-    try w.print("    {s:<10} ", .{@tagName(verdict)});
+    try w.print("    {s:<10} {s}  {s}:{d}", .{ @tagName(verdict), container.name, file.path, container.line });
     if (actual) |sym| {
-        try render.symbol(w, idx, sym, .sig, 0, true);
+        try w.writeByte('\n');
+        try render.symbol(w, idx, sym, .sig, 2, true);
     } else {
-        const container = idx.graph.symbols[parent];
-        try w.print("{s} — no `{s}` member\n", .{ container.name, expected.name });
+        try w.print(" — no `{s}` member\n", .{expected.name});
     }
 }
 
@@ -2938,7 +3048,7 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
         try skippedNote(w, idx);
         return false;
     }
-    try multiMatchNote(w, name, ids.len, buf.len);
+    try multiMatchNote(w, name, ids.len, ids.len == buf.len);
     var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
     defer if (impl_graph) |*graph| graph.deinit();
     var budget: WalkBudget = .{};
@@ -3895,8 +4005,10 @@ pub fn shortestPathIdsWithOptions(
     return reconstruct(idx.gpa, prev, end);
 }
 
+const FlowSearch = struct { prev: []SymbolId, reached: ?SymbolId };
+
 /// Walk `prev` from `end` back to its source, returning the path source-first.
-fn bfsFlow(idx: *const Index, from_ids: []const SymbolId, to_ids: []const SymbolId, strict: bool) ![]SymbolId {
+fn bfsFlow(idx: *const Index, from_ids: []const SymbolId, to_ids: []const SymbolId, strict: bool) !FlowSearch {
     std.debug.assert(from_ids.len > 0);
     std.debug.assert(to_ids.len > 0);
     const n = idx.graph.symbols.len;
@@ -3909,10 +4021,14 @@ fn bfsFlow(idx: *const Index, from_ids: []const SymbolId, to_ids: []const Symbol
         prev[source] = source;
         try queue.append(source);
     }
+    var reached: ?SymbolId = null;
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
-        if (contains(to_ids, cur) and !contains(from_ids, cur)) break;
+        if (contains(to_ids, cur) and !contains(from_ids, cur)) {
+            reached = cur;
+            break;
+        }
         for (idx.graph.symbols[cur].refs) |ref| {
             if (ref.target == invalid or (strict and !ref.exact) or prev[ref.target] != invalid) continue;
             prev[ref.target] = cur;
@@ -3926,7 +4042,7 @@ fn bfsFlow(idx: *const Index, from_ids: []const SymbolId, to_ids: []const Symbol
             try queue.append(owner.id);
         };
     }
-    return prev;
+    return .{ .prev = prev, .reached = reached };
 }
 
 fn reconstruct(gpa: std.mem.Allocator, prev: []const SymbolId, end: SymbolId) ![]SymbolId {
@@ -6179,6 +6295,8 @@ test "phase 1 protocol walks and conformance share inferred implementation edges
         \\    def run(self, value: str) -> str: return value
         \\class BetaRunner:
         \\    def run(self, value: int) -> str: return str(value)
+        \\class GammaRunner:
+        \\    pass
         \\def execute(runner: Runner) -> str:
         \\    return runner.run("x")
     });
@@ -6204,10 +6322,44 @@ test "phase 1 protocol walks and conformance share inferred implementation edges
     try testing.expect(try conforms(&aw.writer, &idx, "*aRunner", .{}));
     try testing.expect(std.mem.indexOf(u8, aw.written(), "sibling conformance") != null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "sig_diff") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "missing    GammaRunner") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "ports.py:") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, aw.written(), "AlphaRunner.run"));
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try conforms(&aw.writer, &idx, "*aRunner", .{ .strict = true }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "missing    GammaRunner") != null);
 
     aw.clearRetainingCapacity();
     try testing.expect(try shortestPath(&aw.writer, &idx, "execute", "FastRunner.run", .{ .impls = true }));
     try testing.expect(std.mem.indexOf(u8, aw.written(), "FastRunner.run") != null);
+}
+
+test "events filters DOM noise and links Kafka topic aliases" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "pipeline.py", .data =
+        \\topics = [config.detections_topic]
+        \\def consume():
+        \\    consumer.subscribe(topics)
+        \\    map.on("mousemove", draw)
+        \\def publish(payload):
+        \\    producer.produce(config.detections_topic, payload)
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try events(&aw.writer, &idx, "", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "event \"detections_topic\"") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "(unpaired)") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "mousemove") == null);
 }
 
 test "phase 1 visibility filters outline and search consistently" {
@@ -6415,6 +6567,35 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
     }
 }
 
+test "hot hints when test callers dominate the visible ranking" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "core.py", .data =
+        \\def h1(): return 1
+        \\def h2(): return 2
+        \\def h3(): return 3
+    });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "checks.py", .data =
+        \\def test_a(): h1(); h2(); h3()
+        \\def test_b(): h1(); h2(); h3()
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try hot(&aw.writer, &idx, "", .{ .limit = 3 }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "use --no-tests") != null);
+    aw.clearRetainingCapacity();
+    _ = try hot(&aw.writer, &idx, "", .{ .limit = 3, .tests = .without });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "use --no-tests") == null);
+}
+
 test "phase 2 flow classifies constructor, member, and augmented accesses" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -6451,6 +6632,117 @@ test "phase 2 flow classifies constructor, member, and augmented accesses" {
     try testing.expect(std.mem.indexOf(u8, type_aw.written(), "READERS ↳:2") != null);
 }
 
+test "flow reports ambiguous definitions and counts module initializers as writers" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.py", .data =
+        \\DEFAULT_AUDIENCE = "alpha"
+        \\def read_a(): return DEFAULT_AUDIENCE
+        \\def sink(): pass
+    });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.py", .data =
+        \\DEFAULT_AUDIENCE = "beta"
+        \\def sink(): pass
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try flow(&aw.writer, &idx, "DEFAULT_AUDIENCE", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "2 definitions match") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "WRITERS ↳:2") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, aw.written(), "[w:init]"));
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try flow(&aw.writer, &idx, "DEFAULT_AUDIENCE@a.py", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "definitions match") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "WRITERS ↳:1") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(!try flow(&aw.writer, &idx, "DEFAULT_AUDIENCE", .{ .flow_to = "sink" }));
+    try testing.expect(std.mem.count(u8, aw.written(), "2 definitions match") == 2);
+}
+
+test "flow --to starts at an initializer and follows readers to the sink" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "path.py", .data =
+        \\VALUE = 1
+        \\def forward():
+        \\    sink()
+        \\    return VALUE
+        \\def sink(): pass
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+
+    const value_ids = idx.lookup("VALUE");
+    const chain = try flowPathIds(&idx, value_ids, "sink", false);
+    defer testing.allocator.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+    try testing.expectEqual(value_ids[0], chain[0]);
+    try testing.expectEqualStrings("sink", idx.graph.symbols[chain[2]].name);
+
+    const owner = idx.graph.symbols[idx.lookup("forward")[0]];
+    const heuristic: model.Reference = .{ .name = "VALUE", .line = owner.line, .kind = .read, .target = value_ids[0], .exact = false };
+    try testing.expect(flowRefSelected(&idx, owner, heuristic, false, .{}));
+    try testing.expect(!flowRefSelected(&idx, owner, heuristic, false, .{ .strict = true }));
+}
+
+test "flow handles an empty index" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(!try flow(&aw.writer, &idx, "VALUE", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "no symbol named 'VALUE'") != null);
+    aw.clearRetainingCapacity();
+    try testing.expect(!try conforms(&aw.writer, &idx, "Port", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "no protocol/interface") != null);
+}
+
+test "flow --to ignores writes to unrelated values" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "paths.py", .data =
+        \\VALUE = 0
+        \\def make(): return 1
+        \\def write_value():
+        \\    VALUE = make()
+        \\def unrelated():
+        \\    other = make()
+        \\    sink()
+        \\def sink(): pass
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+
+    const value_ids = idx.lookup("VALUE");
+    const chain = try flowPathIds(&idx, value_ids, "sink", false);
+    defer testing.allocator.free(chain);
+    try testing.expectEqual(@as(usize, 0), chain.len);
+}
+
 test "phase 2 span ranking is global and biggest first" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -6479,6 +6771,10 @@ test "phase 2 collisions groups duplicate top-level names deterministically" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.py", .data = "class Store:\n    pass\n" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.py", .data = "class Store:\n    pass\nclass Unique:\n    pass\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "mounts.py", .data =
+        \\app.include_router(one.router, prefix="/api")
+        \\app.include_router(two.router, prefix="/api")
+    });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var idx = try index_mod.build(testing.allocator, testing.io, root, false);
@@ -6487,10 +6783,11 @@ test "phase 2 collisions groups duplicate top-level names deterministically" {
     defer buf.deinit(testing.allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try testing.expect(try collisions(&aw.writer, &idx, "", .{ .kinds = "class" }));
+    try testing.expect(try collisions(&aw.writer, &idx, "", .{}));
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "# Store ×2") != null);
     try testing.expect(std.mem.indexOf(u8, out, "# Unique") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "# /api") == null);
 }
 
 test "TestScope.parse accepts aliases and rejects garbage" {
