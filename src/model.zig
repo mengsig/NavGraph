@@ -27,6 +27,10 @@ pub const SymbolKind = enum {
     module,
     import,
     route,
+    /// A router-mount directive (FastAPI `include_router(mod.router, prefix=…)`):
+    /// records the URL prefix under which another module's routes are mounted, so
+    /// `index` can prefix those routes cross-file. Never shown to users.
+    route_mount,
     /// A test unit with its own body/call-graph: a Zig `test "…" {}` block (and,
     /// in future, other native test constructs). Kept as a first-class symbol so
     /// `callers`/`coverage` can see which tests exercise a function.
@@ -62,6 +66,7 @@ pub const SymbolKind = enum {
             .module => "mod",
             .import => "import",
             .route => "route",
+            .route_mount => "mount",
             .test_case => "test",
             .unknown => "sym",
         };
@@ -70,7 +75,7 @@ pub const SymbolKind = enum {
     /// Symbols an agent typically wants as top-level outline entries.
     pub fn isTopLevelInteresting(self: SymbolKind) bool {
         return switch (self) {
-            .import, .field, .unknown => false,
+            .import, .field, .unknown, .route_mount => false,
             else => true,
         };
     }
@@ -351,7 +356,7 @@ test "SymbolKind.tag is unique across every kind" {
         }
         seen += 1;
     }
-    try std.testing.expectEqual(@as(usize, 16), seen);
+    try std.testing.expectEqual(@as(usize, 17), seen);
 }
 
 test "isTopLevelInteresting is false only for import, field and unknown" {
@@ -359,6 +364,7 @@ test "isTopLevelInteresting is false only for import, field and unknown" {
     try std.testing.expect(!SymbolKind.import.isTopLevelInteresting());
     try std.testing.expect(!SymbolKind.field.isTopLevelInteresting());
     try std.testing.expect(!SymbolKind.unknown.isTopLevelInteresting());
+    try std.testing.expect(!SymbolKind.route_mount.isTopLevelInteresting());
     // Everything else is interesting.
     try std.testing.expect(SymbolKind.function.isTopLevelInteresting());
     try std.testing.expect(SymbolKind.method.isTopLevelInteresting());
@@ -385,7 +391,7 @@ test "isTopLevelInteresting count matches expectation across all kinds" {
             boring += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 3), boring);
+    try std.testing.expectEqual(@as(usize, 4), boring);
     try std.testing.expectEqual(@as(usize, 13), interesting);
 }
 

@@ -183,6 +183,49 @@ pub fn matchRouterDecl(toks: []const Token, source: []const u8, i: u32) ?RouterD
     return null;
 }
 
+/// A recognized router-mount call: `<recv>.include_router(<router>, prefix="/x")`.
+/// `module` is the receiver-module of a dotted router argument (`orders.router` →
+/// "orders"), or "" for a bare argument (`router`, `orders_router`). `router` is
+/// the bare last identifier. `prefix` is the mount prefix path.
+pub const RouterMount = struct {
+    module: []const u8,
+    router: []const u8,
+    prefix: []const u8,
+};
+
+/// At token `i`, recognize a FastAPI-style mount `recv.include_router(arg, ...,
+/// prefix="/x", ...)`. Returns null unless a `prefix="/path"` argument is present
+/// (a mount with no prefix changes no route path, so there is nothing to record).
+pub fn matchIncludeRouter(toks: []const Token, source: []const u8, i: u32) ?RouterMount {
+    if (!isIdent(toks, i) or i + 4 >= toks.len) return null;
+    if (!isPunct(toks, source, i + 1, '.') or !identEql(toks, source, i + 2, "include_router")) return null;
+    if (!isPunct(toks, source, i + 3, '(')) return null;
+    if (!isIdent(toks, i + 4)) return null;
+    var module: []const u8 = "";
+    var router = toks[i + 4].text(source);
+    if (isPunct(toks, source, i + 5, '.') and isIdent(toks, i + 6)) {
+        module = toks[i + 4].text(source);
+        router = toks[i + 6].text(source);
+    }
+    // Scan a bounded window of the argument list for `prefix = "/path"`.
+    var j = i + 5;
+    const limit = @min(@as(u32, @intCast(toks.len)), i + 5 + 64);
+    var depth: i32 = 1; // the include_router '(' is already open
+    while (j < limit) : (j += 1) {
+        if (isPunct(toks, source, j, '(') or isPunct(toks, source, j, '[') or isPunct(toks, source, j, '{')) {
+            depth += 1;
+        } else if (isPunct(toks, source, j, ')') or isPunct(toks, source, j, ']') or isPunct(toks, source, j, '}')) {
+            depth -= 1;
+            if (depth <= 0) break;
+        } else if (depth == 1 and identEql(toks, source, j, "prefix") and isPunct(toks, source, j + 1, '=')) {
+            const prefix = stringPath(toks, source, j + 2) orelse return null;
+            if (prefix.len == 0) return null;
+            return .{ .module = module, .router = router, .prefix = prefix };
+        }
+    }
+    return null;
+}
+
 /// At token `i`, recognize a route definition `recv.verb("path", ...)`, either
 /// decorator-form (`@recv.verb(...)`) or a router receiver. Null otherwise.
 pub fn matchRouteDef(toks: []const Token, source: []const u8, i: u32) ?RouteDef {
@@ -376,6 +419,40 @@ test "router prefix declaration recognized" {
     try t.expect(found != null);
     try t.expectEqualStrings("admin_router", found.?.name);
     try t.expectEqualStrings("/api/admin", found.?.prefix);
+}
+
+test "include_router mount recognized (dotted and bare arg)" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const lang = @import("language.zig");
+    const cases = .{
+        .{ "app.include_router(orders.router, prefix=\"/v1\")\n", "orders", "router", "/v1" },
+        .{ "app.include_router(router, prefix=\"/api\")\n", "", "router", "/api" },
+        .{ "app.include_router(orders_router, tags=[\"o\"], prefix=\"/v2\")\n", "", "orders_router", "/v2" },
+    };
+    inline for (cases) |c| {
+        var toks: std.ArrayList(Token) = .empty;
+        defer toks.deinit(gpa);
+        try lexer.tokenize(gpa, c[0], lang.configFor(.python), &toks);
+        var found: ?RouterMount = null;
+        var i: u32 = 0;
+        while (i < toks.items.len) : (i += 1) {
+            if (matchIncludeRouter(toks.items, c[0], i)) |m| found = m;
+        }
+        try t.expect(found != null);
+        try t.expectEqualStrings(c[1], found.?.module);
+        try t.expectEqualStrings(c[2], found.?.router);
+        try t.expectEqualStrings(c[3], found.?.prefix);
+    }
+    // A mount with no prefix is not recorded (nothing to apply).
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    const src = "app.include_router(orders.router)\n";
+    try lexer.tokenize(gpa, src, lang.configFor(.python), &toks);
+    var i: u32 = 0;
+    while (i < toks.items.len) : (i += 1) {
+        try t.expect(matchIncludeRouter(toks.items, src, i) == null);
+    }
 }
 
 test "empty route path is accepted; non-slash relative still rejected" {

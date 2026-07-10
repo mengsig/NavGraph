@@ -86,7 +86,17 @@ const Ctx = struct {
     }
 };
 
-/// Parse `source` for `lang`, appending discovered symbols to `out`.
+/// Parse-health signal for one file. `desync_from` is set when the tokenizer
+/// likely lost sync — an unterminated string/char literal ran to end-of-file,
+/// swallowing the code after it — with the 1-based line range that was lost.
+pub const ParseHealth = struct {
+    desync_from: ?u32 = null,
+    desync_to: u32 = 0,
+};
+
+/// Parse `source` for `lang`, appending discovered symbols to `out`. Returns a
+/// `ParseHealth` so callers can warn about a tokenizer desync (a confidently
+/// wrong, silently-truncated parse is the worst failure mode for an agent).
 /// `arena` owns the reference slices and lives as long as the graph.
 pub fn parse(
     gpa: std.mem.Allocator,
@@ -94,13 +104,14 @@ pub fn parse(
     source: []const u8,
     lang: language.Language,
     out: *std.ArrayList(ParsedSymbol),
-) !void {
+) !ParseHealth {
     std.debug.assert(source.len <= std.math.maxInt(u32));
     const cfg = language.configFor(lang);
     var toks: std.ArrayList(Token) = .empty;
     defer toks.deinit(gpa);
     try lexer.tokenize(gpa, source, cfg, &toks);
     std.debug.assert(toks.items.len >= 1); // always an eof token
+    const health = scanHealth(source, toks.items);
 
     const close = try buildMatches(gpa, source, toks.items);
     defer gpa.free(close);
@@ -137,6 +148,31 @@ pub fn parse(
         .other => {},
     }
     try detectApi(&ctx, n);
+    return health;
+}
+
+/// Detect a tokenizer desync: an unterminated single-line string/char literal
+/// (opened by `"` or `'`) that ran to end-of-file. Its closing delimiter is
+/// missing, so every symbol after the opener was swallowed. Triple-quoted and
+/// template literals legitimately reach EOF, so only plain-quote openers whose
+/// final byte is not their own (unescaped) closing quote count.
+fn scanHealth(source: []const u8, toks: []const Token) ParseHealth {
+    if (source.len == 0) return .{};
+    for (toks) |t| {
+        if (t.kind != .string or t.end != source.len) continue;
+        std.debug.assert(t.start < source.len);
+        const open = source[t.start];
+        if (open != '"' and open != '\'') continue; // not a plain-quote literal
+        if (t.end - t.start >= 3 and source[t.start + 1] == open and source[t.start + 2] == open) continue; // triple-quoted
+        if (t.end - t.start >= 2 and source[t.end - 1] == open) continue; // properly closed
+        var last_line = t.line;
+        var i = t.start;
+        while (i < source.len) : (i += 1) {
+            if (source[i] == '\n') last_line += 1;
+        }
+        return .{ .desync_from = t.line, .desync_to = last_line };
+    }
+    return .{};
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +196,13 @@ fn detectApi(ctx: *Ctx, n: u32) !void {
     i = 0;
     while (i < n) : (i += 1) {
         if (api.matchRouteDef(ctx.toks, ctx.source, i)) |rd| try emitRoute(ctx, rd, n, &prefixes);
+    }
+    // Router mounts (`app.include_router(mod.router, prefix="/v1")`): recorded as
+    // `.route_mount` symbols so `index` can prefix the mounted module's routes
+    // across files (the routes live in a different file than the mount).
+    i = 0;
+    while (i < n) : (i += 1) {
+        if (api.matchIncludeRouter(ctx.toks, ctx.source, i)) |m| try emitMount(ctx, m, i);
     }
     var wrappers = try detectWrappers(ctx, route_start, n);
     defer wrappers.deinit();
@@ -228,6 +271,29 @@ fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32, prefixes: *const std.StringHas
         .exported = true,
         .parent_local = null,
         .refs = refs,
+    });
+}
+
+/// Emit a `.route_mount` symbol for a router mount. `name` carries the mount
+/// prefix and `import_path` the module qualifier of the mounted router
+/// (`orders.router` → "orders", bare → ""); `index` resolves the mounted module
+/// to a file and prefixes its routes.
+fn emitMount(ctx: *Ctx, m: api.RouterMount, recv_i: u32) !void {
+    const span_start = lineStartOffset(ctx, recv_i);
+    const span_end = ctx.toks[recv_i].end;
+    std.debug.assert(span_start <= span_end);
+    _ = try emit(ctx, .{
+        .name = try ctx.arena.dupe(u8, m.prefix),
+        .kind = .route_mount,
+        .line = ctx.toks[recv_i].line,
+        .span_start = span_start,
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = false,
+        .parent_local = null,
+        .refs = &.{},
+        .import_path = try ctx.arena.dupe(u8, m.module),
     });
 }
 
@@ -3525,8 +3591,34 @@ fn parseForTest(src: []const u8, lang: language.Language) !std.ArrayList(ParsedS
     var out: std.ArrayList(ParsedSymbol) = .empty;
     // arena leaks into the test allocator's checking; use testing allocator via arena.
     const arena = testing.allocator;
-    try parse(testing.allocator, arena, src, lang, &out);
+    _ = try parse(testing.allocator, arena, src, lang, &out);
     return out;
+}
+
+test "parse-health: an unterminated string that runs to EOF is reported" {
+    var out: std.ArrayList(ParsedSymbol) = .empty;
+    defer out.deinit(testing.allocator);
+    // The opening quote is never closed, so the tokenizer swallows to EOF.
+    const src =
+        \\function ok() { return 1; }
+        \\const bad = "never closed
+        \\function hidden() { return 2; }
+    ;
+    const health = try parse(testing.allocator, testing.allocator, src, .javascript, &out);
+    try testing.expect(health.desync_from != null);
+    try testing.expectEqual(@as(u32, 2), health.desync_from.?);
+    try testing.expect(health.desync_to >= 3);
+}
+
+test "parse-health: a well-formed file reports no desync" {
+    var out: std.ArrayList(ParsedSymbol) = .empty;
+    defer out.deinit(testing.allocator);
+    const src =
+        \\const re = /("(?:[^"\\]|\\.)*")/g;
+        \\function fine() { return "closed string"; }
+    ;
+    const health = try parse(testing.allocator, testing.allocator, src, .javascript, &out);
+    try testing.expect(health.desync_from == null);
 }
 
 fn findSym(list: []const ParsedSymbol, name: []const u8) ?ParsedSymbol {

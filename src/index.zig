@@ -162,9 +162,14 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     try buildImportTable(&idx);
     try buildGoPackageTable(&idx);
     resolveReferences(&idx);
+    // Persist BEFORE applying router mounts: the mount pass rewrites route
+    // symbol names in place (prepending the mount prefix), and those rewritten
+    // names must not reach the per-file cache — the mount lives in a different
+    // file, so caching the prefixed name would double-prefix on the next build.
+    if (use_cache and cacheStale(&b)) persistCache(&b, &idx);
+    applyRouterMounts(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
-    if (use_cache and cacheStale(&b)) persistCache(&b, &idx);
     return idx;
 }
 
@@ -328,7 +333,7 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
     // real trial hit this with a vendored asciinema player under `testdata/`.
     // Skip it and record the basename for the skipped-note.
     if (isMinifiedText(text)) return noteSkippedMinified(b, basenameOf(rel_path));
-    const parsed = try parseFile(b, text, lang);
+    const parsed = try parseFile(b, rel_path, text, lang);
     try appendFile(b, rel_path, lang, text, parsed, stat);
 }
 
@@ -359,10 +364,16 @@ fn statOf(b: *Builder, rel_path: []const u8) ?cache.FileStat {
     return .{ .mtime_ns = st.mtime.nanoseconds, .ctime_ns = st.ctime.nanoseconds, .size = st.size };
 }
 
-fn parseFile(b: *Builder, text: []const u8, lang: language.Language) ![]parser.ParsedSymbol {
+fn parseFile(b: *Builder, rel_path: []const u8, text: []const u8, lang: language.Language) ![]parser.ParsedSymbol {
     var parsed: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer parsed.deinit(b.gpa);
-    try parser.parse(b.gpa, b.arena, text, lang, &parsed);
+    const health = try parser.parse(b.gpa, b.arena, text, lang, &parsed);
+    if (health.desync_from) |from| {
+        std.debug.print(
+            "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
+            .{ rel_path, from, health.desync_to },
+        );
+    }
     return b.arena.dupe(parser.ParsedSymbol, parsed.items);
 }
 
@@ -586,10 +597,27 @@ fn isLocalBinding(from: model.Symbol, name: []const u8) bool {
 /// (self/this or a local binding), then by treating `recv` as an imported
 /// module bound to a file. If neither applies, leave it external.
 fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
-    if (receiverType(idx, from, ref.qualifier)) |type_name| {
-        ref.target = memberOf(idx, type_name, ref.name);
-        if (ref.target != invalid) {
-            ref.exact = true;
+    // `self`/`this`: dispatch within the *exact* enclosing type (a concrete
+    // parent symbol id), never another file's same-named class. Resolving by the
+    // bare type name here let `self.put()` escape into a sibling package's class
+    // (a confidently-wrong EXACT edge).
+    if (isSelfReceiver(ref.qualifier)) {
+        if (from.parent != invalid) {
+            ref.target = memberOfParent(idx, from.parent, ref.name);
+            if (ref.target != invalid) {
+                ref.exact = true;
+                return;
+            }
+        }
+        // No such member on the own class (inherited/mixin): heuristic below.
+    } else if (receiverType(idx, from, ref.qualifier)) |type_name| {
+        const m = memberOfType(idx, from.file, type_name, ref.name);
+        if (m.id != invalid) {
+            ref.target = m.id;
+            // A named type that resolves to several same-named classes in
+            // different files is ambiguous: bind it but mark it heuristic (`?`)
+            // so `--strict` drops it rather than trusting an arbitrary pick.
+            ref.exact = m.unambiguous;
             return;
         }
         // Known receiver but no such member here (an inherited/mixin method, or
@@ -687,6 +715,101 @@ fn linkRoutes(idx: *Index) void {
     }
 }
 
+/// Apply `include_router(mod.router, prefix="/v1")` mounts across files: for
+/// each `.route_mount` symbol, find the mounted module's file and prepend the
+/// prefix to every `route` symbol defined there. Runs before `linkRoutes` so a
+/// client call to `/v1/orders` matches the now-prefixed route. Each target file
+/// is prefixed at most once (a route cannot be mounted twice).
+fn applyRouterMounts(idx: *Index) void {
+    const arena = idx.arena.allocator();
+    const done = idx.gpa.alloc(bool, idx.graph.files.len) catch return;
+    defer idx.gpa.free(done);
+    @memset(done, false);
+    for (idx.graph.symbols) |mount| {
+        if (mount.kind != .route_mount) continue;
+        std.debug.assert(mount.file < idx.graph.files.len);
+        const target = mountTargetFile(idx, mount.file, mount.import_path) orelse continue;
+        if (done[target]) continue;
+        done[target] = true;
+        prefixRoutesIn(idx, arena, target, mount.name);
+    }
+}
+
+/// The file whose routes a mount in `from_file` prefixes. A dotted router arg
+/// (`orders.router`, `module` = "orders") binds to an imported route-file whose
+/// path stem is that module, else the sole project route-file with that stem
+/// (import edges often resolve only to the package, not the submodule). A bare
+/// arg falls back to the sole imported route-file. Null when ambiguous/absent.
+fn mountTargetFile(idx: *const Index, from_file: FileId, module: []const u8) ?FileId {
+    var single: FileId = invalid;
+    var route_files: u32 = 0;
+    var last: FileId = invalid;
+    for (idx.importsOf(from_file)) |imp| {
+        if (imp.target == last) continue; // collapse repeated edges to one file
+        last = imp.target;
+        if (!fileHasRoutes(idx, imp.target)) continue;
+        if (module.len != 0 and pathStemEquals(idx.graph.files[imp.target].path, module)) return imp.target;
+        route_files += 1;
+        single = imp.target;
+    }
+    if (module.len != 0) return uniqueRouteFileWithStem(idx, module);
+    if (route_files == 1) return single;
+    return null;
+}
+
+/// The single project file that both defines routes and has path stem `stem`
+/// (`routers/orders.py` for "orders"). Null when there is no such file or more
+/// than one — an ambiguous stem must not be guessed.
+fn uniqueRouteFileWithStem(idx: *const Index, stem: []const u8) ?FileId {
+    var found: FileId = invalid;
+    var count: u32 = 0;
+    for (idx.graph.files) |f| {
+        if (!pathStemEquals(f.path, stem)) continue;
+        if (!fileHasRoutes(idx, f.id)) continue;
+        found = f.id;
+        count += 1;
+        if (count > 1) return null;
+    }
+    return if (count == 1) found else null;
+}
+
+/// Whether file `fid` defines at least one `route` symbol.
+fn fileHasRoutes(idx: *const Index, fid: FileId) bool {
+    const f = idx.graph.files[fid];
+    var i = f.sym_start;
+    while (i < f.sym_end) : (i += 1) {
+        if (idx.graph.symbols[i].kind == .route) return true;
+    }
+    return false;
+}
+
+/// Whether `path`'s basename without extension equals `stem` (`routers/orders.py`
+/// vs "orders").
+fn pathStemEquals(path: []const u8, stem: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const base = if (slash) |s| path[s + 1 ..] else path;
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.');
+    const name = if (dot) |d| base[0..d] else base;
+    return std.mem.eql(u8, name, stem);
+}
+
+/// Prepend `prefix` to the path of every `route` symbol in file `fid`. A route
+/// name is "METHOD /path"; the method and any construction prefix are preserved.
+fn prefixRoutesIn(idx: *Index, arena: std.mem.Allocator, fid: FileId, prefix: []const u8) void {
+    const f = idx.graph.files[fid];
+    var i = f.sym_start;
+    while (i < f.sym_end) : (i += 1) {
+        var sym = &idx.graph.symbols[i];
+        if (sym.kind != .route) continue;
+        const ep = api.splitKey(sym.name) orelse continue;
+        const new_path = if (std.mem.eql(u8, ep.path, "/"))
+            arena.dupe(u8, prefix) catch continue
+        else
+            std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, ep.path }) catch continue;
+        sym.name = std.fmt.allocPrint(arena, "{s} {s}", .{ ep.method, new_path }) catch continue;
+    }
+}
+
 fn matchRoute(idx: *const Index, client_key: []const u8) SymbolId {
     const c = api.splitKey(client_key) orelse return invalid;
     for (idx.graph.symbols) |rsym| {
@@ -697,13 +820,17 @@ fn matchRoute(idx: *const Index, client_key: []const u8) SymbolId {
     return invalid;
 }
 
-/// The type name a receiver identifier refers to inside `from`'s body: the
-/// enclosing type for self/this, otherwise a local `var -> type` binding.
+/// Whether `qualifier` is the current-instance receiver (`self`/`this`), whose
+/// dispatch is scoped to the exact enclosing type rather than a type name.
+fn isSelfReceiver(qualifier: []const u8) bool {
+    return std.mem.eql(u8, qualifier, "self") or std.mem.eql(u8, qualifier, "this");
+}
+
+/// The type name a *named* receiver identifier refers to inside `from`'s body: a
+/// local `var -> type` binding. `self`/`this` are handled separately (scoped by
+/// the concrete parent id, see `memberOfParent`).
 fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, qualifier, "self") or std.mem.eql(u8, qualifier, "this")) {
-        if (from.parent == invalid) return null;
-        return idx.graph.symbols[from.parent].name;
-    }
+    _ = idx;
     // Return only a *typed* binding: bindings now also carry untyped locals and
     // parameters (name-only, empty type) to shadow same-named globals in bare
     // resolution, but those give no receiver type to scope a member access by.
@@ -713,15 +840,41 @@ fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[
     return null;
 }
 
-/// A member (method/field/const) named `name` whose parent type is `type_name`.
-fn memberOf(idx: *const Index, type_name: []const u8, name: []const u8) SymbolId {
+/// The member named `name` defined directly on the exact type `parent_id`. This
+/// scopes `self`/`this` dispatch to the receiver's own class, so it can never
+/// bind to a same-named class in another file.
+fn memberOfParent(idx: *const Index, parent_id: SymbolId, name: []const u8) SymbolId {
     const candidates = idx.by_name.get(name) orelse return invalid;
+    for (candidates) |cid| {
+        if (idx.graph.symbols[cid].parent == parent_id) return cid;
+    }
+    return invalid;
+}
+
+/// A resolved member plus whether the pick was unambiguous. `unambiguous` is
+/// false when several classes named the same as the receiver type define the
+/// member in different files, so the caller can downgrade the edge to heuristic.
+const MemberMatch = struct { id: SymbolId, unambiguous: bool };
+
+/// The member named `name` whose parent type is `type_name`, scoped for a *named*
+/// receiver of that type. A member on a type defined in `from_file` wins (a
+/// same-file/-package receiver resolves to its own class); otherwise the sole
+/// project-wide match is taken as unambiguous, and if the type name collides
+/// across files the first is returned but flagged ambiguous.
+fn memberOfType(idx: *const Index, from_file: FileId, type_name: []const u8, name: []const u8) MemberMatch {
+    const candidates = idx.by_name.get(name) orelse return .{ .id = invalid, .unambiguous = false };
+    var any: SymbolId = invalid;
+    var matches: u32 = 0;
     for (candidates) |cid| {
         const cand = idx.graph.symbols[cid];
         if (cand.parent == invalid) continue;
-        if (std.mem.eql(u8, idx.graph.symbols[cand.parent].name, type_name)) return cid;
+        if (!std.mem.eql(u8, idx.graph.symbols[cand.parent].name, type_name)) continue;
+        if (cand.file == from_file) return .{ .id = cid, .unambiguous = true };
+        matches += 1;
+        if (any == invalid) any = cid;
     }
-    return invalid;
+    if (any == invalid) return .{ .id = invalid, .unambiguous = false };
+    return .{ .id = any, .unambiguous = matches == 1 };
 }
 
 const Choice = struct { id: SymbolId, confident: bool };
@@ -1047,6 +1200,56 @@ fn routeId(idx: *const Index) ?SymbolId {
     return null;
 }
 
+test "include_router prefix is applied across files and links a prefixed client" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "routers");
+    // The route is declared bare (/orders) in the router module.
+    try tmp.dir.writeFile(io, .{ .sub_path = "routers/orders.py", .data =
+        \\from fastapi import APIRouter
+        \\router = APIRouter()
+        \\@router.post("/orders")
+        \\def create_order():
+        \\    return 1
+    });
+    // The app mounts it under /v1 in a different file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.py", .data =
+        \\from fastapi import FastAPI
+        \\from .routers import orders
+        \\app = FastAPI()
+        \\app.include_router(orders.router, prefix="/v1")
+    });
+    // A frontend that calls the fully-prefixed path.
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.ts", .data =
+        \\function placeOrder() {
+        \\  return fetch("/v1/orders", { method: "POST" });
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The route's path carries the mount prefix.
+    const route_id = routeId(&idx).?;
+    try testing.expectEqualStrings("POST /v1/orders", idx.graph.symbols[route_id].name);
+
+    // The prefixed client call links (exact) to the route.
+    const client = idx.graph.symbols[idx.lookup("placeOrder")[0]];
+    var linked = false;
+    for (client.refs) |ref| {
+        if (ref.kind != .route_call) continue;
+        try testing.expectEqual(route_id, ref.target);
+        try testing.expect(ref.exact);
+        linked = true;
+    }
+    try testing.expect(linked);
+}
+
 test "links a frontend call through a request() wrapper to a backend route" {
     const testing = std.testing;
     const io = testing.io;
@@ -1169,6 +1372,80 @@ fn qualifiedId(idx: *const Index, parent: []const u8, child: []const u8) ?Symbol
         if (std.mem.eql(u8, idx.graph.symbols[sym.parent].name, parent)) return id;
     }
     return null;
+}
+
+/// A member `parent.child` whose defining file's path contains `path_frag` —
+/// disambiguates same-named classes that live in different files.
+fn qualifiedIdInFile(idx: *const Index, parent: []const u8, child: []const u8, path_frag: []const u8) ?SymbolId {
+    for (idx.lookup(child)) |id| {
+        const sym = idx.graph.symbols[id];
+        if (sym.parent == invalid) continue;
+        if (!std.mem.eql(u8, idx.graph.symbols[sym.parent].name, parent)) continue;
+        if (std.mem.indexOf(u8, idx.graph.files[sym.file].path, path_frag) != null) return id;
+    }
+    return null;
+}
+
+test "self-dispatch and a typed receiver stay in their own file's class" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Two packages each define `Store` with `put`. `self.put()` and a typed
+    // `s: *Store` receiver must bind to pkg_a's Store.put, never pkg_b's.
+    try tmp.dir.createDirPath(io, "pkg_a");
+    try tmp.dir.createDirPath(io, "pkg_b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg_a/store.zig", .data =
+        \\pub const Store = struct {
+        \\    pub fn put(self: *Store, x: i32) void {}
+        \\    pub fn put_twice(self: *Store) void {
+        \\        self.put(1);
+        \\        self.put(2);
+        \\    }
+        \\};
+        \\pub fn use_store(s: *Store) void {
+        \\    s.put(3);
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg_b/store.zig", .data =
+        \\pub const Store = struct {
+        \\    pub fn put(self: *Store, x: i32) void {}
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const a_put = qualifiedIdInFile(&idx, "Store", "put", "pkg_a").?;
+    const b_put = qualifiedIdInFile(&idx, "Store", "put", "pkg_b").?;
+    try testing.expect(a_put != b_put);
+
+    // self.put() resolves to pkg_a Store.put, exact.
+    const put_twice = qualifiedIdInFile(&idx, "Store", "put_twice", "pkg_a").?;
+    var saw_self = false;
+    for (idx.graph.symbols[put_twice].refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "put")) continue;
+        try testing.expectEqual(a_put, ref.target);
+        try testing.expect(ref.exact);
+        saw_self = true;
+    }
+    try testing.expect(saw_self);
+
+    // s.put() with `s: *Store` resolves to pkg_a Store.put, exact.
+    const use_store = idx.graph.symbols[idx.lookup("use_store")[0]];
+    var saw_typed = false;
+    for (use_store.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "put")) continue;
+        try testing.expectEqual(a_put, ref.target);
+        try testing.expect(ref.exact);
+        saw_typed = true;
+    }
+    try testing.expect(saw_typed);
+
+    // pkg_b Store.put gains no phantom cross-package caller.
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(b_put).len);
 }
 
 test "build index over a temp project resolves cross-file calls" {

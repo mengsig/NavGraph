@@ -26,7 +26,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE5";
+const magic = "NGCACHE6";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -411,7 +411,7 @@ test "cache round-trips a file's parsed symbols" {
     ;
     var parsed: std.ArrayList(ParsedSymbol) = .empty;
     defer parsed.deinit(testing.allocator);
-    try parser.parse(testing.allocator, arena, source, .zig, &parsed);
+    _ = try parser.parse(testing.allocator, arena, source, .zig, &parsed);
     try testing.expect(parsed.items.len >= 2);
 
     // Promote parsed symbols into graph Symbols (mirrors index.zig).

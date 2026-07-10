@@ -43,7 +43,7 @@ const none = std.math.maxInt(u32);
 fn isNodeKind(kind: model.SymbolKind) bool {
     return switch (kind) {
         .function, .method, .class, .@"struct", .@"enum", .interface, .type, .macro, .route, .test_case => true,
-        .variable, .constant, .field, .module, .import, .unknown => false,
+        .variable, .constant, .field, .module, .import, .route_mount, .unknown => false,
     };
 }
 
