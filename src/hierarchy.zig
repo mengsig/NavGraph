@@ -161,8 +161,44 @@ fn appendColonBases(idx: *const Index, sym: model.Symbol, toks: []const Token, s
 fn appendRubyBase(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(name_i < toks.len);
     std.debug.assert(isContainer(sym));
-    const less = findPunct(toks, src, name_i + 1, '<') orelse return;
-    try appendSegment(idx, sym, toks, src, less + 1, toks.len, edges);
+    if (findPunct(toks, src, name_i + 1, '<')) |less| {
+        try appendSegment(idx, sym, toks, src, less + 1, toks.len, edges);
+    }
+    try appendRubyMixins(idx, sym, edges);
+}
+
+/// Ruby `include M` / `prepend M` statements add M to the ancestor chain, but
+/// they live in the class body, not its signature. Scan the body (up to the
+/// first nested `def`/`class`/`module`, where top-level mixins conventionally
+/// sit) and append each module constant as a base edge.
+fn appendRubyMixins(idx: *const Index, sym: model.Symbol, edges: *std.ArrayList(BaseEdge)) !void {
+    if (sym.sig_end >= sym.span_end) return;
+    const file = idx.graph.files[sym.file];
+    const body = file.text[sym.sig_end..sym.span_end];
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(idx.gpa);
+    try lexer.tokenize(idx.gpa, body, language.configFor(file.language), &toks);
+    const items = toks.items;
+    var i: usize = 0;
+    while (i < items.len) : (i += 1) {
+        if (items[i].kind != .identifier) continue;
+        const word = items[i].text(body);
+        if (std.mem.eql(u8, word, "def") or std.mem.eql(u8, word, "class") or
+            std.mem.eql(u8, word, "module")) return; // reached nested scope
+        if (!std.mem.eql(u8, word, "include") and !std.mem.eql(u8, word, "prepend")) continue;
+        if (i + 1 >= items.len or items[i + 1].kind != .identifier) continue;
+        const mod = items[i + 1].text(body);
+        if (mod.len == 0 or !std.ascii.isUpper(mod[0])) continue; // Ruby modules are constants
+        // The module name runs to the end of the `include` line (stop at a
+        // newline or comma so we don't swallow the next statement's tokens).
+        const line = items[i + 1].line;
+        var j = i + 1;
+        while (j < items.len and items[j].line == line and (items[j].kind == .identifier or
+            punctEq(items[j], body, ':') or punctEq(items[j], body, '.'))) : (j += 1)
+        {}
+        try appendSegment(idx, sym, items, body, i + 1, j, edges);
+        i = j - 1;
+    }
 }
 
 fn appendSegments(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, lo: usize, hi: usize, edges: *std.ArrayList(BaseEdge)) !void {
@@ -302,9 +338,13 @@ fn resolveContainer(idx: *const Index, child: model.Symbol, name: []const u8) ?S
     var local_count: usize = 0;
     var project: ?SymbolId = null;
     var project_count: usize = 0;
+    // Ruby ancestors reached via `include`/`prepend` are `module`s, which are
+    // not general containers; accept them only when the subtype is itself Ruby.
+    const ruby_child = idx.graph.files[child.file].language.family() == .ruby;
     for (idx.lookup(name)) |id| {
         const sym = idx.graph.symbols[id];
-        if (!isContainer(sym) or id == child.id) continue;
+        const is_base = isContainer(sym) or (ruby_child and sym.kind == .module);
+        if (!is_base or id == child.id) continue;
         if (idx.graph.files[sym.file].language.family() != idx.graph.files[child.file].language.family()) continue;
         project = id;
         project_count += 1;
@@ -672,7 +712,9 @@ fn filterContainers(idx: *const Index, ids: []const SymbolId, out: []SymbolId) [
 
 fn isContainer(sym: model.Symbol) bool {
     return switch (sym.kind) {
-        .class, .@"struct", .interface => true,
+        // Keep in sync with impls.isContainer — `enum` is a trait-implementing /
+        // method-bearing type (Rust/Zig/C#) and participates in the hierarchy.
+        .class, .@"struct", .interface, .@"enum" => true,
         else => false,
     };
 }

@@ -95,8 +95,29 @@ fn appendRef(out: *std.ArrayList(EventRef), gpa: std.mem.Allocator, key: []const
 }
 
 fn callReceiver(toks: []const Token, source: []const u8, open: usize) []const u8 {
-    if (open < 3 or !isPunct(toks, source, open - 2, '.') or toks[open - 3].kind != .identifier) return "";
-    return toks[open - 3].text(source);
+    if (open < 3 or !isPunct(toks, source, open - 2, '.')) return "";
+    const prev = open - 3;
+    if (toks[prev].kind == .identifier) return toks[prev].text(source);
+    // Chained call: `L.marker(x).on(...)` — the receiver is the result of an
+    // inner method call. Use that method's name (e.g. `marker`) as the receiver
+    // so a Leaflet/DOM construct is still recognized and filtered.
+    if (isPunct(toks, source, prev, ')')) {
+        var depth: usize = 0;
+        var i: usize = prev + 1;
+        while (i > 0) {
+            i -= 1;
+            if (isPunct(toks, source, i, ')')) {
+                depth += 1;
+            } else if (isPunct(toks, source, i, '(')) {
+                depth -= 1;
+                if (depth == 0) {
+                    if (i > 0 and toks[i - 1].kind == .identifier) return toks[i - 1].text(source);
+                    return "";
+                }
+            }
+        }
+    }
+    return "";
 }
 
 fn brokerRole(verb: []const u8, receiver: []const u8) ?Role {
@@ -119,6 +140,28 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// True if `hint` occurs in `receiver` as a whole word — delimited by string
+/// bounds, `_`, non-letters, or a camelCase boundary. This suppresses Leaflet
+/// getters like `getLayer` (a `Layer` word) without misfiring on identifiers
+/// that merely contain a hint mid-word (`controller`⊃`control`, `player`⊃`layer`,
+/// `heatmap`⊃`map`), which would otherwise drop real application handlers.
+fn containsWord(receiver: []const u8, hint: []const u8) bool {
+    std.debug.assert(hint.len != 0);
+    if (receiver.len < hint.len) return false;
+    var i: usize = 0;
+    while (i + hint.len <= receiver.len) : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(receiver[i .. i + hint.len], hint)) continue;
+        const first = receiver[i];
+        const left = i == 0 or receiver[i - 1] == '_' or !std.ascii.isAlphabetic(receiver[i - 1]) or
+            (std.ascii.isUpper(first) and std.ascii.isLower(receiver[i - 1]));
+        const end = i + hint.len;
+        const right = end == receiver.len or receiver[end] == '_' or !std.ascii.isAlphabetic(receiver[end]) or
+            (std.ascii.isUpper(receiver[end]) and std.ascii.isLower(receiver[end - 1]));
+        if (left and right) return true;
+    }
+    return false;
+}
+
 /// Suppress known browser/Leaflet listeners only when the receiver also looks
 /// DOM/map-like; application buses using the same key remain visible.
 fn isDomListener(verb: []const u8, receiver: []const u8, key: []const u8) bool {
@@ -132,7 +175,7 @@ fn isDomListener(verb: []const u8, receiver: []const u8, key: []const u8) bool {
         "leaflet",
     };
     var receiver_matches = false;
-    for (dom_receiver) |hint| receiver_matches = receiver_matches or containsIgnoreCase(receiver, hint);
+    for (dom_receiver) |hint| receiver_matches = receiver_matches or containsWord(receiver, hint);
     if (!receiver_matches) return false;
     const dom_events = [_][]const u8{
         "click",     "dblclick",    "move",      "movestart", "moveend",    "mousemove", "mouseenter", "mouseleave",

@@ -89,6 +89,10 @@ pub fn tokenize(
 ) !void {
     std.debug.assert(source.len <= std.math.maxInt(u32));
     var lx = Lexer{ .gpa = gpa, .source = source, .cfg = cfg };
+    // Skip a leading UTF-8 BOM (EF BB BF) so it does not desync the tokenizer and
+    // drop the file's first symbol. Offsets stay absolute (the 3 BOM bytes are
+    // simply covered by no token), keeping `read`/`edits` byte ranges aligned.
+    if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) lx.pos = 3;
     while (lx.pos < lx.source.len) {
         const c = lx.peek();
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {

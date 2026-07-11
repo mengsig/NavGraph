@@ -1818,7 +1818,8 @@ fn symbolObjectExtra(w: *Writer, idx: *const Index, sym: Symbol, v: render.Verbo
 /// Write `s` as a quoted, escaped JSON string.
 pub fn writeString(w: *Writer, s: []const u8) !void {
     try w.writeByte('"');
-    for (s) |c| try writeEscaped(w, c);
+    var i: usize = 0;
+    while (i < s.len) i += try writeUtf8Unit(w, s[i..]);
     try w.writeByte('"');
 }
 
@@ -1828,10 +1829,13 @@ fn writeCollapsedString(w: *Writer, text: []const u8, cap: usize) !void {
     try w.writeByte('"');
     var written: usize = 0;
     var prev_space = false;
-    for (text) |c| {
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
         const is_space = c == ' ' or c == '\t' or c == '\r' or c == '\n';
         if (is_space) {
             prev_space = written != 0;
+            i += 1;
             continue;
         }
         if (prev_space and written < cap) {
@@ -1839,8 +1843,11 @@ fn writeCollapsedString(w: *Writer, text: []const u8, cap: usize) !void {
             written += 1;
         }
         prev_space = false;
+        // Cap counts whole code points; the boundary check happens before a unit
+        // is written so a multi-byte UTF-8 character is never split (which would
+        // otherwise produce invalid JSON).
         if (written >= cap) break;
-        try writeEscaped(w, c);
+        i += try writeUtf8Unit(w, text[i..]);
         written += 1;
     }
     try w.writeByte('"');
@@ -1856,6 +1863,41 @@ fn writeEscaped(w: *Writer, c: u8) !void {
         0...8, 11, 12, 14...31 => try w.print("\\u{x:0>4}", .{c}),
         else => try w.writeByte(c),
     }
+}
+
+/// Write one UTF-8 unit starting at `s[0]` as JSON-safe output and return the
+/// number of input bytes consumed. ASCII bytes are escaped (control chars, quote,
+/// backslash); a valid multi-byte UTF-8 sequence is emitted verbatim (valid UTF-8
+/// is valid JSON); an invalid or truncated byte becomes U+FFFD so the emitted JSON
+/// is always well-formed UTF-8, even when the source contains raw non-UTF-8 bytes.
+fn writeUtf8Unit(w: *Writer, s: []const u8) !usize {
+    const c = s[0];
+    if (c < 0x80) {
+        try writeEscaped(w, c);
+        return 1;
+    }
+    const len: usize = switch (c) {
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => 0, // continuation byte, overlong lead (C0/C1), or 0xF5..0xFF
+    };
+    if (len >= 2 and len <= s.len) {
+        var ok = true;
+        var i: usize = 1;
+        while (i < len) : (i += 1) {
+            if (s[i] & 0xC0 != 0x80) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            try w.writeAll(s[0..len]);
+            return len;
+        }
+    }
+    try w.writeAll("\xEF\xBF\xBD"); // U+FFFD REPLACEMENT CHARACTER
+    return 1;
 }
 
 test "json output is well-formed and escapes control characters" {

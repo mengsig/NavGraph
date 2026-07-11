@@ -3071,19 +3071,29 @@ fn parseGoInterfaceMethods(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!
         const pc = ctx.close[i + 1];
         if (pc == sentinel) continue;
         const name = ctx.textOf(i);
+        // Extend past the return type, which runs to the end of the method's
+        // line (a Go interface method is declared on one line). Including it in
+        // the signature lets conformance comparison see the same shape as the
+        // implementing method (`Get(id) (Widget, error)`), not just the params.
+        const method_line = ctx.toks[i].line;
+        var end_i = pc;
+        var j = pc + 1;
+        while (j < hi and ctx.toks[j].line == method_line and ctx.toks[j].kind != .comment) : (j += 1) {
+            end_i = j;
+        }
         _ = try emit(ctx, .{
             .name = name,
             .kind = .method,
             .line = ctx.toks[i].line,
             .span_start = lineStartOffset(ctx, i),
-            .span_end = ctx.toks[pc].end,
-            .sig_end = ctx.toks[pc].end,
+            .span_end = ctx.toks[end_i].end,
+            .sig_end = ctx.toks[end_i].end,
             .doc = collectDoc(ctx, i),
             .exported = goExported(name),
             .parent_local = parent,
             .refs = &.{},
         });
-        i = pc;
+        i = end_i;
     }
 }
 
@@ -3654,8 +3664,17 @@ fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     }
     if (j >= hi or ctx.toks[j].kind != .identifier) return def_i;
     const name_i = j;
-    const name = ctx.textOf(name_i);
+    var name = ctx.textOf(name_i);
     var after = name_i + 1;
+    // Ruby predicate/bang methods (`available?`, `save!`) end in a sigil that is
+    // a separate adjacent token but part of the method's identifier — include it
+    // so the symbol name matches the source (and its call sites).
+    if (after < hi and ctx.toks[after].start == ctx.toks[name_i].end and
+        (ctx.isPunct(after, '?') or ctx.isPunct(after, '!')))
+    {
+        name = ctx.source[ctx.toks[name_i].start..ctx.toks[after].end];
+        after += 1;
+    }
     if (ctx.isPunct(after, '(')) {
         const pc = ctx.close[after];
         if (pc == sentinel) return def_i;
@@ -4824,10 +4843,11 @@ test "ruby: endless methods and bang/question method names" {
     ;
     var out = try parseForTest(src, .ruby);
     defer freeRefs(&out);
-    // `?`/`!` lex as punct, so the method name is the identifier stem.
-    try testing.expectEqual(SymbolKind.method, findSym(out.items, "valid").?.kind);
-    try testing.expect(hasRef(findSym(out.items, "valid").?, "check"));
-    try testing.expectEqual(SymbolKind.method, findSym(out.items, "save").?.kind);
+    // A trailing `?`/`!` is part of the Ruby method identifier and is kept on the
+    // symbol name so it matches the source and its call sites.
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "valid?").?.kind);
+    try testing.expect(hasRef(findSym(out.items, "valid?").?, "check"));
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "save!").?.kind);
     // An endless method is a single-line method.
     const double = findSym(out.items, "double").?;
     try testing.expectEqual(SymbolKind.method, double.kind);

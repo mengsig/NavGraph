@@ -72,7 +72,10 @@ pub fn build(gpa: std.mem.Allocator, idx: *const Index) !Graph {
 
 pub fn isContainer(sym: model.Symbol) bool {
     return switch (sym.kind) {
-        .class, .@"struct", .interface => true,
+        // `enum` is a first-class, trait-implementing / method-bearing type in
+        // Rust (and carries methods in Zig/C#), so it participates in the
+        // hierarchy / conformance / implementation graphs like other containers.
+        .class, .@"struct", .interface, .@"enum" => true,
         else => false,
     };
 }

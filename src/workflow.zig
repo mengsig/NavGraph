@@ -56,7 +56,7 @@ pub fn affected(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, pos
     std.debug.assert(root.len > 0);
     std.debug.assert(idx.graph.files.len > 0 or idx.graph.symbols.len == 0);
     const since = if (opts.since.len != 0) opts.since else if (positional.len != 0) positional else "HEAD";
-    const changed = try changedSymbols(w, io, idx, root, since);
+    const changed = try changedSymbols(w, io, idx, root, since, opts.format);
     if (changed == null) return false;
     defer idx.gpa.free(changed.?);
     if (changed.?.len == 0) {
@@ -68,17 +68,21 @@ pub fn affected(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, pos
     return renderSymbolSet(w, idx, "affected_tests", since, tests, opts);
 }
 
-fn changedSymbols(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, since: []const u8) !?[]SymbolId {
+fn changedSymbols(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, since: []const u8, format: query.OutputFormat) !?[]SymbolId {
     std.debug.assert(root.len > 0);
     std.debug.assert(since.len > 0);
     const result = query.runGitDiff(idx.gpa, io, root, since) catch |err| {
-        try w.print("navgraph: could not run git diff ({s})\n", .{@errorName(err)});
+        const msg = try std.fmt.allocPrint(idx.gpa, "could not run git diff ({s})", .{@errorName(err)});
+        defer idx.gpa.free(msg);
+        try query.emitError(w, format, msg);
         return null;
     };
     defer idx.gpa.free(result.stdout);
     defer idx.gpa.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
-        try w.print("navgraph: git diff {s} failed: {s}\n", .{ since, std.mem.trim(u8, result.stderr, " \n\r\t") });
+        const msg = try std.fmt.allocPrint(idx.gpa, "git diff {s} failed: {s}", .{ since, std.mem.trim(u8, result.stderr, " \n\r\t") });
+        defer idx.gpa.free(msg);
+        try query.emitError(w, format, msg);
         return null;
     }
     const changes = try gitdiff.parse(idx.gpa, result.stdout);

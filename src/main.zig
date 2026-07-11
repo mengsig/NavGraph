@@ -172,7 +172,22 @@ fn serve(out: *std.Io.Writer, session: *ServerSession) !void {
     var input_buffer: [64 * 1024]u8 = undefined;
     var stdin_file: std.Io.File.Reader = .initStreaming(.stdin(), session.io, &input_buffer);
     const input = &stdin_file.interface;
-    while (try input.takeDelimiter('\n')) |raw| {
+    while (true) {
+        const maybe = input.takeDelimiter('\n') catch |err| switch (err) {
+            // A request line that fills the whole input buffer would otherwise
+            // crash the long-lived server. Drain it (through the newline) to
+            // resync, report a parse error, and keep serving. If it cannot be
+            // drained (EOF / read failure), stop cleanly instead of looping.
+            error.StreamTooLong => {
+                const drained = input.discardDelimiterInclusive('\n');
+                try rpcError(out, null, -32700, "request line exceeds input buffer");
+                try out.flush();
+                _ = drained catch return;
+                continue;
+            },
+            error.ReadFailed => return err,
+        };
+        const raw = maybe orelse break;
         const line = std.mem.trim(u8, raw, " \t\r\n");
         if (line.len == 0) continue;
         const keep_going = try handleServerRequest(out, session, line);

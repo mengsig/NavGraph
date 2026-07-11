@@ -116,7 +116,13 @@ fn walkRaises(idx: *const Index, analysis: *const scan.Analysis, hierarchy: *con
     try appendOwnerRaises(idx, analysis, hierarchy, root, owner, exact, opts, path.items, edges.items, findings);
     if (depth >= opts.depth or findings.items.len >= opts.limit) return;
     for (idx.graph.symbols[owner].refs) |ref| {
-        if (ref.kind != .call or ref.target == invalid or (opts.strict and !ref.exact)) continue;
+        if (ref.target == invalid or (opts.strict and !ref.exact)) continue;
+        // Follow the same executable edges `calls` shows: exclude type/import
+        // and pure data reads (var/const/field), then require a callable target.
+        // Ruby paren-less calls surface as reads resolved to a callable, so this
+        // lets their transitive raises propagate (the paren'd form is a `.call`).
+        if (ref.kind == .type_use or ref.kind == .import) continue;
+        if (query.isDataReadEdge(idx, ref)) continue;
         if (!isCallable(idx.graph.symbols[ref.target].kind)) continue;
         try walkCallSites(idx, analysis, hierarchy, root, owner, ref, depth, exact, opts, active, path, edges, findings);
         if (findings.items.len >= opts.limit) return;
@@ -598,7 +604,11 @@ fn isCallOccurrence(idx: *const Index, owner: SymbolId, ref: model.Reference, of
     const source = idx.graph.files[idx.graph.symbols[owner].file].text;
     if (offset > source.len or ref.name.len > source.len - offset) return false;
     if (!std.mem.eql(u8, source[offset .. offset + ref.name.len], ref.name)) return false;
-    return callSuffixOpen(source, offset + ref.name.len) != null;
+    if (callSuffixOpen(source, offset + ref.name.len) != null) return true;
+    // Ruby allows argument-less calls with no parentheses (`leaf` instead of
+    // `leaf()`); accept the bare occurrence for a reference already resolved to a
+    // callable, otherwise transitive raises through paren-less calls are dropped.
+    return idx.graph.files[idx.graph.symbols[owner].file].language.family() == .ruby;
 }
 
 fn callSuffixOpen(source: []const u8, from: usize) ?usize {

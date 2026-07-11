@@ -2468,8 +2468,55 @@ pub fn conformanceVerdict(idx: *const Index, expected: model.Symbol, actual: ?mo
 
 fn signatureTail(idx: *const Index, sym: model.Symbol) []const u8 {
     const sig = sym.signature(idx.graph.files[sym.file].text);
-    const open = std.mem.indexOfScalar(u8, sig, '(') orelse return sig;
-    return sig[open..];
+    // Anchor at the parameter list that follows the method NAME, so a Go/Rust
+    // receiver (`func (s *T) Get(...)`) or leading `func`/`fn` keyword before the
+    // name is ignored — otherwise an exact implementation reads as SIG-DIFF.
+    const open = methodParamOpen(sig, sym.name) orelse
+        (std.mem.indexOfScalar(u8, sig, '(') orelse return sig);
+    return trimSigTail(sig[open..]);
+}
+
+/// Offset of the `(` that opens the parameter list belonging to method `name`:
+/// the first word-bounded occurrence of `name` followed (past an optional
+/// generic argument list and whitespace) by `(`. Skips a leading receiver.
+fn methodParamOpen(sig: []const u8, name: []const u8) ?usize {
+    if (name.len == 0) return null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, sig, from, name)) |ni| {
+        from = ni + 1;
+        const before_ok = ni == 0 or !isIdentByte(sig[ni - 1]);
+        var j = ni + name.len;
+        const after_ok = j >= sig.len or !isIdentByte(sig[j]);
+        if (!before_ok or !after_ok) continue;
+        while (j < sig.len and std.ascii.isWhitespace(sig[j])) j += 1;
+        if (j < sig.len and sig[j] == '<') { // skip a generic argument list
+            var depth: usize = 0;
+            while (j < sig.len) : (j += 1) {
+                if (sig[j] == '<') depth += 1 else if (sig[j] == '>') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        j += 1;
+                        break;
+                    }
+                }
+            }
+            while (j < sig.len and std.ascii.isWhitespace(sig[j])) j += 1;
+        }
+        if (j < sig.len and sig[j] == '(') return j;
+    }
+    return null;
+}
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Trim trailing whitespace and a single `;` (trait / interface method
+/// declarations end in `;` while their implementations do not).
+fn trimSigTail(s: []const u8) []const u8 {
+    var t = s;
+    while (t.len > 0 and (std.ascii.isWhitespace(t[t.len - 1]) or t[t.len - 1] == ';')) t = t[0 .. t.len - 1];
+    return t;
 }
 
 fn equalIgnoringWhitespace(a: []const u8, b: []const u8) bool {
@@ -2515,13 +2562,19 @@ fn renderSiblingConformance(w: *Writer, idx: *const Index, ids: []const SymbolId
     const parent_count = collectConformanceParents(idx, ids, &parents);
     if (parent_count < 2) return false;
     try w.print("# sibling conformance · {d} classes\n", .{parent_count});
+    // Restrict the compared method set to the explicitly-selected methods only
+    // when the selector picked methods and NOT containers. A glob like `*Product`
+    // also matches the classes' same-named constructors; without this guard that
+    // would collapse the matrix to just the constructor rows and hide the real
+    // method divergences (Label/IsSellable).
+    const restrict_to_ids = idsContainMethods(idx, ids) and !idsContainContainers(idx, ids);
     var rendered_names = std.StringHashMap(void).init(idx.gpa);
     defer rendered_names.deinit();
     var rendered: u32 = 0;
     for (idx.graph.symbols) |method| {
         if (rendered >= opts.limit) break;
         if (method.kind != .method or !contains(parents[0..parent_count], method.parent)) continue;
-        if (idsContainMethods(idx, ids) and !contains(ids, method.id)) continue;
+        if (restrict_to_ids and !contains(ids, method.id)) continue;
         if ((try rendered_names.getOrPut(method.name)).found_existing) continue;
         try render.symbol(w, idx, method, .sig, 1, true);
         rendered += 1;
@@ -2551,6 +2604,24 @@ pub fn collectConformanceParents(idx: *const Index, ids: []const SymbolId, out: 
 pub fn idsContainMethods(idx: *const Index, ids: []const SymbolId) bool {
     for (ids) |id| if (idx.graph.symbols[id].kind == .method) return true;
     return false;
+}
+
+pub fn idsContainContainers(idx: *const Index, ids: []const SymbolId) bool {
+    for (ids) |id| if (impls_mod.isContainer(idx.graph.symbols[id])) return true;
+    return false;
+}
+
+/// Emit a command-level error respecting the output format, so `-j`/`--jsonl`
+/// stay valid JSON instead of leaking raw text (e.g. git usage) to stdout.
+pub fn emitError(w: *Writer, format: OutputFormat, message: []const u8) !void {
+    switch (format) {
+        .json, .jsonl => {
+            try w.writeAll("{\"error\":");
+            try json_out.writeString(w, message);
+            try w.writeAll("}\n");
+        },
+        .text => try w.print("navgraph: {s}\n", .{message}),
+    }
 }
 
 fn renderSiblingCell(w: *Writer, idx: *const Index, expected: model.Symbol, parent: SymbolId, actual_id: ?SymbolId) !void {
@@ -2846,13 +2917,17 @@ fn printEventSite(w: *Writer, idx: *const Index, site: EventSite) !void {
 pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []const u8, opts: Options) !bool {
     const spec = if (ref.len != 0) ref else "HEAD";
     const result = runGitDiff(idx.gpa, io, root, spec) catch |err| {
-        try w.print("navgraph: could not run git diff ({s})\n", .{@errorName(err)});
+        const msg = try std.fmt.allocPrint(idx.gpa, "could not run git diff ({s})", .{@errorName(err)});
+        defer idx.gpa.free(msg);
+        try emitError(w, opts.format, msg);
         return false;
     };
     defer idx.gpa.free(result.stdout);
     defer idx.gpa.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
-        try w.print("navgraph: git diff {s} failed: {s}\n", .{ spec, std.mem.trim(u8, result.stderr, " \n\r\t") });
+        const msg = try std.fmt.allocPrint(idx.gpa, "git diff {s} failed: {s}", .{ spec, std.mem.trim(u8, result.stderr, " \n\r\t") });
+        defer idx.gpa.free(msg);
+        try emitError(w, opts.format, msg);
         return false;
     }
     const changes = try gitdiff.parse(idx.gpa, result.stdout);
@@ -4211,12 +4286,10 @@ fn resolveQualified(idx: *const Index, parent: []const u8, child: []const u8, bu
         buf[n] = id;
         n += 1;
     }
-    if (n == 0) { // fall back to bare child lookup
-        const ids = idx.lookup(child);
-        const m = @min(ids.len, buf.len);
-        @memcpy(buf[0..m], ids[0..m]);
-        return buf[0..m];
-    }
+    // A `Parent.child` selector is an explicit scoping request: if no member
+    // named `child` exists directly under a symbol named `parent`, report
+    // not-found rather than silently falling back to a bare `child` lookup that
+    // would resolve to an unrelated same-named symbol in a different container.
     return buf[0..n];
 }
 
