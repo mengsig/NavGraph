@@ -126,6 +126,7 @@ pub fn parse(
             .go => go_keywords,
             .rust => rust_keywords,
             .ruby => ruby_keywords,
+            .java => java_keywords,
             else => c_keywords,
         },
     };
@@ -142,6 +143,7 @@ pub fn parse(
         },
         .rust => try parseRustScope(&ctx, 0, n, null, false),
         .ruby => try parseRubyScope(&ctx, 0, n, null),
+        .java => try parseCScope(&ctx, 0, n, null),
         .other => {},
     }
     try detectApi(&ctx, n);
@@ -1266,6 +1268,83 @@ const cs_keywords = KeywordSet.initComptime(.{
     .{"out"},      .{"in"},        .{"where"},   .{"get"},       .{"set"},       .{"partial"},
 });
 
+/// Java control/type/modifier keywords — kept apart from `c_keywords` so the
+/// shared C-family scanners skip Java-specific keywords when reading a body's
+/// references and detecting member methods.
+const java_keywords = KeywordSet.initComptime(.{
+    .{"if"},           .{"else"},        .{"for"},      .{"while"},        .{"do"},
+    .{"return"},       .{"switch"},      .{"case"},     .{"break"},        .{"continue"},
+    .{"default"},      .{"class"},       .{"interface"}, .{"enum"},        .{"record"},
+    .{"extends"},      .{"implements"},  .{"throws"},   .{"import"},       .{"package"},
+    .{"public"},       .{"private"},     .{"protected"}, .{"static"},      .{"final"},
+    .{"abstract"},     .{"native"},      .{"synchronized"}, .{"transient"}, .{"volatile"},
+    .{"strictfp"},     .{"void"},        .{"int"},      .{"long"},         .{"short"},
+    .{"byte"},         .{"char"},        .{"float"},    .{"double"},       .{"boolean"},
+    .{"true"},         .{"false"},       .{"null"},     .{"this"},         .{"super"},
+    .{"new"},          .{"instanceof"},  .{"try"},      .{"catch"},        .{"finally"},
+    .{"throw"},        .{"var"},         .{"yield"},    .{"assert"},       .{"sealed"},
+    .{"permits"},      .{"const"},       .{"goto"},
+});
+
+/// A Java `package a.b.c;` declaration — emit a module symbol for outline
+/// visibility. `kw_i` is the `package` token; returns the index just past `;`.
+fn parseJavaPackage(ctx: *Ctx, kw_i: u32, hi: u32) AllocError!u32 {
+    const line = ctx.toks[kw_i].line;
+    var semi = kw_i + 1;
+    var name_i: ?u32 = null;
+    while (semi < hi and !ctx.isPunct(semi, ';') and ctx.toks[semi].line == line) : (semi += 1) {
+        if (ctx.toks[semi].kind == .identifier) name_i = semi;
+    }
+    const end = if (semi < hi) ctx.toks[semi].end else ctx.toks[semi - 1].end;
+    if (name_i) |ni| {
+        _ = try emit(ctx, .{
+            .name = ctx.textOf(ni),
+            .kind = .module,
+            .line = ctx.toks[ni].line,
+            .span_start = lineStartOffset(ctx, kw_i),
+            .span_end = end,
+            .sig_end = ctx.toks[ni].end,
+            .doc = collectDoc(ctx, kw_i),
+            .exported = true,
+            .parent_local = null,
+            .refs = &.{},
+        });
+    }
+    return if (semi < hi) semi + 1 else semi;
+}
+
+/// A Java `import a.b.C;`, `import static a.b.C.member;`, or `import a.b.*;`
+/// directive. Emits an import symbol whose `import_path` is the full dotted path
+/// (as written) and whose name is the last simple identifier — the name the
+/// importing file uses to refer to the type. `kw_i` is the `import` token.
+fn parseJavaImport(ctx: *Ctx, kw_i: u32, hi: u32) AllocError!u32 {
+    const line = ctx.toks[kw_i].line;
+    var start = kw_i + 1;
+    if (ctx.identEql(start, "static")) start += 1;
+    var semi = start;
+    while (semi < hi and !ctx.isPunct(semi, ';') and ctx.toks[semi].line == line) semi += 1;
+    if (semi <= start) return if (semi < hi) semi + 1 else semi;
+    var name_i: ?u32 = null;
+    var j = start;
+    while (j < semi) : (j += 1) {
+        if (ctx.toks[j].kind == .identifier) name_i = j;
+    }
+    const path = ctx.source[ctx.toks[start].start..ctx.toks[semi - 1].end];
+    const simple = if (name_i) |ni| ctx.textOf(ni) else "";
+    _ = try emit(ctx, importSymbol(simple, path, line, lineStartOffset(ctx, kw_i), ctx.toks[semi - 1].end));
+    return if (semi < hi) semi + 1 else semi;
+}
+
+/// Whether token `i` begins a C-family record/type declaration. `record` is a
+/// contextual keyword, so it only counts in C# and Java where it is reserved.
+fn startsCRecord(ctx: *const Ctx, i: u32) bool {
+    if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
+        ctx.identEql(i, "union") or ctx.identEql(i, "class") or
+        ctx.identEql(i, "interface")) return true;
+    return ctx.identEql(i, "record") and
+        (ctx.cfg.language == .csharp or ctx.cfg.language == .java);
+}
+
 fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
     var stmt_start = lo;
     var i = lo;
@@ -1290,6 +1369,20 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
                 continue;
             }
         }
+        if (ctx.cfg.language == .java) {
+            // `package a.b.c;` names the compilation unit's module; `import
+            // a.b.C;` / `import static a.b.C.m;` are Java's imports.
+            if (ctx.identEql(i, "package")) {
+                i = try parseJavaPackage(ctx, i, hi);
+                stmt_start = i;
+                continue;
+            }
+            if (ctx.identEql(i, "import")) {
+                i = try parseJavaImport(ctx, i, hi);
+                stmt_start = i;
+                continue;
+            }
+        }
         if (ctx.identEql(i, "namespace")) {
             const adv = try parseCppNamespace(ctx, i, hi, parent);
             if (adv > i) {
@@ -1298,10 +1391,7 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
                 continue;
             }
         }
-        if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
-            ctx.identEql(i, "union") or ctx.identEql(i, "class") or
-            ctx.identEql(i, "interface"))
-        {
+        if (startsCRecord(ctx, i)) {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
                 i = adv;
@@ -1446,16 +1536,20 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
     // The body `{` must come before any `;` (forward decl / typed variable) and
     // before any `(` (a function returning the type). Inheritance is allowed:
     // `class C : public B { ... }`.
+    const is_record = ctx.identEql(kw_i, "record");
     const open = findNext(ctx, name_i + 1, hi, '{');
     if (open == sentinel or ctx.close[open] == sentinel) return kw_i;
     const semi = findNext(ctx, name_i + 1, hi, ';');
     if (semi != sentinel and semi < open) return kw_i;
     const paren = findNext(ctx, name_i + 1, hi, '(');
-    if (paren != sentinel and paren < open) return kw_i;
+    // A record's positional parameter list (`record Point(int x, int y) {}`)
+    // legitimately precedes its body; for other records a `(` before `{` marks a
+    // function returning the type, so the declaration is not a record body.
+    if (!is_record and paren != sentinel and paren < open) return kw_i;
     const close = ctx.close[open];
     const kind: SymbolKind = if (ctx.identEql(kw_i, "enum"))
         .@"enum"
-    else if (ctx.identEql(kw_i, "class"))
+    else if (ctx.identEql(kw_i, "class") or is_record)
         .class
     else if (ctx.identEql(kw_i, "interface"))
         .interface
@@ -1475,7 +1569,8 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
     });
     // C++ class/struct bodies hold methods; C# class/struct/interface bodies do
     // too. Parse them as members (enums do not hold methods).
-    const parses_members = ctx.cfg.language == .cpp or ctx.cfg.language == .csharp;
+    const parses_members = ctx.cfg.language == .cpp or ctx.cfg.language == .csharp or
+        ctx.cfg.language == .java;
     if (parses_members and kind != .@"enum") {
         try parseCppMembers(ctx, open + 1, close, my_idx);
     }
@@ -1493,10 +1588,7 @@ fn parseCppMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
             stmt_start = i;
             continue;
         }
-        if (ctx.identEql(i, "struct") or ctx.identEql(i, "class") or
-            ctx.identEql(i, "enum") or ctx.identEql(i, "union") or
-            ctx.identEql(i, "interface"))
-        {
+        if (startsCRecord(ctx, i)) {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
                 i = adv;
@@ -1609,7 +1701,7 @@ fn tryCppMethod(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: u32) A
 /// such keyword here and stay exported (`true`); a bare C# member (no modifier)
 /// also stays `true` to avoid over-hiding (its default depends on the container).
 fn memberExported(ctx: *const Ctx, stmt_start: u32, name_i: u32) bool {
-    if (ctx.cfg.language != .csharp) return true;
+    if (ctx.cfg.language != .csharp and ctx.cfg.language != .java) return true;
     return !(hasKeywordBetween(ctx, stmt_start, name_i, "private") or
         hasKeywordBetween(ctx, stmt_start, name_i, "protected") or
         hasKeywordBetween(ctx, stmt_start, name_i, "internal"));
@@ -1635,6 +1727,17 @@ fn cBodyOpen(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
         {
             return findNext(ctx, j + 1, hi, '{');
         }
+        // Java `M(...) throws A, b.C.D { ... }`: the checked-exception list (dotted,
+        // comma-separated type names) precedes the body's `{`.
+        if (ctx.cfg.language == .java and ctx.identEql(j, "throws")) {
+            var k = j + 1;
+            while (k < hi) : (k += 1) {
+                if (ctx.isPunct(k, '{')) return k;
+                if (ctx.toks[k].kind == .identifier or ctx.isPunct(k, '.') or ctx.isPunct(k, ',')) continue;
+                return sentinel; // e.g. the `;` of an abstract/interface declaration
+            }
+            return sentinel;
+        }
         if (ctx.toks[j].kind == .identifier) continue; // const / noexcept / override / final
         return sentinel;
     }
@@ -1652,6 +1755,9 @@ fn declEnd(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
         guard += 1;
     }) {
         if (ctx.isPunct(j, ';')) return j;
+        // Java interface/abstract method declaration `m(...) throws A.B;`.
+        if (ctx.cfg.language == .java and ctx.identEql(j, "throws"))
+            return findNext(ctx, j + 1, hi, ';');
         const ok = ctx.toks[j].kind == .identifier or ctx.toks[j].kind == .number or
             ctx.isPunct(j, '=');
         if (!ok) return sentinel;
@@ -4940,6 +5046,7 @@ test "edge: empty source yields no symbols across languages" {
         language.Language.typescript, language.Language.tsx,
         language.Language.lua,        language.Language.go,
         language.Language.rust,       language.Language.ruby,
+        language.Language.java,
     }) |lang| {
         var out = try parseForTest("", lang);
         defer freeRefs(&out);
@@ -5909,4 +6016,65 @@ test "python docstrings attach to function and class symbols" {
     defer freeRefs(&out);
     try testing.expectEqualStrings("\"\"\"Service contract.\"\"\"", findSym(out.items, "Service").?.doc);
     try testing.expectEqualStrings("\"\"\"Run one request.\"\"\"", findSym(out.items, "run").?.doc);
+}
+
+// --- Java -----------------------------------------------------------------
+
+test "java: package, imports, class, methods, and body refs" {
+    const src =
+        \\package com.foo.app;
+        \\import java.util.List;
+        \\import static java.lang.Math.max;
+        \\
+        \\public class Calc {
+        \\    private int total;
+        \\    public int tally() {
+        \\        return add(total, 1);
+        \\    }
+        \\    int add(int a, int b) { return a + b; }
+        \\}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    // `package` is a module symbol.
+    try testing.expectEqual(SymbolKind.module, findSym(out.items, "app").?.kind);
+    // Imports bind under their simple name with the full dotted path.
+    try testing.expectEqualStrings("java.util.List", findSym(out.items, "List").?.import_path);
+    try testing.expectEqualStrings("java.lang.Math.max", findSym(out.items, "max").?.import_path);
+    // The class and its members are indexed.
+    try testing.expectEqual(SymbolKind.class, findSym(out.items, "Calc").?.kind);
+    const tally = findSym(out.items, "tally").?;
+    try testing.expectEqual(SymbolKind.method, tally.kind);
+    try testing.expect(tally.parent_local != null);
+    try testing.expect(hasCallRef(tally, "add"));
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "add").?.kind);
+}
+
+test "java: interface, enum, and record are their own kinds" {
+    const src =
+        \\public interface Store {
+        \\    String get(String key);
+        \\}
+        \\enum Color { RED, GREEN, BLUE }
+        \\public record Point(int x, int y) {}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.interface, findSym(out.items, "Store").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "get").?.kind);
+    try testing.expectEqual(SymbolKind.@"enum", findSym(out.items, "Color").?.kind);
+    try testing.expectEqual(SymbolKind.class, findSym(out.items, "Point").?.kind);
+}
+
+test "java: private member is not exported; public member is" {
+    const src =
+        \\public class Svc {
+        \\    private void secret() {}
+        \\    public void open() {}
+        \\}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    try testing.expect(!findSym(out.items, "secret").?.exported);
+    try testing.expect(findSym(out.items, "open").?.exported);
 }

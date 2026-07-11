@@ -8,7 +8,7 @@ it never pollutes the tool's own self-navigation; probe each app by rooting into
 it: `navgraph <verb> -C testenv/<app> --no-cache`.
 
 Together they give full-coverage exercise of **every supported language** (Zig,
-C, C++, C#, Python, JavaScript, TypeScript/TSX, Lua, Go, Rust, Ruby) and every
+C, C++, C#, Java, Python, JavaScript, TypeScript/TSX, Lua, Go, Rust, Ruby) and every
 verb. Each app was expanded/authored to exercise the full construct set of its
 language; findings from dogfooding them live in `../new-features.md`.
 
@@ -18,6 +18,7 @@ language; findings from dogfooding them live in `../new-features.md`.
 | `c_lib`       | C                  | headers + object/function-like `#define` macros, structs/enums/unions, typedefs, function pointers, static-helper call edges, dead statics |
 | `cpp_app`     | C++                | nested `namespace`, `class` + (virtual/multiple) inheritance, inline & out-of-line methods, ctor init-lists, templates, operator overloads, `enum class`, free functions |
 | `cs_app`      | C#                 | `using`, dotted + nested `namespace`, classes + inheritance, `interface` impls, generics `<T>`, properties, static members, enums, dead code |
+| `java_app`    | Java               | `package`, `import` + `import static`, package-root import resolution, abstract class + inheritance, `interface` impls, generics `<T>`, `enum`, `record`, static members, checked exceptions (`throws`/`try`/`catch`), dead code |
 | `py_fastapi`  | Python             | FastAPI `@router` with prefix, every HTTP verb, empty-path routes, async def, class services, dataclasses, dotted + **relative** imports, dunders, `test_`/`conftest` dead-code exclusion |
 | `js_express`  | JS (CommonJS+ESM)  | Express routes (all verbs, sub-routers), `require()` + destructured require, ESM `import`/`export … from`, classes, inline-arrow vs identifier handlers, `fetch`/`axios` clients, event bus |
 | `ts_frontend` | TS + TSX           | `interface`/`enum`/`type` (generics), classes, arrow components, index-file + `export … from` re-export resolution, typed-receiver member calls, `fetch({method})`, `import type` |

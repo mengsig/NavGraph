@@ -32,6 +32,7 @@ pub fn candidates(
         .lua => try luaCandidates(arena, importer_path, module),
         .rust => try rustCandidates(arena, importer_path, module),
         .ruby => try rubyCandidates(arena, importer_path, module),
+        .java => try javaCandidates(arena, module),
         else => &.{},
     };
 }
@@ -81,6 +82,31 @@ fn luaCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const
         const nvim = try joinNormalize(arena, "lua", stem);
         try list.append(arena, try concat(arena, nvim, ".lua"));
         try list.append(arena, try concat(arena, nvim, "/init.lua"));
+    }
+    return list.toOwnedSlice(arena);
+}
+
+/// Java `import com.foo.Bar;` maps the fully-qualified name to `com/foo/Bar.java`
+/// under the repo root and the common Maven/Gradle source roots. `import static
+/// a.b.C.m;` names a member, so a variant dropping the trailing segment is also
+/// offered. Wildcard imports (`com.foo.*`) name a package, not a single file.
+fn javaCandidates(arena: std.mem.Allocator, module: []const u8) ![]const []const u8 {
+    if (std.mem.indexOfScalar(u8, module, '*') != null) return &.{};
+    const slashed = try dotsToSlashes(arena, module);
+    if (slashed.len == 0) return &.{};
+    const roots = [_][]const u8{ "", "src/main/java", "src/test/java", "src" };
+    var list: std.ArrayList([]const u8) = .empty;
+    for (roots) |root| {
+        const stem = try joinNormalize(arena, root, slashed);
+        if (stem.len != 0) try list.append(arena, try concat(arena, stem, ".java"));
+    }
+    // Static-member import: also try dropping the trailing `.member` segment.
+    if (std.mem.lastIndexOfScalar(u8, slashed, '/')) |cut| {
+        const outer = slashed[0..cut];
+        for (roots) |root| {
+            const stem = try joinNormalize(arena, root, outer);
+            if (stem.len != 0) try list.append(arena, try concat(arena, stem, ".java"));
+        }
     }
     return list.toOwnedSlice(arena);
 }
@@ -303,6 +329,24 @@ test "candidates: empty module string yields no candidates for every language" {
         const c = try candidates(arena, "src/whatever.ext", "", lang);
         try t_testing.expectEqual(@as(usize, 0), c.len);
     }
+}
+
+test "candidates: java maps a fully-qualified import to source-root paths" {
+    var a = newArena();
+    defer a.deinit();
+    const arena = a.allocator();
+    const c = try candidates(arena, "src/main/java/com/foo/App.java", "com.foo.Bar", .java);
+    try t_testing.expect(c.len >= 2);
+    try t_testing.expectEqualStrings("com/foo/Bar.java", c[0]);
+    try t_testing.expectEqualStrings("src/main/java/com/foo/Bar.java", c[1]);
+}
+
+test "candidates: java wildcard import names a package, not a file" {
+    var a = newArena();
+    defer a.deinit();
+    const arena = a.allocator();
+    const c = try candidates(arena, "src/main/java/com/foo/App.java", "com.foo.*", .java);
+    try t_testing.expectEqual(@as(usize, 0), c.len);
 }
 
 test "candidates: unsupported families (c, cpp, csharp, go, unknown) return empty" {

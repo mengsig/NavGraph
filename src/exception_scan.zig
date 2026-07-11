@@ -77,7 +77,7 @@ fn scanFile(idx: *const Index, file: model.FileId, toks: []const Token, src: []c
                 try appendKeywordRaise(idx, file, toks, src, i, raises)
             else if (std.mem.eql(u8, word, "try"))
                 try appendPythonCatches(idx, file, toks, src, i, catches),
-            .js, .csharp => if (std.mem.eql(u8, word, "throw"))
+            .js, .csharp, .java => if (std.mem.eql(u8, word, "throw"))
                 try appendKeywordRaise(idx, file, toks, src, i, raises)
             else if (std.mem.eql(u8, word, "try"))
                 try appendBraceCatches(idx, file, toks, src, i, catches),
@@ -204,7 +204,7 @@ fn appendCatchTypes(idx: *const Index, owner: SymbolId, toks: []const Token, src
         try appendCatch(idx, owner, toks[catch_i], "*", protected_lo, protected_hi, exact, catches);
         return;
     }
-    if (lang == .cpp or lang == .csharp) {
+    if (lang == .cpp or lang == .csharp or lang == .java) {
         const name = braceCatchType(toks, src, lo, hi);
         try appendCatch(idx, owner, toks[catch_i], name orelse "*", protected_lo, protected_hi, exact, catches);
         return;

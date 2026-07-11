@@ -18,7 +18,7 @@ Ask precise questions ("what does `foo()` call, 2 levels deep?", "which classes
 implement this port?", "which clients hit this route?", "outline this file at
 signature detail") and get exactly the information needed — nothing more.
 
-- **Language-agnostic core.** Ships with Zig, C/C++, C#, Python, JavaScript,
+- **Language-agnostic core.** Ships with Zig, C/C++, C#, Java, Python, JavaScript,
   TypeScript, TSX, Lua, Go, Rust and Ruby.
 - **Depth control.** Walk the call graph outward (callees) or inward (callers)
   to a bounded depth.
@@ -283,7 +283,7 @@ navgraph blame negotiate
 navgraph churn src --last 50 --sort lines
 ```
 
-`hierarchy` derives nominal edges from Python, JS/TS, C++, C#, Ruby, Go
+`hierarchy` derives nominal edges from Python, JS/TS, Java, C++, C#, Ruby, Go
 embedded interfaces, and Rust trait implementations. Resolved local bases feed a
 C3-style MRO; qualified, unresolved, or ambiguous external bases retain their
 source spelling and stay marked as heuristic. If the queried type or a traversed
