@@ -25,6 +25,8 @@ pub const json_out = @import("json_out.zig");
 pub const workflow = @import("workflow.zig");
 pub const render = @import("render.zig");
 pub const viz = @import("viz.zig");
+pub const command_registry = @import("command_registry.zig");
+pub const capabilities = @import("capabilities.zig");
 pub const cli = @import("cli.zig");
 
 test {

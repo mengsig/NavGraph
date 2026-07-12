@@ -7,10 +7,18 @@ token-efficient. **For any indexed language below, use it before raw reads.**
 
 **Indexed extensions:** Python (`.py .pyi`), JS (`.js .jsx .mjs .cjs`), TS
 (`.ts .tsx .mts`), Zig (`.zig`), C (`.c .h`), C++ (`.cpp .hpp .cc .cxx .hh`),
-C# (`.cs`), Lua (`.lua`), Go (`.go`), Rust (`.rs`), Ruby (`.rb`). Representative
-files, symbols, and direct calls were confirmed in every family; this is
-heuristic indexing, not compiler/type-checker acceptance. Anything else (Java,
-Kotlin, Swift, Elixir, shell, config, markdown) → grep/read.
+C# (`.cs`), Lua (`.lua`), Go (`.go`), Rust (`.rs`), Ruby (`.rb`), Java
+(`.java`). Representative files, symbols, and direct calls were confirmed in
+every family; this is heuristic indexing, not compiler/type-checker acceptance.
+Anything else (Kotlin, Swift, Elixir, shell, config, markdown) → grep/read.
+
+<!-- navgraph-supported-languages: zig,c,cpp,csharp,python,javascript,typescript,tsx,lua,go,rust,ruby,java -->
+
+Before generating a client schema or relying on a particular binary, run
+`navgraph capabilities -j`. Its source fingerprint, language inventory,
+commands, aliases, argument shapes, applicable options, output modes, access
+classification, and trust limitations are the executable's authoritative
+contract; README/prompt prose is only workflow guidance.
 
 ## The rule
 
@@ -150,7 +158,8 @@ understand it.
   remain recursive.
 - `--no-cache` bypasses cache reads and writes for that invocation; it leaves an
   existing `.navgraph/cache` untouched. `--follow-imports` changes `unused`
-  only; other commands may accept it without effect.
+  only and is rejected elsewhere. Options outside a command's capability
+  descriptor are rejected instead of being accepted as silent no-ops.
 
 ## Output formats and limits
 

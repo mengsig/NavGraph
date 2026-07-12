@@ -63,6 +63,31 @@ pub const Language = enum {
 
 pub const Family = enum { zig, c, csharp, python, js, lua, go, rust, ruby, java, other };
 
+/// Canonical public language inventory. Detection and the capability manifest
+/// consume the same table so adding a parser family cannot silently leave agent
+/// clients advertising an older set.
+pub const Descriptor = struct {
+    language: Language,
+    name: []const u8,
+    extensions: []const []const u8,
+};
+
+pub const supported = [_]Descriptor{
+    .{ .language = .zig, .name = "zig", .extensions = &.{".zig"} },
+    .{ .language = .c, .name = "c", .extensions = &.{ ".c", ".h" } },
+    .{ .language = .cpp, .name = "cpp", .extensions = &.{ ".cc", ".cpp", ".cxx", ".hpp", ".hh" } },
+    .{ .language = .csharp, .name = "csharp", .extensions = &.{".cs"} },
+    .{ .language = .python, .name = "python", .extensions = &.{ ".py", ".pyi" } },
+    .{ .language = .javascript, .name = "javascript", .extensions = &.{ ".js", ".mjs", ".cjs", ".jsx" } },
+    .{ .language = .typescript, .name = "typescript", .extensions = &.{ ".ts", ".mts" } },
+    .{ .language = .tsx, .name = "tsx", .extensions = &.{".tsx"} },
+    .{ .language = .lua, .name = "lua", .extensions = &.{".lua"} },
+    .{ .language = .go, .name = "go", .extensions = &.{".go"} },
+    .{ .language = .rust, .name = "rust", .extensions = &.{".rs"} },
+    .{ .language = .ruby, .name = "ruby", .extensions = &.{".rb"} },
+    .{ .language = .java, .name = "java", .extensions = &.{".java"} },
+};
+
 /// Doc-comment extraction style differs enough between languages to name it.
 pub const DocStyle = enum {
     /// Zig: lines starting with `///` (and `//!`) immediately above a decl.
@@ -196,33 +221,10 @@ pub fn configFor(language: Language) Config {
 /// extension is not recognised so callers can skip non-source files.
 pub fn detect(path: []const u8) Language {
     const ext = extension(path);
-    const map = .{
-        .{ ".zig", Language.zig },
-        .{ ".c", Language.c },
-        .{ ".h", Language.c },
-        .{ ".cc", Language.cpp },
-        .{ ".cpp", Language.cpp },
-        .{ ".cxx", Language.cpp },
-        .{ ".hpp", Language.cpp },
-        .{ ".hh", Language.cpp },
-        .{ ".cs", Language.csharp },
-        .{ ".py", Language.python },
-        .{ ".pyi", Language.python },
-        .{ ".js", Language.javascript },
-        .{ ".mjs", Language.javascript },
-        .{ ".cjs", Language.javascript },
-        .{ ".jsx", Language.javascript },
-        .{ ".ts", Language.typescript },
-        .{ ".mts", Language.typescript },
-        .{ ".tsx", Language.tsx },
-        .{ ".lua", Language.lua },
-        .{ ".go", Language.go },
-        .{ ".rs", Language.rust },
-        .{ ".rb", Language.ruby },
-        .{ ".java", Language.java },
-    };
-    inline for (map) |entry| {
-        if (std.mem.eql(u8, ext, entry[0])) return entry[1];
+    inline for (supported) |descriptor| {
+        inline for (descriptor.extensions) |candidate| {
+            if (std.mem.eql(u8, ext, candidate)) return descriptor.language;
+        }
     }
     return .unknown;
 }
@@ -250,6 +252,24 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.java, detect("src/main/java/com/foo/Bar.java"));
     try std.testing.expectEqual(Language.unknown, detect("README.md"));
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
+}
+
+test "supported language descriptors cover every indexed enum exactly once" {
+    try std.testing.expectEqual(std.meta.fields(Language).len - 1, supported.len);
+    var seen = std.EnumSet(Language).initEmpty();
+    for (supported) |descriptor| {
+        try std.testing.expect(descriptor.language != .unknown);
+        try std.testing.expectEqualStrings(@tagName(descriptor.language), descriptor.name);
+        try std.testing.expect(!seen.contains(descriptor.language));
+        seen.insert(descriptor.language);
+        try std.testing.expect(descriptor.extensions.len > 0);
+        for (descriptor.extensions) |ext| {
+            try std.testing.expect(ext.len > 1 and ext[0] == '.');
+            var path_buf: [32]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "fixture{s}", .{ext});
+            try std.testing.expectEqual(descriptor.language, detect(path));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

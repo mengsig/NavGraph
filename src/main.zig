@@ -12,6 +12,7 @@ const taint = @import("taint.zig");
 const history_mod = @import("history.zig");
 const json_out = @import("json_out.zig");
 const viz = @import("viz.zig");
+const capabilities = @import("capabilities.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -50,6 +51,12 @@ pub fn main(init: std.process.Init) !void {
     };
     if (parsed.command == .help) {
         try cli.usage(out);
+        try out.flush();
+        return;
+    }
+    if (parsed.command == .capabilities) {
+        try capabilities.writeManifest(out);
+        try out.writeByte('\n');
         try out.flush();
         return;
     }
@@ -127,7 +134,7 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
             try viz.graph(out, idx, parsed.arg, parsed.options);
             break :blk true; // graph always emits a page/model
         },
-        .serve, .help => unreachable,
+        .capabilities, .serve, .help => unreachable,
     };
 }
 
@@ -231,6 +238,7 @@ fn handleServerRequest(out: *std.Io.Writer, session: *ServerSession, line: []con
     if (std.mem.startsWith(u8, method, "notifications/")) return true;
     if (id == null) return true;
     if (std.mem.eql(u8, method, "initialize")) return rpcInitialize(out, id);
+    if (std.mem.eql(u8, method, "navgraph/capabilities")) return rpcCapabilities(out, id);
     if (std.mem.eql(u8, method, "tools/list")) return rpcTools(out, id);
     if (std.mem.eql(u8, method, "tools/call")) return rpcToolCall(out, session, id, obj.get("params"));
     if (std.mem.eql(u8, method, "ping")) {
@@ -250,7 +258,26 @@ fn handleServerRequest(out: *std.Io.Writer, session: *ServerSession, line: []con
 fn rpcInitialize(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     std.debug.assert(id != null);
     try rpcResultPrefix(out, id);
-    try out.writeAll("{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"navgraph\",\"version\":\"phase3\"}}}\n");
+    try out.writeAll("{\"protocolVersion\":");
+    try json_out.writeString(out, capabilities.mcp_protocol_version);
+    try out.writeAll(",\"capabilities\":{\"tools\":{\"listChanged\":false},\"experimental\":{\"navgraph\":{\"capabilitySchema\":");
+    try json_out.writeString(out, capabilities.capability_schema);
+    try out.print(",\"capabilitySchemaVersion\":{},\"agentProtocolVersion\":", .{capabilities.capability_schema_version});
+    try json_out.writeString(out, capabilities.agent_protocol_version);
+    try out.print(",\"schemaHash\":\"wyhash64:{x:0>16}\"", .{capabilities.schemaFingerprint()});
+    try out.writeAll(",\"capabilitiesMethod\":\"navgraph/capabilities\",\"capabilitiesTool\":\"navgraph.capabilities\",\"buildId\":\"");
+    try capabilities.writeBuildId(out);
+    try out.writeAll("\"}}},\"serverInfo\":{\"name\":\"navgraph\",\"version\":\"");
+    try capabilities.writeBuildVersion(out);
+    try out.writeAll("\"}}}\n");
+    return true;
+}
+
+fn rpcCapabilities(out: *std.Io.Writer, id: ?std.json.Value) !bool {
+    std.debug.assert(id != null);
+    try rpcResultPrefix(out, id);
+    try capabilities.writeManifest(out);
+    try out.writeAll("}\n");
     return true;
 }
 
@@ -258,7 +285,8 @@ fn rpcTools(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     std.debug.assert(id != null);
     try rpcResultPrefix(out, id);
     try out.writeAll("{\"tools\":[");
-    try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Run a NavGraph command against the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"]}},");
+    try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Run a NavGraph command against the server's in-memory index. Call navgraph.capabilities first to discover canonical commands, aliases, argument shapes, applicable options, output modes, access class, and trust limitations. Most commands are read-only; rename mutates workspace files unless --preview is supplied.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"],\"additionalProperties\":false}},");
+    try out.writeAll("{\"name\":\"navgraph.capabilities\",\"description\":\"Return NavGraph's machine-readable protocol, build identity, language, command, option, output, access, and trust contract without rebuilding the index.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},");
     try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}}]}}\n");
     return true;
 }
@@ -350,9 +378,36 @@ fn rpcToolCall(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value
     }
     if (std.mem.eql(u8, name.string, "navgraph"))
         return runServerTool(out, session, id, arguments.object.get("args"));
+    if (std.mem.eql(u8, name.string, "navgraph.capabilities"))
+        return rpcCapabilitiesTool(out, session.gpa, id, arguments);
     if (std.mem.eql(u8, name.string, "navgraph.reload"))
         return rpcReloadTool(out, session, id, arguments);
     try rpcError(out, id, -32602, "unknown tool");
+    return true;
+}
+
+fn rpcCapabilitiesTool(
+    out: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    id: ?std.json.Value,
+    arguments: std.json.Value,
+) !bool {
+    std.debug.assert(id != null);
+    if (arguments != .object or arguments.object.count() != 0) {
+        try rpcError(out, id, -32602, "navgraph.capabilities takes no arguments");
+        return true;
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    defer allocating.deinit();
+    try capabilities.writeManifest(&allocating.writer);
+    try rpcResultPrefix(out, id);
+    try out.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+    try json_out.writeString(out, allocating.written());
+    try out.writeAll("}],\"isError\":false,\"schema\":");
+    try json_out.writeString(out, capabilities.capability_schema);
+    try out.writeAll("}}\n");
     return true;
 }
 
@@ -378,8 +433,9 @@ fn runServerTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Val
         try rpcError(out, id, -32602, if (cli.diag().len != 0) cli.diag() else "invalid navgraph arguments");
         return true;
     };
-    if (request.command == .serve or request.command == .help or !std.mem.eql(u8, request.root, ".")) {
-        try rpcError(out, id, -32602, "serve, help, and -C are not allowed inside a server request");
+    if (request.command == .capabilities) return rpcCapabilities(out, id);
+    if (!cli.registry.descriptor(request.command).server_available or !std.mem.eql(u8, request.root, ".")) {
+        try rpcError(out, id, -32602, "this command or -C is not allowed inside a server request");
         return true;
     }
     request.root = session.root;
@@ -1045,6 +1101,85 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32601"));
     try testing.expect(has(aw.written(), "\"isError\":false,\"found\":false"));
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32600"));
+}
+
+test "MCP identity and capability surfaces share the live manifest contract" {
+    const testing = std.testing;
+    const io = testing.io;
+    var fx = try sampleFixture(io);
+    defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    defer session.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"navgraph/capabilities\"}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.capabilities\",\"arguments\":{}}}"));
+
+    var lines = std.mem.tokenizeScalar(u8, aw.written(), '\n');
+    var responses: [4]std.json.Parsed(std.json.Value) = undefined;
+    var response_count: usize = 0;
+    defer for (responses[0..response_count]) |*response| response.deinit();
+    while (lines.next()) |line| {
+        responses[response_count] = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        response_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), response_count);
+
+    const initialize = responses[0].value.object.get("result").?.object;
+    try testing.expectEqualStrings(capabilities.mcp_protocol_version, initialize.get("protocolVersion").?.string);
+    const server_version = initialize.get("serverInfo").?.object.get("version").?.string;
+    try testing.expect(std.mem.startsWith(u8, server_version, capabilities.product_version));
+    try testing.expect(std.mem.indexOf(u8, server_version, "src.") != null);
+    const init_navgraph = initialize.get("capabilities").?.object.get("experimental").?.object.get("navgraph").?.object;
+    try testing.expectEqualStrings(capabilities.capability_schema, init_navgraph.get("capabilitySchema").?.string);
+
+    const tools = responses[1].value.object.get("result").?.object;
+    try testing.expectEqual(@as(usize, 3), tools.get("tools").?.array.items.len);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.capabilities") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "phase3") == null);
+
+    const direct_manifest = responses[2].value.object.get("result").?.object;
+    try testing.expectEqualStrings(capabilities.capability_schema, direct_manifest.get("schema").?.string);
+    try testing.expect(direct_manifest.get("build").?.object.get("buildId") != null);
+    try testing.expectEqualStrings(direct_manifest.get("schemaHash").?.string, init_navgraph.get("schemaHash").?.string);
+
+    const tool_result = responses[3].value.object.get("result").?.object;
+    const manifest_text = tool_result.get("content").?.array.items[0].object.get("text").?.string;
+    var manifest = try std.json.parseFromSlice(std.json.Value, testing.allocator, manifest_text, .{});
+    defer manifest.deinit();
+    try testing.expectEqualStrings(capabilities.capability_schema, manifest.value.object.get("schema").?.string);
+    try testing.expect(std.mem.indexOf(u8, manifest_text, "\"name\":\"java\"") != null);
+    try testing.expectEqualStrings(direct_manifest.get("schemaHash").?.string, manifest.value.object.get("schemaHash").?.string);
+}
+
+test "README and agent prompt carry the generated language inventory marker" {
+    const testing = std.testing;
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const readme = try std.Io.Dir.cwd().readFileAlloc(io, "README.md", allocator, .limited(2 * 1024 * 1024));
+    defer allocator.free(readme);
+    const prompt = try std.Io.Dir.cwd().readFileAlloc(io, "prompt.md", allocator, .limited(2 * 1024 * 1024));
+    defer allocator.free(prompt);
+
+    var marker_buf: std.ArrayList(u8) = .empty;
+    defer marker_buf.deinit(allocator);
+    var marker_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &marker_buf);
+    defer marker_writer.deinit();
+    try marker_writer.writer.writeAll("navgraph-supported-languages: ");
+    for (&@import("language.zig").supported, 0..) |language_desc, i| {
+        if (i != 0) try marker_writer.writer.writeByte(',');
+        try marker_writer.writer.writeAll(language_desc.name);
+    }
+    const marker = marker_writer.written();
+    try testing.expect(std.mem.indexOf(u8, readme, marker) != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, marker) != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "Anything else (Java") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "(`.java`)") != null);
 }
 
 test "server reload atomically refreshes requests and notifications" {

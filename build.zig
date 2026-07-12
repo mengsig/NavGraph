@@ -66,6 +66,10 @@ pub fn build(b: *std.Build) void {
     // branch's matching cache instead of thrashing it.
     const build_opts = b.addOptions();
     build_opts.addOption(u64, "cache_key", srcFingerprint(b));
+    // Release/packaging systems may supply a VCS revision without making the
+    // build graph invoke git (which would be non-hermetic and fail in source
+    // archives). The source fingerprint remains authoritative when omitted.
+    build_opts.addOption([]const u8, "revision", b.option([]const u8, "revision", "source revision embedded in capability metadata") orelse "");
     const build_opts_mod = build_opts.createModule();
     mod.addImport("build_options", build_opts_mod);
 
@@ -137,6 +141,7 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    run_mod_tests.setCwd(b.path("."));
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -147,6 +152,7 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    run_exe_tests.setCwd(b.path("."));
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will

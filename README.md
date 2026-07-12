@@ -20,6 +20,7 @@ signature detail") and get exactly the information needed — nothing more.
 
 - **Language-agnostic core.** Ships with Zig, C/C++, C#, Java, Python, JavaScript,
   TypeScript, TSX, Lua, Go, Rust and Ruby.
+  <!-- navgraph-supported-languages: zig,c,cpp,csharp,python,javascript,typescript,tsx,lua,go,rust,ruby,java -->
 - **Depth control.** Walk the call graph outward (callees) or inward (callers)
   to a bounded depth.
 - **Verbosity levels.** `names` → `sig` → `doc` → `full`, so you spend tokens
@@ -55,6 +56,20 @@ Run the tests:
 ```sh
 zig build test --summary all
 ```
+
+Identify a binary and negotiate its live contract without indexing a repository:
+
+```sh
+navgraph capabilities -j
+navgraph version              # alias; emits the same JSON manifest
+```
+
+The manifest is `navgraph.capabilities.v1`. It includes the content-addressed
+source fingerprint/build ID, protocol and schema versions, supported languages
+and extensions, canonical commands and aliases, positional arguments, applicable
+options, output modes, read/write classification, server/reload features, and
+known trust limitations. Clients should negotiate this output instead of copying
+the README or assuming that an executable at a familiar path matches a checkout.
 
 Estimate test coverage — the fraction of `fn`/`method` symbols reachable in the
 call graph from a test (kcov cannot read Zig 0.16's DWARF5, so there is no
@@ -244,7 +259,9 @@ navgraph serve -C .
 ```
 
 It implements `initialize`, `tools/list`, `tools/call`, and
-`workspace/reload` using one JSON-RPC 2.0 object per line. The `navgraph` tool's
+`workspace/reload` using one JSON-RPC 2.0 object per line. It also exposes the
+same manifest through the `navgraph/capabilities` method and the
+`navgraph.capabilities` tool. The `navgraph` tool's
 `arguments` object accepts `{"args":["search","Foo","-j"]}`. The separate
 `navgraph.reload` tool accepts `{"noCache":true}` and atomically swaps in a
 fresh index only after the rebuild succeeds. A no-id `workspace/reload`

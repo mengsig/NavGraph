@@ -5,47 +5,9 @@ const std = @import("std");
 const query = @import("query.zig");
 const render = @import("render.zig");
 const model = @import("model.zig");
+pub const registry = @import("command_registry.zig");
 
-pub const Command = enum {
-    outline,
-    def,
-    docs,
-    calls,
-    callers,
-    search,
-    routes,
-    events,
-    conforms,
-    hierarchy,
-    raises,
-    catches,
-    neighbors,
-    unused,
-    imports,
-    importers,
-    path,
-    flow,
-    taint,
-    reaches,
-    affected,
-    hot,
-    diff,
-    history,
-    blame,
-    churn,
-    collisions,
-    files,
-    status,
-    read,
-    strings,
-    todos,
-    edits,
-    rename,
-    coverage,
-    graph,
-    serve,
-    help,
-};
+pub const Command = registry.Command;
 
 pub const Parsed = struct {
     command: Command,
@@ -56,6 +18,10 @@ pub const Parsed = struct {
     arg2: []const u8 = "",
     root: []const u8 = ".",
     options: query.Options = .{},
+    /// Public options explicitly selected by argv. This lets descriptor-driven
+    /// applicability reject historical no-op flag combinations without trying
+    /// to infer intent from default-valued `query.Options` fields.
+    used_options: std.EnumSet(registry.Option) = std.EnumSet(registry.Option).initEmpty(),
     /// Use the incremental on-disk cache (`.navgraph/cache`). Disabled by
     /// `--no-cache` for a guaranteed-clean rebuild.
     use_cache: bool = true,
@@ -133,6 +99,8 @@ const usage_text =
     \\  coverage [path]    % of fn/method reachable from a test (call-graph, no instrumentation)
     \\  graph [path]       Interactive HTML visualization of the code graph
     \\                     (redirect stdout to a .html file; -j emits the raw JSON model)
+    \\  capabilities       Machine-readable protocol, build, language, command,
+    \\                     option, output, safety, and trust metadata (alias: version)
     \\  serve             Long-lived JSON-RPC/MCP server over stdin/stdout
     \\  help               Show this help
     \\
@@ -250,7 +218,7 @@ pub fn reason(err: ParseError) []const u8 {
 pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
     diag_msg = "";
     if (args.len == 0) return error.Usage;
-    const command = parseCommand(args[0]) orelse {
+    const command = registry.parseCommand(args[0]) orelse {
         if (args[0].len != 0 and args[0][0] == '-') {
             return fail(error.Usage, "flags go after the command: navgraph <command> [arg] [flags]", .{});
         }
@@ -258,15 +226,16 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
     };
     if (command == .help) return .{ .command = .help };
 
+    const command_descriptor = registry.descriptor(command);
     var result = Parsed{ .command = command };
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (a.len != 0 and a[0] == '-') {
             i = try parseFlag(args, i, &result);
-        } else if (result.arg.len == 0) {
+        } else if (result.arg.len == 0 and command_descriptor.arguments.len >= 1) {
             result.arg = a;
-        } else if (result.arg2.len == 0 and (command == .path or command == .rename)) {
+        } else if (result.arg2.len == 0 and command_descriptor.arguments.len >= 2) {
             result.arg2 = a;
         } else {
             return fail(error.Usage, "unexpected extra argument '{s}'", .{a});
@@ -283,60 +252,20 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
     return result;
 }
 
+/// Kept as a narrow local wrapper for parser tests and callers that audit the
+/// CLI module; spelling truth lives in `command_registry.zig`.
 fn parseCommand(s: []const u8) ?Command {
-    const map = .{
-        .{ "outline", Command.outline },       .{ "o", Command.outline },
-        .{ "def", Command.def },               .{ "show", Command.def },
-        .{ "docs", Command.docs },             .{ "doc", Command.docs },
-        .{ "calls", Command.calls },           .{ "callees", Command.calls },
-        .{ "callers", Command.callers },       .{ "uses", Command.callers },
-        .{ "search", Command.search },         .{ "grep", Command.search },
-        .{ "routes", Command.routes },         .{ "api", Command.routes },
-        .{ "conforms", Command.conforms },     .{ "impls", Command.conforms },
-        .{ "implements", Command.conforms },   .{ "hierarchy", Command.hierarchy },
-        .{ "hier", Command.hierarchy },        .{ "raises", Command.raises },
-        .{ "throws", Command.raises },         .{ "catches", Command.catches },
-        .{ "handles", Command.catches },       .{ "events", Command.events },
-        .{ "dispatch", Command.events },       .{ "bus", Command.events },
-        .{ "neighbors", Command.neighbors },   .{ "near", Command.neighbors },
-        .{ "unused", Command.unused },         .{ "dead", Command.unused },
-        .{ "imports", Command.imports },       .{ "importers", Command.importers },
-        .{ "path", Command.path },             .{ "flow", Command.flow },
-        .{ "dataflow", Command.flow },         .{ "taint", Command.taint },
-        .{ "security", Command.taint },        .{ "reaches", Command.reaches },
-        .{ "reachable", Command.reaches },     .{ "affected", Command.affected },
-        .{ "impact", Command.affected },       .{ "collisions", Command.collisions },
-        .{ "duplicates", Command.collisions }, .{ "diff", Command.diff },
-        .{ "changed", Command.diff },          .{ "history", Command.history },
-        .{ "hist", Command.history },          .{ "blame", Command.blame },
-        .{ "churn", Command.churn },           .{ "hot", Command.hot },
-        .{ "central", Command.hot },           .{ "files", Command.files },
-        .{ "manifest", Command.files },        .{ "status", Command.status },
-        .{ "snapshot", Command.status },       .{ "read", Command.read },
-        .{ "cat", Command.read },              .{ "strings", Command.strings },
-        .{ "str", Command.strings },           .{ "literals", Command.strings },
-        .{ "todos", Command.todos },           .{ "todo", Command.todos },
-        .{ "edits", Command.edits },           .{ "edit-sites", Command.edits },
-        .{ "rename", Command.rename },         .{ "serve", Command.serve },
-        .{ "mcp", Command.serve },             .{ "coverage", Command.coverage },
-        .{ "cov", Command.coverage },          .{ "graph", Command.graph },
-        .{ "viz", Command.graph },             .{ "visualize", Command.graph },
-        .{ "html", Command.graph },            .{ "help", Command.help },
-        .{ "--help", Command.help },           .{ "-h", Command.help },
-    };
-    inline for (map) |e| if (std.mem.eql(u8, s, e[0])) return e[1];
-    return null;
+    return registry.parseCommand(s);
 }
 
 /// Whether `command` has the positional arguments it requires. `outline`,
 /// `routes`, `events`, `unused` and `imports` accept an optional filter; `path`
 /// needs two.
 fn hasRequiredArgs(command: Command, p: Parsed) bool {
-    return switch (command) {
-        .outline, .routes, .events, .unused, .imports, .hot, .files, .status, .diff, .churn, .coverage, .graph, .collisions, .affected, .todos, .serve => true,
-        .path, .rename => p.arg.len != 0 and p.arg2.len != 0,
-        else => p.arg.len != 0,
-    };
+    const arguments = registry.descriptor(command).arguments;
+    if (arguments.len >= 1 and arguments[0].required and p.arg.len == 0) return false;
+    if (arguments.len >= 2 and arguments[1].required and p.arg2.len == 0) return false;
+    return true;
 }
 
 /// Parse a flag at index `i`, returning the index of the last token consumed.
@@ -347,47 +276,56 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     const f = splitFlag(raw);
 
     if (eqAny(f.name, &.{ "-v", "--verbosity" })) {
+        out.used_options.insert(.verbosity);
         const val = try f.value(args, i, f.name);
         out.options.verbosity = render.Verbosity.parse(val) orelse
             return fail(error.BadValue, "invalid value '{s}' for -v/--verbosity (expected names|sig|doc|full)", .{val});
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-d", "--depth" })) {
+        out.used_options.insert(.depth);
         out.options.depth = try parseUint(try f.value(args, i, f.name), "-d/--depth");
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-l", "--limit" })) {
+        out.used_options.insert(.limit);
         out.options.limit = try parseUint(try f.value(args, i, f.name), "-l/--limit");
         if (out.options.limit == 0)
             return fail(error.BadValue, "-l/--limit must be at least 1", .{});
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "--budget", "--max-nodes" })) {
+        out.used_options.insert(if (std.mem.eql(u8, f.name, "--budget")) .budget else .max_nodes);
         const value = try parseUint(try f.value(args, i, f.name), f.name);
         if (value == 0) return fail(error.BadValue, "{s} must be at least 1", .{f.name});
         if (std.mem.eql(u8, f.name, "--budget")) out.options.budget = value else out.options.max_nodes = value;
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--after")) {
+        out.used_options.insert(.after);
         out.options.after = try parseCursor(try f.value(args, i, f.name));
         out.options.after_set = true;
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--since")) {
+        out.used_options.insert(.since);
         out.options.since = try f.value(args, i, f.name);
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--last")) {
+        out.used_options.insert(.last);
         out.options.history_last = try parseUint(try f.value(args, i, f.name), "--last");
         if (out.options.history_last == 0) return fail(error.BadValue, "--last must be at least 1", .{});
         out.options.history_last_set = true;
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-C", "--root" })) {
+        out.used_options.insert(.root);
         out.root = try f.value(args, i, f.name);
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-k", "--kind" })) {
+        out.used_options.insert(.kind);
         const val = try f.value(args, i, f.name);
         var it = std.mem.tokenizeScalar(u8, val, ',');
         while (it.next()) |raw_kind| {
@@ -399,6 +337,7 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         return f.next(i);
     }
     if (eqAny(f.name, &.{"--sort"})) {
+        out.used_options.insert(.sort);
         const val = try f.value(args, i, f.name);
         if (out.command == .files) {
             out.options.file_sort = query.FileSort.parse(val) orelse
@@ -413,23 +352,27 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "--on-type", "--to" })) {
+        out.used_options.insert(if (std.mem.eql(u8, f.name, "--on-type")) .on_type else .to);
         const val = try f.value(args, i, f.name);
         if (std.mem.eql(u8, f.name, "--on-type")) out.options.on_type = val else out.options.flow_to = val;
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-t", "--tests" })) {
+        out.used_options.insert(.tests);
         const val = try f.value(args, i, f.name);
         out.options.tests = query.TestScope.parse(val) orelse
             return fail(error.BadValue, "invalid value '{s}' for -t/--tests (expected with|without|only)", .{val});
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-p", "--vis" })) {
+        out.used_options.insert(.visibility);
         const val = try f.value(args, i, f.name);
         out.options.visibility = query.Vis.parse(val) orelse
             return fail(error.BadValue, "invalid value '{s}' for -p/--vis (expected public|private|all)", .{val});
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--handler")) {
+        out.used_options.insert(.handler);
         out.options.routes_handler = try f.value(args, i, f.name);
         return f.next(i);
     }
@@ -437,112 +380,139 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     if (f.inline_val != null)
         return fail(error.BadValue, "flag {s} takes no value", .{f.name});
     if (eqAny(f.name, &.{"--no-tests"})) {
+        out.used_options.insert(.tests);
         out.options.tests = .without;
         return i;
     }
     if (eqAny(f.name, &.{"--tests-only"})) {
+        out.used_options.insert(.tests);
         out.options.tests = .only;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--summary")) {
+        out.used_options.insert(.summary);
         out.options.summary = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--from-tests")) {
+        out.used_options.insert(.from_tests);
         out.options.from_tests = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--preview")) {
+        out.used_options.insert(.preview);
         out.options.preview = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--exact-source")) {
+        out.used_options.insert(.exact_source);
         out.options.exact_source = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-i", "--impls" })) {
+        out.used_options.insert(.impls);
         out.options.impls = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--overrides")) {
+        out.used_options.insert(.overrides);
         out.options.hierarchy_overrides = true;
         return i;
     }
     if (eqAny(f.name, &.{ "--public", "--no-private" })) {
+        out.used_options.insert(.visibility);
         out.options.visibility = .public;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--private")) {
+        out.used_options.insert(.visibility);
         out.options.visibility = .private;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--clients")) {
+        out.used_options.insert(.clients);
         out.options.routes_clients = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--unhit")) {
+        out.used_options.insert(.unhit);
         out.options.routes_unhit = true;
         return i;
     }
     if (eqAny(f.name, &.{ "--orphan-calls", "--orphan", "--orphans" })) {
+        out.used_options.insert(.orphan_calls);
         out.options.routes_orphan_calls = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-w", "--writers" })) {
+        out.used_options.insert(.writers);
         out.options.writers = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--readers")) {
+        out.used_options.insert(.readers);
         out.options.readers = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-u", "--unread" })) {
+        out.used_options.insert(.unread);
         out.options.unread = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--duplicates")) {
+        out.used_options.insert(.duplicates);
         out.options.duplicates = true;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--members")) {
+        out.used_options.insert(.members);
         out.options.collision_members = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-s", "--strict" })) {
+        out.used_options.insert(.strict);
         out.options.strict = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-j", "--json" })) {
+        out.used_options.insert(.format);
         if (out.options.format == .jsonl) return fail(error.Usage, "--json and --jsonl are mutually exclusive", .{});
         out.options.format = .json;
         return i;
     }
     if (std.mem.eql(u8, f.name, "--jsonl")) {
+        out.used_options.insert(.format);
         if (out.options.format == .json) return fail(error.Usage, "--json and --jsonl are mutually exclusive", .{});
         out.options.format = .jsonl;
         return i;
     }
     if (eqAny(f.name, &.{ "-r", "--refs" })) {
+        out.used_options.insert(.refs);
         out.options.refs = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-e", "--exact" })) {
+        out.used_options.insert(.exact);
         out.options.exact = true;
         return i;
     }
     if (eqAny(f.name, &.{"--no-recurse"})) {
+        out.used_options.insert(.no_recurse);
         out.options.no_recurse = true;
         return i;
     }
     if (eqAny(f.name, &.{"--no-cache"})) {
+        out.used_options.insert(.no_cache);
         out.use_cache = false;
         return i;
     }
     if (eqAny(f.name, &.{"--no-public"})) {
+        out.used_options.insert(.no_public);
         out.options.unused_skip_exported = true;
         return i;
     }
     if (eqAny(f.name, &.{"--follow-imports"})) {
+        out.used_options.insert(.follow_imports);
         out.options.unused_follow_imports = true;
         return i;
     }
@@ -593,6 +563,17 @@ fn splitFlag(raw: []const u8) SplitFlag {
 
 fn validateCommandOptions(parsed: Parsed) ParseError!void {
     const opts = parsed.options;
+    inline for (std.meta.fields(registry.Option)) |field| {
+        const option = @field(registry.Option, field.name);
+        if (parsed.used_options.contains(option) and !registry.hasOption(parsed.command, option)) {
+            return fail(error.Usage, "option '{s}' does not apply to {s}", .{ registry.optionDescriptor(option).name, @tagName(parsed.command) });
+        }
+    }
+    for (registry.descriptor(parsed.command).required_options) |option| {
+        if (!parsed.used_options.contains(option)) {
+            return fail(error.Usage, "{s} requires option '{s}'", .{ @tagName(parsed.command), registry.optionDescriptor(option).name });
+        }
+    }
     if (opts.impls and parsed.command != .calls and parsed.command != .callers and
         parsed.command != .neighbors and parsed.command != .path and parsed.command != .reaches and parsed.command != .affected)
     {
@@ -615,8 +596,6 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         return fail(error.Usage, "flow filters apply only to flow or search --refs", .{});
     if (opts.flow_to.len != 0 and parsed.command != .flow and parsed.command != .taint)
         return fail(error.Usage, "--to applies only to flow and taint", .{});
-    if (parsed.command == .taint and opts.flow_to.len == 0)
-        return fail(error.Usage, "taint requires a sink: navgraph taint <source> --to <sink>", .{});
     if (opts.from_tests and parsed.command != .reaches)
         return fail(error.Usage, "--from-tests applies only to reaches", .{});
     if (opts.since.len != 0 and parsed.command != .affected and parsed.command != .churn)
@@ -633,10 +612,7 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         parsed.command == .reaches or parsed.command == .affected;
     if (compact and !compact_command)
         return fail(error.Usage, "--budget/--max-nodes/--summary require a traversal or ranked listing", .{});
-    const jsonl_command = parsed.command == .outline or parsed.command == .search or parsed.command == .hot or
-        parsed.command == .todos or parsed.command == .reaches or parsed.command == .affected or parsed.command == .edits or
-        parsed.command == .status;
-    if (opts.format == .jsonl and !jsonl_command)
+    if (opts.format == .jsonl and !registry.supportsOutput(parsed.command, .jsonl))
         return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, edits, and status", .{});
     if (opts.after_set and opts.format != .jsonl)
         return fail(error.Usage, "--after requires --jsonl", .{});
@@ -691,6 +667,34 @@ test "parse basic commands and flags" {
 test "--help anywhere resolves to the help command" {
     try std.testing.expectEqual(Command.help, (try parse(&.{ "search", "--help" })).command);
     try std.testing.expectEqual(Command.help, (try parse(&.{ "def", "x", "-h" })).command);
+}
+
+test "capabilities is a no-positional metadata command with version aliases" {
+    const direct = try parse(&.{ "capabilities", "-j" });
+    try std.testing.expectEqual(Command.capabilities, direct.command);
+    try std.testing.expectEqual(query.OutputFormat.json, direct.options.format);
+    try std.testing.expect(!registry.descriptor(direct.command).requires_index);
+    try std.testing.expectEqual(Command.capabilities, (try parse(&.{"version"})).command);
+    try std.testing.expectEqual(Command.capabilities, (try parse(&.{"--version"})).command);
+    try std.testing.expectError(error.Usage, parse(&.{ "capabilities", "unexpected" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "capabilities", "--no-cache" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "capabilities", "--jsonl" }));
+}
+
+test "descriptor applicability rejects accepted-but-meaningless flag combinations" {
+    try std.testing.expectError(error.Usage, parse(&.{ "def", "x", "--no-recurse" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "read", "x.zig", "--limit", "10" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "serve", "--json" }));
+    try std.testing.expect((try parse(&.{ "outline", "src", "--no-recurse" })).options.no_recurse);
+    try std.testing.expect((try parse(&.{ "rename", "Old", "New", "--preview" })).options.preview);
+}
+
+test "help lists every canonical command from the registry" {
+    for (&registry.command_descriptors) |command| {
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "  {s}", .{command.name});
+        try std.testing.expect(std.mem.indexOf(u8, usage_text, needle) != null);
+    }
 }
 
 test "parse diagnostics: named flag, bad kind, zero limit, flag-before-command" {
