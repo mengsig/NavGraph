@@ -26,7 +26,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE9";
+const magic = "NGCACHE10";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -139,6 +139,8 @@ fn skipSymbol(cur: *Cursor) !void {
     _ = try cur.getU8(); // modifiers
     _ = try cur.getStr(); // doc
     _ = try cur.getStr(); // import_path
+    _ = try cur.getStr(); // receiver
+    _ = try cur.getStr(); // impl_protocol
     const ref_count = try cur.getU32();
     var r: u32 = 0;
     while (r < ref_count) : (r += 1) {
@@ -201,6 +203,8 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
     const modifiers: model.Mods = @bitCast(try cur.getU8());
     const doc = try arena.dupe(u8, try cur.getStr());
     const import_path = try arena.dupe(u8, try cur.getStr());
+    const receiver = try arena.dupe(u8, try cur.getStr());
+    const impl_protocol = try arena.dupe(u8, try cur.getStr());
     std.debug.assert(span_start <= sig_end and sig_end <= span_end);
     return .{
         .name = name,
@@ -215,6 +219,8 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
         .parent_local = if (parent_raw == invalid_local) null else parent_raw,
         .refs = try readRefs(arena, cur),
         .bindings = try readBindings(arena, cur),
+        .receiver = receiver,
+        .impl_protocol = impl_protocol,
         .import_path = import_path,
     };
 }
@@ -306,21 +312,31 @@ fn writeFile(
     try putStr(gpa, buf, file.text);
     try putU32(gpa, buf, file.sym_end - file.sym_start);
     var i = file.sym_start;
-    while (i < file.sym_end) : (i += 1) try writeSymbol(gpa, buf, symbols[i], file.sym_start);
+    while (i < file.sym_end) : (i += 1) {
+        try writeSymbol(gpa, buf, symbols[i], file.sym_start, file.sym_end);
+    }
 }
 
-fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbol, base: u32) !void {
+fn writeSymbol(
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    sym: model.Symbol,
+    base: u32,
+    end: u32,
+) !void {
     try putStr(gpa, buf, sym.name);
     try buf.append(gpa, @intFromEnum(sym.kind));
     try putU32(gpa, buf, sym.line);
     try putU32(gpa, buf, sym.span_start);
     try putU32(gpa, buf, sym.span_end);
     try putU32(gpa, buf, sym.sig_end);
-    try putU32(gpa, buf, localParent(sym, base));
+    try putU32(gpa, buf, localParent(sym, base, end));
     try buf.append(gpa, @intFromBool(sym.exported));
     try buf.append(gpa, @as(u8, @bitCast(sym.modifiers)));
     try putStr(gpa, buf, sym.doc);
     try putStr(gpa, buf, sym.import_path);
+    try putStr(gpa, buf, sym.receiver);
+    try putStr(gpa, buf, sym.impl_protocol);
     try putU32(gpa, buf, @intCast(sym.refs.len));
     for (sym.refs) |ref| {
         try putStr(gpa, buf, ref.name);
@@ -341,11 +357,14 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
     }
 }
 
-/// A parent symbol id is always within the same file range; store it relative
-/// to the file base so it survives global-id renumbering. `invalid` → sentinel.
-fn localParent(sym: model.Symbol, base: u32) u32 {
+/// Store same-file parents relative to the file base so they survive global-id
+/// renumbering. Cross-file parents are reconstructed from receiver metadata;
+/// `invalid` and cross-file ids both serialize as the sentinel.
+fn localParent(sym: model.Symbol, base: u32, end: u32) u32 {
     if (sym.parent == model.invalid_symbol) return invalid_local;
-    std.debug.assert(sym.parent >= base);
+    // Cross-file owners are reconstructed from `receiver` after all cached
+    // files are restored; the per-file cache can only encode local parent ids.
+    if (sym.parent < base or sym.parent >= end) return invalid_local;
     return sym.parent - base;
 }
 
@@ -522,6 +541,8 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
         .modifiers = p.modifiers,
         .refs = p.refs,
         .bindings = p.bindings,
+        .receiver = p.receiver,
+        .impl_protocol = p.impl_protocol,
     };
 }
 
@@ -569,6 +590,8 @@ fn encSym(
     try putU8(a, buf, mods_byte);
     try putStr(a, buf, doc);
     try putStr(a, buf, import_path);
+    try putStr(a, buf, ""); // receiver
+    try putStr(a, buf, ""); // impl_protocol
     try putU32(a, buf, @intCast(refs.len));
     for (refs) |r| {
         try putStr(a, buf, r.name);
@@ -636,6 +659,8 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
     try t.expectEqual(@as(u8, @bitCast(expected.modifiers)), @as(u8, @bitCast(got.modifiers)));
     try t.expectEqualStrings(expected.doc, got.doc);
     try t.expectEqualStrings(expected.import_path, got.import_path);
+    try t.expectEqualStrings(expected.receiver, got.receiver);
+    try t.expectEqualStrings(expected.impl_protocol, got.impl_protocol);
     if (expected.parent == model.invalid_symbol) {
         try t.expectEqual(@as(?u32, null), got.parent_local);
     } else {
@@ -685,7 +710,7 @@ test "full round-trip preserves every field across two files with distinct langu
 
     var syms = [_]model.Symbol{
         .{ .id = 0, .file = 0, .name = "Container", .kind = .@"struct", .line = 1, .span_start = 0, .span_end = 20, .sig_end = 10, .doc = "/// A container", .parent = model.invalid_symbol, .exported = true, .refs = &no_refs },
-        .{ .id = 1, .file = 0, .name = "run", .kind = .method, .line = 3, .span_start = 20, .span_end = 30, .sig_end = 25, .doc = "", .parent = 0, .exported = false, .modifiers = .{ .is_async = true, .getter = true }, .refs = &refs1, .bindings = &binds1 },
+        .{ .id = 1, .file = 0, .name = "run", .kind = .method, .line = 3, .span_start = 20, .span_end = 30, .sig_end = 25, .doc = "", .parent = 0, .exported = false, .modifiers = .{ .is_async = true, .getter = true }, .refs = &refs1, .bindings = &binds1, .receiver = "Container", .impl_protocol = "Runnable" },
         // File B (python): an import (carries import_path) + a variable whose
         // parent points base-relative into file B to exercise the base offset.
         .{ .id = 2, .file = 1, .name = "np", .kind = .import, .line = 1, .span_start = 0, .span_end = 10, .sig_end = 8, .doc = "", .parent = model.invalid_symbol, .exported = false, .import_path = "numpy", .refs = &no_refs },

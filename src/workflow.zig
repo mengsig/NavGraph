@@ -884,6 +884,12 @@ fn editSiteObject(w: *Writer, idx: *const Index, site: EditSite) !void {
     try json_out.writeString(w, @tagName(site.kind));
     try w.writeAll(",\"in\":");
     try json_out.writeString(w, idx.graph.symbols[site.owner].name);
+    // `RenamePlan.sites` contains only definition spans and references proven
+    // exact by the resolver. Heuristic/unrecoverable occurrences are excluded
+    // and counted separately as `review_sites`; make that split explicit on
+    // every returned span so an editing agent never has to infer safety.
+    try w.writeAll(",\"exact\":true,\"editable\":true,\"provenance\":");
+    try json_out.writeString(w, if (site.kind == .definition) "indexed_definition" else "resolved_reference");
     try w.writeByte('}');
 }
 

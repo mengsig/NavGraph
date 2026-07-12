@@ -44,7 +44,7 @@ pub const SymbolKind = enum {
         inline for (@typeInfo(SymbolKind).@"enum".fields) |f| {
             if (std.mem.eql(u8, t, @field(SymbolKind, f.name).tag())) return true;
         }
-        inline for (.{ "function", "func", "constant", "variable" }) |a| {
+        inline for (.{ "function", "func", "constant", "variable", "interface" }) |a| {
             if (std.mem.eql(u8, t, a)) return true;
         }
         return false;
@@ -87,6 +87,35 @@ pub const RefKind = enum {
     read,
     import,
     route_call,
+};
+
+/// Confidence assigned to a reference after project-wide resolution. `exact`
+/// remains the compatibility/strict-traversal bit; this enum explains every
+/// non-exact edge without forcing consumers to reverse-engineer that boolean.
+pub const ResolutionStatus = enum {
+    unresolved,
+    exact,
+    inferred,
+    heuristic,
+    ambiguous,
+};
+
+/// Bounded provenance for the resolver branch that produced (or attempted to
+/// produce) a reference edge. This deliberately describes evidence, not every
+/// language-specific parser detail, so the JSON contract stays small/stable.
+pub const ResolutionReason = enum {
+    none,
+    lexical_member,
+    self_member,
+    typed_receiver,
+    type_qualifier,
+    local_import,
+    static_import,
+    inheritance,
+    same_file_fallback,
+    global_fallback,
+    route,
+    go_package,
 };
 
 /// Definition modifiers that refine a symbol without changing its `kind`:
@@ -137,9 +166,14 @@ pub const Reference = struct {
     /// source order and aligned with `count`; rename uses these as edit sites.
     offsets: []const u32 = &.{},
     target: SymbolId = invalid_symbol,
-    /// True when resolution bound `target` via a known receiver type or self,
-    /// rather than a heuristic global name match. `--strict` follows only these.
+    /// Compatibility trust bit for strict traversal. New consumers should also
+    /// inspect `resolution_status`/`resolution_reason`; `--strict` follows only
+    /// references whose `exact` bit is true.
     exact: bool = false,
+    /// Machine-readable confidence/provenance. Resolution fills these alongside
+    /// `target`; parser/cache construction can rely on the unresolved defaults.
+    resolution_status: ResolutionStatus = .unresolved,
+    resolution_reason: ResolutionReason = .none,
 };
 
 /// A local variable binding discovered inside a symbol body: `name` was declared
@@ -175,6 +209,16 @@ pub const Symbol = struct {
     refs: []Reference,
     /// Local variable -> type-name bindings discovered in the body.
     bindings: []const Binding = &.{},
+    /// Declaring/receiver type recorded when a language puts a method outside
+    /// its type body (`impl Type` in Rust, `func (r Type)` in Go).  The parser
+    /// may not be able to assign `parent` until every project file is indexed;
+    /// the index consumes this hint in a cross-file parenting pass.  Kept on
+    /// the symbol so warm-cache and clean builds make the same decision.
+    receiver: []const u8 = "",
+    /// Nominal protocol named by an out-of-line implementation declaration
+    /// (`impl Trait for Type`). Empty for inherent methods and languages that
+    /// do not spell a protocol at the implementation site.
+    impl_protocol: []const u8 = "",
     /// For an `import` symbol: the raw module string (`"util.zig"`, `"./api"`,
     /// `os.path`). Empty for every other kind. `name` holds the binding it is
     /// imported as, so `import_path` + `name` gives `alias -> module`.
@@ -345,6 +389,7 @@ test "SymbolKind.validName accepts every tag and alias, rejects typos" {
     try std.testing.expect(SymbolKind.validName("function"));
     try std.testing.expect(SymbolKind.validName("func"));
     try std.testing.expect(SymbolKind.validName("variable"));
+    try std.testing.expect(SymbolKind.validName("interface"));
     try std.testing.expect(!SymbolKind.validName("xyz123"));
     try std.testing.expect(!SymbolKind.validName("fns"));
 }

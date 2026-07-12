@@ -10,8 +10,9 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const registry = @import("command_registry.zig");
 const language = @import("language.zig");
+const agent_api = @import("agent_api.zig");
 
-pub const product_version = "0.0.0";
+pub const product_version = "0.1.0";
 pub const capability_schema = "navgraph.capabilities.v1";
 pub const capability_schema_version: u32 = 1;
 pub const agent_protocol_version = "1.0";
@@ -43,35 +44,17 @@ const trust_limitations = [_]TrustLimitation{
         .commands = &.{ "calls", "callers", "neighbors", "path", "flow", "taint", "reaches", "affected" },
     },
     .{
-        .id = "approximate_output_budget",
-        .summary = "--budget estimates graph-node bytes and is not a hard serialized-output ceiling.",
-        .mitigation = "Clients requiring a hard context bound must cap captured bytes and treat truncation explicitly.",
-        .commands = &.{ "outline", "search", "calls", "callers", "neighbors", "hot", "reaches", "affected" },
-    },
-    .{
-        .id = "limit_not_uniform_for_walks",
-        .summary = "The current -l/--limit contract is not uniformly enforced by every graph walk.",
-        .mitigation = "Also set --max-nodes and enforce a client-side byte/result ceiling.",
-        .commands = &.{ "calls", "callers", "neighbors" },
-    },
-    .{
-        .id = "source_read_not_paginated",
-        .summary = "read accepts explicit ranges, but whole-file reads do not honor result or byte budgets and have no continuation cursor.",
-        .mitigation = "Request bounded file:A-B ranges and enforce client-side line/byte caps.",
-        .commands = &.{"read"},
-    },
-    .{
-        .id = "java_resolution_incomplete",
-        .summary = "Java indexing is supported, but some bare same-class, inherited, and static-import calls can remain unresolved.",
-        .mitigation = "Treat missing Java edges as unknown and verify with exact source/build tools.",
-        .languages = &.{"java"},
-        .commands = &.{ "calls", "callers", "path", "flow" },
-    },
-    .{
         .id = "serve_snapshot_requires_reload",
         .summary = "Long-lived serve sessions keep an in-memory snapshot and do not automatically observe edits.",
         .mitigation = "Call navgraph.reload or workspace/reload after filesystem changes.",
         .commands = &.{"serve"},
+    },
+    .{
+        .id = "route_mount_multiplicity",
+        .summary = "Mounted routes currently retain one effective cross-file prefix per target file; multiple router instances or mounts of one file can be incomplete.",
+        .mitigation = "Verify multi-router and multi-mount route instances in source before editing clients or handlers.",
+        .languages = &.{"python"},
+        .commands = &.{"routes"},
     },
 };
 
@@ -79,6 +62,19 @@ pub fn schemaFingerprint() u64 {
     var hasher = std.hash.Wyhash.init(0x4e_41_56_47_52_41_50_48);
     hashToken(&hasher, capability_schema);
     hashToken(&hasher, agent_protocol_version);
+    hashToken(&hasher, agent_api.tool_name);
+    hashToken(&hasher, agent_api.query_schema);
+    hashToken(&hasher, agent_api.result_schema);
+    hashToken(&hasher, agent_api.input_schema_json);
+    hashToken(&hasher, "structuredContent-hard-max-bytes");
+    hashToken(&hasher, "serialized-stdout-hard-budget:v1");
+    hashToken(&hasher, "path-ambiguity-abstain:v1");
+    hashToken(&hasher, "source-selected-line-cursor:v1");
+    hashToken(&hasher, "command-language-support:imports-v1");
+    hashToken(&hasher, "reference-resolution-status-reason:v1");
+    hashToken(&hasher, "edit-site-completeness:v1");
+    hashToken(&hasher, "typed-ordinal-cursor:v1");
+    hashToken(&hasher, "diagnostics-likely-local:v1");
     for (&language.supported) |lang| {
         hashToken(&hasher, lang.name);
         hashToken(&hasher, @tagName(lang.language.family()));
@@ -171,6 +167,12 @@ pub fn writeManifest(w: *std.Io.Writer) !void {
     }
     try w.writeByte(']');
 
+    // A parser entry means NavGraph can index symbols in a language; it does
+    // not imply that every higher-level relation is implemented there. Publish
+    // the first command-specific matrix explicitly so clients never infer local
+    // dependency support merely from the language list.
+    try w.writeAll(",\"languageSupport\":{\"baseline\":\"heuristic_symbol_indexing_for_listed_languages\",\"commandOverrides\":[{\"commands\":[\"imports\",\"importers\"],\"supported\":[\"zig\",\"javascript\",\"typescript\",\"tsx\",\"python\",\"lua\",\"ruby\"],\"partial\":[{\"language\":\"rust\",\"detail\":\"local mod declarations; use paths are not resolved\"},{\"language\":\"java\",\"detail\":\"qualified and static local candidates; wildcard imports remain external\"}],\"unsupported\":[\"c\",\"cpp\",\"csharp\",\"go\"]}]}");
+
     try w.writeAll(",\"commands\":[");
     for (&registry.command_descriptors, 0..) |command, i| {
         if (i != 0) try w.writeByte(',');
@@ -241,9 +243,20 @@ pub fn writeManifest(w: *std.Io.Writer) !void {
     }
     try w.writeByte(']');
 
+    try w.writeAll(",\"outputContract\":{\"limit\":{\"scope\":\"semantic_results_for_commands_declaring_limit\",\"hard\":true},\"budget\":{\"scope\":\"serialized_stdout_for_commands_declaring_budget\",\"unit\":\"bytes\",\"minimum\":64,\"hard\":true},\"source\":{\"defaultLines\":300,\"defaultBytes\":65536,\"cursor\":\"v1:selected-line-ordinal\",\"ranges\":\"sorted_merged\"},\"ambiguity\":{\"path\":\"abstain_with_candidates\",\"agentRelations\":\"abstain_with_candidates\"},\"resolution\":{\"statuses\":[\"exact\",\"inferred\",\"heuristic\",\"ambiguous\",\"unresolved\"],\"reason\":\"per_reference_and_relation_edge\"},\"editSites\":{\"listed\":\"exact_editable_only\",\"omitted\":\"counted_as_review_sites_and_warned\"}}");
+
     try w.writeAll(",\"server\":{\"transport\":\"stdio-json-rpc-2.0\",\"mcpProtocolVersion\":");
     try string(w, mcp_protocol_version);
-    try w.writeAll(",\"capabilitiesMethod\":\"navgraph/capabilities\",\"capabilitiesTool\":\"navgraph.capabilities\",\"reloadMethod\":\"workspace/reload\",\"reloadTool\":\"navgraph.reload\",\"snapshotRefresh\":\"explicit\"}");
+    try w.writeAll(",\"capabilitiesMethod\":\"navgraph/capabilities\",\"capabilitiesTool\":\"navgraph.capabilities\",\"queryTool\":");
+    try string(w, agent_api.tool_name);
+    try w.writeAll(",\"querySchema\":");
+    try string(w, agent_api.query_schema);
+    try w.writeAll(",\"resultSchema\":");
+    try string(w, agent_api.result_schema);
+    try w.print(",\"agentSchemaHash\":\"wyhash64:{x:0>16}\"", .{agent_api.inputSchemaFingerprint()});
+    try w.print(",\"maxBytes\":{{\"scope\":\"structuredContent\",\"default\":{},\"minimum\":{},\"maximum\":{},\"hard\":true}}", .{ agent_api.default_max_bytes, agent_api.min_max_bytes, agent_api.max_max_bytes });
+    try w.writeAll(",\"pagination\":{\"cursor\":\"v1:ordinal\",\"next\":\"directly_runnable_query\",\"operations\":[\"map\",\"diagnostics\",\"impact.edit_sites\",\"impact.affected_tests\",\"source\"]}");
+    try w.writeAll(",\"legacyTool\":\"navgraph\",\"legacyAccess\":\"read_only\",\"reloadMethod\":\"workspace/reload\",\"reloadTool\":\"navgraph.reload\",\"snapshotRefresh\":\"explicit\"}");
 
     try w.writeAll(",\"trust\":{\"default\":\"heuristic\",\"strictFlag\":\"--strict\",\"limitations\":[");
     for (&trust_limitations, 0..) |limitation, i| {
@@ -318,6 +331,9 @@ test "capability manifest is valid, self-identifying JSON" {
     try std.testing.expect(std.mem.indexOf(u8, build.get("buildId").?.string, "src.") != null);
     try std.testing.expectEqual(@as(usize, 16), build.get("sourceFingerprint").?.string.len);
     try std.testing.expectEqual(language.supported.len, root.get("languages").?.array.items.len);
+    const import_support = root.get("languageSupport").?.object.get("commandOverrides").?.array.items[0].object;
+    try std.testing.expectEqualStrings("imports", import_support.get("commands").?.array.items[0].string);
+    try std.testing.expectEqual(@as(usize, 4), import_support.get("unsupported").?.array.items.len);
     try std.testing.expectEqual(registry.command_descriptors.len, root.get("commands").?.array.items.len);
     try std.testing.expectEqual(registry.option_descriptors.len, root.get("options").?.array.items.len);
 }
@@ -332,5 +348,13 @@ test "capability manifest advertises Java and exact CLI/MCP contract anchors" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"name\":\"rename\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"access\":\"mutating\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "navgraph/capabilities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"queryTool\":\"navgraph.query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"agentSchemaHash\":\"wyhash64:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"legacyAccess\":\"read_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"scope\":\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "use paths are not resolved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "route_mount_multiplicity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "per_reference_and_relation_edge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "directly_runnable_query") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "phase3") == null);
 }

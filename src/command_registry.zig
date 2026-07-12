@@ -51,7 +51,7 @@ pub const Command = enum {
 
 pub const Access = enum { read_only, mutating, metadata, server };
 pub const OutputMode = enum { text, json, jsonl, html, json_rpc };
-pub const ArgumentKind = enum { path_filter, symbol, pattern, filter, git_ref, source_range, new_name };
+pub const ArgumentKind = enum { path_filter, symbol, pattern, filter, git_ref, source_range, new_name, command_name };
 
 pub const Argument = struct {
     name: []const u8,
@@ -121,7 +121,7 @@ pub const option_descriptors = [_]OptionDescriptor{
     .{ .option = .verbosity, .name = "verbosity", .flags = &.{ "-v", "--verbosity" }, .value_kind = .enumeration, .values = &.{ "names", "sig", "doc", "full" } },
     .{ .option = .depth, .name = "depth", .flags = &.{ "-d", "--depth" }, .value_kind = .integer, .minimum = 0 },
     .{ .option = .limit, .name = "limit", .flags = &.{ "-l", "--limit" }, .value_kind = .integer, .minimum = 1 },
-    .{ .option = .budget, .name = "budget", .flags = &.{"--budget"}, .value_kind = .integer, .minimum = 1 },
+    .{ .option = .budget, .name = "budget", .flags = &.{"--budget"}, .value_kind = .integer, .minimum = 64 },
     .{ .option = .max_nodes, .name = "max_nodes", .flags = &.{"--max-nodes"}, .value_kind = .integer, .minimum = 1 },
     .{ .option = .summary, .name = "summary", .flags = &.{"--summary"}, .value_kind = .boolean },
     .{ .option = .strict, .name = "strict", .flags = &.{ "-s", "--strict" }, .value_kind = .boolean },
@@ -176,6 +176,7 @@ pub const OptionValueOverride = struct {
 };
 
 const no_args = [_]Argument{};
+const help_args = [_]Argument{.{ .name = "command", .kind = .command_name, .required = false }};
 const optional_path = [_]Argument{.{ .name = "path", .kind = .path_filter, .required = false }};
 const optional_filter = [_]Argument{.{ .name = "filter", .kind = .filter, .required = false }};
 const optional_ref = [_]Argument{.{ .name = "ref", .kind = .git_ref, .required = false }};
@@ -229,14 +230,14 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .reaches, .name = "reaches", .aliases = &.{"reachable"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .tests, .impls, .from_tests }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .affected, .name = "affected", .aliases = &.{"impact"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .impls, .since }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .hot, .name = "hot", .aliases = &.{"central"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .sort, .tests }, .option_value_overrides = &hot_sort_values, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .diff, .name = "diff", .aliases = &.{"changed"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .exact_source }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .diff, .name = "diff", .aliases = &.{"changed"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .format, .exact_source }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .history, .name = "history", .aliases = &.{"hist"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .last }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .blame, .name = "blame", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .churn, .name = "churn", .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .sort, .since, .last }, .option_value_overrides = &churn_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .collisions, .name = "collisions", .aliases = &.{"duplicates"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .kind, .tests, .visibility, .members }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .files, .name = "files", .aliases = &.{"manifest"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .sort, .no_recurse }, .option_value_overrides = &files_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .status, .name = "status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .after, .no_recurse }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .no_cache, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .strings, .name = "strings", .aliases = &.{ "str", "literals" }, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .todos, .name = "todos", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .after }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .edits, .name = "edits", .aliases = &.{"edit-sites"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .format, .after }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
@@ -245,7 +246,7 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
     .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false },
     .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
-    .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &no_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false },
+    .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false },
 };
 
 pub fn parseCommand(name: []const u8) ?Command {

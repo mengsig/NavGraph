@@ -91,7 +91,8 @@ const usage_text =
     \\  files [filter]     List every indexed file + its symbol count (index coverage);
     \\                     add --sort symbols to rank biggest-first
     \\  status [filter]    Index/cache snapshot, freshness, skipped paths, and diagnostics
-    \\  read <file[:A-B]>  Print raw source lines (numbered); batch ranges: file:A-B,C-D
+    \\  read <file[:A-B]>  Bounded raw source page; batch ranges: file:A-B,C-D;
+    \\                     continue truncated pages with --after v1:N
     \\  strings <pattern>  Search inside string literals (URLs, log/error text, regexes)
     \\  todos [path]       TODO/FIXME/HACK markers from real comments only
     \\  edits <symbol>     Exact definition/reference sites for a safe rename
@@ -102,15 +103,15 @@ const usage_text =
     \\  capabilities       Machine-readable protocol, build, language, command,
     \\                     option, output, safety, and trust metadata (alias: version)
     \\  serve             Long-lived JSON-RPC/MCP server over stdin/stdout
-    \\  help               Show this help
+    \\  help [command]     Full catalogue or concise help for one command
     \\
-    \\FLAGS:
+    \\FLAGS (command-scoped; run `navgraph help <command>` for the exact set):
     \\  -v, --verbosity <names|sig|doc|full>   Detail level (default: sig)
     \\  -d, --depth <N>                        Graph depth for calls/callers/raises (default: 1)
     \\  -C, --root <path>                      Index root: a directory, or a single
     \\                                         file to scope to it (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
-    \\  --budget <bytes> / --max-nodes <N>     Bound traversal output; --summary compacts it
+    \\  --budget <bytes> / --max-nodes <N>     Hard stdout-byte / graph-node bounds
     \\  --since <ref> / --from-tests           Affected/churn history and reaches selectors
     \\  --last <N>                             history/churn commit bound (default: 10)
     \\  --preview                              rename: emit patch without writing files
@@ -148,7 +149,8 @@ const usage_text =
     \\  --orphan-calls, --orphan, --orphans    routes: show calls matching no route
     \\  --handler <name>                       routes: select by handler (glob accepted)
     \\  -j, --json                             Emit JSON (stable, for tooling/MCP)
-    \\  --jsonl [--after v1:N]                 Stream stable, cursor-pageable JSON rows
+    \\  --jsonl [--after v1:N]                 Stream stable, cursor-pageable JSON rows;
+    \\                                         read accepts --after in text or JSON
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
     \\  --no-public                            unused: drop exported symbols (possible public API)
     \\  --follow-imports                       unused: disambiguate same-name symbols by
@@ -160,7 +162,8 @@ const usage_text =
     \\  and a trailing `?` marks a heuristic edge — verify those or use `-s` to
     \\  drop them. A `navgraph: parse-health:` stderr warning means tokenizer
     \\  desynchronization may have hidden symbols in the reported line range.
-    \\  Flag values may be attached (`-d2`, `--depth=2`).
+    \\  Flag values may be attached (`-d2`, `--depth=2`). Use `--` before a
+    \\  positional value beginning with `-` (for example `strings -- --no-tests`).
     \\
     \\  PATTERNS: a name/filter containing `*` is a glob (`def Ba*`, `search *_handler`,
     \\  `callers Matcher.is*`). Globs anchor on the whole name; without `*`, names
@@ -204,6 +207,103 @@ pub fn usage(w: *std.Io.Writer) !void {
     try w.writeAll(usage_text);
 }
 
+/// Concise command help generated from the same registry that validates argv
+/// and publishes capabilities. Agents can recover from a scoped flag error
+/// without paying for (or guessing from) the full command catalogue.
+pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
+    const command = registry.parseCommand(name) orelse return false;
+    const desc = registry.descriptor(command);
+    try w.print("NavGraph command: {s}\n\nUSAGE: navgraph {s}", .{ desc.name, desc.name });
+    for (desc.arguments) |argument| {
+        if (argument.required) {
+            try w.print(" <{s}>", .{argument.name});
+        } else {
+            try w.print(" [{s}]", .{argument.name});
+        }
+    }
+    if (desc.options.len != 0) try w.writeAll(" [options]");
+    try w.writeByte('\n');
+
+    if (desc.aliases.len != 0) {
+        try w.writeAll("ALIASES: ");
+        for (desc.aliases, 0..) |alias, i| {
+            if (i != 0) try w.writeAll(", ");
+            try w.writeAll(alias);
+        }
+        try w.writeByte('\n');
+    }
+    try w.print("ACCESS: {s}\nOUTPUT: ", .{@tagName(desc.access)});
+    for (desc.outputs, 0..) |output, i| {
+        if (i != 0) try w.writeAll(", ");
+        try w.writeAll(@tagName(output));
+    }
+    try w.writeByte('\n');
+
+    if (desc.arguments.len != 0) {
+        try w.writeAll("ARGUMENTS:\n");
+        for (desc.arguments) |argument| {
+            try w.print("  {s}  {s}; {s}\n", .{
+                argument.name,
+                @tagName(argument.kind),
+                if (argument.required) "required" else "optional",
+            });
+        }
+    }
+    if (desc.options.len != 0) {
+        try w.writeAll("OPTIONS:\n");
+        for (desc.options) |option| {
+            const option_desc = registry.optionDescriptor(option);
+            try w.writeAll("  ");
+            if (option == .format) {
+                try w.writeAll("-j, --json | --jsonl  (text is the default)\n");
+                continue;
+            }
+            if (option == .tests) {
+                try w.writeAll("-t, --tests <with|without|only>; --no-tests; --tests-only\n");
+                continue;
+            }
+            if (option == .visibility) {
+                try w.writeAll("-p, --vis <all|public|private>; --public; --private; --no-private\n");
+                continue;
+            }
+            for (option_desc.flags, 0..) |flag, i| {
+                if (i != 0) try w.writeAll(", ");
+                try w.writeAll(flag);
+            }
+            const values = commandOptionValues(desc, option);
+            if (option_desc.value_kind != .boolean) {
+                try w.writeAll(" <");
+                if (values.len != 0) {
+                    for (values, 0..) |value, i| {
+                        if (i != 0) try w.writeByte('|');
+                        try w.writeAll(value);
+                    }
+                } else {
+                    try w.writeAll(switch (option_desc.value_kind) {
+                        .integer => "N",
+                        .cursor => "v1:N",
+                        .string => "value",
+                        .enumeration => "value",
+                        .boolean => unreachable,
+                    });
+                }
+                try w.writeByte('>');
+            }
+            if (option_desc.minimum) |minimum| try w.print("  (min {d})", .{minimum});
+            try w.writeByte('\n');
+        }
+    }
+    try w.writeAll("\nMachine contract: navgraph capabilities\n");
+    return true;
+}
+
+fn commandOptionValues(desc: *const registry.CommandDescriptor, option: registry.Option) []const []const u8 {
+    for (desc.option_value_overrides) |override| {
+        if (override.option == option) return override.values;
+    }
+    return registry.optionDescriptor(option).values;
+}
+
 /// A short human explanation for a parse failure, shown before the usage text.
 pub fn reason(err: ParseError) []const u8 {
     return switch (err) {
@@ -224,14 +324,23 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
         }
         return fail(error.Usage, "unknown command '{s}' — run `navgraph help` for the list", .{args[0]});
     };
-    if (command == .help) return .{ .command = .help };
+    if (command == .help) {
+        if (args.len == 1) return .{ .command = .help };
+        if (args.len != 2) return fail(error.Usage, "help accepts at most one command name", .{});
+        const target = registry.parseCommand(args[1]) orelse
+            return fail(error.Usage, "unknown command '{s}' — run `navgraph help` for the list", .{args[1]});
+        return .{ .command = .help, .arg = registry.descriptor(target).name };
+    }
 
     const command_descriptor = registry.descriptor(command);
     var result = Parsed{ .command = command };
     var i: usize = 1;
+    var positional_only = false;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (a.len != 0 and a[0] == '-') {
+        if (!positional_only and std.mem.eql(u8, a, "--")) {
+            positional_only = true;
+        } else if (!positional_only and a.len != 0 and a[0] == '-') {
             i = try parseFlag(args, i, &result);
         } else if (result.arg.len == 0 and command_descriptor.arguments.len >= 1) {
             result.arg = a;
@@ -242,7 +351,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
         }
     }
     // `navgraph search --help` — the help flag overrides the command wholesale.
-    if (result.command == .help) return .{ .command = .help };
+    if (result.command == .help) return .{ .command = .help, .arg = registry.descriptor(command).name };
     if (!hasRequiredArgs(command, result)) {
         if (command == .path) return fail(error.Usage, "path needs two symbol names: navgraph path <A> <B>", .{});
         if (command == .rename) return fail(error.Usage, "rename needs a selector and new name: navgraph rename <symbol> <new-name> [--preview]", .{});
@@ -297,7 +406,10 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     if (eqAny(f.name, &.{ "--budget", "--max-nodes" })) {
         out.used_options.insert(if (std.mem.eql(u8, f.name, "--budget")) .budget else .max_nodes);
         const value = try parseUint(try f.value(args, i, f.name), f.name);
-        if (value == 0) return fail(error.BadValue, "{s} must be at least 1", .{f.name});
+        if (std.mem.eql(u8, f.name, "--budget") and value < 64)
+            return fail(error.BadValue, "--budget must be at least 64 bytes (enough for valid truncation metadata)", .{});
+        if (std.mem.eql(u8, f.name, "--max-nodes") and value == 0)
+            return fail(error.BadValue, "--max-nodes must be at least 1", .{});
         if (std.mem.eql(u8, f.name, "--budget")) out.options.budget = value else out.options.max_nodes = value;
         return f.next(i);
     }
@@ -606,16 +718,16 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         return fail(error.Usage, "--preview applies only to rename", .{});
     if (opts.exact_source and parsed.command != .diff)
         return fail(error.Usage, "--exact-source applies only to diff", .{});
-    const compact = opts.budget != 0 or opts.max_nodes != 0 or opts.summary;
-    const compact_command = parsed.command == .calls or parsed.command == .callers or parsed.command == .neighbors or
+    const compact = opts.max_nodes != 0 or opts.summary;
+    const compact_command = parsed.command == .calls or parsed.command == .callers or parsed.command == .neighbors or parsed.command == .read or
         parsed.command == .outline or parsed.command == .search or parsed.command == .hot or
         parsed.command == .reaches or parsed.command == .affected;
     if (compact and !compact_command)
-        return fail(error.Usage, "--budget/--max-nodes/--summary require a traversal or ranked listing", .{});
+        return fail(error.Usage, "--max-nodes/--summary require a traversal or ranked listing", .{});
     if (opts.format == .jsonl and !registry.supportsOutput(parsed.command, .jsonl))
         return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, edits, and status", .{});
-    if (opts.after_set and opts.format != .jsonl)
-        return fail(error.Usage, "--after requires --jsonl", .{});
+    if (opts.after_set and opts.format != .jsonl and parsed.command != .read)
+        return fail(error.Usage, "--after requires --jsonl (except for read pages)", .{});
     if (opts.duplicates and (parsed.command != .search or opts.refs))
         return fail(error.Usage, "--duplicates applies only to definition search", .{});
     if (opts.collision_members and parsed.command != .collisions)
@@ -665,8 +777,12 @@ test "parse basic commands and flags" {
 }
 
 test "--help anywhere resolves to the help command" {
-    try std.testing.expectEqual(Command.help, (try parse(&.{ "search", "--help" })).command);
-    try std.testing.expectEqual(Command.help, (try parse(&.{ "def", "x", "-h" })).command);
+    const search_help = try parse(&.{ "search", "--help" });
+    try std.testing.expectEqual(Command.help, search_help.command);
+    try std.testing.expectEqualStrings("search", search_help.arg);
+    const def_help = try parse(&.{ "def", "x", "-h" });
+    try std.testing.expectEqual(Command.help, def_help.command);
+    try std.testing.expectEqualStrings("def", def_help.arg);
 }
 
 test "capabilities is a no-positional metadata command with version aliases" {
@@ -683,7 +799,7 @@ test "capabilities is a no-positional metadata command with version aliases" {
 
 test "descriptor applicability rejects accepted-but-meaningless flag combinations" {
     try std.testing.expectError(error.Usage, parse(&.{ "def", "x", "--no-recurse" }));
-    try std.testing.expectError(error.Usage, parse(&.{ "read", "x.zig", "--limit", "10" }));
+    try std.testing.expectEqual(@as(u32, 10), (try parse(&.{ "read", "x.zig", "--limit", "10" })).options.limit);
     try std.testing.expectError(error.Usage, parse(&.{ "serve", "--json" }));
     try std.testing.expect((try parse(&.{ "outline", "src", "--no-recurse" })).options.no_recurse);
     try std.testing.expect((try parse(&.{ "rename", "Old", "New", "--preview" })).options.preview);
@@ -931,6 +1047,7 @@ test "phase 3 workflows, compaction, rename, and JSONL flags parse" {
     const reaches_cmd = try parse(&.{ "reaches", "parse,emit", "--from-tests", "--budget=4096" });
     try std.testing.expect(reaches_cmd.options.from_tests);
     try std.testing.expectEqual(@as(u32, 4096), reaches_cmd.options.budget);
+    try std.testing.expectError(error.BadValue, parse(&.{ "calls", "parse", "--budget", "63" }));
     const rename_cmd = try parse(&.{ "rename", "Store.get", "fetch", "--preview" });
     try std.testing.expectEqualStrings("fetch", rename_cmd.arg2);
     try std.testing.expect(rename_cmd.options.preview);
@@ -1001,20 +1118,35 @@ test "parse: aliases resolve through parse to the same command" {
     try std.testing.expectEqual(Command.strings, (try parse(&.{ "literals", "pat" })).command);
 }
 
-test "parse: help returns immediately and ignores trailing tokens" {
+test "parse: help accepts one canonical command or alias" {
     const a = try parse(&.{"help"});
     try std.testing.expectEqual(Command.help, a.command);
 
-    // Trailing junk (including an otherwise-unknown flag) is ignored for help.
-    const b = try parse(&.{ "help", "garbage", "--nope", "-d", "x" });
+    const b = try parse(&.{ "help", "cat" });
     try std.testing.expectEqual(Command.help, b.command);
-    try std.testing.expectEqualStrings("", b.arg);
+    try std.testing.expectEqualStrings("read", b.arg);
+    try std.testing.expectError(error.Usage, parse(&.{ "help", "garbage" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "help", "read", "extra" }));
 
     const c = try parse(&.{"--help"});
     try std.testing.expectEqual(Command.help, c.command);
 
     const d = try parse(&.{"-h"});
     try std.testing.expectEqual(Command.help, d.command);
+}
+
+test "usageCommand renders concise registry-derived argument and option help" {
+    const testing = std.testing;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try usageCommand(&aw.writer, "read"));
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "USAGE: navgraph read <source> [options]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "-l, --limit <N>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "--after <v1:N>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") == null);
 }
 
 test "parse: default option values on a bare command" {
@@ -1262,7 +1394,7 @@ test "usage: writes the full help banner" {
     try testing.expect(std.mem.indexOf(u8, out, "NavGraph") != null);
     try testing.expect(std.mem.indexOf(u8, out, "USAGE:") != null);
     try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "FLAGS:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "FLAGS (command-scoped") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--no-cache") != null);
 }
 
@@ -1401,6 +1533,38 @@ test "parse: multiple mixed flags accumulate onto one Parsed" {
     try std.testing.expectEqual(query.OutputFormat.json, p.options.format);
 }
 
+test "double dash terminates options for flag-looking positional literals" {
+    const literal = try parse(&.{ "strings", "--", "--no-tests" });
+    try std.testing.expectEqual(Command.strings, literal.command);
+    try std.testing.expectEqualStrings("--no-tests", literal.arg);
+
+    const search = try parse(&.{ "search", "--", "-needle" });
+    try std.testing.expectEqualStrings("-needle", search.arg);
+
+    const source = try parse(&.{ "read", "--", "-generated.py:1-2" });
+    try std.testing.expectEqualStrings("-generated.py:1-2", source.arg);
+
+    try std.testing.expectError(error.Usage, parse(&.{ "strings", "--" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "strings", "value", "--", "extra" }));
+}
+
+test "read accepts line budget and cursor page options in text and json" {
+    const json_page = try parse(&.{ "read", "m.py", "-l2", "--budget", "1000", "--after=v1:2", "-j" });
+    try std.testing.expectEqual(Command.read, json_page.command);
+    try std.testing.expectEqual(@as(u32, 2), json_page.options.limit);
+    try std.testing.expectEqual(@as(u32, 1000), json_page.options.budget);
+    try std.testing.expectEqual(@as(u32, 2), json_page.options.after);
+    try std.testing.expect(json_page.options.after_set);
+    try std.testing.expectEqual(query.OutputFormat.json, json_page.options.format);
+
+    const text_page = try parse(&.{ "read", "m.py", "--after", "v1:4" });
+    try std.testing.expectEqual(@as(u32, 4), text_page.options.after);
+    try std.testing.expectEqual(query.OutputFormat.text, text_page.options.format);
+
+    try std.testing.expectError(error.Usage, parse(&.{ "read", "m.py", "--max-nodes", "2" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "def", "name", "--after", "v1:2" }));
+}
+
 test "coverage command and unified --tests scope selector" {
     const t = std.testing;
     try t.expectEqual(Command.coverage, (try parse(&.{"coverage"})).command);
@@ -1423,8 +1587,9 @@ test "status and exact-source options are scoped and structured-output aware" {
     try std.testing.expectEqualStrings("src", status_request.arg);
     try std.testing.expectEqual(query.OutputFormat.jsonl, status_request.options.format);
 
-    const diff_request = try parse(&.{ "diff", "HEAD~1", "--exact-source", "-j" });
+    const diff_request = try parse(&.{ "diff", "HEAD~1", "--exact-source", "--budget", "1000", "-j" });
     try std.testing.expect(diff_request.options.exact_source);
+    try std.testing.expectEqual(@as(u32, 1000), diff_request.options.budget);
     try std.testing.expectEqual(query.OutputFormat.json, diff_request.options.format);
     try std.testing.expectError(error.Usage, parse(&.{ "search", "x", "--exact-source" }));
 }

@@ -14,17 +14,37 @@ const Language = language.Language;
 /// JS/TS resolution extensions, in priority order.
 const js_exts = [_][]const u8{ ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs" };
 
-/// Repo-relative candidate paths `module` (imported from `importer_path`) may
-/// resolve to, most-specific first. Empty when the import is external (a bare
-/// package name with no local file). Every element is arena-owned.
-pub fn candidates(
+/// Classification produced before the index tries candidate paths against the
+/// files in the workspace. Keeping `external` and `outside_root` distinct is
+/// important: neither is a local edge, but the latter proves that a relative
+/// import deliberately crossed the configured workspace boundary.
+pub const CandidateStatus = enum { local, external, outside_root };
+
+pub const CandidateResolution = union(CandidateStatus) {
+    local: []const []const u8,
+    external,
+    outside_root,
+
+    /// Compatibility view for callers that only need possible local paths.
+    /// New graph-building code should retain the tagged result instead.
+    pub fn paths(self: CandidateResolution) []const []const u8 {
+        return switch (self) {
+            .local => |items| items,
+            .external, .outside_root => &.{},
+        };
+    }
+};
+
+/// Classify `module` and, for a potentially local import, return repo-relative
+/// candidate paths in priority order. Every candidate is arena-owned.
+pub fn resolveCandidates(
     arena: std.mem.Allocator,
     importer_path: []const u8,
     module: []const u8,
     lang: Language,
-) ![]const []const u8 {
+) !CandidateResolution {
     std.debug.assert(importer_path.len > 0);
-    if (module.len == 0) return &.{};
+    if (module.len == 0) return .external;
     return switch (lang.family()) {
         .zig => try zigCandidates(arena, importer_path, module),
         .js => try jsCandidates(arena, importer_path, module),
@@ -33,35 +53,61 @@ pub fn candidates(
         .rust => try rustCandidates(arena, importer_path, module),
         .ruby => try rubyCandidates(arena, importer_path, module),
         .java => try javaCandidates(arena, module),
-        else => &.{},
+        else => .external,
     };
+}
+
+/// Repo-relative candidate paths `module` may resolve to. Empty for external
+/// and outside-root imports. Prefer `resolveCandidates` when the distinction is
+/// useful to diagnostics or trust reporting.
+pub fn candidates(
+    arena: std.mem.Allocator,
+    importer_path: []const u8,
+    module: []const u8,
+    lang: Language,
+) ![]const []const u8 {
+    return (try resolveCandidates(arena, importer_path, module, lang)).paths();
 }
 
 /// Rust `mod name;` resolves to a sibling `name.rs` or a subdir `name/mod.rs`.
 /// A `use` path is intra-crate (`crate::a::b`) and unresolvable to a file
 /// without the crate root, so `::`-bearing modules yield no candidates.
-fn rustCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
-    if (std.mem.indexOf(u8, module, "::") != null) return &.{};
+fn rustCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) !CandidateResolution {
+    if (std.mem.indexOf(u8, module, "::") != null) return .external;
     const dir = dirOf(importer);
-    const stem = try joinNormalize(arena, dir, module);
-    if (stem.len == 0) return &.{};
+    const stem = switch (try joinNormalize(arena, dir, module)) {
+        .inside_root => |path| path,
+        .outside_root => return .outside_root,
+    };
+    if (stem.len == 0) return .external;
     var list: std.ArrayList([]const u8) = .empty;
     try list.append(arena, try concat(arena, stem, ".rs"));
     try list.append(arena, try concat(arena, stem, "/mod.rs"));
-    return list.toOwnedSlice(arena);
+    return .{ .local = try list.toOwnedSlice(arena) };
 }
 
 /// Ruby `require_relative "lib/user"` resolves from the importer's directory;
 /// a plain `require "user"` may be a gem, but we also offer a repo-relative
 /// `user.rb` in case it names a local file. Non-existent candidates are simply
 /// never matched by the index.
-fn rubyCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+fn rubyCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) !CandidateResolution {
     var list: std.ArrayList([]const u8) = .empty;
-    const rel = try joinNormalize(arena, dirOf(importer), module);
+    const rel = switch (try joinNormalize(arena, dirOf(importer), module)) {
+        .inside_root => |path| path,
+        .outside_root => return .outside_root,
+    };
     if (rel.len != 0) try list.append(arena, try concat(arena, rel, ".rb"));
-    const root = try joinNormalize(arena, "", module);
-    if (root.len != 0 and !std.mem.eql(u8, root, rel)) try list.append(arena, try concat(arena, root, ".rb"));
-    return list.toOwnedSlice(arena);
+    // A path beginning with `.` is explicitly relative. Trying it again from
+    // the workspace root can both change its meaning and hide an escape.
+    if (!std.mem.startsWith(u8, module, ".")) {
+        const root = switch (try joinNormalize(arena, "", module)) {
+            .inside_root => |path| path,
+            .outside_root => return .outside_root,
+        };
+        if (root.len != 0 and !std.mem.eql(u8, root, rel)) try list.append(arena, try concat(arena, root, ".rb"));
+    }
+    const paths = try list.toOwnedSlice(arena);
+    return if (paths.len == 0) .external else .{ .local = paths };
 }
 
 /// Lua `require "a.b.c"` maps the dotted module to `a/b/c.lua` or the package
@@ -69,83 +115,130 @@ fn rubyCandidates(arena: std.mem.Allocator, importer: []const u8, module: []cons
 /// plain Lua) and under a `lua/` prefix (the Neovim runtimepath convention,
 /// where `require("advantage.util")` resolves to `lua/advantage/util.lua`). A
 /// leading `.` (relative require) resolves from the importer's directory.
-fn luaCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
-    const dots = leadingDots(module);
-    const base_dir = if (dots > 0) dirOf(importer) else "";
-    const slashed = try dotsToSlashes(arena, module[dots..]);
-    const stem = try joinNormalize(arena, base_dir, slashed);
-    if (stem.len == 0) return &.{};
+fn luaCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) !CandidateResolution {
+    const slash_relative = startsWithRelativeSegment(module);
+    const dots = if (slash_relative) 0 else leadingDots(module);
+    const base_dir = if (slash_relative or dots > 0) dirOf(importer) else "";
+    const rel_path = if (slash_relative)
+        module
+    else blk: {
+        const slashed = try dotsToSlashes(arena, module[dots..]);
+        break :blk if (dots > 0) try prependUp(arena, dots - 1, slashed) else slashed;
+    };
+    const stem = switch (try joinNormalize(arena, base_dir, rel_path)) {
+        .inside_root => |path| path,
+        .outside_root => return .outside_root,
+    };
+    if (stem.len == 0) return .external;
     var list: std.ArrayList([]const u8) = .empty;
     try list.append(arena, try concat(arena, stem, ".lua"));
     try list.append(arena, try concat(arena, stem, "/init.lua"));
-    if (dots == 0) { // Neovim `lua/`-rooted modules
-        const nvim = try joinNormalize(arena, "lua", stem);
+    if (!slash_relative and dots == 0) { // Neovim `lua/`-rooted modules
+        const nvim = switch (try joinNormalize(arena, "lua", stem)) {
+            .inside_root => |path| path,
+            .outside_root => return .outside_root,
+        };
         try list.append(arena, try concat(arena, nvim, ".lua"));
         try list.append(arena, try concat(arena, nvim, "/init.lua"));
     }
-    return list.toOwnedSlice(arena);
+    return .{ .local = try list.toOwnedSlice(arena) };
 }
 
 /// Java `import com.foo.Bar;` maps the fully-qualified name to `com/foo/Bar.java`
 /// under the repo root and the common Maven/Gradle source roots. `import static
 /// a.b.C.m;` names a member, so a variant dropping the trailing segment is also
 /// offered. Wildcard imports (`com.foo.*`) name a package, not a single file.
-fn javaCandidates(arena: std.mem.Allocator, module: []const u8) ![]const []const u8 {
-    if (std.mem.indexOfScalar(u8, module, '*') != null) return &.{};
+fn javaCandidates(arena: std.mem.Allocator, module: []const u8) !CandidateResolution {
+    if (std.mem.indexOfScalar(u8, module, '*') != null) return .external;
+    // Java imports are qualified identifiers, never filesystem paths. Classify
+    // a path-shaped traversal explicitly before dotsToSlashes could erase it.
+    if (std.mem.indexOfAny(u8, module, "/\\") != null) {
+        return switch (try joinNormalize(arena, "", module)) {
+            .inside_root => .external,
+            .outside_root => .outside_root,
+        };
+    }
+    if (std.mem.startsWith(u8, module, ".") or
+        std.mem.endsWith(u8, module, ".") or
+        std.mem.indexOf(u8, module, "..") != null) return .external;
     const slashed = try dotsToSlashes(arena, module);
-    if (slashed.len == 0) return &.{};
+    if (slashed.len == 0) return .external;
     const roots = [_][]const u8{ "", "src/main/java", "src/test/java", "src" };
     var list: std.ArrayList([]const u8) = .empty;
     for (roots) |root| {
-        const stem = try joinNormalize(arena, root, slashed);
+        const stem = switch (try joinNormalize(arena, root, slashed)) {
+            .inside_root => |path| path,
+            .outside_root => return .outside_root,
+        };
         if (stem.len != 0) try list.append(arena, try concat(arena, stem, ".java"));
     }
     // Static-member import: also try dropping the trailing `.member` segment.
     if (std.mem.lastIndexOfScalar(u8, slashed, '/')) |cut| {
         const outer = slashed[0..cut];
         for (roots) |root| {
-            const stem = try joinNormalize(arena, root, outer);
+            const stem = switch (try joinNormalize(arena, root, outer)) {
+                .inside_root => |path| path,
+                .outside_root => return .outside_root,
+            };
             if (stem.len != 0) try list.append(arena, try concat(arena, stem, ".java"));
         }
     }
-    return list.toOwnedSlice(arena);
+    return .{ .local = try list.toOwnedSlice(arena) };
 }
 
-fn zigCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+fn zigCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) !CandidateResolution {
     // `@import("std")` and other package roots have no local file.
-    if (!std.mem.endsWith(u8, module, ".zig")) return &.{};
-    const joined = try joinNormalize(arena, dirOf(importer), module);
-    return dupeOne(arena, joined);
+    if (!std.mem.endsWith(u8, module, ".zig")) return .external;
+    const joined = switch (try joinNormalize(arena, dirOf(importer), module)) {
+        .inside_root => |path| path,
+        .outside_root => return .outside_root,
+    };
+    return .{ .local = try dupeOne(arena, joined) };
 }
 
-fn jsCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+fn jsCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) !CandidateResolution {
     // Only relative imports refer to local files; bare specifiers are packages.
-    if (!std.mem.startsWith(u8, module, ".")) return &.{};
-    const base = try joinNormalize(arena, dirOf(importer), module);
+    if (!std.mem.startsWith(u8, module, ".")) return .external;
+    const base = switch (try joinNormalize(arena, dirOf(importer), module)) {
+        .inside_root => |path| path,
+        .outside_root => return .outside_root,
+    };
     var list: std.ArrayList([]const u8) = .empty;
     if (hasKnownExt(base)) {
         try list.append(arena, base); // already `./foo.ts`
-        return list.toOwnedSlice(arena);
+        return .{ .local = try list.toOwnedSlice(arena) };
     }
     for (js_exts) |ext| try list.append(arena, try concat(arena, base, ext));
     for (js_exts) |ext| try list.append(arena, try concat(arena, base, try concat(arena, "/index", ext)));
-    return list.toOwnedSlice(arena);
+    return .{ .local = try list.toOwnedSlice(arena) };
 }
 
-fn pyCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) ![]const []const u8 {
+fn pyCandidates(arena: std.mem.Allocator, importer: []const u8, module: []const u8) !CandidateResolution {
     // Leading dots => relative import: N dots means go up (N-1) package levels
     // from the importer's directory. No leading dot => absolute from the root.
+    // Python syntax cannot contain filesystem separators. Check path-shaped
+    // malformed input before dotsToSlashes could erase its `..` traversal.
+    if (std.mem.indexOfAny(u8, module, "/\\") != null) {
+        return switch (try joinNormalize(arena, dirOf(importer), module)) {
+            .inside_root => .external,
+            .outside_root => .outside_root,
+        };
+    }
     const dots = leadingDots(module);
     const slashed = try dotsToSlashes(arena, module[dots..]);
     const rel_path = if (dots > 0) try prependUp(arena, dots - 1, slashed) else slashed;
     const base_dir = if (dots > 0) dirOf(importer) else "";
-    const stem = try joinNormalize(arena, base_dir, rel_path);
+    const stem = switch (try joinNormalize(arena, base_dir, rel_path)) {
+        .inside_root => |path| path,
+        .outside_root => return .outside_root,
+    };
     var list: std.ArrayList([]const u8) = .empty;
     if (stem.len != 0) {
         try list.append(arena, try concat(arena, stem, ".py"));
         try list.append(arena, try concat(arena, stem, "/__init__.py"));
     }
-    return list.toOwnedSlice(arena);
+    const paths = try list.toOwnedSlice(arena);
+    return if (paths.len == 0) .external else .{ .local = paths };
 }
 
 /// Prefix `path` with `levels` `../` segments (for Python relative imports).
@@ -168,32 +261,57 @@ pub fn dirOf(path: []const u8) []const u8 {
     return path[0..slash];
 }
 
+pub const NormalizedPathStatus = enum { inside_root, outside_root };
+pub const NormalizedPath = union(NormalizedPathStatus) {
+    inside_root: []const u8,
+    outside_root,
+};
+
 /// Join `base` and `rel` and resolve `.`/`..` segments into a clean, forward-
-/// slash repo-relative path. A `..` that escapes above the root is dropped.
-pub fn joinNormalize(arena: std.mem.Allocator, base: []const u8, rel: []const u8) ![]const u8 {
+/// slash repo-relative path. Traversal above the configured root is retained as
+/// `outside_root`; it is never silently normalized back into a local path.
+pub fn joinNormalize(arena: std.mem.Allocator, base: []const u8, rel: []const u8) !NormalizedPath {
     var segs: std.ArrayList([]const u8) = .empty;
     defer segs.deinit(arena);
-    try pushSegments(arena, &segs, base);
-    try pushSegments(arena, &segs, rel);
+    if (!try pushSegments(arena, &segs, base)) return .outside_root;
+    if (!try pushSegments(arena, &segs, rel)) return .outside_root;
 
     var out: std.ArrayList(u8) = .empty;
     for (segs.items, 0..) |seg, k| {
         if (k != 0) try out.append(arena, '/');
         try out.appendSlice(arena, seg);
     }
-    return out.toOwnedSlice(arena);
+    return .{ .inside_root = try out.toOwnedSlice(arena) };
 }
 
-fn pushSegments(arena: std.mem.Allocator, segs: *std.ArrayList([]const u8), part: []const u8) !void {
-    var it = std.mem.tokenizeScalar(u8, part, '/');
+/// Append normalized path segments. `false` means the part was absolute or a
+/// `..` attempted to pop past the repo-relative root.
+fn pushSegments(arena: std.mem.Allocator, segs: *std.ArrayList([]const u8), part: []const u8) !bool {
+    if (isAbsolutePath(part)) return false;
+    var it = std.mem.tokenizeAny(u8, part, "/\\");
     while (it.next()) |seg| {
         if (std.mem.eql(u8, seg, ".") or seg.len == 0) continue;
         if (std.mem.eql(u8, seg, "..")) {
-            if (segs.items.len != 0) _ = segs.pop();
+            if (segs.items.len == 0) return false;
+            _ = segs.pop();
             continue;
         }
         try segs.append(arena, seg);
     }
+    return true;
+}
+
+fn startsWithRelativeSegment(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "./") or
+        std.mem.startsWith(u8, path, "../") or
+        std.mem.startsWith(u8, path, ".\\") or
+        std.mem.startsWith(u8, path, "..\\");
+}
+
+fn isAbsolutePath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/' or path[0] == '\\') return true;
+    return path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':';
 }
 
 fn dotsToSlashes(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
@@ -316,6 +434,17 @@ fn newArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(t_testing.allocator);
 }
 
+fn expectCandidateStatus(expected: CandidateStatus, actual: CandidateResolution) !void {
+    try t_testing.expectEqual(expected, std.meta.activeTag(actual));
+}
+
+fn expectInsidePath(expected: []const u8, actual: NormalizedPath) !void {
+    switch (actual) {
+        .inside_root => |path| try t_testing.expectEqualStrings(expected, path),
+        .outside_root => return error.TestUnexpectedResult,
+    }
+}
+
 // --------------------------------------------------------------------------
 // candidates(): top-level dispatch & guards
 // --------------------------------------------------------------------------
@@ -360,6 +489,53 @@ test "candidates: unsupported families (c, cpp, csharp, go, unknown) return empt
     }
 }
 
+test "resolveCandidates: known external imports retain an explicit external outcome" {
+    var a = newArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    try expectCandidateStatus(.external, try resolveCandidates(arena, "src/main.zig", "std", .zig));
+    try expectCandidateStatus(.external, try resolveCandidates(arena, "src/main.ts", "react", .typescript));
+    try expectCandidateStatus(.external, try resolveCandidates(arena, "src/main.rs", "crate::api", .rust));
+    try expectCandidateStatus(.external, try resolveCandidates(arena, "src/main.go", "example.com/api", .go));
+}
+
+test "resolveCandidates: traversal outside workspace stays outside_root across import families" {
+    var a = newArena();
+    defer a.deinit();
+    const arena = a.allocator();
+    const Case = struct { importer: []const u8, module: []const u8, lang: Language };
+    const cases = [_]Case{
+        .{ .importer = "src/main.zig", .module = "../../outside.zig", .lang = .zig },
+        .{ .importer = "src/main.ts", .module = "../../outside", .lang = .typescript },
+        .{ .importer = "src/pkg/main.py", .module = "....outside", .lang = .python },
+        .{ .importer = "src/main.lua", .module = "../../outside", .lang = .lua },
+        .{ .importer = "src/main.rs", .module = "../../outside", .lang = .rust },
+        .{ .importer = "src/main.rb", .module = "../../outside", .lang = .ruby },
+        .{ .importer = "src/App.java", .module = "../../outside", .lang = .java },
+    };
+    for (cases) |case| {
+        const resolution = try resolveCandidates(arena, case.importer, case.module, case.lang);
+        try expectCandidateStatus(.outside_root, resolution);
+        try t_testing.expectEqual(@as(usize, 0), resolution.paths().len);
+    }
+}
+
+test "resolveCandidates: multiple parent segments that stop at root remain local" {
+    var a = newArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const js = try candidates(arena, "a/b/main.ts", "../../root", .typescript);
+    try t_testing.expectEqualStrings("root.ts", js[0]);
+    const lua = try candidates(arena, "a/b/main.lua", "../../root", .lua);
+    try t_testing.expectEqualStrings("root.lua", lua[0]);
+    const rust = try candidates(arena, "a/b/main.rs", "../../root", .rust);
+    try t_testing.expectEqualStrings("root.rs", rust[0]);
+    const ruby = try candidates(arena, "a/b/main.rb", "../../root", .ruby);
+    try t_testing.expectEqualStrings("root.rb", ruby[0]);
+}
+
 test "candidates: all three js-family languages route to jsCandidates" {
     var a = newArena();
     defer a.deinit();
@@ -402,13 +578,13 @@ test "zig: multiple .. segments normalize upward" {
     try t_testing.expectEqualStrings("src/top.zig", c[0]);
 }
 
-test "zig: .. that escapes above root is dropped" {
+test "zig: .. that escapes above root is outside_root, never root-local" {
     var a = newArena();
     defer a.deinit();
     const arena = a.allocator();
-    const c = try candidates(arena, "a.zig", "../b.zig", .zig);
-    try t_testing.expectEqual(@as(usize, 1), c.len);
-    try t_testing.expectEqualStrings("b.zig", c[0]);
+    const resolution = try resolveCandidates(arena, "a.zig", "../b.zig", .zig);
+    try expectCandidateStatus(.outside_root, resolution);
+    try t_testing.expectEqual(@as(usize, 0), resolution.paths().len);
 }
 
 test "zig: modules not ending in .zig are external (empty)" {
@@ -685,31 +861,32 @@ test "joinNormalize: basic join, dot and dotdot resolution" {
     var a = newArena();
     defer a.deinit();
     const arena = a.allocator();
-    try t_testing.expectEqualStrings("a/b/c", try joinNormalize(arena, "a/b", "c"));
-    try t_testing.expectEqualStrings("a/c", try joinNormalize(arena, "a/b", "../c"));
-    try t_testing.expectEqualStrings("c", try joinNormalize(arena, "a/b", "../../c"));
+    try expectInsidePath("a/b/c", try joinNormalize(arena, "a/b", "c"));
+    try expectInsidePath("a/c", try joinNormalize(arena, "a/b", "../c"));
+    try expectInsidePath("c", try joinNormalize(arena, "a/b", "../../c"));
     // interior "." segments are stripped
-    try t_testing.expectEqualStrings("a/b/c", try joinNormalize(arena, "a", "./b/./c"));
+    try expectInsidePath("a/b/c", try joinNormalize(arena, "a", "./b/./c"));
 }
 
-test "joinNormalize: escaping above the root drops the extra .. segments" {
+test "joinNormalize: escaping above root and absolute paths stay outside_root" {
     var a = newArena();
     defer a.deinit();
     const arena = a.allocator();
-    try t_testing.expectEqualStrings("x", try joinNormalize(arena, "", "../x"));
-    try t_testing.expectEqualStrings("x", try joinNormalize(arena, "a", "../../../x"));
-    try t_testing.expectEqualStrings("", try joinNormalize(arena, "a/b", "../.."));
+    try t_testing.expectEqual(NormalizedPathStatus.outside_root, std.meta.activeTag(try joinNormalize(arena, "", "../x")));
+    try t_testing.expectEqual(NormalizedPathStatus.outside_root, std.meta.activeTag(try joinNormalize(arena, "a", "../../../x")));
+    try t_testing.expectEqual(NormalizedPathStatus.outside_root, std.meta.activeTag(try joinNormalize(arena, "", "/x")));
+    try t_testing.expectEqual(NormalizedPathStatus.outside_root, std.meta.activeTag(try joinNormalize(arena, "", "C:\\x")));
+    // Reaching the root exactly is valid and produces the empty repo-relative path.
+    try expectInsidePath("", try joinNormalize(arena, "a/b", "../.."));
 }
 
 test "joinNormalize: empty inputs and redundant slashes" {
     var a = newArena();
     defer a.deinit();
     const arena = a.allocator();
-    try t_testing.expectEqualStrings("", try joinNormalize(arena, "", ""));
-    // consecutive/leading slashes tokenize away (leading slash dropped)
-    try t_testing.expectEqualStrings("a/b", try joinNormalize(arena, "a//b", ""));
-    try t_testing.expectEqualStrings("a/b", try joinNormalize(arena, "/a/b", ""));
-    try t_testing.expectEqualStrings("a/b", try joinNormalize(arena, "", "/a/b"));
+    try expectInsidePath("", try joinNormalize(arena, "", ""));
+    try expectInsidePath("a/b", try joinNormalize(arena, "a//b", ""));
+    try expectInsidePath("a/b", try joinNormalize(arena, "a\\b", ""));
 }
 
 // --------------------------------------------------------------------------
@@ -722,17 +899,15 @@ test "pushSegments: appends, skips . and empty, pops on .." {
     const arena = a.allocator();
     var segs: std.ArrayList([]const u8) = .empty;
     defer segs.deinit(arena);
-    try pushSegments(arena, &segs, "a/./b//c");
+    try t_testing.expect(try pushSegments(arena, &segs, "a/./b//c"));
     try t_testing.expectEqual(@as(usize, 3), segs.items.len);
-    try pushSegments(arena, &segs, "../d");
+    try t_testing.expect(try pushSegments(arena, &segs, "../d"));
     try t_testing.expectEqual(@as(usize, 3), segs.items.len);
     try t_testing.expectEqualStrings("a", segs.items[0]);
     try t_testing.expectEqualStrings("b", segs.items[1]);
     try t_testing.expectEqualStrings("d", segs.items[2]);
-    // popping past empty is a no-op
-    try pushSegments(arena, &segs, "../../../../../z");
-    try t_testing.expectEqual(@as(usize, 1), segs.items.len);
-    try t_testing.expectEqualStrings("z", segs.items[0]);
+    // Popping past empty is an explicit outside-root result.
+    try t_testing.expect(!try pushSegments(arena, &segs, "../../../../../z"));
 }
 
 // --------------------------------------------------------------------------

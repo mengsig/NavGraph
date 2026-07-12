@@ -357,6 +357,7 @@ fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, l
         try w.writeAll(",\"qualifier\":");
         try writeString(w, ref.qualifier);
     }
+    try writeResolutionFields(w, ref);
     if (ref.target != invalid) {
         try w.writeAll(",\"target\":");
         try writeString(w, idx.graph.files[idx.graph.symbols[ref.target].file].path);
@@ -364,12 +365,22 @@ fn refObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference, l
     } else if (query.referenceIsLocal(sym, ref)) {
         try w.writeAll(",\"resolved\":false,\"resolution\":\"local\"");
     } else if (query.referenceNeedsDiagnostic(sym, ref)) {
-        try w.writeAll(",\"resolved\":false,\"resolution\":\"unresolved_or_external\",\"diagnostic\":\"unresolved_reference\"");
+        const class = query.referenceDiagnosticClass(idx, sym, ref).?;
+        try w.writeAll(",\"resolved\":false,\"resolution\":");
+        try writeString(w, @tagName(class));
+        try w.writeAll(",\"diagnostic\":\"unresolved_reference\"");
     } else {
         try w.writeAll(",\"resolved\":false,\"resolution\":\"external_or_unmodeled\"");
     }
     try writeParseHealthField(w, "owner_parse_health", idx.graph.files[sym.file].parse_health);
     try w.writeByte('}');
+}
+
+fn writeResolutionFields(w: *Writer, ref: model.Reference) !void {
+    try w.writeAll(",\"resolution_status\":");
+    try writeString(w, @tagName(ref.resolution_status));
+    try w.writeAll(",\"resolution_reason\":");
+    try writeString(w, @tagName(ref.resolution_reason));
 }
 
 /// `strings --json`: array of `{file, line, text}` string-literal matches.
@@ -414,7 +425,8 @@ const JsonBudget = struct {
         std.debug.assert(opts.limit > 0);
         const sym = idx.graph.symbols[id];
         const estimate: u32 = @intCast(@min(@as(usize, std.math.maxInt(u32)), 64 + sym.name.len + idx.graph.files[sym.file].path.len));
-        if ((opts.max_nodes != 0 and self.nodes >= opts.max_nodes) or
+        if (self.nodes >= opts.limit or
+            (opts.max_nodes != 0 and self.nodes >= opts.max_nodes) or
             (opts.budget != 0 and self.nodes != 0 and self.estimated_bytes + estimate > opts.budget))
         {
             self.pruned +|= 1;
@@ -443,7 +455,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
         if (roots_written != 0) try w.writeByte(',');
         roots_written += 1;
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited, &budget);
+        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, null, false, &visited, &budget);
     }
     if (budget.pruned != 0) {
         if (roots_written != 0) try w.writeByte(',');
@@ -465,6 +477,7 @@ fn walkNode(
     sites: u32,
     lines: []const u32,
     exact: bool,
+    edge_ref: ?model.Reference,
     implementation_edge: bool,
     visited: *std.AutoHashMap(SymbolId, void),
     budget: *JsonBudget,
@@ -486,6 +499,7 @@ fn walkNode(
     }
     // Only heuristic (name-match) edges are annotated; absence means confident.
     if ((site != 0 or implementation_edge) and !exact) try w.writeAll(",\"exact\":false");
+    if (edge_ref) |ref| try writeResolutionFields(w, ref);
     if (implementation_edge) try w.writeAll(",\"edge\":\"impl\"");
     if (depth >= opts.depth) {
         if (impl_graph) |graph| try implLeafArray(w, idx, graph, id, incoming, opts.strict, opts, budget);
@@ -529,7 +543,7 @@ fn walkCallees(
             if (!opts.refs and query.isDataReadEdge(idx, ref)) continue;
             if (!budget.take(idx, ref.target, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, impl_graph, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, budget);
+            try walkNode(w, idx, impl_graph, ref.target, false, opts, depth + 1, ref.line, ref.count, ref.lines, ref.exact, ref, false, visited, budget);
             wrote += 1;
         } else if (ref.target == invalid and (ref.kind == .call or ref.kind == .route_call)) {
             ext += 1;
@@ -540,7 +554,7 @@ fn walkCallees(
             if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
             if (!budget.take(idx, edge.implementation_method, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited, budget);
+            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, depth + 1, 0, 1, &.{}, edge.exact, null, true, visited, budget);
             wrote += 1;
         }
     }
@@ -603,7 +617,8 @@ fn walkCallers(
         if (!budget.take(idx, cid, opts)) continue;
         if (wrote != 0) try w.writeByte(',');
         try query.callSiteLines(idx, cid, id, &lines);
-        try walkNode(w, idx, impl_graph, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), false, visited, budget);
+        const edge_ref = referenceTo(idx, cid, id);
+        try walkNode(w, idx, impl_graph, cid, true, opts, depth + 1, query.callSiteLine(idx, cid, id), query.callSiteCount(idx, cid, id), lines.items, query.hasExactEdge(idx, cid, id), edge_ref, false, visited, budget);
         wrote += 1;
     }
     if (impl_graph) |graph| {
@@ -617,11 +632,23 @@ fn walkCallers(
                 continue;
             if (!budget.take(idx, target, opts)) continue;
             if (wrote != 0) try w.writeByte(',');
-            try walkNode(w, idx, impl_graph, target, true, opts, depth + 1, 0, 1, &.{}, edge.exact, true, visited, budget);
+            try walkNode(w, idx, impl_graph, target, true, opts, depth + 1, 0, 1, &.{}, edge.exact, null, true, visited, budget);
             wrote += 1;
         }
     }
     try w.writeByte(']');
+}
+
+/// The representative reference behind a reverse edge. Prefer an exact site so
+/// its provenance agrees with the compatibility semantics of `hasExactEdge`.
+fn referenceTo(idx: *const Index, owner: SymbolId, target: SymbolId) ?model.Reference {
+    var first: ?model.Reference = null;
+    for (idx.graph.symbols[owner].refs) |ref| {
+        if (ref.target != target) continue;
+        if (ref.exact) return ref;
+        if (first == null) first = ref;
+    }
+    return first;
 }
 
 /// Hot: array of `{...symbol, fan_in, fan_in_exact, fan_in_test, fan_out, fan_out_exact}`
@@ -770,7 +797,16 @@ fn typeConsumerSites(w: *Writer, idx: *const Index, ids: []const SymbolId, opts:
         if (state.shown >= opts.limit) return;
         const consumer = query.typeConsumerBinding(idx, ids, owner) orelse continue;
         if (state.consumers != 0) try w.writeByte(',');
-        const ref: model.Reference = .{ .name = idx.graph.symbols[target].name, .qualifier = consumer.binding, .line = consumer.line, .kind = .type_use, .target = target, .exact = true };
+        const ref: model.Reference = .{
+            .name = idx.graph.symbols[target].name,
+            .qualifier = consumer.binding,
+            .line = consumer.line,
+            .kind = .type_use,
+            .target = target,
+            .exact = true,
+            .resolution_status = .exact,
+            .resolution_reason = .typed_receiver,
+        };
         try refObject(w, idx, owner, ref, consumer.line);
         state.consumers += 1;
         state.shown += 1;
@@ -1247,6 +1283,7 @@ fn calleeArray(w: *Writer, idx: *const Index, graph: ?*const impls_mod.Graph, sy
         try nodeHead(w, idx, idx.graph.symbols[ref.target]);
         if (ref.line != 0) try w.print(",\"site\":{d}", .{ref.line});
         if (!ref.exact) try w.writeAll(",\"exact\":false");
+        try writeResolutionFields(w, ref);
         try w.writeByte('}');
         wrote += 1;
     }
@@ -1443,18 +1480,25 @@ fn writeUnresolvedStatus(
     report: query.StatusReport,
     opts: Options,
 ) !void {
-    try w.print(",\"unresolved_references\":{{\"count\":{},\"scope\":\"call_type_import_edges\",\"items\":[", .{report.unresolved_refs});
+    try w.print(",\"unresolved_references\":{{\"count\":{},\"scope\":\"call_type_import_edges\",\"categories\":{{\"likely_local\":{},\"external_or_unmodeled\":{}}},\"items\":[", .{
+        report.unresolved_refs,
+        report.likely_local_refs,
+        report.external_or_unmodeled_refs,
+    });
     var shown: u32 = 0;
-    outer: for (idx.graph.symbols) |sym| {
-        const file = idx.graph.files[sym.file];
-        if (!query.statusFileSelected(file, filter, opts)) continue;
-        for (sym.refs) |ref| {
-            if (!query.referenceNeedsDiagnostic(sym, ref)) continue;
-            if (shown != 0) try w.writeByte(',');
-            try unresolvedObject(w, idx, sym, ref);
-            shown += 1;
-            if (shown >= opts.limit) break :outer;
+    inline for (.{ query.ReferenceDiagnosticClass.likely_local, query.ReferenceDiagnosticClass.external_or_unmodeled }) |wanted| {
+        outer: for (idx.graph.symbols) |sym| {
+            const file = idx.graph.files[sym.file];
+            if (!query.statusFileSelected(file, filter, opts)) continue;
+            for (sym.refs) |ref| {
+                if (query.referenceDiagnosticClass(idx, sym, ref) != wanted) continue;
+                if (shown != 0) try w.writeByte(',');
+                try unresolvedObject(w, idx, sym, ref);
+                shown += 1;
+                if (shown >= opts.limit) break :outer;
+            }
         }
+        if (shown >= opts.limit) break;
     }
     try w.print("],\"shown\":{},\"truncated\":{}}}", .{ shown, shown < report.unresolved_refs });
 }
@@ -1475,17 +1519,19 @@ fn statusJsonlHealth(w: *Writer, idx: *const Index, filter: []const u8, opts: Op
 
 fn statusJsonlUnresolved(w: *Writer, idx: *const Index, filter: []const u8, opts: Options, page: *JsonlPage, start: u32) !u32 {
     var ordinal = start;
-    for (idx.graph.symbols) |sym| {
-        const file = idx.graph.files[sym.file];
-        if (!query.statusFileSelected(file, filter, opts)) continue;
-        for (sym.refs) |ref| {
-            if (!query.referenceNeedsDiagnostic(sym, ref)) continue;
-            if (page.accepts(ordinal)) {
-                try jsonlHead(w, page.last);
-                try unresolvedObject(w, idx, sym, ref);
-                try w.writeAll("}\n");
+    inline for (.{ query.ReferenceDiagnosticClass.likely_local, query.ReferenceDiagnosticClass.external_or_unmodeled }) |wanted| {
+        for (idx.graph.symbols) |sym| {
+            const file = idx.graph.files[sym.file];
+            if (!query.statusFileSelected(file, filter, opts)) continue;
+            for (sym.refs) |ref| {
+                if (query.referenceDiagnosticClass(idx, sym, ref) != wanted) continue;
+                if (page.accepts(ordinal)) {
+                    try jsonlHead(w, page.last);
+                    try unresolvedObject(w, idx, sym, ref);
+                    try w.writeAll("}\n");
+                }
+                ordinal += 1;
             }
-            ordinal += 1;
         }
     }
     return ordinal;
@@ -1501,8 +1547,10 @@ fn parseHealthObject(w: *Writer, file: model.SourceFile) !void {
 
 fn unresolvedObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference) !void {
     const file = idx.graph.files[sym.file];
-    std.debug.assert(query.referenceNeedsDiagnostic(sym, ref));
-    try w.writeAll("{\"kind\":\"unresolved_reference\",\"resolution\":\"unresolved_or_external\",\"name\":");
+    const class = query.referenceDiagnosticClass(idx, sym, ref).?;
+    try w.writeAll("{\"kind\":\"unresolved_reference\",\"resolution\":");
+    try writeString(w, @tagName(class));
+    try w.writeAll(",\"name\":");
     try writeString(w, ref.name);
     try w.print(",\"reference_kind\":\"{s}\",\"mode\":\"{s}\",\"file\":", .{ @tagName(ref.kind), if (ref.write) "write" else "read" });
     try writeString(w, file.path);
@@ -1516,19 +1564,23 @@ fn unresolvedObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Refer
     try w.writeByte('}');
 }
 
-pub fn readError(w: *Writer, code: []const u8, value: []const u8) !void {
+pub fn readError(w: *Writer, code: []const u8, message: []const u8, value: []const u8) !void {
     std.debug.assert(code.len > 0);
+    std.debug.assert(message.len > 0);
     std.debug.assert(value.len > 0);
     try w.writeAll("{\"error\":");
     try writeString(w, code);
+    try w.writeAll(",\"message\":");
+    try writeString(w, message);
     try w.writeAll(",\"value\":");
     try writeString(w, value);
     try w.writeAll("}\n");
 }
 
-pub fn sourceLines(w: *Writer, path: []const u8, text: []const u8, ranges: []const query.LineRange) !bool {
+pub fn sourceLines(w: *Writer, path: []const u8, text: []const u8, ranges: []const query.LineRange, page: query.ReadPage) !bool {
     std.debug.assert(path.len > 0);
     for (ranges) |range| std.debug.assert(range.lo > 0 and range.hi >= range.lo);
+    for (page.ranges) |range| std.debug.assert(range.lo > 0 and range.hi >= range.lo);
     const total = query.lineCount(text);
     try w.writeAll("{\"file\":");
     try writeString(w, path);
@@ -1539,8 +1591,34 @@ pub fn sourceLines(w: *Writer, path: []const u8, text: []const u8, ranges: []con
         if (range.hi == std.math.maxInt(usize)) try w.writeAll("null") else try w.print("{d}", .{range.hi});
         try w.writeByte('}');
     }
-    try w.writeAll("],\"lines\":[");
-    const emitted = try sourceLineObjects(w, text, ranges);
+    try w.print("],\"offset\":{d},\"limit\":{d},\"budget\":{d},\"estimated_bytes\":{d},\"selected\":{d},\"shown\":{d},\"truncated\":{s},\"next\":", .{
+        page.offset,
+        page.limit,
+        page.budget,
+        page.estimated_bytes,
+        page.selected,
+        page.shown,
+        if (page.truncated) "true" else "false",
+    });
+    if (page.next) |next| {
+        try w.print("\"v1:{d}\"", .{next});
+    } else {
+        try w.writeAll("null");
+    }
+    if (page.selected == 0) {
+        for (ranges) |range| {
+            if (range.lo <= total) continue;
+            try w.print(",\"selection_error\":{{\"code\":\"no_such_line\",\"requested\":{d},\"total_lines\":{d}}}", .{ range.lo, total });
+            break;
+        }
+    }
+    try w.writeAll(",\"lines\":[");
+    // `sourceLineObjects` historically treats an empty range list as "all
+    // lines" for standalone callers. In a paged read, however, an empty page
+    // means the requested selection was past EOF (or its cursor is exhausted),
+    // never "expand to the whole file".
+    const emitted = if (page.ranges.len == 0) 0 else try sourceLineObjects(w, text, page.ranges);
+    std.debug.assert(emitted == page.shown);
     try w.writeAll("]}\n");
     return emitted != 0;
 }
@@ -1704,6 +1782,12 @@ fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool 
 pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_name: []const u8, opts: Options) !bool {
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
+    const from_ids = query.resolveIds(idx, from_name, &fbuf);
+    const to_ids = query.resolveIds(idx, to_name, &tbuf);
+    if (from_ids.len > 1 or to_ids.len > 1) {
+        try writeAmbiguousPath(w, idx, from_name, to_name, from_ids, to_ids, fbuf.len, tbuf.len);
+        return false;
+    }
     const chain = query.shortestPathIdsWithOptions(idx, from_name, to_name, &fbuf, &tbuf, opts) catch {
         try w.writeAll("[]\n");
         return false;
@@ -1717,6 +1801,63 @@ pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_nam
     }
     try w.writeAll("]\n");
     return chain.len > 0;
+}
+
+fn writeAmbiguousPath(
+    w: *Writer,
+    idx: *const Index,
+    from_name: []const u8,
+    to_name: []const u8,
+    from_ids: []const SymbolId,
+    to_ids: []const SymbolId,
+    from_capacity: usize,
+    to_capacity: usize,
+) !void {
+    try w.writeAll("{\"ambiguous\":true,\"traversed\":false,\"from\":");
+    try writePathEndpoint(w, idx, from_name, from_ids, from_capacity);
+    try w.writeAll(",\"to\":");
+    try writePathEndpoint(w, idx, to_name, to_ids, to_capacity);
+    try w.writeAll(",\"candidates\":[");
+    const candidates = if (from_ids.len > 1) from_ids else to_ids;
+    for (candidates[0..@min(candidates.len, 12)], 0..) |candidate, i| {
+        if (i != 0) try w.writeByte(',');
+        try nodeHead(w, idx, idx.graph.symbols[candidate]);
+        try w.writeAll(",\"selector\":");
+        try writePinnedPathSelector(w, idx, candidate);
+        try w.writeByte('}');
+    }
+    try w.writeAll("],\"suggested_calls\":[");
+    if (candidates.len != 0) {
+        try w.writeAll("{\"command\":\"path\",\"from\":");
+        if (from_ids.len > 1) try writePinnedPathSelector(w, idx, candidates[0]) else try writeString(w, from_name);
+        try w.writeAll(",\"to\":");
+        if (to_ids.len > 1) try writePinnedPathSelector(w, idx, candidates[0]) else try writeString(w, to_name);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}\n");
+}
+
+fn writePathEndpoint(w: *Writer, idx: *const Index, selector: []const u8, ids: []const SymbolId, capacity: usize) !void {
+    _ = idx;
+    try w.writeAll("{\"selector\":");
+    try writeString(w, selector);
+    try w.print(",\"matches\":{},\"truncated\":{}}}", .{ ids.len, ids.len == capacity });
+}
+
+fn writePinnedPathSelector(w: *Writer, idx: *const Index, id: SymbolId) !void {
+    const sym = idx.graph.symbols[id];
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(idx.gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(idx.gpa, &buf);
+    defer aw.deinit();
+    if (sym.parent != invalid) {
+        try aw.writer.writeAll(idx.graph.symbols[sym.parent].name);
+        try aw.writer.writeByte('.');
+    }
+    try aw.writer.writeAll(sym.name);
+    try aw.writer.writeByte('@');
+    try aw.writer.writeAll(idx.graph.files[sym.file].path);
+    try writeString(w, aw.written());
 }
 
 // ---------------------------------------------------------------------------
@@ -2350,6 +2491,8 @@ test "search --refs json emits reference objects with the resolved target" {
         try testing.expect(o.get("line").?.integer >= 1);
         // The reference resolves to add's file.
         try testing.expect(std.mem.endsWith(u8, o.get("target").?.string, "r.zig"));
+        try testing.expectEqualStrings("exact", o.get("resolution_status").?.string);
+        try testing.expectEqualStrings("same_file_fallback", o.get("resolution_reason").?.string);
     }
     try testing.expect(found);
 }
@@ -2407,6 +2550,8 @@ test "calls json nests callees and marks a mutual-recursion cycle" {
     try testing.expectEqualStrings("pong", callees[0].object.get("name").?.string);
     // Every callee edge carries the call-site line.
     try testing.expect(callees[0].object.get("site").?.integer >= 1);
+    try testing.expectEqualStrings("exact", callees[0].object.get("resolution_status").?.string);
+    try testing.expectEqualStrings("same_file_fallback", callees[0].object.get("resolution_reason").?.string);
     // The cycle closes when ping is revisited, marked recursion:true.
     try testing.expect(std.mem.indexOf(u8, out, "\"recursion\":true") != null);
 }
@@ -2490,6 +2635,8 @@ test "callers json nests incoming edges with a call-site line" {
     try testing.expectEqual(@as(usize, 1), callers.len);
     try testing.expectEqualStrings("mid", callers[0].object.get("name").?.string);
     try testing.expect(callers[0].object.get("site").?.integer >= 1);
+    try testing.expectEqualStrings("exact", callers[0].object.get("resolution_status").?.string);
+    try testing.expectEqualStrings("same_file_fallback", callers[0].object.get("resolution_reason").?.string);
 }
 
 test "calls json flags a heuristic edge with exact:false; strict drops it" {
@@ -2520,6 +2667,9 @@ test "calls json flags a heuristic edge with exact:false; strict drops it" {
         var p = try tjParse(out);
         defer p.deinit();
         try testing.expect(std.mem.indexOf(u8, out, "\"exact\":false") != null);
+        const callee = p.value.array.items[0].object.get("callees").?.array.items[0].object;
+        try testing.expectEqualStrings("heuristic", callee.get("resolution_status").?.string);
+        try testing.expectEqualStrings("same_file_fallback", callee.get("resolution_reason").?.string);
     }
     { // Strict follows only exact edges → the heuristic callee is gone.
         var aw = tjWriter();
@@ -2848,6 +2998,8 @@ test "neighbors json splits callees and callers with call-site lines" {
     try testing.expectEqual(@as(usize, 1), callees.len);
     try testing.expectEqualStrings("leaf", callees[0].object.get("name").?.string);
     try testing.expect(callees[0].object.get("site").?.integer >= 1);
+    try testing.expectEqualStrings("exact", callees[0].object.get("resolution_status").?.string);
+    try testing.expectEqualStrings("same_file_fallback", callees[0].object.get("resolution_reason").?.string);
     const callers = o.get("callers").?.array.items;
     try testing.expectEqual(@as(usize, 1), callers.len);
     try testing.expectEqualStrings("top", callers[0].object.get("name").?.string);
@@ -3172,6 +3324,36 @@ test "path json returns the chain of symbols and empties when none exists" {
     }
 }
 
+test "path json returns candidates instead of traversing an ambiguous endpoint" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn start() void { dst(); }
+        \\pub fn dst() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn start() void {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    try testing.expect(!try shortestPath(&aw.writer, &idx, "start", "dst", .{ .format = .json }));
+    var parsed = try tjParse(aw.written());
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try testing.expect(object.get("ambiguous").?.bool);
+    try testing.expect(!object.get("traversed").?.bool);
+    try testing.expectEqual(@as(usize, 2), object.get("candidates").?.array.items.len);
+    const suggested = object.get("suggested_calls").?.array.items[0].object;
+    const pinned = suggested.get("from").?.string;
+    var ids: [4]SymbolId = undefined;
+    try testing.expectEqual(@as(usize, 1), query.resolveIds(&idx, pinned, &ids).len);
+}
+
 // --- modifiers ------------------------------------------------------------
 
 test "json modifiers array carries static, classmethod, and abstract" {
@@ -3250,4 +3432,50 @@ test "def json at full verbosity embeds an escaped body and stays well-formed" {
     // The raw JSON escaped the interior quote as \" (a backslash then a quote).
     try testing.expect(std.mem.indexOf(u8, out, "\\\"hi") != null);
     try testing.expect(balancedBrackets(out));
+}
+
+test "source read json is valid, bounded, and carries a continuation cursor" {
+    const testing = std.testing;
+    const text = "one\ntwo \"quoted\"\nthree\\slash\nfour\nfive\n";
+    const requested = [_]query.LineRange{.{ .lo = 1, .hi = 5 }};
+    var page_ranges: [query.max_read_ranges]query.LineRange = undefined;
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    const first = query.sourcePage(text, &requested, .{ .limit = 2 }, &page_ranges);
+    try testing.expect(try sourceLines(&aw.writer, "sample.txt", text, &requested, first));
+    var parsed = try tjParse(aw.written());
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("sample.txt", root.get("file").?.string);
+    try testing.expectEqual(@as(i64, 5), root.get("total_lines").?.integer);
+    try testing.expectEqual(@as(i64, 5), root.get("selected").?.integer);
+    try testing.expectEqual(@as(i64, 2), root.get("shown").?.integer);
+    try testing.expect(root.get("truncated").?.bool);
+    try testing.expectEqualStrings("v1:2", root.get("next").?.string);
+    try testing.expectEqual(@as(usize, 2), root.get("lines").?.array.items.len);
+    try testing.expectEqualStrings("two \"quoted\"", root.get("lines").?.array.items[1].object.get("text").?.string);
+
+    aw.clearRetainingCapacity();
+    const second = query.sourcePage(text, &requested, .{ .limit = 2, .after = 2, .after_set = true }, &page_ranges);
+    try testing.expect(try sourceLines(&aw.writer, "sample.txt", text, &requested, second));
+    var parsed_second = try tjParse(aw.written());
+    defer parsed_second.deinit();
+    const second_root = parsed_second.value.object;
+    try testing.expectEqual(@as(i64, 2), second_root.get("offset").?.integer);
+    try testing.expectEqualStrings("v1:4", second_root.get("next").?.string);
+    try testing.expectEqual(@as(i64, 3), second_root.get("lines").?.array.items[0].object.get("line").?.integer);
+}
+
+test "source read json validation errors have stable code message and value" {
+    const testing = std.testing;
+    var aw = tjWriter();
+    defer aw.deinit();
+    try readError(&aw.writer, "descending_range", "range end must not precede its start", "100-50");
+    var parsed = try tjParse(aw.written());
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("descending_range", root.get("error").?.string);
+    try testing.expectEqualStrings("range end must not precede its start", root.get("message").?.string);
+    try testing.expectEqualStrings("100-50", root.get("value").?.string);
 }

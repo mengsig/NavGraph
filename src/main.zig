@@ -13,6 +13,7 @@ const history_mod = @import("history.zig");
 const json_out = @import("json_out.zig");
 const viz = @import("viz.zig");
 const capabilities = @import("capabilities.zig");
+const agent_api = @import("agent_api.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -50,7 +51,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
     if (parsed.command == .help) {
-        try cli.usage(out);
+        if (parsed.arg.len == 0) {
+            try cli.usage(out);
+        } else {
+            _ = try cli.usageCommand(out, parsed.arg);
+        }
         try out.flush();
         return;
     }
@@ -60,11 +65,23 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         return;
     }
+    if (parsed.command == .read) {
+        const found = query.readLinesStandalone(out, io, gpa, parsed.root, parsed.arg, parsed.options) catch |err| switch (err) {
+            error.WriteFailed => std.process.exit(141),
+            else => return err,
+        };
+        out.flush() catch std.process.exit(141);
+        if (!found) std.process.exit(1);
+        return;
+    }
 
     var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
-        return err;
+        // The diagnostic is the product contract. Returning the error from
+        // `main` adds an internal Zig stack trace that is noisy and unactionable
+        // for an agent.
+        std.process.exit(1);
     };
     defer idx.deinit();
 
@@ -76,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const found = dispatch(out, io, &idx, parsed) catch |err| switch (err) {
+    const found = dispatchHardBudget(out, io, &idx, parsed) catch |err| switch (err) {
         // Downstream closed the pipe (`navgraph … | head`). That's a normal way
         // to consume a Unix tool, not an internal error: exit quietly with the
         // conventional SIGPIPE status instead of spraying `error.WriteFailed`.
@@ -138,12 +155,129 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
     };
 }
 
+const CapturedDispatch = struct {
+    bytes: []u8,
+    found: bool,
+};
+
+/// `--budget` is an exact serialized stdout contract. Individual query domains
+/// still use it to rank/prune likely-useful rows, then this final boundary
+/// measures the real rendering (signatures, source, JSON escaping, metadata and
+/// all) and compacts/re-renders until the complete value fits.
+fn dispatchHardBudget(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !bool {
+    if (parsed.options.budget == 0 or parsed.command == .read) return dispatch(out, io, idx, parsed);
+    const hard_limit = parsed.options.budget;
+
+    const initial = try captureDispatch(idx.gpa, io, idx, parsed);
+    defer idx.gpa.free(initial.bytes);
+    if (initial.bytes.len <= hard_limit) {
+        try out.writeAll(initial.bytes);
+        return initial.found;
+    }
+    const found = initial.found;
+
+    var compact = parsed;
+    compact.options.budget = 0;
+    compact.options.summary = true;
+    compact.options.verbosity = .names;
+    // Raw patches cannot be semantically compacted by lowering a result count;
+    // fall back to the changed-symbol summary before resorting to a metadata-only
+    // hard-budget response.
+    if (compact.command == .diff) compact.options.exact_source = false;
+    var cap = compact.options.limit;
+    if (compact.options.max_nodes != 0) cap = @min(cap, compact.options.max_nodes);
+    cap = @min(cap, @max(@as(u32, 1), hard_limit / 96));
+
+    while (true) {
+        compact.options.limit = cap;
+        compact.options.max_nodes = cap;
+        const rendered = try captureDispatch(idx.gpa, io, idx, compact);
+        defer idx.gpa.free(rendered.bytes);
+        const annotated = try annotateHardBudget(idx.gpa, rendered.bytes, parsed.options.format, hard_limit, initial.bytes.len);
+        defer idx.gpa.free(annotated);
+        if (annotated.len <= hard_limit) {
+            try out.writeAll(annotated);
+            return found;
+        }
+        if (cap == 1) break;
+        cap = @max(@as(u32, 1), cap / 2);
+    }
+
+    const minimal = try hardBudgetOnly(idx.gpa, parsed.options.format, hard_limit);
+    defer idx.gpa.free(minimal);
+    std.debug.assert(minimal.len <= hard_limit);
+    try out.writeAll(minimal);
+    return found;
+}
+
+fn captureDispatch(allocator: std.mem.Allocator, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !CapturedDispatch {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    defer aw.deinit();
+    const found = try dispatch(&aw.writer, io, idx, parsed);
+    return .{ .bytes = try allocator.dupe(u8, aw.written()), .found = found };
+}
+
+fn annotateHardBudget(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    format: query.OutputFormat,
+    budget: u32,
+    original_bytes: usize,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    defer aw.deinit();
+    const w = &aw.writer;
+    switch (format) {
+        .text => {
+            try w.writeAll(raw);
+            if (raw.len != 0 and raw[raw.len - 1] != '\n') try w.writeByte('\n');
+            try w.print("… hard byte budget truncated/compacted output (budget={}, original_bytes={})\n", .{ budget, original_bytes });
+        },
+        .json => {
+            const trimmed = std.mem.trimEnd(u8, raw, " \t\r\n");
+            if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+                try w.writeAll(trimmed[0 .. trimmed.len - 1]);
+                if (std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n").len != 0) try w.writeByte(',');
+                try w.print("{{\"truncated\":true,\"reason\":\"hard_byte_budget\",\"budget\":{},\"original_bytes\":{}}}]\n", .{ budget, original_bytes });
+            } else if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
+                try w.writeAll(trimmed[0 .. trimmed.len - 1]);
+                if (std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n").len != 0) try w.writeByte(',');
+                try w.print("\"hard_budget\":{{\"truncated\":true,\"budget\":{},\"original_bytes\":{}}}}}\n", .{ budget, original_bytes });
+            } else {
+                return hardBudgetOnly(allocator, format, budget);
+            }
+        },
+        .jsonl => {
+            try w.writeAll(raw);
+            if (raw.len != 0 and raw[raw.len - 1] != '\n') try w.writeByte('\n');
+            try w.print("{{\"kind\":\"budget\",\"truncated\":true,\"budget\":{},\"original_bytes\":{}}}\n", .{ budget, original_bytes });
+        },
+    }
+    return aw.toOwnedSlice();
+}
+
+fn hardBudgetOnly(allocator: std.mem.Allocator, format: query.OutputFormat, budget: u32) ![]u8 {
+    var buf: [96]u8 = undefined;
+    const rendered = switch (format) {
+        .text => std.fmt.bufPrint(&buf, "… output truncated (--budget {})\n", .{budget}) catch "",
+        .json, .jsonl => std.fmt.bufPrint(&buf, "{{\"truncated\":true,\"reason\":\"hard_byte_budget\",\"budget\":{}}}\n", .{budget}) catch "{}\n",
+    };
+    // CLI validation keeps budgets >=64, enough for the complete diagnostic.
+    // Retain a defensive slice for programmatic Options constructed in tests.
+    return allocator.dupe(u8, rendered[0..@min(rendered.len, budget)]);
+}
+
 const ServerSession = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     idx: *index_mod.Index,
     root: []u8,
     use_cache: bool,
+    snapshot_id: u64,
 
     fn init(
         gpa: std.mem.Allocator,
@@ -154,7 +288,14 @@ const ServerSession = struct {
     ) !ServerSession {
         std.debug.assert(root.len > 0);
         std.debug.assert(idx.gpa.ptr == gpa.ptr);
-        return .{ .gpa = gpa, .io = io, .idx = idx, .root = try gpa.dupe(u8, root), .use_cache = use_cache };
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .idx = idx,
+            .root = try gpa.dupe(u8, root),
+            .use_cache = use_cache,
+            .snapshot_id = agent_api.snapshotFingerprint(idx),
+        };
     }
 
     fn deinit(self: *ServerSession) void {
@@ -166,8 +307,10 @@ const ServerSession = struct {
         std.debug.assert(self.root.len > 0);
         std.debug.assert(self.idx.gpa.ptr == self.gpa.ptr);
         var fresh = try index_mod.build(self.gpa, self.io, self.root, use_cache);
+        const fresh_snapshot_id = agent_api.snapshotFingerprint(&fresh);
         const old = self.idx.*;
         self.idx.* = fresh;
+        self.snapshot_id = fresh_snapshot_id;
         fresh = old;
         fresh.deinit();
     }
@@ -265,7 +408,14 @@ fn rpcInitialize(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     try out.print(",\"capabilitySchemaVersion\":{},\"agentProtocolVersion\":", .{capabilities.capability_schema_version});
     try json_out.writeString(out, capabilities.agent_protocol_version);
     try out.print(",\"schemaHash\":\"wyhash64:{x:0>16}\"", .{capabilities.schemaFingerprint()});
-    try out.writeAll(",\"capabilitiesMethod\":\"navgraph/capabilities\",\"capabilitiesTool\":\"navgraph.capabilities\",\"buildId\":\"");
+    try out.writeAll(",\"capabilitiesMethod\":\"navgraph/capabilities\",\"capabilitiesTool\":\"navgraph.capabilities\",\"queryTool\":");
+    try json_out.writeString(out, agent_api.tool_name);
+    try out.writeAll(",\"querySchema\":");
+    try json_out.writeString(out, agent_api.query_schema);
+    try out.writeAll(",\"resultSchema\":");
+    try json_out.writeString(out, agent_api.result_schema);
+    try out.print(",\"agentSchemaHash\":\"wyhash64:{x:0>16}\"", .{agent_api.inputSchemaFingerprint()});
+    try out.writeAll(",\"buildId\":\"");
     try capabilities.writeBuildId(out);
     try out.writeAll("\"}}},\"serverInfo\":{\"name\":\"navgraph\",\"version\":\"");
     try capabilities.writeBuildVersion(out);
@@ -285,7 +435,16 @@ fn rpcTools(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     std.debug.assert(id != null);
     try rpcResultPrefix(out, id);
     try out.writeAll("{\"tools\":[");
-    try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Run a NavGraph command against the server's in-memory index. Call navgraph.capabilities first to discover canonical commands, aliases, argument shapes, applicable options, output modes, access class, and trust limitations. Most commands are read-only; rename mutates workspace files unless --preview is supplied.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"],\"additionalProperties\":false}},");
+    try out.writeAll("{\"name\":\"");
+    try out.writeAll(agent_api.tool_name);
+    try out.writeAll("\",\"description\":\"Compact typed read-only API; no argv or mutation. map uses query/path; symbol views definition/docs/source; relations views callees/callers/neighbors/imports/importers/hierarchy/implementations/path/flow; source uses bounded lines; impact views edit_sites/affected_tests/changed_symbols; diagnostics views status/coverage. Protocol ");
+    try out.writeAll(capabilities.agent_protocol_version);
+    try out.writeAll("; build ");
+    try capabilities.writeBuildId(out);
+    try out.writeAll(". max_bytes hard-bounds structuredContent.\",\"inputSchema\":");
+    try agent_api.writeInputSchema(out);
+    try out.writeAll(",\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Legacy read-only argv compatibility tool. Prefer navgraph.query. Mutating commands, including rename and rename --preview, are rejected.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false}},");
     try out.writeAll("{\"name\":\"navgraph.capabilities\",\"description\":\"Return NavGraph's machine-readable protocol, build identity, language, command, option, output, access, and trust contract without rebuilding the index.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},");
     try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}}]}}\n");
     return true;
@@ -378,6 +537,8 @@ fn rpcToolCall(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value
     }
     if (std.mem.eql(u8, name.string, "navgraph"))
         return runServerTool(out, session, id, arguments.object.get("args"));
+    if (std.mem.eql(u8, name.string, agent_api.tool_name))
+        return runAgentTool(out, session, id, arguments);
     if (std.mem.eql(u8, name.string, "navgraph.capabilities"))
         return rpcCapabilitiesTool(out, session.gpa, id, arguments);
     if (std.mem.eql(u8, name.string, "navgraph.reload"))
@@ -434,13 +595,71 @@ fn runServerTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Val
         return true;
     };
     if (request.command == .capabilities) return rpcCapabilities(out, id);
-    if (!cli.registry.descriptor(request.command).server_available or !std.mem.eql(u8, request.root, ".")) {
+    const descriptor = cli.registry.descriptor(request.command);
+    if (descriptor.access != .read_only) {
+        try rpcError(out, id, -32602, "legacy navgraph MCP tool is read-only; mutating commands are prohibited");
+        return true;
+    }
+    if (!descriptor.server_available or !std.mem.eql(u8, request.root, ".")) {
         try rpcError(out, id, -32602, "this command or -C is not allowed inside a server request");
         return true;
     }
     request.root = session.root;
     try dispatchServerResult(out, session, id, request);
     return true;
+}
+
+fn runAgentTool(
+    out: *std.Io.Writer,
+    session: *ServerSession,
+    id: ?std.json.Value,
+    arguments: std.json.Value,
+) !bool {
+    std.debug.assert(id != null);
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var request = agent_api.decode(arena, arguments) catch |err| {
+        try rpcError(out, id, -32602, agent_api.reason(err));
+        return true;
+    };
+    const descriptor = cli.registry.descriptor(request.parsed.command);
+    if (descriptor.access != .read_only or !descriptor.server_available) {
+        try rpcError(out, id, -32602, "navgraph.query resolved to a prohibited command");
+        return true;
+    }
+    request.parsed.root = session.root;
+
+    if (try agent_api.ambiguityEnvelopeOwned(session.gpa, session.idx, session.snapshot_id, request)) |envelope| {
+        defer session.gpa.free(envelope);
+        std.debug.assert(envelope.len <= request.max_bytes);
+        try writeAgentResult(out, id, envelope);
+        return true;
+    }
+
+    var raw_buf: std.ArrayList(u8) = .empty;
+    defer raw_buf.deinit(session.gpa);
+    var raw_writer: std.Io.Writer.Allocating = .fromArrayList(session.gpa, &raw_buf);
+    defer raw_writer.deinit();
+    const found = dispatch(&raw_writer.writer, session.io, session.idx, request.parsed) catch |err| {
+        try rpcError(out, id, -32603, @errorName(err));
+        return true;
+    };
+    const envelope = agent_api.envelopeOwned(session.gpa, session.idx, session.snapshot_id, request, found, raw_writer.written()) catch |err| {
+        try rpcError(out, id, -32603, @errorName(err));
+        return true;
+    };
+    defer session.gpa.free(envelope);
+    std.debug.assert(envelope.len <= request.max_bytes);
+    try writeAgentResult(out, id, envelope);
+    return true;
+}
+
+fn writeAgentResult(out: *std.Io.Writer, id: ?std.json.Value, envelope: []const u8) !void {
+    try rpcResultPrefix(out, id);
+    try out.writeAll("{\"content\":[{\"type\":\"text\",\"text\":\"NavGraph structured result\"}],\"structuredContent\":");
+    try out.writeAll(envelope);
+    try out.writeAll(",\"isError\":false}}\n");
 }
 
 fn dispatchServerResult(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, request: cli.Parsed) !void {
@@ -450,7 +669,7 @@ fn dispatchServerResult(out: *std.Io.Writer, session: *ServerSession, id: ?std.j
     defer buf.deinit(session.gpa);
     var aw: std.Io.Writer.Allocating = .fromArrayList(session.gpa, &buf);
     defer aw.deinit();
-    const found = dispatch(&aw.writer, session.io, session.idx, request) catch |err| {
+    const found = dispatchHardBudget(&aw.writer, session.io, session.idx, request) catch |err| {
         try rpcError(out, id, -32603, @errorName(err));
         return;
     };
@@ -547,6 +766,35 @@ fn sampleFixture(io: std.Io) !SampleFixture {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     errdefer tmp.cleanup();
     try writeSampleProject(io, tmp.dir);
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const idx = try index_mod.build(std.testing.allocator, io, root, false);
+    return .{ .tmp = tmp, .idx = idx };
+}
+
+fn ambiguousFixture(io: std.Io) !SampleFixture {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    errdefer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub const Alpha = struct {
+        \\    pub fn parse() void { tokenize(); }
+        \\    fn tokenize() void {}
+        \\};
+        \\pub const Beta = struct {
+        \\    pub fn parse() void { tokenize(); }
+        \\    fn tokenize() void {}
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub const Gamma = struct {
+        \\    pub fn parse() void { tokenize(); }
+        \\    fn tokenize() void {}
+        \\};
+        \\pub const Delta = struct {
+        \\    pub fn parse() void { tokenize(); }
+        \\    fn tokenize() void {}
+        \\};
+    });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const idx = try index_mod.build(std.testing.allocator, io, root, false);
@@ -1049,6 +1297,46 @@ test "phase 3 reachability, docs, todos, rename preview, and compaction dispatch
     defer testing.allocator.free(bounded_neighbors);
     try testing.expect(has(bounded_neighbors, "nodes shown"));
     try testing.expect(!has(bounded_neighbors, "() void"));
+
+    // `-l/--limit` is the universal result contract, including tree walks.
+    // It must cap nodes even when neither of the optional compaction flags is
+    // present; agents rely on this before they know a graph's fan-out.
+    const limited = try dispatchOwned(testing.allocator, io, &fx.idx, .{ .command = .calls, .arg = "run", .options = .{ .depth = 3, .limit = 1 } });
+    defer testing.allocator.free(limited);
+    try testing.expect(has(limited, "run"));
+    try testing.expect(!has(limited, "mid"));
+    try testing.expect(has(limited, "1 nodes shown"));
+
+    const limited_json = try dispatchOwned(testing.allocator, io, &fx.idx, .{ .command = .neighbors, .arg = "run", .options = .{ .format = .json, .limit = 1 } });
+    defer testing.allocator.free(limited_json);
+    var parsed_limited = try std.json.parseFromSlice(std.json.Value, testing.allocator, limited_json, .{});
+    defer parsed_limited.deinit();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, limited_json, "\"id\":"));
+    try testing.expect(has(limited_json, "\"truncated\":true"));
+
+    var hard_text_buf: std.ArrayList(u8) = .empty;
+    defer hard_text_buf.deinit(testing.allocator);
+    var hard_text_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &hard_text_buf);
+    defer hard_text_writer.deinit();
+    try testing.expect(try dispatchHardBudget(&hard_text_writer.writer, io, &fx.idx, .{
+        .command = .calls,
+        .arg = "run",
+        .options = .{ .depth = 3, .verbosity = .full, .budget = 160 },
+    }));
+    try testing.expect(hard_text_writer.written().len <= 160);
+
+    var hard_json_buf: std.ArrayList(u8) = .empty;
+    defer hard_json_buf.deinit(testing.allocator);
+    var hard_json_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &hard_json_buf);
+    defer hard_json_writer.deinit();
+    try testing.expect(try dispatchHardBudget(&hard_json_writer.writer, io, &fx.idx, .{
+        .command = .neighbors,
+        .arg = "run",
+        .options = .{ .format = .json, .budget = 256 },
+    }));
+    try testing.expect(hard_json_writer.written().len <= 256);
+    var hard_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, hard_json_writer.written(), .{});
+    defer hard_json.deinit();
 }
 
 test "phase 3 JSONL pages are independently valid and expose a cursor" {
@@ -1103,6 +1391,119 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32600"));
 }
 
+test "typed MCP facade covers six read-only surfaces with a stable bounded envelope" {
+    const testing = std.testing;
+    const io = testing.io;
+    var fx = try sampleFixture(io);
+    defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    defer session.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    const requests = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"map\",\"query\":\"leaf\",\"limit\":5}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"symbol\",\"selector\":\"leaf\",\"view\":\"definition\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"relations\",\"selector\":\"leaf\",\"view\":\"callers\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"source\",\"path\":\"app.zig\",\"start_line\":1,\"limit\":200,\"max_bytes\":1024}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"impact\",\"view\":\"edit_sites\",\"selector\":\"leaf\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"diagnostics\",\"view\":\"status\",\"limit\":1,\"max_bytes\":4096}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"source\",\"path\":\"app.zig\",\"selector\":\"leaf\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph\",\"arguments\":{\"args\":[\"rename\",\"leaf\",\"finish\",\"--preview\"]}}}",
+    };
+    for (requests) |request| try testing.expect(try handleServerRequest(&aw.writer, &session, request));
+
+    var lines = std.mem.tokenizeScalar(u8, aw.written(), '\n');
+    var responses: [requests.len]std.json.Parsed(std.json.Value) = undefined;
+    var response_count: usize = 0;
+    defer for (responses[0..response_count]) |*response| response.deinit();
+    while (lines.next()) |line| {
+        responses[response_count] = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        response_count += 1;
+    }
+    try testing.expectEqual(requests.len, response_count);
+    const operations = [_][]const u8{ "map", "symbol", "relations", "source", "impact", "diagnostics" };
+    const first_snapshot = responses[0].value.object.get("result").?.object.get("structuredContent").?.object.get("snapshot_id").?.string;
+    for (responses[0..operations.len], operations) |response, operation| {
+        const result = response.value.object.get("result").?.object;
+        try testing.expect(!result.get("isError").?.bool);
+        const envelope = result.get("structuredContent").?.object;
+        try testing.expectEqualStrings(agent_api.result_schema, envelope.get("schema").?.string);
+        try testing.expectEqualStrings(operation, envelope.get("operation").?.string);
+        try testing.expectEqualStrings(first_snapshot, envelope.get("snapshot_id").?.string);
+        inline for (.{ "found", "exactness", "ambiguous", "candidates", "truncated", "next", "parse_health", "resolution_health", "warnings", "content", "items", "source_spans", "suggested_calls" }) |field|
+            try testing.expect(envelope.get(field) != null);
+    }
+    const bounded = responses[3].value.object.get("result").?.object.get("structuredContent").?.object;
+    const bounded_json = try std.json.Stringify.valueAlloc(testing.allocator, std.json.Value{ .object = bounded }, .{});
+    defer testing.allocator.free(bounded_json);
+    try testing.expect(bounded_json.len <= 1024);
+    try testing.expect(bounded.get("next").? != .null);
+    const bounded_items = bounded.get("items").?.array.items;
+    try testing.expect(bounded_items.len > 0);
+    const last_emitted_line = bounded_items[bounded_items.len - 1].object.get("line").?.integer;
+    try testing.expectEqual(last_emitted_line + 1, bounded.get("next").?.object.get("start_line").?.integer);
+    try testing.expectEqual(last_emitted_line, bounded.get("source_spans").?.array.items[0].object.get("end_line").?.integer);
+    try testing.expectEqual(@as(i64, -32602), responses[6].value.object.get("error").?.object.get("code").?.integer);
+    try testing.expectEqual(@as(i64, -32602), responses[7].value.object.get("error").?.object.get("code").?.integer);
+    try testing.expect(std.mem.indexOf(u8, responses[7].value.object.get("error").?.object.get("message").?.string, "read-only") != null);
+}
+
+test "typed MCP relations abstain before ambiguous calls and path traversal" {
+    const testing = std.testing;
+    const io = testing.io;
+    var fx = try ambiguousFixture(io);
+    defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    defer session.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"relations\",\"selector\":\"parse\",\"view\":\"callees\"}}}"));
+    try testing.expect(try handleServerRequest(&aw.writer, &session, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"navgraph.query\",\"arguments\":{\"operation\":\"relations\",\"selector\":\"parse\",\"view\":\"path\",\"to\":\"tokenize\"}}}"));
+
+    var lines = std.mem.tokenizeScalar(u8, aw.written(), '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| : (count += 1) {
+        var response = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer response.deinit();
+        const envelope = response.value.object.get("result").?.object.get("structuredContent").?.object;
+        try testing.expect(envelope.get("ambiguous").?.bool);
+        try testing.expect(envelope.get("content").? == .null);
+        try testing.expectEqual(@as(usize, 0), envelope.get("items").?.array.items.len);
+        try testing.expect(envelope.get("candidates").?.array.items.len >= 2);
+        try testing.expect(envelope.get("suggested_calls").?.array.items.len >= 1);
+        for (envelope.get("suggested_calls").?.array.items) |suggested| {
+            const call = suggested.object;
+            var selector_buf: [64]model.SymbolId = undefined;
+            const selector = call.get("selector").?.string;
+            try testing.expect(std.mem.indexOfScalar(u8, selector, '.') != null);
+            try testing.expectEqual(@as(usize, 1), query.resolveIds(&fx.idx, selector, &selector_buf).len);
+            if (call.get("to")) |to| {
+                var to_buf: [64]model.SymbolId = undefined;
+                try testing.expectEqual(@as(usize, 1), query.resolveIds(&fx.idx, to.string, &to_buf).len);
+            }
+        }
+        if (count == 1) {
+            var saw_from = false;
+            var saw_to = false;
+            for (envelope.get("candidates").?.array.items) |candidate| {
+                const endpoint = candidate.object.get("endpoint").?.string;
+                saw_from = saw_from or std.mem.eql(u8, endpoint, "from");
+                saw_to = saw_to or std.mem.eql(u8, endpoint, "to");
+            }
+            try testing.expect(saw_from and saw_to);
+            const suggestion = envelope.get("suggested_calls").?.array.items[0].object;
+            try testing.expect(suggestion.get("selector") != null and suggestion.get("to") != null);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
 test "MCP identity and capability surfaces share the live manifest contract" {
     const testing = std.testing;
     const io = testing.io;
@@ -1139,14 +1540,20 @@ test "MCP identity and capability surfaces share the live manifest contract" {
     try testing.expectEqualStrings(capabilities.capability_schema, init_navgraph.get("capabilitySchema").?.string);
 
     const tools = responses[1].value.object.get("result").?.object;
-    try testing.expectEqual(@as(usize, 3), tools.get("tools").?.array.items.len);
+    try testing.expectEqual(@as(usize, 4), tools.get("tools").?.array.items.len);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.capabilities") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.query") != null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "phase3") == null);
+    try testing.expectEqualStrings(agent_api.tool_name, init_navgraph.get("queryTool").?.string);
+    try testing.expectEqualStrings(agent_api.query_schema, init_navgraph.get("querySchema").?.string);
+    try testing.expectEqualStrings(agent_api.result_schema, init_navgraph.get("resultSchema").?.string);
+    try testing.expect(init_navgraph.get("agentSchemaHash") != null);
 
     const direct_manifest = responses[2].value.object.get("result").?.object;
     try testing.expectEqualStrings(capabilities.capability_schema, direct_manifest.get("schema").?.string);
     try testing.expect(direct_manifest.get("build").?.object.get("buildId") != null);
     try testing.expectEqualStrings(direct_manifest.get("schemaHash").?.string, init_navgraph.get("schemaHash").?.string);
+    try testing.expectEqualStrings(direct_manifest.get("server").?.object.get("agentSchemaHash").?.string, init_navgraph.get("agentSchemaHash").?.string);
 
     const tool_result = responses[3].value.object.get("result").?.object;
     const manifest_text = tool_result.get("content").?.array.items[0].object.get("text").?.string;

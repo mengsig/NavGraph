@@ -35,7 +35,8 @@ signature detail") and get exactly the information needed — nothing more.
   FastAPI router prefixes, and expose unhit routes and orphan calls.
 - **Trust signals.** Type-scoped member resolution avoids global same-name guesses;
   `status` reports snapshot freshness, skipped paths, parse health, and unresolved
-  or external graph references; structured symbol/ref output distinguishes locals.
+  or external graph references; structured references and relation edges carry
+  `exact|inferred|heuristic|ambiguous|unresolved` status plus resolution reason.
 - **Agent workflow.** Select affected tests, page stable JSONL, compact deep walks
   to a node/byte budget, inspect exact edit sites, and preview or apply safe renames.
 - **Fast.** A ~550-file project indexes and answers a query in ~0.2s. The default
@@ -54,7 +55,9 @@ zig build -Doptimize=ReleaseFast --prefix ~/.local   # installs to ~/.local/bin/
 Run the tests:
 
 ```sh
-zig build test --summary all
+zig build test --summary all       # unit + integration suite
+zig build contract --summary all   # real CLI over every supported testenv file
+zig build efficiency               # deterministic agent-context byte budgets
 ```
 
 Identify a binary and negotiate its live contract without indexing a repository:
@@ -66,10 +69,15 @@ navgraph version              # alias; emits the same JSON manifest
 
 The manifest is `navgraph.capabilities.v1`. It includes the content-addressed
 source fingerprint/build ID, protocol and schema versions, supported languages
-and extensions, canonical commands and aliases, positional arguments, applicable
-options, output modes, read/write classification, server/reload features, and
-known trust limitations. Clients should negotiate this output instead of copying
+and extensions, command-specific language overrides, canonical commands and
+aliases, positional arguments, applicable options, output modes, hard
+limit/byte-budget and source-cursor contracts,
+ambiguity behavior, read/write classification, server/reload features, and known
+trust limitations. Clients should negotiate this output instead of copying
 the README or assuming that an executable at a familiar path matches a checkout.
+The language list means symbol indexing, not universal feature parity: today the
+manifest explicitly records the narrower `imports`/`importers` matrix, including
+partial Rust (`mod`, not `use`) and Java support and unsupported C/C++/C#/Go.
 
 Estimate test coverage — the fraction of `fn`/`method` symbols reachable in the
 call graph from a test (kcov cannot read Zig 0.16's DWARF5, so there is no
@@ -115,7 +123,7 @@ navgraph <command> [arg] [flags]
 | `calls <name>`     | Tree of what `<name>` calls/uses (callees).                   |
 | `callers <name>`   | Tree of who calls/uses `<name>` (callers).                    |
 | `search <pattern>` | Symbols whose name contains `<pattern>` (`--refs` for use sites; `Recv.field`/`.field` pins attribute reads). |
-| `routes [filter]`  | HTTP routes and cross-language client calls. Views: `--clients`, `--unhit`, `--orphan-calls` (`--orphan`/`--orphans`), `--handler <glob>`. Stacked and aliased FastAPI router prefixes are applied automatically. |
+| `routes [filter]`  | HTTP routes and cross-language client calls. Views: `--clients`, `--unhit`, `--orphan-calls` (`--orphan`/`--orphans`), `--handler <glob>`. Stacked and aliased FastAPI router prefixes are applied automatically; multiple router instances/mounts of one target file remain a declared trust limitation. |
 | `conforms <selector>` | Audit Protocol/interface implementations or compare sibling classes/methods for missing, signature, and async divergence; every sibling verdict names its class and file. Aliases: `impls`, `implements`. |
 | `hierarchy <Type>` | Nominal MRO/supertypes and transitive subtypes; `--overrides` includes the queried type and descendant override map. Alias: `hier`. |
 | `raises <symbol>`  | Trace direct/transitive exception sites to their nearest matching handler or an unhandled gap. Alias: `throws`. |
@@ -138,7 +146,7 @@ navgraph <command> [arg] [flags]
 | `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
 | `status [filter]`  | Index/cache snapshot, changed-since-build files, skipped paths, parse health, and unresolved/external graph-reference diagnostics. |
-| `read <file[:A-B]>`| Print raw source lines (numbered); batch ranges: `file:A-B,C-D`. |
+| `read <file[:A-B]>`| Paged numbered source; ranges are validated/merged, `-l` and hard `--budget` bound pages, and `--after <next>` resumes. |
 | `strings <pattern>`| Search inside string literals (URLs, log/error text, regexes). |
 | `todos [path]`     | Find `TODO`/`FIXME`/`HACK` markers in real comment tokens. |
 | `edits <symbol>`   | List exact definition and resolved-reference edit sites, with source offsets. |
@@ -146,7 +154,7 @@ navgraph <command> [arg] [flags]
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges}` JSON. Respects `--tests`. |
 | `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. |
-| `help`             | Show help.                                                    |
+| `help [command]`   | Show the full catalogue or concise registry-derived help for one command. |
 
 **Flags**
 
@@ -156,7 +164,7 @@ navgraph <command> [arg] [flags]
 | `-d, --depth <N>`             | Graph depth for call walks and `raises` propagation (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
 | `-l, --limit <N>`             | Max results (default `300`).               |
-| `--budget <bytes>`            | Approximate output-byte budget for deep walks/ranked listings; high-importance exact branches are retained first. |
+| `--budget <bytes>`            | On commands declaring this option, a hard serialized stdout ceiling (minimum 64 bytes); results are importance-ranked, compacted, and marked/cursored when truncated. |
 | `--max-nodes <N>`             | Exact retained-node cap; `--summary` renders retained nodes at name detail and reports elision. |
 | `--since <ref>`               | Git comparison ref for `affected` or the lower history bound for `churn`. |
 | `--last <N>`                  | Commit bound for `history`/`churn` (default `10`). |
@@ -259,11 +267,22 @@ navgraph serve -C .
 ```
 
 It implements `initialize`, `tools/list`, `tools/call`, and
-`workspace/reload` using one JSON-RPC 2.0 object per line. It also exposes the
-same manifest through the `navgraph/capabilities` method and the
-`navgraph.capabilities` tool. The `navgraph` tool's
-`arguments` object accepts `{"args":["search","Foo","-j"]}`. The separate
-`navgraph.reload` tool accepts `{"noCache":true}` and atomically swaps in a
+`workspace/reload` using one JSON-RPC 2.0 object per line. Agents should use the
+compact, typed, read-only `navgraph.query` tool. Its six operations are `map`,
+`symbol`, `relations`, `source`, `impact`, and `diagnostics`; `max_bytes` hard-
+bounds the complete structured result envelope, which consistently reports
+snapshot identity, exactness, ambiguity candidates, truncation/continuation,
+health, items/source spans, warnings, and ready-to-call suggestions.
+Edit-site spans are individually marked exact/editable; omitted heuristic or
+unrecoverable occurrences are counted as review gaps and downgrade completeness.
+Array-like map, diagnostics, edit-site, and affected-test results accept
+`after: "v1:N"`; `next` is a directly runnable query. Diagnostics also offers a
+focused `likely_local` view instead of forcing agents through expected externals.
+
+The full manifest remains available through `navgraph/capabilities` and
+`navgraph.capabilities` for client-side negotiation. The legacy raw-argv
+`navgraph` tool remains temporarily available but is read-only; mutation is
+rejected. `navgraph.reload` accepts `{"noCache":true}` and atomically swaps in a
 fresh index only after the rebuild succeeds. A no-id `workspace/reload`
 notification refreshes the snapshot without emitting a response.
 

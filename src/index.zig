@@ -26,6 +26,19 @@ const max_gitignore_bytes: usize = 1024 * 1024;
 /// (named/`from` imports), which still populate the import dependency graph.
 pub const FileImport = struct { binding: []const u8, target: FileId };
 
+/// Resolution state for every parsed import declaration. Local dependency
+/// consumers continue to use `FileImport`; this parallel compact record keeps
+/// expected external imports, missing local candidates, and workspace escapes
+/// distinguishable for diagnostics and agent trust reporting.
+pub const ImportOutcomeStatus = enum { resolved_local, unresolved_local, external, outside_root };
+
+pub const FileImportOutcome = struct {
+    binding: []const u8,
+    module: []const u8,
+    status: ImportOutcomeStatus,
+    target: ?FileId = null,
+};
+
 pub const CacheRewrite = enum { disabled, current, written, failed };
 
 pub const CacheSnapshot = struct {
@@ -44,6 +57,8 @@ pub const Index = struct {
     callers: [][]SymbolId,
     /// Per-file resolved imports (arena-owned), indexed by `FileId`.
     file_imports: [][]const FileImport,
+    /// Per-file outcome for every import declaration, including non-local ones.
+    import_outcomes: [][]const FileImportOutcome,
     root: []const u8,
     /// Filesystem stats captured while this in-memory snapshot was built.
     file_stats: []const cache.FileStat = &.{},
@@ -81,6 +96,12 @@ pub const Index = struct {
     pub fn importsOf(self: *const Index, id: FileId) []const FileImport {
         std.debug.assert(id < self.file_imports.len);
         return self.file_imports[id];
+    }
+
+    /// Classified outcomes for every import declaration in file `id`.
+    pub fn importOutcomesOf(self: *const Index, id: FileId) []const FileImportOutcome {
+        std.debug.assert(id < self.import_outcomes.len);
+        return self.import_outcomes[id];
     }
 };
 
@@ -172,6 +193,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .by_name = .empty,
         .callers = &.{},
         .file_imports = &.{},
+        .import_outcomes = &.{},
         .root = try arena.dupe(u8, root_path),
         .file_stats = try arena.dupe(cache.FileStat, b.stats.items),
         .cache_snapshot = .{
@@ -184,6 +206,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .skipped_dirs = try arena.dupe([]const u8, b.skipped.items),
     };
     try buildNameIndex(&idx);
+    attachCrossFileMethodParents(&idx);
     try buildImportTable(&idx);
     try buildGoPackageTable(&idx);
     resolveReferences(&idx);
@@ -450,6 +473,8 @@ fn appendFile(
             .modifiers = p.modifiers,
             .refs = p.refs,
             .bindings = p.bindings,
+            .receiver = p.receiver,
+            .impl_protocol = p.impl_protocol,
             .import_path = p.import_path,
         });
     }
@@ -493,9 +518,37 @@ fn buildNameIndex(idx: *Index) !void {
     }
 }
 
-/// Resolve every file's import statements to target `FileId`s (arena-owned),
-/// building the per-file import table used for module-qualified resolution and
-/// the imports/importers dependency graph.
+/// Attach out-of-line methods whose receiver type is declared in another file.
+/// A local parent assigned by the parser always wins. For a cross-file hint we
+/// require exactly one same-language container in the project; ambiguous module
+/// names stay parentless instead of manufacturing a confidently-wrong owner.
+fn attachCrossFileMethodParents(idx: *Index) void {
+    for (idx.graph.symbols) |*sym| {
+        if (sym.kind != .method or sym.parent != invalid or sym.receiver.len == 0) continue;
+        const from_family = idx.graph.files[sym.file].language.family();
+        var match: SymbolId = invalid;
+        var count: u32 = 0;
+        for (idx.lookup(sym.receiver)) |cid| {
+            const candidate = idx.graph.symbols[cid];
+            if (!isContainer(candidate)) continue;
+            if (idx.graph.files[candidate.file].language.family() != from_family) continue;
+            match = cid;
+            count += 1;
+        }
+        if (count == 1) sym.parent = match;
+    }
+}
+
+fn isContainer(sym: model.Symbol) bool {
+    return switch (sym.kind) {
+        .class, .interface, .@"struct", .@"enum", .type => true,
+        else => false,
+    };
+}
+
+/// Resolve every file's import statements (arena-owned), building both the
+/// local-edge table used for graph navigation and a compact outcome table that
+/// retains external, unresolved-local, and outside-root classifications.
 fn buildImportTable(idx: *Index) !void {
     var by_path = std.StringHashMapUnmanaged(FileId){};
     defer by_path.deinit(idx.gpa);
@@ -503,28 +556,62 @@ fn buildImportTable(idx: *Index) !void {
 
     const a = idx.arena.allocator();
     const lists = try a.alloc([]const FileImport, idx.graph.files.len);
-    for (idx.graph.files) |f| lists[f.id] = try resolveFileImports(idx, a, f, &by_path);
+    const outcomes = try a.alloc([]const FileImportOutcome, idx.graph.files.len);
+    for (idx.graph.files) |f| {
+        const resolved = try resolveFileImports(idx, a, f, &by_path);
+        lists[f.id] = resolved.local_edges;
+        outcomes[f.id] = resolved.outcomes;
+    }
     idx.file_imports = lists;
+    idx.import_outcomes = outcomes;
 }
+
+const ResolvedFileImports = struct {
+    local_edges: []const FileImport,
+    outcomes: []const FileImportOutcome,
+};
 
 fn resolveFileImports(
     idx: *const Index,
     arena: std.mem.Allocator,
     f: model.SourceFile,
     by_path: *const std.StringHashMapUnmanaged(FileId),
-) ![]const FileImport {
-    var tmp: std.ArrayList(FileImport) = .empty;
-    defer tmp.deinit(idx.gpa);
+) !ResolvedFileImports {
+    var local_edges: std.ArrayList(FileImport) = .empty;
+    defer local_edges.deinit(idx.gpa);
+    var outcomes: std.ArrayList(FileImportOutcome) = .empty;
+    defer outcomes.deinit(idx.gpa);
     var i = f.sym_start;
     while (i < f.sym_end) : (i += 1) {
         const s = idx.graph.symbols[i];
         if (s.kind != .import or s.import_path.len == 0) continue;
-        const target = resolveModule(idx, arena, f, s.import_path, by_path) orelse continue;
-        if (target == f.id) continue; // ignore self-imports
-        try tmp.append(idx.gpa, .{ .binding = s.name, .target = target });
+        const resolution = try resolveModule(idx, arena, f, s.import_path, by_path);
+        const target: ?FileId = switch (resolution) {
+            .resolved_local => |fid| fid,
+            .unresolved_local, .external, .outside_root => null,
+        };
+        try outcomes.append(idx.gpa, .{
+            .binding = s.name,
+            .module = s.import_path,
+            .status = std.meta.activeTag(resolution),
+            .target = target,
+        });
+        if (target) |fid| {
+            if (fid != f.id) try local_edges.append(idx.gpa, .{ .binding = s.name, .target = fid });
+        }
     }
-    return arena.dupe(FileImport, tmp.items);
+    return .{
+        .local_edges = try arena.dupe(FileImport, local_edges.items),
+        .outcomes = try arena.dupe(FileImportOutcome, outcomes.items),
+    };
 }
+
+const ModuleResolution = union(ImportOutcomeStatus) {
+    resolved_local: FileId,
+    unresolved_local,
+    external,
+    outside_root,
+};
 
 /// Match a module string to an indexed file via language-aware candidate paths.
 ///
@@ -540,13 +627,18 @@ fn resolveModule(
     importer: model.SourceFile,
     module: []const u8,
     by_path: *const std.StringHashMapUnmanaged(FileId),
-) ?FileId {
-    const cands = imports.candidates(arena, importer.path, module, importer.language) catch return null;
-    for (cands) |c| if (by_path.get(c)) |fid| return fid;
+) !ModuleResolution {
+    const candidate_resolution = try imports.resolveCandidates(arena, importer.path, module, importer.language);
+    const cands = switch (candidate_resolution) {
+        .local => |paths| paths,
+        .external => return .external,
+        .outside_root => return .outside_root,
+    };
+    for (cands) |c| if (by_path.get(c)) |fid| return .{ .resolved_local = fid };
     if (importer.language.family() == .python) {
-        for (cands) |c| if (uniqueSuffixMatch(idx, c)) |fid| return fid;
+        for (cands) |c| if (uniqueSuffixMatch(idx, c)) |fid| return .{ .resolved_local = fid };
     }
-    return null;
+    return .unresolved_local;
 }
 
 /// The single indexed file whose path is `<something>/<cand>`, or null when
@@ -587,7 +679,7 @@ fn buildGoPackageTable(idx: *Index) !void {
 /// Resolve a Go package-qualified call (`caddy.Load(...)`) to a top-level
 /// definition in one of the files declaring `package <qualifier>`. Exact when
 /// exactly one package file defines the name; a cross-package name collision
-/// binds the first hit as heuristic.
+/// binds the first hit as ambiguous.
 fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference) bool {
     if (idx.graph.files[from.file].language != .go) return false;
     const files = idx.go_packages.get(ref.qualifier) orelse return false;
@@ -603,6 +695,8 @@ fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference)
     if (found == invalid) return false;
     ref.target = found;
     ref.exact = hits == 1;
+    ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+    ref.resolution_reason = .go_package;
     return true;
 }
 
@@ -628,6 +722,65 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     // not a reference to a same-named global — don't bind it (kills false edges
     // like a local `const candidates = ...` pointing at a global `fn candidates`).
     if (isLocalBinding(from, ref.name)) return;
+    // A bare import binding (for example `import run from "pkg"`) must also
+    // retain a proven non-local outcome. Otherwise global-name fallback can
+    // silently bind it to an unrelated workspace definition named `run`.
+    if (hasNonLocalImportBinding(idx, from.file, ref.name)) return;
+
+    // Zig declarations inside a container share its lexical namespace: a
+    // method can call a sibling helper or const function alias without spelling
+    // `@This().helper`. Scope that lookup to the concrete parent before the
+    // top-level fallback, exactly as Java's implicit same-class lookup below.
+    if (idx.graph.files[from.file].language == .zig and from.parent != invalid) {
+        const own = memberOfParent(idx, from.parent, ref.name);
+        if (own.id != invalid) {
+            ref.target = own.id;
+            ref.exact = own.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+            ref.resolution_reason = .lexical_member;
+            return;
+        }
+    }
+
+    if (idx.graph.files[from.file].language == .java) {
+        // Java permits an unqualified member access inside the declaring class.
+        // The concrete parent id makes a unique direct member a proven edge;
+        // overloads remain visible but are not exact because references do not
+        // retain argument types.
+        if (from.parent != invalid) {
+            const own = memberOfParent(idx, from.parent, ref.name);
+            if (own.id != invalid) {
+                ref.target = own.id;
+                ref.exact = own.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .lexical_member;
+                return;
+            }
+            // Inherited lookup is useful but intentionally inferred: this
+            // dependency-free scanner does not build Java's complete classpath,
+            // accessibility rules, overload set, or generic substitution.
+            ref.target = javaInheritedMember(idx, from, ref.name);
+            if (ref.target != invalid) {
+                ref.exact = false;
+                ref.resolution_status = .inferred;
+                ref.resolution_reason = .inheritance;
+                return;
+            }
+        }
+
+        // An explicit import binding can name a top-level type or a statically
+        // imported member (`import static inventory.util.Money.format`). The
+        // import table has already resolved the compilation unit to one file.
+        const imported = importedBareTarget(idx, from.file, ref.name);
+        if (imported.id != invalid) {
+            ref.target = imported.id;
+            ref.exact = imported.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+            ref.resolution_reason = if (idx.graph.symbols[imported.id].parent == invalid) .local_import else .static_import;
+            return;
+        }
+    }
+
     const candidates = idx.by_name.get(ref.name) orelse return;
     // A bare identifier never denotes a class member: a method/field is always
     // reached through a receiver (`self.x`, `obj.m()`, `Type.m()`). Binding a
@@ -637,12 +790,139 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     const choice = chooseTarget(idx, from, candidates, false);
     ref.target = choice.id;
     ref.exact = choice.confident;
+    if (ref.target != invalid) {
+        ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
+    }
+    // A chained Java call such as `line.item().sku()` can lose its receiver in
+    // the lightweight token model. Keep a small same-language method guess
+    // visible, but never exact, after every lexical/import path failed.
+    if (ref.target == invalid and idx.graph.files[from.file].language == .java and ref.kind == .call) {
+        ref.target = heuristicMethodTarget(idx, from, ref.name);
+        ref.exact = false;
+        if (ref.target != invalid) {
+            ref.resolution_status = .heuristic;
+            ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
+        }
+    }
 }
 
 /// Whether `name` is a local binding (typed local or parameter) of `from`.
 fn isLocalBinding(from: model.Symbol, name: []const u8) bool {
     for (from.bindings) |b| if (std.mem.eql(u8, b.name, name)) return true;
     return false;
+}
+
+/// A symbol explicitly imported under bare `name`. Java's ordinary type imports
+/// resolve to a top-level symbol; static member imports resolve to a child in the
+/// target file. Multiple matching overloads/imports are returned as heuristic.
+fn importedBareTarget(idx: *const Index, file: FileId, name: []const u8) MemberMatch {
+    var top_level: SymbolId = invalid;
+    var top_level_matches: u32 = 0;
+    var member: SymbolId = invalid;
+    var member_matches: u32 = 0;
+    for (idx.importsOf(file)) |imp| {
+        if (imp.binding.len == 0 or !std.mem.eql(u8, imp.binding, name)) continue;
+        const target_file = idx.graph.files[imp.target];
+        var sid = target_file.sym_start;
+        while (sid < target_file.sym_end) : (sid += 1) {
+            const candidate = idx.graph.symbols[sid];
+            if (candidate.kind == .import or !std.mem.eql(u8, candidate.name, name)) continue;
+            if (candidate.parent == invalid) {
+                if (top_level == invalid) top_level = candidate.id;
+                top_level_matches += 1;
+            } else {
+                if (member == invalid) member = candidate.id;
+                member_matches += 1;
+            }
+        }
+    }
+    // An ordinary `import pkg.Type` often lands in a file that also contains a
+    // constructor method named `Type`; the top-level type is the import binding.
+    if (top_level != invalid) return .{ .id = top_level, .unambiguous = top_level_matches == 1 };
+    return .{ .id = member, .unambiguous = member_matches == 1 };
+}
+
+/// Resolve an unqualified Java member through the enclosing type's declared
+/// superclass/interfaces. The selected edge is always marked non-exact by the
+/// caller; this pass only finds a useful local candidate and refuses cycles.
+fn javaInheritedMember(idx: *const Index, from: model.Symbol, name: []const u8) SymbolId {
+    if (from.parent == invalid) return invalid;
+    var visited: [16]SymbolId = @splat(invalid);
+    return javaInheritedMemberFrom(idx, from.parent, name, &visited, 0);
+}
+
+fn javaInheritedMemberFrom(
+    idx: *const Index,
+    type_id: SymbolId,
+    name: []const u8,
+    visited: *[16]SymbolId,
+    depth: usize,
+) SymbolId {
+    if (depth >= visited.len) return invalid;
+    for (visited[0..depth]) |seen| if (seen == type_id) return invalid;
+    visited[depth] = type_id;
+
+    const subtype = idx.graph.symbols[type_id];
+    const signature = subtype.signature(idx.graph.files[subtype.file].text);
+    for (idx.graph.symbols) |base| {
+        if (base.id == type_id or !isContainer(base)) continue;
+        if (idx.graph.files[base.file].language != .java) continue;
+        if (!javaDeclaresBase(signature, base.name)) continue;
+
+        // An explicit import of the base name disambiguates same-named classes;
+        // otherwise any chosen base remains a non-exact hint at the call site.
+        if (importTarget(idx, subtype.file, base.name)) |target_file| {
+            if (base.file != target_file) continue;
+        }
+        const direct = memberOfParent(idx, base.id, name);
+        if (direct.id != invalid) return direct.id;
+        const inherited = javaInheritedMemberFrom(idx, base.id, name, visited, depth + 1);
+        if (inherited != invalid) return inherited;
+    }
+    return invalid;
+}
+
+/// Whether a Java type signature declares `name` after `extends` or
+/// `implements`. Generic arguments are skipped so `extends Box<Product>` does
+/// not pretend that `Product` is itself a base class.
+fn javaDeclaresBase(signature: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    var in_bases = false;
+    var angle_depth: u32 = 0;
+    while (i < signature.len) {
+        const c = signature[i];
+        if (c == '<') {
+            angle_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '>') {
+            angle_depth -|= 1;
+            i += 1;
+            continue;
+        }
+        if (!isIdentByte(c)) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        i += 1;
+        while (i < signature.len and isIdentByte(signature[i])) i += 1;
+        const word = signature[start..i];
+        if (angle_depth != 0) continue;
+        if (std.mem.eql(u8, word, "extends") or std.mem.eql(u8, word, "implements")) {
+            in_bases = true;
+            continue;
+        }
+        if (in_bases and std.mem.eql(u8, word, "permits")) return false;
+        if (in_bases and std.mem.eql(u8, word, name)) return true;
+    }
+    return false;
+}
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
 }
 
 /// Resolve a member access `recv.name`: first by the receiver's known type
@@ -655,10 +935,22 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
     // (a confidently-wrong EXACT edge).
     if (isSelfReceiver(ref.qualifier)) {
         if (from.parent != invalid) {
-            ref.target = memberOfParent(idx, from.parent, ref.name);
+            const own = memberOfParent(idx, from.parent, ref.name);
+            ref.target = own.id;
             if (ref.target != invalid) {
-                ref.exact = true;
+                ref.exact = own.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .self_member;
                 return;
+            }
+            if (idx.graph.files[from.file].language == .java) {
+                ref.target = javaInheritedMember(idx, from, ref.name);
+                if (ref.target != invalid) {
+                    ref.exact = false;
+                    ref.resolution_status = .inferred;
+                    ref.resolution_reason = .inheritance;
+                    return;
+                }
             }
         }
         // No such member on the own class (inherited/mixin): heuristic below.
@@ -667,9 +959,11 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         if (m.id != invalid) {
             ref.target = m.id;
             // A named type that resolves to several same-named classes in
-            // different files is ambiguous: bind it but mark it heuristic (`?`)
+            // different files is ambiguous: bind it but mark it non-exact (`?`)
             // so `--strict` drops it rather than trusting an arbitrary pick.
             ref.exact = m.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+            ref.resolution_reason = .typed_receiver;
             return;
         }
         // Known receiver but no such member here (an inherited/mixin method, or
@@ -681,15 +975,65 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         if (m.id != invalid) {
             ref.target = m.id;
             ref.exact = m.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+            ref.resolution_reason = .typed_receiver;
             return;
         }
+    } else if (if (isLocalBinding(from, ref.qualifier)) null else sameFileContainer(idx, from.file, ref.qualifier)) |container| {
+        // A direct same-file type qualifier (`ServerSession.init`) is stronger
+        // evidence than a global method-name guess. Refuse a missing/overloaded
+        // member instead of escaping to an arbitrary same-named definition.
+        const member = memberOfParent(idx, container, ref.name);
+        ref.resolution_reason = .type_qualifier;
+        if (member.id != invalid) {
+            ref.target = member.id;
+            ref.exact = member.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        }
+        return;
+    } else if (if (isLocalBinding(from, ref.qualifier)) null else importedContainer(idx, from.file, ref.qualifier)) |container| {
+        // Chained static access keeps only its immediate type token in the
+        // compact reference (`graph_mod.Selector.parse` -> qualifier `Selector`).
+        // A unique type with that name in a directly imported local file is
+        // still namespace evidence; unlike a project-wide type-name guess it is
+        // safe to bind exactly.
+        const member = memberOfParent(idx, container, ref.name);
+        ref.resolution_reason = .local_import;
+        if (member.id != invalid) {
+            ref.target = member.id;
+            ref.exact = member.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        }
+        return;
     } else if (importTarget(idx, from.file, ref.qualifier)) |file_id| {
+        // Lua modules conventionally return a local table (`local M = {}`) and
+        // attach exports with `function M.open()`. Those methods are parented to
+        // `M` so qualified selectors work, which means they are intentionally
+        // not top-level definitions. Prefer a unique module-table member for a
+        // `require()` receiver; keep multiple candidate tables heuristic.
+        if (idx.graph.files[file_id].language == .lua) {
+            const member = luaModuleMemberIn(idx, file_id, ref.name);
+            if (member.id != invalid) {
+                ref.target = member.id;
+                ref.exact = member.confident;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .local_import;
+                return;
+            }
+        }
         ref.target = topLevelIn(idx, file_id, ref.name);
         if (ref.target != invalid) {
             ref.exact = true;
+            ref.resolution_status = .exact;
+            ref.resolution_reason = .local_import;
             return;
         }
     } else if (goPackageTarget(idx, from, ref)) {
+        return;
+    } else if (hasNonLocalImportBinding(idx, from.file, ref.qualifier)) {
+        // The receiver is a declared import that we proved is external,
+        // unresolved, or outside the workspace. Do not erase that evidence by
+        // guessing a same-named local callable through the global fallback.
         return;
     }
     // Heuristic fallback: a *call* whose receiver type we can't infer
@@ -701,7 +1045,52 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
     if (ref.kind == .call) {
         ref.target = heuristicMethodTarget(idx, from, ref.name);
         ref.exact = false;
+        if (ref.target != invalid) {
+            ref.resolution_status = .heuristic;
+            ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
+        }
     }
+}
+
+/// A unique, top-level type/container named `name` in the reference's own file.
+/// Deliberately does not search other files: without an import or typed binding,
+/// a cross-file same-name pick would manufacture confidence.
+fn sameFileContainer(idx: *const Index, file: FileId, name: []const u8) ?SymbolId {
+    const source = idx.graph.files[file];
+    var found: SymbolId = invalid;
+    var id = source.sym_start;
+    while (id < source.sym_end) : (id += 1) {
+        const sym = idx.graph.symbols[id];
+        if (sym.parent != invalid or !isContainer(sym) or !std.mem.eql(u8, sym.name, name)) continue;
+        if (found != invalid) return null;
+        found = id;
+    }
+    return if (found == invalid) null else found;
+}
+
+/// The sole top-level container named `name` in a file directly imported by
+/// `file`. Duplicate import edges and duplicate same-named containers abstain.
+fn importedContainer(idx: *const Index, file: FileId, name: []const u8) ?SymbolId {
+    var found: SymbolId = invalid;
+    for (idx.importsOf(file), 0..) |imp, pos| {
+        var duplicate_file = false;
+        for (idx.importsOf(file)[0..pos]) |prior| {
+            if (prior.target == imp.target) {
+                duplicate_file = true;
+                break;
+            }
+        }
+        if (duplicate_file) continue;
+        const imported = idx.graph.files[imp.target];
+        var id = imported.sym_start;
+        while (id < imported.sym_end) : (id += 1) {
+            const sym = idx.graph.symbols[id];
+            if (sym.parent != invalid or !isContainer(sym) or !std.mem.eql(u8, sym.name, name)) continue;
+            if (found != invalid) return null;
+            found = id;
+        }
+    }
+    return if (found == invalid) null else found;
 }
 
 /// Best method/function named `name` for an unresolved member *call*: a member
@@ -747,6 +1136,15 @@ fn importTarget(idx: *const Index, file: FileId, binding: []const u8) ?FileId {
     return null;
 }
 
+fn hasNonLocalImportBinding(idx: *const Index, file: FileId, binding: []const u8) bool {
+    if (binding.len == 0) return false;
+    for (idx.importOutcomesOf(file)) |outcome| {
+        if (outcome.status == .resolved_local or outcome.binding.len == 0) continue;
+        if (std.mem.eql(u8, outcome.binding, binding)) return true;
+    }
+    return false;
+}
+
 /// A top-level (non-nested) symbol named `name` in file `file_id`, preferring an
 /// exported one. `invalid` when the file has no such definition.
 fn topLevelIn(idx: *const Index, file_id: FileId, name: []const u8) SymbolId {
@@ -763,6 +1161,23 @@ fn topLevelIn(idx: *const Index, file_id: FileId, name: []const u8) SymbolId {
     return fallback;
 }
 
+fn luaModuleMemberIn(idx: *const Index, file_id: FileId, name: []const u8) Choice {
+    const f = idx.graph.files[file_id];
+    var found: SymbolId = invalid;
+    var count: u32 = 0;
+    var i = f.sym_start;
+    while (i < f.sym_end) : (i += 1) {
+        const sym = idx.graph.symbols[i];
+        if (sym.parent == invalid or !std.mem.eql(u8, sym.name, name)) continue;
+        const parent = idx.graph.symbols[sym.parent];
+        if (parent.file != file_id or parent.parent != invalid) continue;
+        if (parent.kind != .variable and parent.kind != .constant and parent.kind != .module) continue;
+        if (found == invalid) found = sym.id;
+        count += 1;
+    }
+    return .{ .id = found, .confident = count == 1 };
+}
+
 /// Resolve `route_call` references (HTTP client calls) to the `route` symbol
 /// whose method and path pattern they match — the cross-language edge that links
 /// a frontend fetch/axios/requests call to the backend endpoint that serves it.
@@ -772,6 +1187,8 @@ fn linkRoutes(idx: *Index) void {
             if (ref.kind != .route_call) continue;
             ref.target = matchRoute(idx, ref.name);
             ref.exact = ref.target != invalid;
+            ref.resolution_status = if (ref.exact) .exact else .unresolved;
+            ref.resolution_reason = .route;
         }
     }
 }
@@ -918,12 +1335,16 @@ fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[
 /// The member named `name` defined directly on the exact type `parent_id`. This
 /// scopes `self`/`this` dispatch to the receiver's own class, so it can never
 /// bind to a same-named class in another file.
-fn memberOfParent(idx: *const Index, parent_id: SymbolId, name: []const u8) SymbolId {
-    const candidates = idx.by_name.get(name) orelse return invalid;
+fn memberOfParent(idx: *const Index, parent_id: SymbolId, name: []const u8) MemberMatch {
+    const candidates = idx.by_name.get(name) orelse return .{ .id = invalid, .unambiguous = false };
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
     for (candidates) |cid| {
-        if (idx.graph.symbols[cid].parent == parent_id) return cid;
+        if (idx.graph.symbols[cid].parent != parent_id) continue;
+        if (found == invalid) found = cid;
+        matches += 1;
     }
-    return invalid;
+    return .{ .id = found, .unambiguous = matches == 1 };
 }
 
 /// A resolved member plus whether the pick was unambiguous. `unambiguous` is
@@ -1043,6 +1464,8 @@ test "module-qualified calls resolve through imports" {
         try testing.expectEqualStrings("util", ref.qualifier);
         try testing.expectEqual(helper, ref.target); // resolved via import, not name
         try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+        try testing.expectEqual(model.ResolutionReason.local_import, ref.resolution_reason);
         linked = true;
     }
     try testing.expect(linked);
@@ -1050,6 +1473,97 @@ test "module-qualified calls resolve through imports" {
     try testing.expectEqual(run.id, idx.callersOf(helper)[0]);
     const main_file = idx.graph.symbols[run.id].file;
     try testing.expect(idx.importsOf(main_file).len == 1);
+}
+
+test "outside-root imports never bind root-local files and survive a warm cache" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src/nested");
+    try tmp.dir.writeFile(io, .{ .sub_path = "target.zig", .data =
+        \\pub fn targetFn() u32 { return 1; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoy.ts", .data =
+        \\export default function decoyFn(): number { return 1; }
+    });
+    // From `src/`, two parent segments cross above the configured root. Before
+    // the safety fix this normalized back to `target.zig` and manufactured a
+    // confidently local import edge to the root-local decoy.
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/escape.zig", .data =
+        \\const std = @import("std");
+        \\const dep = @import("../../target.zig");
+        \\pub fn escapeProbe() u32 { _ = std; return dep.targetFn(); }
+    });
+    // The same spelling from two directories deep lands exactly at the root and
+    // must remain a valid local import rather than being rejected wholesale.
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/nested/inside.zig", .data =
+        \\const dep = @import("../../target.zig");
+        \\pub fn insideProbe() u32 { return dep.targetFn(); }
+    });
+    // Default JS imports exercise the bare-reference path: without retaining the
+    // outcome, `decoyFn()` could globally bind to the root-local decoy even
+    // though its declared module escaped the workspace.
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/escape.ts", .data =
+        \\import decoyFn from "../../decoy";
+        \\export function tsEscapeProbe(): number { return decoyFn(); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // Seed the cache, then compare a warm restore with a clean parse. Import
+    // outcomes are rebuilt from either source and must be byte-for-byte equal.
+    var cold = try build(testing.allocator, io, root, true);
+    cold.deinit();
+    var warm = try build(testing.allocator, io, root, true);
+    defer warm.deinit();
+    var clean = try build(testing.allocator, io, root, false);
+    defer clean.deinit();
+    try testing.expect(warm.cache_snapshot.hits > 0);
+    try expectEquivalentIndexes(&clean, &warm);
+
+    const target_file = warm.graph.symbols[warm.lookup("targetFn")[0]].file;
+    const escape = warm.graph.symbols[warm.lookup("escapeProbe")[0]];
+    try testing.expectEqual(@as(usize, 0), warm.importsOf(escape.file).len);
+    var saw_external = false;
+    var saw_outside = false;
+    for (warm.importOutcomesOf(escape.file)) |outcome| {
+        if (std.mem.eql(u8, outcome.module, "std")) {
+            try testing.expectEqual(ImportOutcomeStatus.external, outcome.status);
+            try testing.expectEqual(@as(?FileId, null), outcome.target);
+            saw_external = true;
+        } else if (std.mem.eql(u8, outcome.module, "../../target.zig")) {
+            try testing.expectEqual(ImportOutcomeStatus.outside_root, outcome.status);
+            try testing.expectEqual(@as(?FileId, null), outcome.target);
+            saw_outside = true;
+        }
+    }
+    try testing.expect(saw_external and saw_outside);
+    const escaped_ref = refByQual(escape, "dep", "targetFn").?;
+    try testing.expectEqual(invalid, escaped_ref.target);
+
+    const ts_escape = warm.graph.symbols[warm.lookup("tsEscapeProbe")[0]];
+    try testing.expectEqual(@as(usize, 0), warm.importsOf(ts_escape.file).len);
+    const ts_outcomes = warm.importOutcomesOf(ts_escape.file);
+    try testing.expectEqual(@as(usize, 1), ts_outcomes.len);
+    try testing.expectEqualStrings("decoyFn", ts_outcomes[0].binding);
+    try testing.expectEqual(ImportOutcomeStatus.outside_root, ts_outcomes[0].status);
+    try testing.expectEqual(@as(?FileId, null), ts_outcomes[0].target);
+    const bare_escaped_ref = refByName(ts_escape, "decoyFn").?;
+    try testing.expectEqual(invalid, bare_escaped_ref.target);
+
+    const inside = warm.graph.symbols[warm.lookup("insideProbe")[0]];
+    try testing.expectEqual(@as(usize, 1), warm.importsOf(inside.file).len);
+    try testing.expectEqual(target_file, warm.importsOf(inside.file)[0].target);
+    const inside_outcomes = warm.importOutcomesOf(inside.file);
+    try testing.expectEqual(@as(usize, 1), inside_outcomes.len);
+    try testing.expectEqual(ImportOutcomeStatus.resolved_local, inside_outcomes[0].status);
+    try testing.expectEqual(target_file, inside_outcomes[0].target.?);
+    const inside_ref = refByQual(inside, "dep", "targetFn").?;
+    try testing.expectEqual(warm.lookup("targetFn")[0], inside_ref.target);
+    try testing.expect(inside_ref.exact);
 }
 
 test "qualified call to a same-named function in another module resolves" {
@@ -1587,6 +2101,8 @@ test "self-dispatch and a typed receiver stay in their own file's class" {
         if (!std.mem.eql(u8, ref.name, "put")) continue;
         try testing.expectEqual(a_put, ref.target);
         try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+        try testing.expectEqual(model.ResolutionReason.self_member, ref.resolution_reason);
         saw_self = true;
     }
     try testing.expect(saw_self);
@@ -1598,6 +2114,8 @@ test "self-dispatch and a typed receiver stay in their own file's class" {
         if (!std.mem.eql(u8, ref.name, "put")) continue;
         try testing.expectEqual(a_put, ref.target);
         try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+        try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
         saw_typed = true;
     }
     try testing.expect(saw_typed);
@@ -1860,6 +2378,113 @@ test "rust: a call resolves by name across files within the Rust family" {
     // `mod util;` resolved to util.rs as an import dependency.
     const main_file = idx.graph.symbols[run].file;
     try testing.expectEqual(@as(usize, 1), idx.importsOf(main_file).len);
+}
+
+test "checked-in Java corpus resolves lexical, static-import, and inherited members honestly" {
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/java_app", false);
+    defer idx.deinit();
+
+    const main_id = qualifiedId(&idx, "Program", "main").?;
+    const seed_id = qualifiedId(&idx, "Program", "seedCatalog").?;
+    const format_id = qualifiedId(&idx, "Money", "format").?;
+    const main = idx.graph.symbols[main_id];
+    const seed_ref = refByName(main, "seedCatalog").?;
+    try testing.expectEqual(seed_id, seed_ref.target);
+    try testing.expect(seed_ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, seed_ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.lexical_member, seed_ref.resolution_reason);
+    const format_ref = refByName(main, "format").?;
+    try testing.expectEqual(format_id, format_ref.target);
+    try testing.expect(format_ref.exact);
+    try testing.expectEqual(model.ResolutionReason.static_import, format_ref.resolution_reason);
+
+    const safe = idx.graph.symbols[qualifiedId(&idx, "OrderService", "placeOrderSafe").?];
+    const place_id = qualifiedId(&idx, "OrderService", "placeOrder").?;
+    const place_ref = refByName(safe, "placeOrder").?;
+    try testing.expectEqual(place_id, place_ref.target);
+    try testing.expect(place_ref.exact);
+
+    const sellable = idx.graph.symbols[qualifiedId(&idx, "DurableProduct", "isSellable").?];
+    const cents_id = qualifiedId(&idx, "Product", "priceCents").?;
+    const cents_ref = refByName(sellable, "priceCents").?;
+    try testing.expectEqual(cents_id, cents_ref.target);
+    try testing.expect(!cents_ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.inferred, cents_ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.inheritance, cents_ref.resolution_reason);
+}
+
+test "Java overloads never make an arbitrary bare member edge exact" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Overloaded.java", .data =
+        \\class Overloaded {
+        \\    void run() { helper(1); }
+        \\    void helper(int value) {}
+        \\    void helper(String value) {}
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, testing.io, root, false);
+    defer idx.deinit();
+
+    const run = idx.graph.symbols[qualifiedId(&idx, "Overloaded", "run").?];
+    const helper = refByName(run, "helper").?;
+    try testing.expect(helper.target != invalid);
+    try testing.expect(!helper.exact);
+}
+
+test "checked-in Rust corpus parents a cross-file nominal impl on its type" {
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    defer idx.deinit();
+
+    const expr = idx.lookup("Expr")[0];
+    var saw_impl = false;
+    for (idx.lookup("evaluate")) |id| {
+        const method = idx.graph.symbols[id];
+        if (method.parent != expr) continue;
+        try testing.expectEqualStrings("Expr", method.receiver);
+        try testing.expectEqualStrings("Evaluate", method.impl_protocol);
+        saw_impl = true;
+    }
+    try testing.expect(saw_impl);
+}
+
+test "Rust cross-file impl parenting survives a warm cache restore" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "expr.rs", .data = "pub struct Expr;\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "eval.rs", .data =
+        \\pub trait Evaluate { fn evaluate(&self); }
+        \\impl Evaluate for Expr { fn evaluate(&self) {} }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var clean = try build(testing.allocator, testing.io, root, true);
+    defer clean.deinit();
+    const clean_expr = clean.lookup("Expr")[0];
+    var clean_attached = false;
+    for (clean.lookup("evaluate")) |id| {
+        const method = clean.graph.symbols[id];
+        if (method.parent == clean_expr and std.mem.eql(u8, method.impl_protocol, "Evaluate")) clean_attached = true;
+    }
+    try testing.expect(clean_attached);
+
+    var warm = try build(testing.allocator, testing.io, root, true);
+    defer warm.deinit();
+    try testing.expectEqual(@as(u32, 2), warm.cache_snapshot.hits);
+    const warm_expr = warm.lookup("Expr")[0];
+    var attached = false;
+    for (warm.lookup("evaluate")) |id| {
+        const method = warm.graph.symbols[id];
+        if (method.parent == warm_expr and std.mem.eql(u8, method.impl_protocol, "Evaluate")) attached = true;
+    }
+    try testing.expect(attached);
 }
 
 test "ruby: require_relative resolves and a cross-file call links within the Ruby family" {
@@ -2227,6 +2852,8 @@ test "chooseTarget: a bare call to a name defined in two files is a non-confiden
     // Two equally-plausible cross-file candidates: it binds one but is not exact.
     try testing.expect(ref.target != invalid);
     try testing.expect(!ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.ambiguous, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.global_fallback, ref.resolution_reason);
     // The chosen target is one of the two `shared` defs and `go` is its only
     // caller; the total caller count across both defs is exactly one.
     var total: usize = 0;
@@ -2301,7 +2928,104 @@ test "member call: a self receiver resolves exactly to a sibling method (zig)" {
     // `self.second()` resolves to the enclosing type's member, exactly.
     try testing.expectEqual(second, ref.target);
     try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.self_member, ref.resolution_reason);
     try testing.expectEqual(first, idx.callersOf(second)[0]);
+}
+
+test "a bare Zig sibling in the same container resolves as a lexical member" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data =
+        \\pub const T = struct {
+        \\    pub fn first() u32 { return second(); }
+        \\    fn second() u32 { return 2; }
+        \\};
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const first = qualifiedId(&idx, "T", "first").?;
+    const second = qualifiedId(&idx, "T", "second").?;
+    const ref = refByName(idx.graph.symbols[first], "second").?;
+    try testing.expectEqual(second, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.lexical_member, ref.resolution_reason);
+}
+
+test "a direct same-file type qualifier resolves only its own member" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "session.zig", .data =
+        \\pub const ServerSession = struct {
+        \\    pub fn init() u32 { return 1; }
+        \\};
+        \\pub fn boot() u32 { return ServerSession.init(); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoy.zig", .data =
+        \\pub const Other = struct {
+        \\    pub fn init() u32 { return 2; }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const wanted = qualifiedId(&idx, "ServerSession", "init").?;
+    const decoy = qualifiedId(&idx, "Other", "init").?;
+    const boot = idx.graph.symbols[idx.lookup("boot")[0]];
+    const ref = refByQual(boot, "ServerSession", "init").?;
+    try testing.expectEqual(wanted, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.type_qualifier, ref.resolution_reason);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(decoy).len);
+}
+
+test "an immediate type token inside an imported module chain resolves in that imported file" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "dep.zig", .data =
+        \\pub const Selector = struct {
+        \\    pub fn parse(raw: []const u8) ?Selector { _ = raw; return null; }
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data =
+        \\const graph_mod = @import("dep.zig");
+        \\pub fn run() ?graph_mod.Selector { return graph_mod.Selector.parse("x"); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoy.zig", .data =
+        \\pub const Selector = struct {
+        \\    pub fn parse(raw: []const u8) ?Selector { _ = raw; return null; }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ref = refByQual(run, "Selector", "parse").?;
+    const target = idx.graph.symbols[ref.target];
+    try testing.expectEqualStrings("dep.zig", idx.graph.files[target.file].path);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.local_import, ref.resolution_reason);
 }
 
 test "member call: a this receiver resolves exactly to a sibling method (js class)" {
@@ -2362,6 +3086,8 @@ test "unknown receiver: a member call is a heuristic guess, a member read stays 
     const call = refByQual(build_sym, "obj", "compute").?;
     try testing.expectEqual(compute, call.target);
     try testing.expect(!call.exact);
+    try testing.expectEqual(model.ResolutionStatus.heuristic, call.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.same_file_fallback, call.resolution_reason);
     try testing.expectEqual(build_sym.id, idx.callersOf(compute)[0]);
 
     // `obj.value` is a member *read*, so it must not inflate the field's fan-in.
@@ -2469,6 +3195,8 @@ test "route linking: an unmatched client fetch stays external and the route has 
         // No backend route matches `/nonexistent`, so it stays unresolved.
         try testing.expectEqual(invalid, ref.target);
         try testing.expect(!ref.exact);
+        try testing.expectEqual(model.ResolutionStatus.unresolved, ref.resolution_status);
+        try testing.expectEqual(model.ResolutionReason.route, ref.resolution_reason);
         seen = true;
     }
     try testing.expect(seen);
@@ -2739,6 +3467,8 @@ fn expectEquivalentIndexes(expected: *const Index, actual: *const Index) !void {
         try testing.expectEqualStrings(left.doc, right.doc);
         try testing.expectEqual(left.exported, right.exported);
         try testing.expectEqual(left.modifiers, right.modifiers);
+        try testing.expectEqualStrings(left.receiver, right.receiver);
+        try testing.expectEqualStrings(left.impl_protocol, right.impl_protocol);
         try testing.expectEqualStrings(left.import_path, right.import_path);
         try expectEquivalentBindings(left.bindings, right.bindings);
         try expectEquivalentRefs(left.refs, right.refs);
@@ -2751,6 +3481,16 @@ fn expectEquivalentIndexes(expected: *const Index, actual: *const Index) !void {
         for (left, right) |left_import, right_import| {
             try testing.expectEqualStrings(left_import.binding, right_import.binding);
             try testing.expectEqual(left_import.target, right_import.target);
+        }
+    }
+    try testing.expectEqual(expected.import_outcomes.len, actual.import_outcomes.len);
+    for (expected.import_outcomes, actual.import_outcomes) |left, right| {
+        try testing.expectEqual(left.len, right.len);
+        for (left, right) |left_outcome, right_outcome| {
+            try testing.expectEqualStrings(left_outcome.binding, right_outcome.binding);
+            try testing.expectEqualStrings(left_outcome.module, right_outcome.module);
+            try testing.expectEqual(left_outcome.status, right_outcome.status);
+            try testing.expectEqual(left_outcome.target, right_outcome.target);
         }
     }
 }
@@ -2778,6 +3518,8 @@ fn expectEquivalentRefs(expected: []const model.Reference, actual: []const model
         try testing.expectEqual(left.count, right.count);
         try testing.expectEqual(left.target, right.target);
         try testing.expectEqual(left.exact, right.exact);
+        try testing.expectEqual(left.resolution_status, right.resolution_status);
+        try testing.expectEqual(left.resolution_reason, right.resolution_reason);
         try testing.expectEqualSlices(u32, left.lines, right.lines);
         try testing.expectEqualSlices(u32, left.offsets, right.offsets);
     }

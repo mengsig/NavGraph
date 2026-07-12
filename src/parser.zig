@@ -38,11 +38,13 @@ pub const ParsedSymbol = struct {
     bindings: []const Binding = &.{},
     /// For an `import` symbol: the raw module string (see `model.Symbol`).
     import_path: []const u8 = "",
-    /// Transient (never cached): a Go method's receiver type name
-    /// (`func (m *Metrics) Provision(…)` → "Metrics"). The Go post-pass
-    /// (`attachGoReceivers`) resolves it to `parent_local` when the type is
-    /// declared in the same file, then it is dead weight.
+    /// An out-of-line method's receiver/implemented type name. Go records the
+    /// receiver from `func (m *Metrics) Provision`, and Rust records `Expr`
+    /// from `impl Trait for Expr`. A same-file post-pass may assign
+    /// `parent_local`; the index retains this hint to parent cross-file impls.
     receiver: []const u8 = "",
+    /// Trait named by Rust's `impl Trait for Type`; empty for inherent impls.
+    impl_protocol: []const u8 = "",
 };
 
 /// References plus local bindings collected from one symbol body.
@@ -147,6 +149,7 @@ pub fn parse(
         .other => {},
     }
     try detectApi(&ctx, n);
+    try removeNestedReferenceOwnership(&ctx);
     return health;
 }
 
@@ -565,6 +568,13 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         const name = t.text(ctx.source);
         if (name.len < 2 or kw.has(name)) continue;
         const member_qualifier = memberQualifier(ctx, i, lo);
+        // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
+        // `.{ .value = x }`) are labels, not references to a same-named symbol.
+        // Keeping them as bare refs lets a unique unrelated definition become
+        // an "exact" call/read edge later, which is especially dangerous in
+        // strict agent queries. Preserve real receivers such as `value.field`
+        // and `make().field`.
+        if (isZigReceiverlessMember(ctx, i, lo, member_qualifier)) continue;
         const assignment = assignmentAccess(ctx, i, hi);
         const qualifier = if (assignment.write and member_qualifier.len == 0)
             enclosingCallQualifier(ctx, i, lo)
@@ -595,6 +605,23 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         .refs = try ctx.arena.dupe(Reference, refs.items),
         .bindings = try collectBindings(ctx, params_open, lo, hi),
     };
+}
+
+fn isZigReceiverlessMember(ctx: *const Ctx, i: u32, lo: u32, qualifier: []const u8) bool {
+    if (ctx.cfg.language != .zig or i <= lo or !ctx.isPunct(i - 1, '.')) return false;
+    if (qualifier.len != 0) return false;
+    if (i < lo + 2) return true;
+    const recv = ctx.toks[i - 2];
+    if (recv.kind == .identifier and !zig_keywords.has(ctx.textOf(i - 2))) return false;
+    if (recv.kind == .punct) {
+        const c = ctx.ch(i - 2);
+        // Zig postfix unwrap/deref chains are `value.?.field` / `ptr.*.field`.
+        if ((c == '?' or c == '*') and i >= lo + 4 and ctx.isPunct(i - 3, '.')) return false;
+        // A closed expression is a receiver only when the member dot is
+        // adjacent. In `if (cond) .ready`, the gap starts an inferred enum tag.
+        if (c == ')' or c == ']' or c == '}') return recv.end != ctx.toks[i - 1].start;
+    }
+    return true;
 }
 
 /// Classify a direct assignment target. Augmented assignment is both a read and
@@ -672,8 +699,17 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     std.debug.assert(i < ctx.toks.len);
     // `recv.name`
     if (i >= lo + 2 and ctx.isPunct(i - 1, '.')) {
-        if (ctx.toks[i - 2].kind == .identifier) return ctx.textOf(i - 2);
+        if (ctx.toks[i - 2].kind == .identifier) {
+            if (ctx.cfg.language != .zig or !zig_keywords.has(ctx.textOf(i - 2))) return ctx.textOf(i - 2);
+        }
         if (ctx.isPunct(i - 2, '>')) return genericReceiver(ctx, i - 2, lo);
+    }
+    // Zig postfix unwrap/deref: `opt.?.name` / `ptr.*.name`.
+    if (ctx.cfg.language == .zig and i >= lo + 4 and ctx.isPunct(i - 1, '.') and
+        (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '*')) and ctx.isPunct(i - 3, '.') and
+        ctx.toks[i - 4].kind == .identifier)
+    {
+        return ctx.textOf(i - 4);
     }
     // Two-punct member operators, receiver two tokens back:
     //   `recv?.name` / `recv!.name` — JS/TS optional-chaining & non-null assertion
@@ -769,6 +805,165 @@ fn recordRef(
     var ol: std.ArrayList(u32) = .empty;
     try ol.append(ctx.gpa, offset);
     try offset_lists.append(ctx.gpa, ol);
+}
+
+/// A broad body scan sees through nested function declarations. Once every
+/// symbol in the file is known, assign each occurrence to the innermost
+/// callable span so the outer owner does not inherit the nested function's
+/// calls. Rebuild partially-overlapping refs occurrence-by-occurrence: an outer
+/// function may legitimately use the same name outside its nested function.
+fn removeNestedReferenceOwnership(ctx: *Ctx) !void {
+    for (ctx.out.items, 0..) |*owner, owner_idx| {
+        if (!isCallable(owner.kind) or owner.refs.len == 0) continue;
+        if (!hasNestedCallable(ctx, owner_idx)) continue;
+        var changed = false;
+        for (owner.refs) |ref| {
+            for (ref.offsets) |offset| {
+                if (nestedCallableOwnsOffset(ctx, owner_idx, offset)) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) break;
+        }
+        if (!changed) continue;
+
+        var refs: std.ArrayList(Reference) = .empty;
+        var transferred = false;
+        defer {
+            if (!transferred) for (refs.items) |ref| freeReferenceSites(ctx, ref);
+            refs.deinit(ctx.gpa);
+        }
+        for (owner.refs) |ref| {
+            if (ref.offsets.len == 0) {
+                const kept = try cloneReferenceSites(ctx, ref, ref.offsets, ref.lines);
+                refs.append(ctx.gpa, kept) catch |err| {
+                    freeReferenceSites(ctx, kept);
+                    return err;
+                };
+                continue;
+            }
+            var offsets: std.ArrayList(u32) = .empty;
+            defer offsets.deinit(ctx.gpa);
+            var lines: std.ArrayList(u32) = .empty;
+            defer lines.deinit(ctx.gpa);
+            var has_call = false;
+            for (ref.offsets) |offset| {
+                if (nestedCallableOwnsOffset(ctx, owner_idx, offset)) {
+                    continue;
+                }
+                try offsets.append(ctx.gpa, offset);
+                const tok_i = tokenAtOffset(ctx, offset) orelse continue;
+                const line = ctx.toks[tok_i].line;
+                if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line)
+                    try lines.append(ctx.gpa, line);
+                if (!ref.write and referenceCallOpen(ctx, tok_i, @intCast(ctx.toks.len - 1)) != null)
+                    has_call = true;
+            }
+            if (offsets.items.len == 0) continue;
+            var kept = try cloneReferenceSites(
+                ctx,
+                ref,
+                offsets.items,
+                if (lines.items.len > 1) lines.items else &.{},
+            );
+            kept.count = @intCast(offsets.items.len);
+            if (lines.items.len != 0) kept.line = lines.items[0];
+            if (ref.kind == .call or ref.kind == .read) kept.kind = if (has_call) .call else .read;
+            refs.append(ctx.gpa, kept) catch |err| {
+                freeReferenceSites(ctx, kept);
+                return err;
+            };
+        }
+        const old_refs = owner.refs;
+        const replacement = try ctx.arena.dupe(Reference, refs.items);
+        owner.refs = replacement;
+        for (old_refs) |old| {
+            freeReferenceSites(ctx, old);
+        }
+        ctx.arena.free(old_refs);
+        transferred = true;
+    }
+}
+
+fn cloneReferenceSites(
+    ctx: *Ctx,
+    ref: Reference,
+    offsets: []const u32,
+    lines: []const u32,
+) !Reference {
+    var kept = ref;
+    kept.lines = &.{};
+    kept.offsets = &.{};
+    if (lines.len != 0) {
+        kept.lines = try ctx.arena.dupe(u32, lines);
+        errdefer ctx.arena.free(kept.lines);
+    }
+    if (offsets.len != 0) {
+        kept.offsets = try ctx.arena.dupe(u32, offsets);
+        errdefer ctx.arena.free(kept.offsets);
+    }
+    return kept;
+}
+
+fn freeReferenceSites(ctx: *Ctx, ref: Reference) void {
+    if (ref.lines.len != 0) ctx.arena.free(ref.lines);
+    if (ref.offsets.len != 0) ctx.arena.free(ref.offsets);
+}
+
+fn isCallable(kind: SymbolKind) bool {
+    return kind == .function or kind == .method or kind == .test_case;
+}
+
+fn hasNestedCallable(ctx: *const Ctx, owner_idx: usize) bool {
+    const owner = ctx.out.items[owner_idx];
+    for (ctx.out.items, 0..) |nested, nested_idx| {
+        if (nested_idx == owner_idx or !isCallable(nested.kind)) continue;
+        if (nested.span_start > owner.span_start and nested.span_end <= owner.span_end) return true;
+    }
+    return false;
+}
+
+fn nestedCallableOwnsOffset(ctx: *const Ctx, owner_idx: usize, offset: u32) bool {
+    const owner = ctx.out.items[owner_idx];
+    for (ctx.out.items, 0..) |nested, nested_idx| {
+        if (nested_idx == owner_idx or !isCallable(nested.kind)) continue;
+        if (nested.span_start <= owner.span_start or nested.span_end > owner.span_end) continue;
+        if (offset < nested.span_start or offset >= nested.span_end) continue;
+        if (ctx.cfg.language != .python) return true;
+        // Python evaluates nested defaults/annotations while defining the inner
+        // function, in the outer scope. Preserve those signature expressions,
+        // but remove the declaration name and everything in the nested body.
+        if (offset >= nested.sig_end) return true;
+        if (nestedNameOffset(ctx, nested)) |name_offset| {
+            if (offset == name_offset) return true;
+        }
+    }
+    return false;
+}
+
+fn nestedNameOffset(ctx: *const Ctx, nested: ParsedSymbol) ?u32 {
+    for (ctx.toks) |tok| {
+        if (tok.start < nested.span_start) continue;
+        if (tok.start >= nested.sig_end) break;
+        if (tok.line != nested.line or tok.kind != .identifier) continue;
+        if (std.mem.eql(u8, tok.text(ctx.source), nested.name)) return tok.start;
+    }
+    return null;
+}
+
+fn tokenAtOffset(ctx: *const Ctx, offset: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = ctx.toks.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ctx.toks[mid].start < offset)
+            lo = mid + 1
+        else
+            hi = mid;
+    }
+    if (lo < ctx.toks.len and ctx.toks[lo].start == offset) return @intCast(lo);
+    return null;
 }
 
 /// Factory-method names whose receiver is the constructed type: `T.init(...)`.
@@ -1061,7 +1256,7 @@ fn parseZigFn(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exporte
         span_end = sig_end;
     }
     const body = try collectRefs(ctx, fn_i + 2, body_lo, body_hi, ctx.textOf(name_i), zig_keywords);
-    _ = try emit(ctx, .{
+    const fn_idx = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = kind,
         .line = ctx.toks[name_i].line,
@@ -1074,7 +1269,40 @@ fn parseZigFn(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exporte
         .refs = body.refs,
         .bindings = body.bindings,
     });
+    if (body_lo < body_hi) try parseZigReturnedContainerMembers(ctx, body_lo, body_hi, fn_idx);
     return if (span_end > ctx.toks[start_i].start) tokenAfterOffset(ctx, span_end, hi) else start_i + 1;
+}
+
+/// A Zig generic type factory commonly has the shape
+/// `fn Box(comptime T: type) type { return struct { ... }; }`. The function is
+/// still the public symbol, but its returned anonymous container owns useful
+/// methods that agents need to discover and edit. Parent those methods to the
+/// factory so selectors such as `Box.init` remain stable and intuitive.
+fn parseZigReturnedContainerMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
+    var i = lo;
+    while (i < hi) {
+        if (ctx.identEql(i, "return")) {
+            var kind_i = i + 1;
+            while (kind_i < hi and (ctx.identEql(kind_i, "packed") or ctx.identEql(kind_i, "extern")))
+                kind_i += 1;
+            if (kind_i < hi and (ctx.identEql(kind_i, "struct") or ctx.identEql(kind_i, "union") or
+                ctx.identEql(kind_i, "enum") or ctx.identEql(kind_i, "opaque")))
+            {
+                const open = findNext(ctx, kind_i + 1, hi, '{');
+                if (open != sentinel and ctx.close[open] != sentinel and ctx.close[open] <= hi) {
+                    try parseZigScope(ctx, open + 1, ctx.close[open], parent);
+                    i = ctx.close[open] + 1;
+                    continue;
+                }
+            }
+        }
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '{') or ctx.isPunct(i, '[')) {
+            const next = skipBracket(ctx, i);
+            i = if (next > i) next else i + 1;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn parseZigConst(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
@@ -1272,18 +1500,18 @@ const cs_keywords = KeywordSet.initComptime(.{
 /// shared C-family scanners skip Java-specific keywords when reading a body's
 /// references and detecting member methods.
 const java_keywords = KeywordSet.initComptime(.{
-    .{"if"},           .{"else"},        .{"for"},      .{"while"},        .{"do"},
-    .{"return"},       .{"switch"},      .{"case"},     .{"break"},        .{"continue"},
-    .{"default"},      .{"class"},       .{"interface"}, .{"enum"},        .{"record"},
-    .{"extends"},      .{"implements"},  .{"throws"},   .{"import"},       .{"package"},
-    .{"public"},       .{"private"},     .{"protected"}, .{"static"},      .{"final"},
-    .{"abstract"},     .{"native"},      .{"synchronized"}, .{"transient"}, .{"volatile"},
-    .{"strictfp"},     .{"void"},        .{"int"},      .{"long"},         .{"short"},
-    .{"byte"},         .{"char"},        .{"float"},    .{"double"},       .{"boolean"},
-    .{"true"},         .{"false"},       .{"null"},     .{"this"},         .{"super"},
-    .{"new"},          .{"instanceof"},  .{"try"},      .{"catch"},        .{"finally"},
-    .{"throw"},        .{"var"},         .{"yield"},    .{"assert"},       .{"sealed"},
-    .{"permits"},      .{"const"},       .{"goto"},
+    .{"if"},       .{"else"},       .{"for"},          .{"while"},     .{"do"},
+    .{"return"},   .{"switch"},     .{"case"},         .{"break"},     .{"continue"},
+    .{"default"},  .{"class"},      .{"interface"},    .{"enum"},      .{"record"},
+    .{"extends"},  .{"implements"}, .{"throws"},       .{"import"},    .{"package"},
+    .{"public"},   .{"private"},    .{"protected"},    .{"static"},    .{"final"},
+    .{"abstract"}, .{"native"},     .{"synchronized"}, .{"transient"}, .{"volatile"},
+    .{"strictfp"}, .{"void"},       .{"int"},          .{"long"},      .{"short"},
+    .{"byte"},     .{"char"},       .{"float"},        .{"double"},    .{"boolean"},
+    .{"true"},     .{"false"},      .{"null"},         .{"this"},      .{"super"},
+    .{"new"},      .{"instanceof"}, .{"try"},          .{"catch"},     .{"finally"},
+    .{"throw"},    .{"var"},        .{"yield"},        .{"assert"},    .{"sealed"},
+    .{"permits"},  .{"const"},      .{"goto"},
 });
 
 /// A Java `package a.b.c;` declaration — emit a module symbol for outline
@@ -2577,14 +2805,21 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
 }
 
 fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
-    // `NAME = ...` or `NAME: TYPE = ...` at line start → module/class variable.
-    if (i + 1 >= hi) return;
-    var j = i + 1;
-    if (ctx.isPunct(j, ':')) { // annotation
-        while (j < hi and !ctx.isPunct(j, '=') and ctx.toks[j].line == ctx.toks[i].line) j += 1;
-    }
-    if (j >= hi or !ctx.isPunct(j, '=')) return;
-    if (j + 1 < hi and ctx.isPunct(j + 1, '=')) return; // comparison ==
+    // `NAME = ...`, `NAME: TYPE = ...`, or annotation-only `NAME: TYPE` at line
+    // start → module/class variable. Dataclasses and ordinary classes both use
+    // annotation-only fields, and omitting them makes outline/flow blind to a
+    // large part of the data model.
+    if (i + 1 >= hi or pyInsideBracket(ctx, i)) return;
+    const annotated = ctx.isPunct(i + 1, ':');
+    const eq_i = if (annotated)
+        pyAnnotationInitializer(ctx, i + 2, hi, ctx.toks[i].line)
+    else if (ctx.isPunct(i + 1, '='))
+        i + 1
+    else
+        sentinel;
+    const has_initializer = eq_i != sentinel;
+    if (!has_initializer and !annotated) return;
+    if (has_initializer and eq_i + 1 < hi and ctx.isPunct(eq_i + 1, '=')) return; // comparison ==
     const first_line_end = lineEndOffset(ctx, ctx.toks[i].start);
     // A bracketed multi-line initializer (`NAME = [ … ]` / `{ … }` / `( … )`)
     // spans past line 1: capture the whole literal so `def NAME -v full` shows
@@ -2592,8 +2827,8 @@ fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
     // signature stays the first line, so the `sig` view still collapses to the
     // head. Only a *direct* bracket literal extends — `NAME = f([…])` does not.
     var span_end = first_line_end;
-    if (j + 1 < hi and (ctx.isPunct(j + 1, '[') or ctx.isPunct(j + 1, '{') or ctx.isPunct(j + 1, '('))) {
-        const close = ctx.close[j + 1];
+    if (has_initializer and eq_i + 1 < hi and (ctx.isPunct(eq_i + 1, '[') or ctx.isPunct(eq_i + 1, '{') or ctx.isPunct(eq_i + 1, '('))) {
+        const close = ctx.close[eq_i + 1];
         if (close != sentinel and close < hi) span_end = @max(span_end, ctx.toks[close].end);
     }
     _ = try emit(ctx, .{
@@ -2608,6 +2843,51 @@ fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
         .parent_local = parent,
         .refs = &.{},
     });
+}
+
+fn pyAnnotationInitializer(ctx: *const Ctx, from: u32, hi: u32, line: u32) u32 {
+    var i = from;
+    while (i < hi and ctx.toks[i].line == line) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '{')) {
+            const close = ctx.close[i];
+            if (close == sentinel) return sentinel;
+            i = close + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, '=')) return i;
+        i += 1;
+    }
+    return sentinel;
+}
+
+fn pyInsideBracket(ctx: *const Ctx, i: u32) bool {
+    var parens: u32 = 0;
+    var brackets: u32 = 0;
+    var braces: u32 = 0;
+    var j = i;
+    while (j != 0) {
+        j -= 1;
+        if (ctx.toks[j].kind != .punct) continue;
+        switch (ctx.ch(j)) {
+            ')' => parens += 1,
+            ']' => brackets += 1,
+            '}' => braces += 1,
+            '(' => {
+                if (parens == 0) return true;
+                parens -= 1;
+            },
+            '[' => {
+                if (brackets == 0) return true;
+                brackets -= 1;
+            },
+            '{' => {
+                if (braces == 0) return true;
+                braces -= 1;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn lineStartTrimEnd(ctx: *const Ctx, term: u32) u32 {
@@ -2628,9 +2908,10 @@ const lua_keywords = KeywordSet.initComptime(.{
 });
 
 /// The name a Lua function definition binds: `function a.b:c(...)` yields the
-/// last segment `c`, whether the final separator was a `:` (implicit `self`),
-/// whether any receiver preceded it, and the params `(` index.
-const LuaName = struct { name_i: u32, is_member: bool, is_method: bool, open_i: u32 };
+/// last segment `c`, the first receiver segment `a`, whether the final separator
+/// was a `:` (implicit `self`), whether any receiver preceded it, and the params
+/// `(` index.
+const LuaName = struct { name_i: u32, receiver_i: u32, is_member: bool, is_method: bool, open_i: u32 };
 
 fn luaFuncName(ctx: *const Ctx, start: u32, hi: u32) ?LuaName {
     if (start >= hi or ctx.toks[start].kind != .identifier) return null;
@@ -2645,7 +2926,7 @@ fn luaFuncName(ctx: *const Ctx, start: u32, hi: u32) ?LuaName {
         if (is_method) break; // `:` is only valid as the final separator
     }
     const open = if (ctx.isPunct(last + 1, '(')) last + 1 else sentinel;
-    return .{ .name_i = last, .is_member = is_member, .is_method = is_method, .open_i = open };
+    return .{ .name_i = last, .receiver_i = start, .is_member = is_member, .is_method = is_method, .open_i = open };
 }
 
 /// Keywords that open an `end`/`until`-terminated Lua block. `for`/`while`
@@ -2717,6 +2998,10 @@ fn parseLuaFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, i
     const params_close = ctx.close[nm.open_i];
     const end_i = luaBlockEnd(ctx, params_close + 1, hi);
     const name = ctx.textOf(nm.name_i);
+    const member_parent = if (nm.is_member)
+        findLuaReceiver(ctx, ctx.textOf(nm.receiver_i)) orelse parent
+    else
+        parent;
     const span_end = if (end_i < hi) ctx.toks[end_i].end else @as(u32, @intCast(ctx.source.len));
     const body = try collectRefs(ctx, nm.open_i, params_close + 1, end_i, name, lua_keywords);
     _ = try emit(ctx, .{
@@ -2728,11 +3013,28 @@ fn parseLuaFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, i
         .sig_end = ctx.toks[params_close].end,
         .doc = collectDoc(ctx, start_i),
         .exported = !is_local,
-        .parent_local = parent,
+        .parent_local = member_parent,
         .refs = body.refs,
         .bindings = body.bindings,
     });
     return if (end_i < hi) end_i + 1 else hi;
+}
+
+fn findLuaReceiver(ctx: *const Ctx, name: []const u8) ?u32 {
+    var i = ctx.out.items.len;
+    while (i != 0) {
+        i -= 1;
+        const sym = ctx.out.items[i];
+        if (!std.mem.eql(u8, sym.name, name)) continue;
+        switch (sym.kind) {
+            // Lua receiver roots emitted by this parser are table/value
+            // variables or require() imports. A same-named nested field is not
+            // evidence for a later bare `T.method` declaration.
+            .variable, .import => return @intCast(i),
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Parse `[local] NAME[.field|:method]* = RHS`. `ns` is the first target token
@@ -2755,9 +3057,13 @@ fn parseLuaAssign(ctx: *Ctx, start_i: u32, ns: u32, hi: u32, parent: ?u32, is_lo
     if (!is_member) {
         if (luaRequirePath(ctx, rhs, hi)) |path| return emitLuaImport(ctx, start_i, name_i, path, hi);
     }
+    const binding_parent = if (is_member)
+        findLuaReceiver(ctx, ctx.textOf(ns)) orelse parent
+    else
+        parent;
     if (rhs < hi and ctx.identEql(rhs, "function"))
-        return parseLuaFuncExpr(ctx, start_i, name_i, rhs, hi, parent, is_local, is_member);
-    return parseLuaVar(ctx, start_i, name_i, rhs, hi, parent, is_local, is_member);
+        return parseLuaFuncExpr(ctx, start_i, name_i, rhs, hi, binding_parent, is_local, is_member);
+    return parseLuaVar(ctx, start_i, name_i, rhs, hi, binding_parent, is_local, is_member);
 }
 
 fn emitLuaImport(ctx: *Ctx, start_i: u32, name_i: u32, path: []const u8, hi: u32) !u32 {
@@ -3482,9 +3788,42 @@ fn parseRustImpl(ctx: *Ctx, impl_i: u32, hi: u32) AllocError!u32 {
     // Nest methods under the implemented type when it is a known container, so
     // outline groups them; otherwise leave them parentless but still methods.
     const type_name = rustImplTypeName(ctx, impl_i + 1, open);
+    const protocol_name = rustImplProtocolName(ctx, impl_i + 1, open);
     const parent = if (type_name.len != 0) findEmittedContainer(ctx, type_name) else null;
+    const first_method = ctx.out.items.len;
     try parseRustScope(ctx, open + 1, close, parent, true);
+    // `impl` blocks commonly live in a different module from the type. Keep
+    // enough nominal evidence for the whole-project index to attach those
+    // otherwise-parentless methods after every file has been parsed.
+    for (ctx.out.items[first_method..]) |*sym| {
+        if (sym.kind != .method) continue;
+        sym.receiver = type_name;
+        sym.impl_protocol = protocol_name;
+    }
     return close + 1;
+}
+
+/// Trait name from `impl Trait for Type`, or empty for an inherent `impl Type`.
+/// Like `rustImplTypeName`, this keeps the last path segment (`traits::Draw` ->
+/// `Draw`); resolution later requires a unique project container before it
+/// treats the nominal relation as exact.
+fn rustImplProtocolName(ctx: *const Ctx, from: u32, open: u32) []const u8 {
+    var j = skipRustGenerics(ctx, from, open);
+    var protocol: []const u8 = "";
+    while (j < open) : (j += 1) {
+        if (ctx.identEql(j, "for")) return protocol;
+        if (ctx.isPunct(j, '<')) {
+            const next = skipRustGenerics(ctx, j, open);
+            if (next > j) {
+                j = next - 1;
+                continue;
+            }
+        }
+        if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) {
+            protocol = ctx.textOf(j);
+        }
+    }
+    return "";
 }
 
 /// The `{` that opens an `impl ... { }` body, skipping generics, the `for` type,
@@ -3531,12 +3870,13 @@ fn rustImplTypeName(ctx: *const Ctx, from: u32, open: u32) []const u8 {
             after_for = true;
             continue;
         }
+        if (ctx.identEql(j, "where")) break;
         if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) {
-            // The impl'd type is the first identifier; `impl Trait for Type` names
-            // the type after `for` instead.
+            // Keep the final path segment; `impl crate::Trait for model::Type`
+            // must attach to `Type`, not the leading module identifier.
             if (after_for) {
-                if (for_ident.len == 0) for_ident = ctx.textOf(j);
-            } else if (type_ident.len == 0) {
+                for_ident = ctx.textOf(j);
+            } else {
                 type_ident = ctx.textOf(j);
             }
         }
@@ -3949,6 +4289,69 @@ test "zig: functions, struct, methods, refs" {
     try testing.expect(found_add_ref);
 }
 
+test "zig: a generic type factory indexes returned anonymous-container methods" {
+    const src =
+        \\pub fn Box(comptime T: type) type {
+        \\    return struct {
+        \\        value: T,
+        \\        pub fn init(value: T) @This() {
+        \\            return .{ .value = value };
+        \\        }
+        \\        pub fn get(self: @This()) T {
+        \\            return self.value;
+        \\        }
+        \\    };
+        \\}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    var box_idx: ?u32 = null;
+    for (out.items, 0..) |sym, i| {
+        if (std.mem.eql(u8, sym.name, "Box")) box_idx = @intCast(i);
+    }
+    try testing.expect(box_idx != null);
+    const init = findSym(out.items, "init").?;
+    const get = findSym(out.items, "get").?;
+    try testing.expectEqual(SymbolKind.method, init.kind);
+    try testing.expectEqual(SymbolKind.method, get.kind);
+    try testing.expectEqual(box_idx, init.parent_local);
+    try testing.expectEqual(box_idx, get.parent_local);
+}
+
+test "zig: receiverless enum tags and struct fields never become symbol references" {
+    const src =
+        \\const Operation = enum { symbol, relations };
+        \\const Node = struct { field: usize };
+        \\fn symbol() void {}
+        \\fn ready() void {}
+        \\fn decode(operation: Operation, opt: ?Node, ptr: *Node, cond: bool) void {
+        \\    switch (operation) {
+        \\        .symbol => {},
+        \\        .relations => {},
+        \\    }
+        \\    _ = opt.?.field;
+        \\    _ = ptr.*.field;
+        \\    const selected: Operation = if (cond) .ready else .relations;
+        \\    _ = selected;
+        \\}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const decode = findSym(out.items, "decode").?;
+    try testing.expect(!hasRef(decode, "symbol"));
+    try testing.expect(!hasRef(decode, "relations"));
+    try testing.expect(!hasRef(decode, "ready"));
+    var saw_opt_field = false;
+    var saw_ptr_field = false;
+    for (decode.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "field")) continue;
+        if (std.mem.eql(u8, ref.qualifier, "opt")) saw_opt_field = true;
+        if (std.mem.eql(u8, ref.qualifier, "ptr")) saw_ptr_field = true;
+    }
+    try testing.expect(saw_opt_field);
+    try testing.expect(saw_ptr_field);
+}
+
 test "python: def, class, method, refs" {
     const src =
         \\import os
@@ -3973,6 +4376,38 @@ test "python: def, class, method, refs" {
         if (std.mem.eql(u8, r.name, "helper")) found = true;
     }
     try testing.expect(found);
+}
+
+test "python: annotation-only class and dataclass fields are indexed" {
+    const src =
+        \\from dataclasses import dataclass
+        \\from typing import Literal
+        \\@dataclass
+        \\class User:
+        \\    name: str
+        \\    age: int = 0
+        \\    rule: Literal[1 == 1] = "same"
+        \\    mapping = {
+        \\        key: value,
+        \\    }
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    var user_idx: ?u32 = null;
+    for (out.items, 0..) |sym, i| {
+        if (std.mem.eql(u8, sym.name, "User")) user_idx = @intCast(i);
+    }
+    try testing.expect(user_idx != null);
+    const name = findSym(out.items, "name").?;
+    const age = findSym(out.items, "age").?;
+    const rule = findSym(out.items, "rule").?;
+    try testing.expectEqual(SymbolKind.field, name.kind);
+    try testing.expectEqual(SymbolKind.field, age.kind);
+    try testing.expectEqual(SymbolKind.field, rule.kind);
+    try testing.expectEqual(user_idx, name.parent_local);
+    try testing.expectEqual(user_idx, age.parent_local);
+    try testing.expectEqual(user_idx, rule.parent_local);
+    try testing.expect(findSym(out.items, "key") == null);
 }
 
 test "python: multi-line signature with dedented close paren does not crash" {
@@ -4515,6 +4950,10 @@ test "lua: local/global functions, table methods, refs and export flags" {
         \\function M:method(x)
         \\  return self.value + x
         \\end
+        \\
+        \\M.assigned = function(x)
+        \\  return x
+        \\end
     ;
     var out = try parseForTest(src, .lua);
     defer freeRefs(&out);
@@ -4525,7 +4964,16 @@ test "lua: local/global functions, table methods, refs and export flags" {
     const pub_add = findSym(out.items, "publicAdd").?;
     try testing.expectEqual(SymbolKind.method, pub_add.kind);
     try testing.expect(pub_add.exported); // table function → public
-    try testing.expectEqual(SymbolKind.method, findSym(out.items, "method").?.kind);
+    const method = findSym(out.items, "method").?;
+    try testing.expectEqual(SymbolKind.method, method.kind);
+    var module_idx: ?u32 = null;
+    for (out.items, 0..) |sym, i| {
+        if (std.mem.eql(u8, sym.name, "M")) module_idx = @intCast(i);
+    }
+    try testing.expect(module_idx != null);
+    try testing.expectEqual(module_idx, pub_add.parent_local);
+    try testing.expectEqual(module_idx, method.parent_local);
+    try testing.expectEqual(module_idx, findSym(out.items, "assigned").?.parent_local);
     var found = false;
     for (pub_add.refs) |r| {
         if (std.mem.eql(u8, r.name, "addPrivate")) {
@@ -4534,6 +4982,20 @@ test "lua: local/global functions, table methods, refs and export flags" {
         }
     }
     try testing.expect(found);
+}
+
+test "lua: an unrelated nested field is not a receiver root for a bare method" {
+    const src =
+        \\local Other = {}
+        \\Other.T = {}
+        \\function T.open()
+        \\  return 1
+        \\end
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "T").?.parent_local != null);
+    try testing.expect(findSym(out.items, "open").?.parent_local == null);
 }
 
 test "lua: require() emits an import; a block comment hides code inside it" {
@@ -4842,7 +5304,7 @@ test "rust: multiple impl blocks and a trait impl all contribute methods to the 
         \\    pub fn new() -> Widget { Widget }
         \\    fn helper(&self) -> u32 { 1 }
         \\}
-        \\impl Draw for Widget {
+        \\impl crate::Draw for crate::Widget {
         \\    fn draw(&self) { self.helper(); }
         \\}
     ;
@@ -4858,6 +5320,15 @@ test "rust: multiple impl blocks and a trait impl all contribute methods to the 
     try testing.expect(new.parent_local != null);
     try testing.expect(findSym(out.items, "helper").?.parent_local != null);
     try testing.expect(countKind(out.items, .method) >= 3);
+    var saw_nominal_impl = false;
+    for (out.items) |sym| {
+        if (!std.mem.eql(u8, sym.name, "draw") or sym.receiver.len == 0) continue;
+        try testing.expectEqualStrings("Widget", sym.receiver);
+        try testing.expectEqualStrings("Draw", sym.impl_protocol);
+        try testing.expect(sym.parent_local != null);
+        saw_nominal_impl = true;
+    }
+    try testing.expect(saw_nominal_impl);
 }
 
 test "rust: where-clause and Fn() bounds do not break the fn body" {
@@ -4982,13 +5453,13 @@ test "zig: enum and tagged union are indexed; a test block is a test_case symbol
     try testing.expect(findSym(out.items, "add") == null);
 }
 
-test "python: subclass async method captures nested fn and call refs" {
+test "python: nested body calls belong to the inner owner while defaults stay outer" {
     const src =
         \\class Base:
         \\    pass
         \\class Derived(Base):
         \\    async def load(self):
-        \\        def inner():
+        \\        def inner(value=make_default()):
         \\            return fetch()
         \\        return inner()
     ;
@@ -4999,13 +5470,16 @@ test "python: subclass async method captures nested fn and call refs" {
     const load = findSym(out.items, "load").?;
     try testing.expectEqual(SymbolKind.method, load.kind);
     try testing.expect(load.parent_local != null);
-    // The async method sees both its nested-fn call and the inner fetch.
+    // The async method owns its call to the nested function, but not calls made
+    // inside that nested function.
     try testing.expect(hasCallRef(load, "inner"));
-    try testing.expect(hasCallRef(load, "fetch"));
+    try testing.expect(hasCallRef(load, "make_default"));
+    try testing.expect(!hasRef(load, "fetch"));
     // The nested function is itself indexed and calls fetch.
     const inner = findSym(out.items, "inner").?;
     try testing.expectEqual(SymbolKind.function, inner.kind);
     try testing.expect(hasCallRef(inner, "fetch"));
+    try testing.expect(!hasRef(inner, "make_default"));
 }
 
 test "ts: an exported arrow-const is a function that captures its call" {

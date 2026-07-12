@@ -161,6 +161,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Real executable/corpus contracts live outside the white-box test roots.
+    // Named steps remain independently runnable, and the main `test` gate also
+    // depends on both so CI cannot accidentally exercise only white-box roots.
+    const contract_cmd = b.addSystemCommand(&.{"sh"});
+    contract_cmd.addFileArg(b.path("tests/agent-contract.sh"));
+    contract_cmd.addArtifactArg(exe);
+    contract_cmd.addDirectoryArg(b.path("."));
+    contract_cmd.setCwd(b.path("."));
+    const contract_step = b.step("contract", "Run black-box agent and polyglot corpus contracts");
+    contract_step.dependOn(&contract_cmd.step);
+
+    const efficiency_cmd = b.addSystemCommand(&.{"sh"});
+    efficiency_cmd.addFileArg(b.path("tests/efficiency-contract.sh"));
+    efficiency_cmd.addArtifactArg(exe);
+    efficiency_cmd.addDirectoryArg(b.path("."));
+    efficiency_cmd.setCwd(b.path("."));
+    const efficiency_step = b.step("efficiency", "Check deterministic agent-context compression budgets");
+    efficiency_step.dependOn(&efficiency_cmd.step);
+    test_step.dependOn(&contract_cmd.step);
+    test_step.dependOn(&efficiency_cmd.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

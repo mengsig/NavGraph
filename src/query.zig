@@ -242,6 +242,7 @@ pub fn kindAllowed(kind: model.SymbolKind, filter: []const u8) bool {
         const t = std.mem.trim(u8, raw, " ");
         if (std.mem.eql(u8, t, tag)) return true;
         if (kind == .function and (std.mem.eql(u8, t, "function") or std.mem.eql(u8, t, "func"))) return true;
+        if (kind == .interface and std.mem.eql(u8, t, "interface")) return true;
         if (kind == .constant and std.mem.eql(u8, t, "constant")) return true;
         if (kind == .variable and std.mem.eql(u8, t, "variable")) return true;
     }
@@ -511,6 +512,8 @@ pub const StatusReport = struct {
     scope_symbols: u32 = 0,
     parse_warnings: u32 = 0,
     unresolved_refs: u32 = 0,
+    likely_local_refs: u32 = 0,
+    external_or_unmodeled_refs: u32 = 0,
     skipped: u32 = 0,
 
     pub fn deinit(self: *StatusReport, gpa: std.mem.Allocator) void {
@@ -541,7 +544,10 @@ fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Option
         report.scope_files += 1;
         report.scope_symbols += file.sym_end - file.sym_start;
         if (!file.parse_health.reliable()) report.parse_warnings += 1;
-        report.unresolved_refs += unresolvedInFile(idx, file);
+        const resolution = unresolvedInFile(idx, file);
+        report.likely_local_refs += resolution.likely_local;
+        report.external_or_unmodeled_refs += resolution.external_or_unmodeled;
+        report.unresolved_refs += resolution.likely_local + resolution.external_or_unmodeled;
     }
     for (idx.skipped_dirs) |path| {
         if (filter.len == 0 or matchesFilter(path, filter)) report.skipped += 1;
@@ -555,13 +561,18 @@ pub fn statusFileSelected(file: model.SourceFile, filter: []const u8, opts: Opti
     return !opts.no_recurse or inDirNonRecursive(file.path, filter);
 }
 
-fn unresolvedInFile(idx: *const Index, file: model.SourceFile) u32 {
+const UnresolvedCounts = struct { likely_local: u32 = 0, external_or_unmodeled: u32 = 0 };
+
+fn unresolvedInFile(idx: *const Index, file: model.SourceFile) UnresolvedCounts {
     std.debug.assert(file.sym_start <= file.sym_end);
     std.debug.assert(file.sym_end <= idx.graph.symbols.len);
-    var count: u32 = 0;
+    var count: UnresolvedCounts = .{};
     for (idx.graph.symbols[file.sym_start..file.sym_end]) |sym| {
         for (sym.refs) |ref| if (referenceNeedsDiagnostic(sym, ref)) {
-            count += 1;
+            switch (referenceDiagnosticClass(idx, sym, ref).?) {
+                .likely_local => count.likely_local += 1,
+                .external_or_unmodeled => count.external_or_unmodeled += 1,
+            }
         };
     }
     return count;
@@ -586,6 +597,65 @@ pub fn referenceIsUnresolved(sym: model.Symbol, ref: model.Reference) bool {
 pub fn referenceNeedsDiagnostic(sym: model.Symbol, ref: model.Reference) bool {
     if (!referenceIsUnresolved(sym, ref)) return false;
     return ref.kind != .read;
+}
+
+pub const ReferenceDiagnosticClass = enum { likely_local, external_or_unmodeled };
+
+/// Split actionable graph misses from ordinary library/dynamic calls. This is
+/// deliberately conservative: a miss is "likely local" only when indexed
+/// evidence (same-family candidate, known receiver type, or self dispatch)
+/// says NavGraph should plausibly have linked it.
+pub fn referenceDiagnosticClass(idx: *const Index, sym: model.Symbol, ref: model.Reference) ?ReferenceDiagnosticClass {
+    if (!referenceNeedsDiagnostic(sym, ref)) return null;
+    if (std.mem.eql(u8, ref.qualifier, "self") or std.mem.eql(u8, ref.qualifier, "this")) return .likely_local;
+
+    const from_family = idx.graph.files[sym.file].language.family();
+    if (ref.qualifier.len != 0) {
+        for (sym.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.name, ref.qualifier) or binding.type_name.len == 0) continue;
+            for (idx.lookup(binding.type_name)) |type_id| {
+                const type_sym = idx.graph.symbols[type_id];
+                if (diagnosticTypeLike(type_sym.kind) and idx.graph.files[type_sym.file].language.family() == from_family) return .likely_local;
+            }
+        }
+        for (idx.lookup(ref.qualifier)) |type_id| {
+            const type_sym = idx.graph.symbols[type_id];
+            if (diagnosticTypeLike(type_sym.kind) and idx.graph.files[type_sym.file].language.family() == from_family) return .likely_local;
+        }
+        return .external_or_unmodeled;
+    }
+
+    // Chained/literal member calls can have no identifier receiver in the
+    // lightweight reference model (`String(x).replace(...)`, `xs?.slice()`).
+    // Their exact offsets still prove the occurrence is dot-qualified. Do not
+    // promote those to "likely local" merely because an unrelated workspace
+    // method shares the same common builtin name.
+    if (receiverlessMemberSyntax(idx.graph.files[sym.file].text, ref)) return .external_or_unmodeled;
+
+    for (idx.lookup(ref.name)) |candidate_id| {
+        const candidate = idx.graph.symbols[candidate_id];
+        if (idx.graph.files[candidate.file].language.family() != from_family) continue;
+        if (candidate.file == sym.file or ref.kind == .type_use or ref.kind == .call) return .likely_local;
+    }
+    return .external_or_unmodeled;
+}
+
+fn receiverlessMemberSyntax(source: []const u8, ref: model.Reference) bool {
+    if (ref.offsets.len == 0) return false;
+    for (ref.offsets) |raw_offset| {
+        var offset: usize = @intCast(raw_offset);
+        if (offset > source.len) return false;
+        while (offset != 0 and std.ascii.isWhitespace(source[offset - 1])) offset -= 1;
+        if (offset == 0 or source[offset - 1] != '.') return false;
+    }
+    return true;
+}
+
+fn diagnosticTypeLike(kind: model.SymbolKind) bool {
+    return switch (kind) {
+        .class, .@"struct", .@"enum", .interface, .type => true,
+        else => false,
+    };
 }
 
 fn collectStatusChanges(
@@ -667,28 +737,42 @@ fn renderStatusDiagnostics(w: *Writer, idx: *const Index, filter: []const u8, re
     }
     try w.print("skipped: {d}\n", .{report.skipped});
     for (idx.skipped_dirs) |path| if (filter.len == 0 or matchesFilter(path, filter)) try w.print("  {s}\n", .{path});
-    try renderUnresolvedStatus(w, idx, filter, report.unresolved_refs, opts);
+    try renderUnresolvedStatus(w, idx, filter, report, opts);
 }
 
-fn renderUnresolvedStatus(w: *Writer, idx: *const Index, filter: []const u8, total: u32, opts: Options) !void {
-    try w.print("unresolved/external graph edges: {d}\n", .{total});
+fn renderUnresolvedStatus(w: *Writer, idx: *const Index, filter: []const u8, report: StatusReport, opts: Options) !void {
+    try w.print("resolution health: {d} likely-local miss{s}; {d} external/unmodeled edge{s}\n", .{
+        report.likely_local_refs,
+        if (report.likely_local_refs == 1) "" else "es",
+        report.external_or_unmodeled_refs,
+        if (report.external_or_unmodeled_refs == 1) "" else "s",
+    });
     var shown: u32 = 0;
-    outer: for (idx.graph.symbols) |sym| {
-        const file = idx.graph.files[sym.file];
-        if (!statusFileSelected(file, filter, opts)) continue;
-        for (sym.refs) |ref| {
-            if (!referenceNeedsDiagnostic(sym, ref)) continue;
-            const qualifier = if (ref.qualifier.len == 0) "" else ref.qualifier;
-            try w.print("  {s}:{d} {s}{s}{s} in {s}", .{
-                file.path, ref.line, qualifier, if (qualifier.len == 0) "" else ".", ref.name, sym.name,
-            });
-            if (!file.parse_health.reliable()) try w.writeAll(" (parse unreliable)");
-            try w.writeByte('\n');
-            shown += 1;
-            if (shown >= opts.limit) break :outer;
+    inline for (.{ ReferenceDiagnosticClass.likely_local, ReferenceDiagnosticClass.external_or_unmodeled }) |wanted| {
+        outer: for (idx.graph.symbols) |sym| {
+            const file = idx.graph.files[sym.file];
+            if (!statusFileSelected(file, filter, opts)) continue;
+            for (sym.refs) |ref| {
+                if (referenceDiagnosticClass(idx, sym, ref) != wanted) continue;
+                const qualifier = if (ref.qualifier.len == 0) "" else ref.qualifier;
+                try w.print("  [{s}] {s}:{d} {s}{s}{s} in {s}", .{
+                    if (wanted == .likely_local) "likely-local" else "external",
+                    file.path,
+                    ref.line,
+                    qualifier,
+                    if (qualifier.len == 0) "" else ".",
+                    ref.name,
+                    sym.name,
+                });
+                if (!file.parse_health.reliable()) try w.writeAll(" (parse unreliable)");
+                try w.writeByte('\n');
+                shown += 1;
+                if (shown >= opts.limit) break :outer;
+            }
         }
+        if (shown >= opts.limit) break;
     }
-    if (shown < total) try w.print("  … {d} graph edges elided (-l {d})\n", .{ total - shown, opts.limit });
+    if (shown < report.unresolved_refs) try w.print("  … {d} graph edges elided (-l {d})\n", .{ report.unresolved_refs - shown, opts.limit });
 }
 
 /// The index's coverage manifest: every indexed file with its language and
@@ -729,13 +813,21 @@ pub fn collectFiles(idx: *const Index, filter: []const u8, opts: Options) ![]Ran
         if (opts.no_recurse and !inDirNonRecursive(file.path, filter)) continue;
         try ranked.append(idx.gpa, .{ .id = file.id, .count = fileSymbolCount(idx, file) });
     }
-    if (opts.file_sort == .symbols) std.mem.sort(RankedFile, ranked.items, idx, rankedFileLessThan);
+    if (opts.file_sort == .symbols) {
+        std.mem.sort(RankedFile, ranked.items, idx, rankedFileLessThan);
+    } else {
+        std.mem.sort(RankedFile, ranked.items, idx, rankedFilePathLessThan);
+    }
     return ranked.toOwnedSlice(idx.gpa);
 }
 
 /// Descending symbol count, then ascending path for a stable, readable order.
 fn rankedFileLessThan(idx: *const Index, a: RankedFile, b: RankedFile) bool {
     if (a.count != b.count) return a.count > b.count;
+    return std.mem.lessThan(u8, idx.graph.files[a.id].path, idx.graph.files[b.id].path);
+}
+
+fn rankedFilePathLessThan(idx: *const Index, a: RankedFile, b: RankedFile) bool {
     return std.mem.lessThan(u8, idx.graph.files[a.id].path, idx.graph.files[b.id].path);
 }
 
@@ -751,6 +843,39 @@ pub fn fileSymbolCount(idx: *const Index, file: model.SourceFile) u32 {
 
 /// Cap on a `read` from disk (indexed files are already bounded at index time).
 const max_read_bytes = 8 * 1024 * 1024;
+/// A source request may batch this many user ranges. The bound keeps parsing and
+/// continuation metadata small and deterministic for agent callers.
+pub const max_read_ranges: usize = 16;
+/// `read` always has a byte-shaped safety bound, even when the caller only uses
+/// the universal line/result limit. This is an estimate over numbered source
+/// rows; `--budget` can request a smaller or larger page explicitly.
+pub const default_read_budget: u32 = 64 * 1024;
+
+pub const ReadSpecError = error{
+    MalformedRange,
+    DescendingRange,
+    TooManyRanges,
+};
+
+pub const ReadSpec = struct {
+    path: []const u8,
+    ranges: []const LineRange,
+};
+
+/// One bounded page of the normalized source selection. `after` is an ordinal
+/// in the selected (not physical-file) lines, so the same cursor works for a
+/// whole file and for a batched set of disjoint ranges.
+pub const ReadPage = struct {
+    ranges: []const LineRange,
+    offset: u32,
+    limit: u32,
+    budget: u32,
+    selected: u32,
+    shown: u32,
+    estimated_bytes: u32,
+    truncated: bool,
+    next: ?u32,
+};
 
 /// Print raw, numbered source lines of `spec` — a `path` or `path:A-B` range.
 /// The escape hatch for text NavGraph can't attribute to a symbol: module-scope
@@ -761,43 +886,184 @@ const max_read_bytes = 8 * 1024 * 1024;
 pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !bool {
     std.debug.assert(root.len > 0);
     std.debug.assert(spec.len > 0);
-    var path = spec;
     // Empty `ranges` means the whole file; one or more means `file:A-B,C-D` — a
     // batched read that pulls several disjoint slices in one call (a symbol and
     // its neighbours, a definition and its use, etc.) instead of N invocations.
-    var ranges_buf: [16]LineRange = undefined;
-    var ranges: []const LineRange = &.{};
-    if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
-        if (parseRanges(spec[c + 1 ..], &ranges_buf)) |rs| {
-            path = spec[0..c];
-            ranges = rs;
-        }
-    }
+    // Range-shaped suffixes are parsed as a typed request: malformed input must
+    // never fall through to a misleading `no_such_file` result.
+    var ranges_buf: [max_read_ranges]LineRange = undefined;
+    const parsed = parseReadSpec(spec, &ranges_buf) catch |err| {
+        const value = readRangeSuffix(spec);
+        try renderReadError(w, opts.format, readSpecErrorCode(err), readSpecErrorMessage(err), value);
+        return false;
+    };
+    const path = parsed.path;
+    const ranges = parsed.ranges;
     var owned: ?[]u8 = null;
     defer if (owned) |b| idx.gpa.free(b);
     const text = indexedText(idx, path) orelse blk: {
         var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
-            if (opts.format == .json) {
-                try json_out.readError(w, "cannot_open_root", root);
-            } else {
-                try w.print("(cannot open root '{s}')\n", .{root});
-            }
+            try renderReadError(w, opts.format, "cannot_open_root", "cannot open repository root", root);
             return false;
         };
         defer rd.close(io);
         const bytes = rd.readFileAlloc(io, path, idx.gpa, .limited(max_read_bytes)) catch {
-            if (opts.format == .json) {
-                try json_out.readError(w, "no_such_file", path);
-            } else {
-                try w.print("(no such file: '{s}' — give a path relative to the repo root; `navgraph files` lists them)\n", .{path});
-            }
+            try renderReadError(w, opts.format, "no_such_file", "give a readable path relative to the repository root", path);
             return false;
         };
         owned = bytes;
         break :blk bytes;
     };
-    if (opts.format == .json) return json_out.sourceLines(w, path, text, ranges);
-    return printNumbered(w, path, text, ranges);
+    return renderBoundedSourcePage(w, idx.gpa, path, text, ranges, opts);
+}
+
+/// Source-only CLI fast path. Reading an unsupported/config file must not first
+/// index every supported file beneath `root` (or emit unrelated parse-health
+/// warnings). Long-lived sessions still use `readLines` so indexed text can be
+/// served from their coherent snapshot; one-shot `read` goes straight to disk.
+pub fn readLinesStandalone(
+    w: *Writer,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    spec: []const u8,
+    opts: Options,
+) !bool {
+    std.debug.assert(root.len > 0);
+    std.debug.assert(spec.len > 0);
+    var ranges_buf: [max_read_ranges]LineRange = undefined;
+    const parsed = parseReadSpec(spec, &ranges_buf) catch |err| {
+        const value = readRangeSuffix(spec);
+        try renderReadError(w, opts.format, readSpecErrorCode(err), readSpecErrorMessage(err), value);
+        return false;
+    };
+    var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
+        try renderReadError(w, opts.format, "cannot_open_root", "cannot open repository root", root);
+        return false;
+    };
+    defer rd.close(io);
+    const text = rd.readFileAlloc(io, parsed.path, allocator, .limited(max_read_bytes)) catch {
+        try renderReadError(w, opts.format, "no_such_file", "give a readable path relative to the repository root", parsed.path);
+        return false;
+    };
+    defer allocator.free(text);
+    return renderBoundedSourcePage(w, allocator, parsed.path, text, parsed.ranges, opts);
+}
+
+fn renderReadError(w: *Writer, format: OutputFormat, code: []const u8, message: []const u8, value: []const u8) !void {
+    if (format == .json) {
+        try json_out.readError(w, code, message, value);
+    } else {
+        try w.print("(read error [{s}]: {s}; got '{s}')\n", .{ code, message, value });
+    }
+}
+
+fn sourcePageForLineCap(text: []const u8, ranges: []const LineRange, opts: Options, line_cap: u32, buf: []LineRange) ReadPage {
+    std.debug.assert(line_cap > 0);
+    var scan_opts = opts;
+    scan_opts.limit = line_cap;
+    // Serialized-size enforcement happens after rendering. Disable the row
+    // estimate while choosing a candidate so it cannot leave usable budget idle.
+    scan_opts.budget = std.math.maxInt(u32);
+    var page = sourcePage(text, ranges, scan_opts, buf);
+    page.limit = opts.limit;
+    page.budget = if (opts.budget == 0) default_read_budget else opts.budget;
+    return page;
+}
+
+fn renderSourcePageBuffered(
+    aw: *std.Io.Writer.Allocating,
+    path: []const u8,
+    text: []const u8,
+    ranges: []const LineRange,
+    page: ReadPage,
+    format: OutputFormat,
+) !bool {
+    aw.clearRetainingCapacity();
+    if (format == .json) return json_out.sourceLines(&aw.writer, path, text, ranges, page);
+    return printNumbered(&aw.writer, path, text, ranges, page);
+}
+
+/// Render to a temporary buffer before committing any bytes. This lets `read`
+/// enforce its byte budget over the actual serialized text/JSON (including JSON
+/// escaping and continuation metadata), then reduce the line page and re-render
+/// without ever leaking a partial or invalid result.
+fn renderBoundedSourcePage(
+    w: *Writer,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    ranges: []const LineRange,
+    opts: Options,
+) !bool {
+    const budget = if (opts.budget == 0) default_read_budget else opts.budget;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &bytes);
+    defer aw.deinit();
+    var page_ranges: [max_read_ranges]LineRange = undefined;
+
+    var page = sourcePageForLineCap(text, ranges, opts, opts.limit, &page_ranges);
+    var found = try renderSourcePageBuffered(&aw, path, text, ranges, page, opts.format);
+    if (aw.written().len <= budget) {
+        try w.writeAll(aw.written());
+        return found;
+    }
+
+    // Find the largest whole-line prefix whose final encoding fits. The page is
+    // monotonic in line count, so a bounded binary search avoids one render per
+    // source line while retaining the most useful prefix.
+    var best: u32 = 0;
+    var low: u32 = 1;
+    var high = if (page.shown == 0) @as(u32, 0) else page.shown - 1;
+    while (low <= high and high != 0) {
+        const middle = low + (high - low) / 2;
+        page = sourcePageForLineCap(text, ranges, opts, middle, &page_ranges);
+        _ = try renderSourcePageBuffered(&aw, path, text, ranges, page, opts.format);
+        if (aw.written().len <= budget) {
+            best = middle;
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    if (best != 0) {
+        page = sourcePageForLineCap(text, ranges, opts, best, &page_ranges);
+        found = try renderSourcePageBuffered(&aw, path, text, ranges, page, opts.format);
+        std.debug.assert(aw.written().len <= budget);
+        try w.writeAll(aw.written());
+        return found;
+    }
+
+    // An individual source row or even the requested path metadata can be larger
+    // than the budget. Return a valid, bounded diagnostic; the unchanged cursor
+    // tells the caller exactly where a retry with a larger budget resumes.
+    try renderReadBudgetTooSmall(w, opts.format, budget, opts.after, aw.written().len);
+    return false;
+}
+
+fn renderReadBudgetTooSmall(w: *Writer, format: OutputFormat, budget: u32, after: u32, minimum: usize) !void {
+    var buf: [256]u8 = undefined;
+    const full = if (format == .json)
+        try std.fmt.bufPrint(&buf, "{{\"error\":\"budget_too_small\",\"message\":\"budget cannot fit one complete source row\",\"minimum\":{d},\"next\":\"v1:{d}\"}}\n", .{ minimum, after })
+    else
+        try std.fmt.bufPrint(&buf, "(read error [budget_too_small]: budget cannot fit one complete source row; minimum {d} bytes; retry --budget {d} --after v1:{d})\n", .{ minimum, minimum, after });
+    if (full.len <= budget) {
+        try w.writeAll(full);
+        return;
+    }
+    const fallbacks: []const []const u8 = if (format == .json)
+        &.{ "{\"error\":\"budget_too_small\"}\n", "{}\n", "{}", "0" }
+    else
+        &.{ "read budget too small\n", "budget\n", "\n" };
+    for (fallbacks) |fallback| {
+        if (fallback.len <= budget) {
+            try w.writeAll(fallback);
+            return;
+        }
+    }
+    // A one-byte text budget cannot carry a useful diagnostic; emitting nothing
+    // is still preferable to violating the caller's hard ceiling.
 }
 
 /// The in-memory text of an indexed file matching `path` (exact, else a unique
@@ -822,34 +1088,97 @@ fn indexedText(idx: *const Index, path: []const u8) ?[]const u8 {
 pub const LineRange = struct { lo: usize, hi: usize };
 
 /// Parse a `read` range suffix: `A-B`, `A-` (A to end), or `A` (single line).
-/// Returns null on anything unparseable so a genuine `:` in a path is left alone.
-fn parseLineRange(s: []const u8) ?LineRange {
-    if (s.len == 0) return null;
+fn parseLineRange(s: []const u8) ReadSpecError!LineRange {
+    if (s.len == 0) return error.MalformedRange;
     if (std.mem.indexOfScalar(u8, s, '-')) |d| {
-        const lo = std.fmt.parseInt(usize, s[0..d], 10) catch return null;
+        if (d == 0) return error.MalformedRange;
+        const lo = std.fmt.parseInt(usize, s[0..d], 10) catch return error.MalformedRange;
         const rest = s[d + 1 ..];
-        const hi = if (rest.len == 0) std.math.maxInt(usize) else std.fmt.parseInt(usize, rest, 10) catch return null;
-        if (lo == 0 or hi < lo) return null;
+        const hi = if (rest.len == 0) std.math.maxInt(usize) else std.fmt.parseInt(usize, rest, 10) catch return error.MalformedRange;
+        if (lo == 0 or hi == 0) return error.MalformedRange;
+        if (hi < lo) return error.DescendingRange;
         return .{ .lo = lo, .hi = hi };
     }
-    const only = std.fmt.parseInt(usize, s, 10) catch return null;
-    if (only == 0) return null;
+    const only = std.fmt.parseInt(usize, s, 10) catch return error.MalformedRange;
+    if (only == 0) return error.MalformedRange;
     return .{ .lo = only, .hi = only };
 }
 
-/// Parse a comma-separated list of ranges (`A-B,C-D,E`) into `buf`. Returns null
-/// if empty, over-long, or any part is unparseable — so a lone `:` in a path (or
-/// a non-range suffix) leaves the whole spec treated as a path.
-fn parseRanges(s: []const u8, buf: []LineRange) ?[]const LineRange {
-    if (s.len == 0) return null;
+/// Parse `path[:ranges]` without confusing an ordinary colon-bearing filename
+/// (`notes:archive`) with a line request. A suffix beginning with a digit, `-`,
+/// or `,` declares range intent; once declared, validation failures stay typed.
+fn parseReadSpec(spec: []const u8, buf: []LineRange) ReadSpecError!ReadSpec {
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse
+        return .{ .path = spec, .ranges = &.{} };
+    const suffix = spec[colon + 1 ..];
+    if (!looksLikeRangeSuffix(suffix)) return .{ .path = spec, .ranges = &.{} };
+    const parsed = try parseRanges(suffix, buf);
+    return .{ .path = spec[0..colon], .ranges = normalizeRanges(parsed) };
+}
+
+fn looksLikeRangeSuffix(s: []const u8) bool {
+    if (s.len == 0) return false;
+    return std.ascii.isDigit(s[0]) or s[0] == '-' or s[0] == ',';
+}
+
+fn readRangeSuffix(spec: []const u8) []const u8 {
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return spec;
+    return spec[colon + 1 ..];
+}
+
+/// Parse a comma-separated list (`A-B,C-D,E`) into `buf` with deterministic
+/// failure classes. The caller normalizes the successfully parsed list in place.
+fn parseRanges(s: []const u8, buf: []LineRange) ReadSpecError![]LineRange {
+    if (s.len == 0) return error.MalformedRange;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, s, ',');
     while (it.next()) |part| {
-        if (n >= buf.len) return null;
-        buf[n] = parseLineRange(part) orelse return null;
+        if (n >= buf.len) return error.TooManyRanges;
+        buf[n] = try parseLineRange(part);
         n += 1;
     }
-    return if (n == 0) null else buf[0..n];
+    if (n == 0) return error.MalformedRange;
+    return buf[0..n];
+}
+
+fn lineRangeLessThan(_: void, a: LineRange, b: LineRange) bool {
+    if (a.lo != b.lo) return a.lo < b.lo;
+    return a.hi < b.hi;
+}
+
+/// Sort and coalesce overlapping or adjacent spans in place. Besides producing
+/// compact metadata, this guarantees that neither renderer can duplicate a line.
+fn normalizeRanges(ranges: []LineRange) []const LineRange {
+    if (ranges.len < 2) return ranges;
+    std.mem.sort(LineRange, ranges, {}, lineRangeLessThan);
+    var out: usize = 1;
+    for (ranges[1..]) |range| {
+        const previous = &ranges[out - 1];
+        const adjacent = previous.hi != std.math.maxInt(usize) and range.lo == previous.hi + 1;
+        if (range.lo <= previous.hi or adjacent) {
+            previous.hi = @max(previous.hi, range.hi);
+        } else {
+            ranges[out] = range;
+            out += 1;
+        }
+    }
+    return ranges[0..out];
+}
+
+fn readSpecErrorCode(err: ReadSpecError) []const u8 {
+    return switch (err) {
+        error.MalformedRange => "malformed_range",
+        error.DescendingRange => "descending_range",
+        error.TooManyRanges => "too_many_ranges",
+    };
+}
+
+fn readSpecErrorMessage(err: ReadSpecError) []const u8 {
+    return switch (err) {
+        error.MalformedRange => "expected positive line ranges A, A-B, or A-",
+        error.DescendingRange => "range end must not precede its start",
+        error.TooManyRanges => "at most 16 source ranges are allowed",
+    };
 }
 
 /// The number of lines in `text` (a trailing newline is not counted as a line).
@@ -882,18 +1211,88 @@ fn emitRange(w: *Writer, text: []const u8, lo: usize, hi: usize) !usize {
     return emitted;
 }
 
+fn decimalDigits(value: usize) usize {
+    var n = value;
+    var digits: usize = 1;
+    while (n >= 10) : (n /= 10) digits += 1;
+    return digits;
+}
+
+fn sourceLineSelected(line: usize, ranges: []const LineRange) bool {
+    if (ranges.len == 0) return true;
+    for (ranges) |range| {
+        if (line < range.lo) return false;
+        if (line <= range.hi) return true;
+    }
+    return false;
+}
+
+/// Select the first safe page from a whole-file or explicit-range request.
+/// `limit` is exact. The source byte budget uses numbered text-row estimates and
+/// always retains one useful row, matching the traversal budget convention.
+pub fn sourcePage(text: []const u8, ranges: []const LineRange, opts: Options, buf: []LineRange) ReadPage {
+    std.debug.assert(opts.limit > 0);
+    std.debug.assert(buf.len >= max_read_ranges);
+    const budget = if (opts.budget == 0) default_read_budget else opts.budget;
+    var start: usize = 0;
+    var line: usize = 1;
+    var selected: u32 = 0;
+    var shown: u32 = 0;
+    var estimated: u32 = 0;
+    var page_ranges: usize = 0;
+    var page_full = false;
+    while (start < text.len) : (line += 1) {
+        const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        if (sourceLineSelected(line, ranges)) {
+            const ordinal = selected;
+            selected +|= 1;
+            if (ordinal >= opts.after and !page_full and shown < opts.limit) {
+                const raw_estimate = text[start..newline].len + decimalDigits(line) + 2;
+                const row_estimate: u32 = @intCast(@min(raw_estimate, std.math.maxInt(u32)));
+                if (shown == 0 or estimated +| row_estimate <= budget) {
+                    if (page_ranges != 0 and buf[page_ranges - 1].hi != std.math.maxInt(usize) and line == buf[page_ranges - 1].hi + 1) {
+                        buf[page_ranges - 1].hi = line;
+                    } else {
+                        std.debug.assert(page_ranges < buf.len);
+                        buf[page_ranges] = .{ .lo = line, .hi = line };
+                        page_ranges += 1;
+                    }
+                    shown +|= 1;
+                    estimated +|= row_estimate;
+                    if (shown == opts.limit) page_full = true;
+                } else {
+                    // Do not skip an oversized row and take a later, shorter one:
+                    // the cursor is a selected-row ordinal and pages are prefixes.
+                    page_full = true;
+                }
+            }
+        }
+        start = newline + 1;
+    }
+    const consumed = @as(u64, opts.after) + shown;
+    const truncated = consumed < selected;
+    return .{
+        .ranges = buf[0..page_ranges],
+        .offset = opts.after,
+        .limit = opts.limit,
+        .budget = budget,
+        .selected = selected,
+        .shown = shown,
+        .estimated_bytes = estimated,
+        .truncated = truncated,
+        .next = if (truncated) @intCast(consumed) else null,
+    };
+}
+
 /// Emit `text` for `ranges` (empty = whole file) as numbered lines under a header
 /// naming the file and line count. Disjoint ranges are separated by a `⋯` gap
 /// marker so it's clear lines were skipped between them. Returns whether at
 /// least one source line was emitted.
-fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const LineRange) !bool {
+fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const LineRange, page: ReadPage) !bool {
     const total = lineCount(text);
-    if (ranges.len == 0) {
+    if (ranges.len == 0 or page.truncated or page.offset != 0) {
         try w.print("# {s} ({d} line{s})\n", .{ path, total, if (total == 1) "" else "s" });
-        const emitted = try emitRange(w, text, 1, std.math.maxInt(usize));
-        return emitted > 0;
-    }
-    if (ranges.len == 1 and ranges[0].hi != std.math.maxInt(usize)) {
+    } else if (ranges.len == 1 and ranges[0].hi != std.math.maxInt(usize)) {
         const r = ranges[0];
         try w.print("# {s} (lines {d}-{d} of {d})\n", .{ path, r.lo, @min(r.hi, total), total });
     } else {
@@ -901,14 +1300,20 @@ fn printNumbered(w: *Writer, path: []const u8, text: []const u8, ranges: []const
     }
     var prev_hi: usize = 0;
     var emitted: usize = 0;
-    for (ranges) |r| {
-        if (r.lo > total) {
-            try w.print("(no such line: {d}; file has {d})\n", .{ r.lo, total });
-            continue;
-        }
+    for (page.ranges) |r| {
         if (prev_hi != 0 and r.lo > prev_hi + 1) try w.writeAll("  ⋯\n");
         emitted += try emitRange(w, text, r.lo, r.hi);
         prev_hi = @min(r.hi, total);
+    }
+    if (page.selected == 0) for (ranges) |r| {
+        if (r.lo > total) {
+            try w.print("(no such line: {d}; file has {d})\n", .{ r.lo, total });
+        }
+    };
+    if (page.truncated) {
+        try w.print("# truncated: {d} of {d} selected lines shown (offset {d}); next: --after v1:{d}\n", .{ page.shown, page.selected, page.offset, page.next.? });
+    } else if (page.offset != 0) {
+        try w.print("# page: {d} selected lines shown at offset {d} of {d}; end of selection\n", .{ page.shown, page.offset, page.selected });
     }
     return emitted > 0;
 }
@@ -1138,7 +1543,8 @@ const WalkBudget = struct {
         std.debug.assert(opts.limit > 0);
         const sym = idx.graph.symbols[id];
         const estimate: u32 = @intCast(@min(@as(usize, std.math.maxInt(u32)), 48 + sym.name.len + idx.graph.files[sym.file].path.len));
-        if ((opts.max_nodes != 0 and self.nodes >= opts.max_nodes) or
+        if (self.nodes >= opts.limit or
+            (opts.max_nodes != 0 and self.nodes >= opts.max_nodes) or
             (opts.budget != 0 and self.nodes != 0 and self.estimated_bytes + estimate > opts.budget))
         {
             self.pruned +|= 1;
@@ -1911,7 +2317,16 @@ fn renderTypeConsumers(w: *Writer, idx: *const Index, ids: []const SymbolId, opt
     for (idx.graph.symbols) |owner| {
         if (shown.* >= opts.limit) return;
         const consumer = typeConsumerBinding(idx, ids, owner) orelse continue;
-        const ref: model.Reference = .{ .name = idx.graph.symbols[target].name, .qualifier = consumer.binding, .line = consumer.line, .kind = .type_use, .target = target, .exact = true };
+        const ref: model.Reference = .{
+            .name = idx.graph.symbols[target].name,
+            .qualifier = consumer.binding,
+            .line = consumer.line,
+            .kind = .type_use,
+            .target = target,
+            .exact = true,
+            .resolution_status = .exact,
+            .resolution_reason = .typed_receiver,
+        };
         try printRefRow(w, idx, owner, ref, consumer.line, opts.verbosity);
         shown.* += 1;
     }
@@ -2943,12 +3358,14 @@ pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []
         try emitError(w, opts.format, msg);
         return false;
     }
-    const changes = try gitdiff.parse(idx.gpa, result.stdout);
+    const patch = try patchWithUntracked(idx.gpa, io, root, idx, result.stdout);
+    defer idx.gpa.free(patch);
+    const changes = try gitdiff.parse(idx.gpa, patch);
     defer gitdiff.freeChanges(idx.gpa, changes);
-    if (opts.format == .json) return json_out.diff(w, idx, changes, result.stdout, opts);
+    if (opts.format == .json) return json_out.diff(w, idx, changes, patch, opts);
     const found = try renderDiff(w, idx, changes, opts);
     if (!opts.exact_source) return found;
-    const source_found = try renderExactSource(w, idx, changes, result.stdout);
+    const source_found = try renderExactSource(w, idx, changes, patch);
     return found or source_found;
 }
 
@@ -2961,6 +3378,47 @@ pub fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []c
     if (!gitutil.validRef(ref)) return error.InvalidGitRef;
     const argv = [_][]const u8{ "git", "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "--no-color", ref, "--" };
     return gitutil.run(gpa, io, root, &argv);
+}
+
+/// `git diff` intentionally omits untracked files. They are nevertheless part
+/// of the live workspace NavGraph indexed and often the most important pending
+/// edit. Append canonical no-index patches only for supported, indexed,
+/// non-ignored files; the ordinary git-diff parser then treats tracked and new
+/// sources through one exact range model.
+fn patchWithUntracked(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    idx: *const Index,
+    tracked_patch: []const u8,
+) ![]u8 {
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(gpa);
+    try combined.appendSlice(gpa, tracked_patch);
+
+    const list_argv = [_][]const u8{ "git", "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z", "--" };
+    const listed = try gitutil.run(gpa, io, root, &list_argv);
+    defer gpa.free(listed.stdout);
+    defer gpa.free(listed.stderr);
+    if (listed.term != .exited or listed.term.exited != 0) return error.GitUntrackedListFailed;
+
+    var paths = std.mem.splitScalar(u8, listed.stdout, 0);
+    while (paths.next()) |path| {
+        if (path.len == 0 or findDiffFile(idx, path) == null) continue;
+        const diff_argv = [_][]const u8{
+            "git",           "-c",          "core.quotePath=false", "diff", "--no-index", "--no-ext-diff",
+            "--no-textconv", "--unified=0", "--no-color",           "--",   "/dev/null",  path,
+        };
+        const untracked = try gitutil.run(gpa, io, root, &diff_argv);
+        defer gpa.free(untracked.stdout);
+        defer gpa.free(untracked.stderr);
+        if (untracked.term != .exited or (untracked.term.exited != 0 and untracked.term.exited != 1))
+            return error.GitUntrackedDiffFailed;
+        if (untracked.stdout.len == 0) continue;
+        if (combined.items.len != 0 and combined.items[combined.items.len - 1] != '\n') try combined.append(gpa, '\n');
+        try combined.appendSlice(gpa, untracked.stdout);
+    }
+    return combined.toOwnedSlice(gpa);
 }
 
 pub const SourceRange = struct {
@@ -4047,6 +4505,10 @@ pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_nam
     if (opts.format == .json) return json_out.shortestPath(w, idx, from_name, to_name, opts);
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
+    const from_ids = resolveIds(idx, from_name, &fbuf);
+    const to_ids = resolveIds(idx, to_name, &tbuf);
+    if (from_ids.len > 1) return renderAmbiguousPathEndpoint(w, idx, "from", from_name, to_name, from_ids, fbuf.len);
+    if (to_ids.len > 1) return renderAmbiguousPathEndpoint(w, idx, "to", from_name, to_name, to_ids, tbuf.len);
     const chain = try shortestPathIdsWithOptions(idx, from_name, to_name, &fbuf, &tbuf, opts);
     defer idx.gpa.free(chain);
     if (chain.len == 0) {
@@ -4068,6 +4530,45 @@ pub fn shortestPath(w: *Writer, idx: *const Index, from_name: []const u8, to_nam
         try render.symbol(w, idx, idx.graph.symbols[id], v, indent, true);
     }
     return true;
+}
+
+/// Refuse to run a semantic BFS from an arbitrary same-named definition.  The
+/// candidate list is itself useful discovery output, while each `try` row is a
+/// ready-to-call selector that preserves the original opposite endpoint.
+fn renderAmbiguousPathEndpoint(
+    w: *Writer,
+    idx: *const Index,
+    endpoint: []const u8,
+    from_name: []const u8,
+    to_name: []const u8,
+    ids: []const SymbolId,
+    capacity: usize,
+) !bool {
+    const selector = if (std.mem.eql(u8, endpoint, "from")) from_name else to_name;
+    try w.print("(ambiguous path {s} endpoint '{s}': {d}{s} candidates — pin one; no path was traversed)\n", .{
+        endpoint, selector, ids.len, if (ids.len == capacity) "+" else "",
+    });
+    const shown = @min(ids.len, 12);
+    for (ids[0..shown]) |id| {
+        try render.symbol(w, idx, idx.graph.symbols[id], .names, 1, true);
+        try w.writeAll("    try: navgraph path ");
+        if (std.mem.eql(u8, endpoint, "from")) {
+            try writePinnedPathSelector(w, idx, id);
+            try w.print(" {s}\n", .{to_name});
+        } else {
+            try w.print("{s} ", .{from_name});
+            try writePinnedPathSelector(w, idx, id);
+            try w.writeByte('\n');
+        }
+    }
+    if (ids.len > shown) try w.print("  … {d} more candidates\n", .{ids.len - shown});
+    return false;
+}
+
+fn writePinnedPathSelector(w: *Writer, idx: *const Index, id: SymbolId) !void {
+    const sym = idx.graph.symbols[id];
+    if (sym.parent != invalid) try w.print("{s}.", .{idx.graph.symbols[sym.parent].name});
+    try w.print("{s}@{s}", .{ sym.name, idx.graph.files[sym.file].path });
 }
 
 /// The shortest call path from `from_name` to `to_name` as source→…→target
@@ -4093,7 +4594,10 @@ pub fn shortestPathIdsWithOptions(
 ) ![]SymbolId {
     const from_ids = resolveIds(idx, from_name, fbuf);
     const to_ids = resolveIds(idx, to_name, tbuf);
-    if (from_ids.len == 0 or to_ids.len == 0) return idx.gpa.alloc(SymbolId, 0);
+    // A semantic path is authoritative only when both endpoints are unique.
+    // Callers that want discovery receive candidates from the rendering/API
+    // layer and retry with Parent.name/name@path; never seed BFS arbitrarily.
+    if (from_ids.len != 1 or to_ids.len != 1) return idx.gpa.alloc(SymbolId, 0);
     var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
     defer if (impl_graph) |*graph| graph.deinit();
     const prev = try bfsPrev(idx, from_ids, to_ids, opts.strict, if (impl_graph) |*g| g else null);
@@ -5172,11 +5676,11 @@ test "files --sort symbols ranks the file with more symbols first" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "small.py", .data =
+    try tmp.dir.writeFile(io, .{ .sub_path = "a_small.py", .data =
         \\def only():
         \\    return 1
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "big.py", .data =
+    try tmp.dir.writeFile(io, .{ .sub_path = "z_big.py", .data =
         \\def a():
         \\    return 1
         \\def b():
@@ -5195,9 +5699,19 @@ test "files --sort symbols ranks the file with more symbols first" {
     defer aw.deinit();
     _ = try listFiles(&aw.writer, &idx, "", .{ .file_sort = .symbols });
     const out = aw.written();
-    const big = std.mem.indexOf(u8, out, "big.py") orelse return error.TestUnexpectedResult;
-    const small = std.mem.indexOf(u8, out, "small.py") orelse return error.TestUnexpectedResult;
+    const big = std.mem.indexOf(u8, out, "z_big.py") orelse return error.TestUnexpectedResult;
+    const small = std.mem.indexOf(u8, out, "a_small.py") orelse return error.TestUnexpectedResult;
     try testing.expect(big < small);
+
+    var path_buf_out: std.ArrayList(u8) = .empty;
+    defer path_buf_out.deinit(testing.allocator);
+    var path_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &path_buf_out);
+    defer path_writer.deinit();
+    _ = try listFiles(&path_writer.writer, &idx, "", .{ .file_sort = .path });
+    const path_out = path_writer.written();
+    const path_big = std.mem.indexOf(u8, path_out, "z_big.py") orelse return error.TestUnexpectedResult;
+    const path_small = std.mem.indexOf(u8, path_out, "a_small.py") orelse return error.TestUnexpectedResult;
+    try testing.expect(path_small < path_big);
 }
 
 test "end line is correct despite a leading comment or template prefix" {
@@ -5307,6 +5821,46 @@ test "diff maps a changed hunk to its symbol and lists the blast radius" {
     // `run` itself (lines 4-6) is not touched, so it is not a top-level `~` entry.
     try testing.expect(std.mem.indexOf(u8, out, "~ pub fn run") == null and
         std.mem.indexOf(u8, out, "~ fn run") == null);
+}
+
+test "diff includes untracked supported source and exact new-file patch" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "base.zig", .data = "pub fn base() void {}\n" });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const Git = struct {
+        fn ok(allocator: std.mem.Allocator, test_io: std.Io, cwd: []const u8, argv: []const []const u8) !void {
+            const result = try gitutil.run(allocator, test_io, cwd, argv);
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try testing.expect(result.term == .exited and result.term.exited == 0);
+        }
+    };
+    try Git.ok(testing.allocator, io, root, &.{ "git", "init", "--quiet" });
+    try Git.ok(testing.allocator, io, root, &.{ "git", "add", "--", "base.zig" });
+    try Git.ok(testing.allocator, io, root, &.{
+        "git", "-c", "user.name=NavGraph Test", "-c", "user.email=navgraph@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--no-verify", "-m", "base",
+    });
+
+    // Supported and not ignored: it is in the live index despite being absent
+    // from HEAD. The unsupported note must not leak into the source diff.
+    try tmp.dir.writeFile(io, .{ .sub_path = "fresh.zig", .data = "pub fn fresh() u32 { return 7; }\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "not source\n" });
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try diff(&aw.writer, io, &idx, root, "HEAD", .{ .exact_source = true }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "fresh") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "+++ b/fresh.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "notes.txt") == null);
 }
 
 test "events marks a key with only one side unpaired and honors the filter" {
@@ -5670,6 +6224,190 @@ test "read: multiple comma-separated ranges with a gap marker" {
     try testing.expect(std.mem.indexOf(u8, out, "⋯") != null);
 }
 
+test "read spec keeps colon filenames distinct and normalizes declared ranges" {
+    var buf: [max_read_ranges]LineRange = undefined;
+
+    const filename = try parseReadSpec("notes:archive", &buf);
+    try std.testing.expectEqualStrings("notes:archive", filename.path);
+    try std.testing.expectEqual(@as(usize, 0), filename.ranges.len);
+
+    const parsed = try parseReadSpec("m.py:12,8-10,2-5,4-8", &buf);
+    try std.testing.expectEqualStrings("m.py", parsed.path);
+    try std.testing.expectEqual(@as(usize, 2), parsed.ranges.len);
+    try std.testing.expectEqual(LineRange{ .lo = 2, .hi = 10 }, parsed.ranges[0]);
+    try std.testing.expectEqual(LineRange{ .lo = 12, .hi = 12 }, parsed.ranges[1]);
+
+    try std.testing.expectError(error.DescendingRange, parseReadSpec("m.py:100-50", &buf));
+    try std.testing.expectError(error.MalformedRange, parseReadSpec("m.py:2-x", &buf));
+    try std.testing.expectError(error.TooManyRanges, parseReadSpec("m.py:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17", &buf));
+    try std.testing.expectEqualStrings("descending_range", readSpecErrorCode(error.DescendingRange));
+    try std.testing.expectEqualStrings("range end must not precede its start", readSpecErrorMessage(error.DescendingRange));
+}
+
+test "read merges overlapping ranges and never emits duplicate lines" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data =
+        \\one = 1
+        \\two = 2
+        \\three = 3
+        \\four = 4
+        \\five = 5
+        \\six = 6
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "m.py:4-6,2-4,1-2", .{}));
+    const out = aw.written();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "1\tone = 1\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "2\ttwo = 2\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "3\tthree = 3\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "4\tfour = 4\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "5\tfive = 5\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "6\tsix = 6\n"));
+}
+
+test "read pages whole files and explicit selections with a selected-line cursor" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "page.py", .data =
+        \\one = 1  # source paging fixture row
+        \\two = 2  # source paging fixture row
+        \\three = 3  # source paging fixture row
+        \\four = 4  # source paging fixture row
+        \\five = 5  # source paging fixture row
+        \\six = 6  # source paging fixture row
+        \\seven = 7  # source paging fixture row
+        \\eight = 8  # source paging fixture row
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "page.py", .{ .limit = 3 }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "1\tone = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "3\tthree = 3") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "4\tfour = 4") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "truncated: 3 of 8") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "next: --after v1:3") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "page.py", .{ .limit = 3, .after = 3, .after_set = true }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "3\tthree = 3") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "4\tfour = 4") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "6\tsix = 6") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "next: --after v1:6") != null);
+
+    // The cursor is an ordinal in the normalized selection: offset 2 begins at
+    // physical line 6 for the disjoint selection 2-3,6-8.
+    aw.clearRetainingCapacity();
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "page.py:6-8,2-3", .{ .limit = 2, .after = 2, .after_set = true }));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "3\tthree = 3") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "6\tsix = 6") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "7\tseven = 7") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "next: --after v1:4") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "page.py", .{ .limit = 8, .budget = 160 }));
+    try testing.expect(aw.written().len <= 160);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "1\tone = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "2\ttwo = 2") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "next: --after v1:1") != null);
+
+    aw.clearRetainingCapacity();
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "page.py", .{ .limit = 8, .budget = 400, .format = .json }));
+    try testing.expect(aw.written().len <= 400);
+    var json_page = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer json_page.deinit();
+    try testing.expect(json_page.value.object.get("truncated").?.bool);
+    try testing.expect(json_page.value.object.get("next").? == .string);
+    const json_lines = json_page.value.object.get("lines").?.array.items;
+    try testing.expect(json_lines.len > 0 and json_lines.len < 8);
+
+    // Even a budget too small for one complete JSON source row returns a valid
+    // bounded JSON diagnostic rather than a chopped envelope.
+    aw.clearRetainingCapacity();
+    try testing.expect(!try readLines(&aw.writer, io, &idx, root, "page.py", .{ .limit = 8, .budget = 64, .format = .json }));
+    try testing.expect(aw.written().len <= 64);
+    var budget_error = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer budget_error.deinit();
+    try testing.expectEqualStrings("budget_too_small", budget_error.value.object.get("error").?.string);
+}
+
+test "read whole-file default returns the first 300-line page" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    var source_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &source);
+    defer source_writer.deinit();
+    for (1..306) |line| try source_writer.writer.print("line {d}\n", .{line});
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.txt", .data = source_writer.written() });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(try readLines(&aw.writer, io, &idx, root, "large.txt", .{}));
+    try testing.expectEqual(@as(usize, 300), std.mem.count(u8, aw.written(), "\tline "));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "300\tline 300") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "301\tline 301") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "next: --after v1:300") != null);
+}
+
+test "read validation errors are typed in text and do not probe fake filenames" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data = "value = 1\n" });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    try testing.expect(!try readLines(&aw.writer, io, &idx, root, "m.py:100-50", .{}));
+    try testing.expectEqualStrings("(read error [descending_range]: range end must not precede its start; got '100-50')\n", aw.written());
+
+    aw.clearRetainingCapacity();
+    try testing.expect(!try readLines(&aw.writer, io, &idx, root, "m.py:1-x", .{}));
+    try testing.expectEqualStrings("(read error [malformed_range]: expected positive line ranges A, A-B, or A-; got '1-x')\n", aw.written());
+
+    aw.clearRetainingCapacity();
+    try testing.expect(!try readLines(&aw.writer, io, &idx, root, "m.py:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17", .{}));
+    try testing.expectEqualStrings("(read error [too_many_ranges]: at most 16 source ranges are allowed; got '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17')\n", aw.written());
+}
+
 test "unused: a prod fn used only from a tests/ directory is test-only (dir scope)" {
     const testing = std.testing;
     const io = testing.io;
@@ -5776,46 +6514,46 @@ test "matchesName: substring without star, whole-name glob with star" {
 
 test "parseLineRange: single, A-B, open-ended A-, and rejected forms" {
     // Single line.
-    const one = parseLineRange("7").?;
+    const one = try parseLineRange("7");
     try std.testing.expectEqual(@as(usize, 7), one.lo);
     try std.testing.expectEqual(@as(usize, 7), one.hi);
     // Bounded range.
-    const rng = parseLineRange("3-9").?;
+    const rng = try parseLineRange("3-9");
     try std.testing.expectEqual(@as(usize, 3), rng.lo);
     try std.testing.expectEqual(@as(usize, 9), rng.hi);
     // Open-ended tail: A- means A to end (hi == maxInt).
-    const tail = parseLineRange("4-").?;
+    const tail = try parseLineRange("4-");
     try std.testing.expectEqual(@as(usize, 4), tail.lo);
     try std.testing.expectEqual(std.math.maxInt(usize), tail.hi);
-    // Rejections leave the token to be treated as a literal path fragment.
-    try std.testing.expect(parseLineRange("") == null); // empty
-    try std.testing.expect(parseLineRange("0") == null); // line 0 invalid
-    try std.testing.expect(parseLineRange("5-2") == null); // hi < lo
-    try std.testing.expect(parseLineRange("abc") == null); // non-numeric
-    try std.testing.expect(parseLineRange("2-x") == null); // bad hi
-    try std.testing.expect(parseLineRange("0-3") == null); // lo == 0
+    // Rejections retain a stable failure class instead of becoming filenames.
+    try std.testing.expectError(error.MalformedRange, parseLineRange(""));
+    try std.testing.expectError(error.MalformedRange, parseLineRange("0"));
+    try std.testing.expectError(error.DescendingRange, parseLineRange("5-2"));
+    try std.testing.expectError(error.MalformedRange, parseLineRange("abc"));
+    try std.testing.expectError(error.MalformedRange, parseLineRange("2-x"));
+    try std.testing.expectError(error.MalformedRange, parseLineRange("0-3"));
 }
 
 test "parseRanges: single, comma list, empty, overflow, and a bad member" {
     var buf: [4]LineRange = undefined;
     // Single member.
-    const single = parseRanges("5", &buf).?;
+    const single = try parseRanges("5", &buf);
     try std.testing.expectEqual(@as(usize, 1), single.len);
     try std.testing.expectEqual(@as(usize, 5), single[0].lo);
     // Comma-separated members, in order.
-    const list = parseRanges("1,4-6,9", &buf).?;
+    const list = try parseRanges("1,4-6,9", &buf);
     try std.testing.expectEqual(@as(usize, 3), list.len);
     try std.testing.expectEqual(@as(usize, 1), list[0].lo);
     try std.testing.expectEqual(@as(usize, 4), list[1].lo);
     try std.testing.expectEqual(@as(usize, 6), list[1].hi);
     try std.testing.expectEqual(@as(usize, 9), list[2].lo);
-    // Empty → null (so a lone ':' in a path is not read as a range).
-    try std.testing.expect(parseRanges("", &buf) == null);
+    // Empty and malformed members have a deterministic validation error.
+    try std.testing.expectError(error.MalformedRange, parseRanges("", &buf));
     // Any unparseable member poisons the whole spec.
-    try std.testing.expect(parseRanges("1,bad,3", &buf) == null);
-    // More members than the buffer holds → null (spec left as a path).
+    try std.testing.expectError(error.MalformedRange, parseRanges("1,bad,3", &buf));
+    // More members than the buffer holds gets its own failure class.
     var tiny: [2]LineRange = undefined;
-    try std.testing.expect(parseRanges("1,2,3", &tiny) == null);
+    try std.testing.expectError(error.TooManyRanges, parseRanges("1,2,3", &tiny));
 }
 
 test "hotLimit: short default only when -l was omitted (sentinel), else the given cap" {
@@ -6093,6 +6831,24 @@ test "read: out-of-range line noted; open-ended A- tail runs to EOF" {
         defer aw.deinit();
         _ = try readLines(&aw.writer, io, &idx, root, "m.py:10-20", .{});
         try testing.expect(std.mem.indexOf(u8, aw.written(), "no such line: 10; file has 3") != null);
+    }
+    { // JSON keeps the empty selection typed; it must never reinterpret an
+        // empty page range as the whole file and then fail its byte budget.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+        defer aw.deinit();
+        _ = try readLines(&aw.writer, io, &idx, root, "m.py:10-20", .{ .format = .json });
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try testing.expectEqual(@as(i64, 0), object.get("selected").?.integer);
+        try testing.expectEqual(@as(i64, 0), object.get("shown").?.integer);
+        try testing.expectEqual(@as(usize, 0), object.get("lines").?.array.items.len);
+        try testing.expect(object.get("error") == null);
+        const selection_error = object.get("selection_error").?.object;
+        try testing.expectEqualStrings("no_such_line", selection_error.get("code").?.string);
+        try testing.expectEqual(@as(i64, 10), selection_error.get("requested").?.integer);
     }
     { // Open-ended `2-` emits from line 2 through the last line, dropping line 1.
         var buf: std.ArrayList(u8) = .empty;
@@ -6643,6 +7399,37 @@ test "shortestPath renders the chain, a same-node path, and a no-path note" {
     }
 }
 
+test "shortestPath abstains on ambiguous endpoints and offers unique pins" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn start() void { target(); }
+        \\pub fn target() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn start() void {}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    try testing.expect(!try shortestPath(&aw.writer, &idx, "start", "target", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "ambiguous path from endpoint") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "no path was traversed") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "start@a.zig") != null);
+
+    buf.clearRetainingCapacity();
+    try testing.expect(try shortestPath(&aw.writer, &idx, "start@a.zig", "target", .{}));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "target") != null);
+}
+
 test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
     const testing = std.testing;
     const io = testing.io;
@@ -7030,7 +7817,11 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "ok.js", .data = "function caller(localValue) { const assigned = localValue; missingCall(); return assigned; }\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok.js", .data =
+        \\class LocalThing { run() { this.missingMember(); } }
+        \\class OtherThing { slice() { return 1; } }
+        \\function caller(localValue) { const assigned = localValue; missingCall(); return "x".slice(); }
+    });
     try tmp.dir.writeFile(io, .{ .sub_path = "bad.js", .data =
         \\function beforeBad() { return 1; }
         \\const bad = "never closed
@@ -7053,7 +7844,11 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     try testing.expect(!root_obj.get("freshness").?.object.get("current").?.bool);
     try testing.expectEqual(@as(usize, 1), root_obj.get("freshness").?.object.get("changes").?.array.items.len);
     try testing.expectEqual(@as(i64, 1), root_obj.get("parse_health").?.object.get("count").?.integer);
-    try testing.expectEqual(@as(i64, 1), root_obj.get("unresolved_references").?.object.get("count").?.integer);
+    const resolution = root_obj.get("unresolved_references").?.object;
+    try testing.expectEqual(@as(i64, 3), resolution.get("count").?.integer);
+    try testing.expectEqual(@as(i64, 1), resolution.get("categories").?.object.get("likely_local").?.integer);
+    try testing.expectEqual(@as(i64, 2), resolution.get("categories").?.object.get("external_or_unmodeled").?.integer);
+    try testing.expectEqualStrings("likely_local", resolution.get("items").?.array.items[0].object.get("resolution").?.string);
 
     var local_buf: std.ArrayList(u8) = .empty;
     defer local_buf.deinit(testing.allocator);

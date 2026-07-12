@@ -100,6 +100,32 @@ pub fn isPort(idx: *const Index, sym: model.Symbol) bool {
 pub fn methodOf(idx: *const Index, parent: SymbolId, name: []const u8) ?SymbolId {
     std.debug.assert(parent < idx.graph.symbols.len);
     std.debug.assert(name.len > 0);
+    if (directMethodOf(idx, parent, name)) |direct| return direct;
+
+    // A nominal implementation inherits concrete default methods from its
+    // protocol. Surface that effective method instead of reporting a false
+    // MISSING cell for Rust `impl Trait for Type` (and keep structural matches,
+    // which have no nominal metadata, unchanged). Ambiguous defaults abstain.
+    var inherited: ?SymbolId = null;
+    for (idx.graph.symbols) |impl_method| {
+        if (impl_method.parent != parent or impl_method.impl_protocol.len == 0) continue;
+        for (idx.lookup(impl_method.impl_protocol)) |port_id| {
+            if (!isPort(idx, idx.graph.symbols[port_id])) continue;
+            for (idx.lookup(name)) |method_id| {
+                const default = idx.graph.symbols[method_id];
+                if (default.parent != port_id or default.kind != .method or isStubMethod(idx, default)) continue;
+                if (inherited != null and inherited.? != method_id) return null;
+                inherited = method_id;
+            }
+        }
+    }
+    return inherited;
+}
+
+/// A method physically declared under `parent`, excluding inherited protocol
+/// defaults. Structural conformance uses this cheaper/stricter lookup so a
+/// missing member does not trigger a whole-graph nominal scan for every class.
+fn directMethodOf(idx: *const Index, parent: SymbolId, name: []const u8) ?SymbolId {
     for (idx.lookup(name)) |id| {
         const sym = idx.graph.symbols[id];
         if (sym.parent == parent and sym.kind == .method) return id;
@@ -121,7 +147,7 @@ fn coversMethods(idx: *const Index, port: SymbolId, candidate: SymbolId) bool {
     for (idx.graph.symbols) |method| {
         if (method.parent != port or method.kind != .method) continue;
         required += 1;
-        if (methodOf(idx, candidate, method.name) == null) return false;
+        if (directMethodOf(idx, candidate, method.name) == null) return false;
     }
     return required > 0;
 }
@@ -139,11 +165,20 @@ fn appendSharedEdges(
     for (idx.graph.symbols) |method| {
         if (method.parent != port or method.kind != .method) continue;
         const target = methodOf(idx, implementation, method.name) orelse continue;
+        if (target == method.id) continue; // inherited protocol default, not an override edge
         try edges.append(gpa, .{ .port_method = method.id, .implementation_method = target, .exact = exact });
     }
 }
 
 fn namesBase(idx: *const Index, candidate: model.Symbol, port_name: []const u8) bool {
+    // Rust declares nominal conformance out of line (`impl Trait for Type`), so
+    // the implemented type's own signature cannot name the trait. The parser
+    // retains that declaration on each attached impl method; one is sufficient
+    // to prove the candidate names this port.
+    for (idx.graph.symbols) |method| {
+        if (method.parent != candidate.id or method.kind != .method) continue;
+        if (std.mem.eql(u8, method.impl_protocol, port_name)) return true;
+    }
     const sig = candidate.signature(idx.graph.files[candidate.file].text);
     const own = std.mem.indexOf(u8, sig, candidate.name) orelse return false;
     return containsIdentifier(sig[own + candidate.name.len ..], port_name);
@@ -219,4 +254,21 @@ test "build discovers structural and nominal protocol implementations" {
     try testing.expect(graph.relation(port, partial) != null);
     try testing.expect(graph.relation(port, partial).?.exact);
     try testing.expectEqual(@as(usize, 3), graph.edges.len);
+}
+
+test "checked-in Rust cross-file impl is an exact nominal conformance" {
+    const testing = std.testing;
+    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    defer idx.deinit();
+    var graph = try build(testing.allocator, &idx);
+    defer graph.deinit();
+
+    const port = idx.lookup("Evaluate")[0];
+    const implementation = idx.lookup("Expr")[0];
+    const relation = graph.relation(port, implementation).?;
+    try testing.expect(relation.exact);
+    try testing.expectEqual(idx.graph.symbols[implementation].id, implementation);
+    try testing.expect(methodOf(&idx, implementation, "evaluate") != null);
+    const inherited_default = methodOf(&idx, implementation, "evaluate_number").?;
+    try testing.expectEqual(port, idx.graph.symbols[inherited_default].parent);
 }

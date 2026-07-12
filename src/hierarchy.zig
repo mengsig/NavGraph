@@ -324,11 +324,28 @@ fn scanRustImpls(idx: *const Index, file_id: model.FileId, toks: []const Token, 
         const trait_name = segmentName(toks, src, i + 1, for_i) orelse continue;
         const type_end = findTokenRange(toks, src, for_i + 1, open, "where") orelse open;
         const type_name = segmentName(toks, src, for_i + 1, type_end) orelse continue;
-        const child = resolveContainerInFile(idx, file_id, type_name) orelse continue;
+        const child = resolveRustImplType(idx, file_id, type_name) orelse continue;
         const child_sym = idx.graph.symbols[child];
         const target = resolveContainer(idx, child_sym, trait_name);
         try appendEdge(edges, idx.gpa, .{ .subtype = child, .supertype = target orelse invalid, .name = trait_name, .exact = target != null });
     }
+}
+
+/// Rust permits an `impl Trait for Type` in a different module from `Type`.
+/// Prefer a container in the impl file, then accept a unique Rust container in
+/// the project. Name collisions remain unresolved rather than creating an
+/// exact-looking cross-module inheritance edge.
+fn resolveRustImplType(idx: *const Index, file: model.FileId, name: []const u8) ?SymbolId {
+    if (resolveContainerInFile(idx, file, name)) |local| return local;
+    var found: ?SymbolId = null;
+    var count: usize = 0;
+    for (idx.lookup(name)) |id| {
+        const sym = idx.graph.symbols[id];
+        if (!isContainer(sym) or idx.graph.files[sym.file].language != .rust) continue;
+        found = id;
+        count += 1;
+    }
+    return if (count == 1) found else null;
 }
 
 fn resolveContainer(idx: *const Index, child: model.Symbol, name: []const u8) ?SymbolId {
