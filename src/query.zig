@@ -2157,10 +2157,23 @@ fn externalBaseOfClass(idx: *const Index, class_sym: model.Symbol, depth: u32) ?
     const sig = class_sym.signature(idx.graph.files[class_sym.file].text);
     const n = std.mem.indexOf(u8, sig, class_sym.name) orelse return null;
     const clause = sig[n + class_sym.name.len ..];
+    // Python spells its bases in parentheses (`class C(Base):`), but Java/C#
+    // records carry a positional parameter list there (`record P(int x)`), which
+    // is not an inheritance clause — skip parenthesized groups for those.
+    const parens_are_bases = idx.graph.files[class_sym.file].language.family() == .python;
     // Walk identifiers in the base clause; a dotted chain's LAST segment is the
     // type. Skip clause keywords and `kwarg=` labels (Python metaclass=…).
     var i: usize = 0;
     while (i < clause.len) {
+        if (clause[i] == '(' and !parens_are_bases) {
+            var pd: u32 = 1;
+            i += 1;
+            while (i < clause.len and pd > 0) : (i += 1) {
+                if (clause[i] == '(') pd += 1;
+                if (clause[i] == ')') pd -= 1;
+            }
+            continue;
+        }
         if (!isIdentStart(clause[i])) {
             i += 1;
             continue;
@@ -4648,6 +4661,36 @@ test "unused: a class never instantiated is dead; an instantiated one is live" {
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "DeadThing") != null);
     try testing.expect(std.mem.indexOf(u8, out, "UsedThing") == null);
+}
+
+test "unused: a Java record's positional parameter is not read as an external base" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // `record PricedLine(Product product, ...)` carries a positional parameter
+    // list, not an inheritance clause. The unused annotator must not mistake the
+    // `product` parameter for an external base and label `unitCents` as
+    // framework-invoked; it is plain (exported) dead code here.
+    try tmp.dir.writeFile(io, .{ .sub_path = "PricedLine.java", .data =
+        \\package shop;
+        \\public record PricedLine(Product product, int quantity, int totalCents) {
+        \\    public int unitCents() { return totalCents / quantity; }
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+    _ = try unused(&aw.writer, &idx, "", .{});
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "unitCents") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "framework-invoked") == null);
 }
 
 test "unused: a dead symbol is flagged despite a used same-name twin in another language" {

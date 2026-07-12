@@ -120,7 +120,7 @@ fn appendDeclaredBases(gpa: std.mem.Allocator, idx: *const Index, sym: model.Sym
     const name_i = findToken(toks.items, sig, sym.name) orelse return;
     switch (file.language.family()) {
         .python => try appendPythonBases(idx, sym, toks.items, sig, name_i, edges),
-        .js => try appendKeywordBases(idx, sym, toks.items, sig, name_i, edges),
+        .js, .java => try appendKeywordBases(idx, sym, toks.items, sig, name_i, edges),
         .c, .csharp => try appendColonBases(idx, sym, toks.items, sig, name_i, edges),
         .ruby => try appendRubyBase(idx, sym, toks.items, sig, name_i, edges),
         else => {},
@@ -500,7 +500,7 @@ fn overrideExact(idx: *const Index, method: SymbolId, base_method: SymbolId) boo
     std.debug.assert(method < idx.graph.symbols.len);
     std.debug.assert(base_method < idx.graph.symbols.len);
     const lang = idx.graph.files[idx.graph.symbols[method].file].language;
-    return lang != .cpp and lang != .csharp;
+    return lang != .cpp and lang != .csharp and lang != .java;
 }
 
 fn nearestBaseMethod(idx: *const Index, name: []const u8, mro: []const SymbolId) ?SymbolId {

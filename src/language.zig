@@ -20,6 +20,7 @@ pub const Language = enum {
     go,
     rust,
     ruby,
+    java,
     unknown,
 
     /// Human-readable short tag used in compressed output.
@@ -37,6 +38,7 @@ pub const Language = enum {
             .go => "go",
             .rust => "rs",
             .ruby => "rb",
+            .java => "java",
             .unknown => "?",
         };
     }
@@ -53,12 +55,13 @@ pub const Language = enum {
             .go => .go,
             .rust => .rust,
             .ruby => .ruby,
+            .java => .java,
             .unknown => .other,
         };
     }
 };
 
-pub const Family = enum { zig, c, csharp, python, js, lua, go, rust, ruby, other };
+pub const Family = enum { zig, c, csharp, python, js, lua, go, rust, ruby, java, other };
 
 /// Doc-comment extraction style differs enough between languages to name it.
 pub const DocStyle = enum {
@@ -103,7 +106,7 @@ pub fn configFor(language: Language) Config {
             .doc_style = .zig_slashes,
             .brace_scoped = true,
         },
-        .c, .cpp, .csharp => .{
+        .c, .cpp, .csharp, .java => .{
             .language = language,
             .line_comment = "//",
             .block_open = "/*",
@@ -216,6 +219,7 @@ pub fn detect(path: []const u8) Language {
         .{ ".go", Language.go },
         .{ ".rs", Language.rust },
         .{ ".rb", Language.ruby },
+        .{ ".java", Language.java },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, ext, entry[0])) return entry[1];
@@ -243,6 +247,7 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.go, detect("cmd/server/main.go"));
     try std.testing.expectEqual(Language.rust, detect("src/lib.rs"));
     try std.testing.expectEqual(Language.ruby, detect("app/models/user.rb"));
+    try std.testing.expectEqual(Language.java, detect("src/main/java/com/foo/Bar.java"));
     try std.testing.expectEqual(Language.unknown, detect("README.md"));
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
 }
@@ -530,6 +535,18 @@ test "configFor: ruby specifics" {
     try std.testing.expectEqual(false, cfg.template_strings);
 }
 
+test "configFor: java specifics" {
+    const cfg = configFor(.java);
+    try std.testing.expectEqual(Language.java, cfg.language);
+    try std.testing.expectEqualStrings("//", cfg.line_comment);
+    try std.testing.expectEqualStrings("/*", cfg.block_open);
+    try std.testing.expectEqualStrings("*/", cfg.block_close);
+    try std.testing.expectEqualStrings("\"'", cfg.string_delims);
+    try std.testing.expectEqual(false, cfg.template_strings);
+    try std.testing.expectEqual(DocStyle.block_star, cfg.doc_style);
+    try std.testing.expectEqual(true, cfg.brace_scoped);
+}
+
 test "configFor: unknown is fully inert" {
     const cfg = configFor(.unknown);
     try std.testing.expectEqualStrings("", cfg.line_comment);
@@ -558,6 +575,7 @@ test "tag: every language yields its documented short tag" {
     try std.testing.expectEqualStrings("go", Language.go.tag());
     try std.testing.expectEqualStrings("rs", Language.rust.tag());
     try std.testing.expectEqualStrings("rb", Language.ruby.tag());
+    try std.testing.expectEqualStrings("java", Language.java.tag());
     try std.testing.expectEqualStrings("?", Language.unknown.tag());
 }
 
@@ -583,6 +601,7 @@ test "family: each language maps to its resolution family" {
     try std.testing.expectEqual(Family.go, Language.go.family());
     try std.testing.expectEqual(Family.rust, Language.rust.family());
     try std.testing.expectEqual(Family.ruby, Language.ruby.family());
+    try std.testing.expectEqual(Family.java, Language.java.family());
     try std.testing.expectEqual(Family.other, Language.unknown.family());
 }
 
