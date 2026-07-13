@@ -11,6 +11,7 @@ const gitdiff = @import("gitdiff.zig");
 const impls_mod = @import("impls.zig");
 const lexer = @import("lexer.zig");
 const language = @import("language.zig");
+const gitutil = @import("gitutil.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -53,7 +54,10 @@ pub fn reaches(w: *Writer, idx: *const Index, selectors: []const u8, opts: query
 }
 
 pub fn affected(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, positional: []const u8, opts: query.Options) !bool {
-    std.debug.assert(root.len > 0);
+    return affectedAt(w, io, idx, .{ .path = root }, positional, opts);
+}
+
+pub fn affectedAt(w: *Writer, io: std.Io, idx: *const Index, root: gitutil.Root, positional: []const u8, opts: query.Options) !bool {
     std.debug.assert(idx.graph.files.len > 0 or idx.graph.symbols.len == 0);
     const since = if (opts.since.len != 0) opts.since else if (positional.len != 0) positional else "HEAD";
     const changed = try changedSymbols(w, io, idx, root, since, opts.format);
@@ -68,10 +72,9 @@ pub fn affected(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, pos
     return renderSymbolSet(w, idx, "affected_tests", since, tests, opts);
 }
 
-fn changedSymbols(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, since: []const u8, format: query.OutputFormat) !?[]SymbolId {
-    std.debug.assert(root.len > 0);
+fn changedSymbols(w: *Writer, io: std.Io, idx: *const Index, root: gitutil.Root, since: []const u8, format: query.OutputFormat) !?[]SymbolId {
     std.debug.assert(since.len > 0);
-    const result = query.runGitDiff(idx.gpa, io, root, since) catch |err| {
+    const result = query.runGitDiffAt(idx.gpa, io, root, since) catch |err| {
         const msg = try std.fmt.allocPrint(idx.gpa, "could not run git diff ({s})", .{@errorName(err)});
         defer idx.gpa.free(msg);
         try query.emitError(w, format, msg);

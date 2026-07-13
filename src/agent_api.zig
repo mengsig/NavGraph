@@ -9,6 +9,7 @@ const cli = @import("cli.zig");
 const index_mod = @import("index.zig");
 const model = @import("model.zig");
 const query = @import("query.zig");
+const workspace_path = @import("workspace_path.zig");
 
 pub const tool_name = "navgraph.query";
 pub const query_schema = "navgraph.agent.query.v1";
@@ -72,6 +73,7 @@ pub const DecodeError = error{
     InvalidChoice,
     InvalidCombination,
     InvalidCursor,
+    PathOutsideRoot,
     NumberOutOfRange,
     OutOfMemory,
 };
@@ -88,6 +90,7 @@ pub fn reason(err: DecodeError) []const u8 {
         error.InvalidChoice => "field value is not one of the documented choices",
         error.InvalidCombination => "fields form an invalid operation-specific combination",
         error.InvalidCursor => "after must be a cursor of the form v1:N",
+        error.PathOutsideRoot => "source path must be relative to and remain beneath the repository root",
         error.NumberOutOfRange => "numeric field is outside its documented range",
         error.OutOfMemory => "out of memory while decoding navgraph.query",
     };
@@ -239,6 +242,7 @@ fn decodeRelations(obj: std.json.ObjectMap) DecodeError!Request {
 fn decodeSource(allocator: std.mem.Allocator, obj: std.json.ObjectMap) DecodeError!Request {
     try onlyFields(obj, &.{ "operation", "path", "start_line", "end_line", "limit", "max_bytes" });
     const path = try requiredString(obj, "path", error.MissingField);
+    workspace_path.validateRelative(path) catch return error.PathOutsideRoot;
     const start = try boundedInt(obj, "start_line", 1, 1, std.math.maxInt(u32));
     const requested_end = try optionalInt(obj, "end_line", 1, std.math.maxInt(u32));
     if (requested_end != null and requested_end.? < start) return error.InvalidCombination;
@@ -1125,6 +1129,8 @@ test "typed agent decoder constructs canonical read-only requests" {
 test "typed agent decoder rejects cross-operation and unsafe combinations" {
     const cases = [_]struct { json: []const u8, expected: DecodeError }{
         .{ .json = "{\"operation\":\"source\",\"path\":\"a.zig\",\"start_line\":9,\"end_line\":2}", .expected = error.InvalidCombination },
+        .{ .json = "{\"operation\":\"source\",\"path\":\"/etc/passwd\"}", .expected = error.PathOutsideRoot },
+        .{ .json = "{\"operation\":\"source\",\"path\":\"../secret\"}", .expected = error.PathOutsideRoot },
         .{ .json = "{\"operation\":\"map\",\"path\":\"src\",\"query\":\"run\"}", .expected = error.InvalidCombination },
         .{ .json = "{\"operation\":\"symbol\",\"selector\":\"run\",\"to\":\"leaf\"}", .expected = error.UnknownField },
         .{ .json = "{\"operation\":\"impact\",\"view\":\"edit_sites\",\"since\":\"HEAD~1\"}", .expected = error.InvalidCombination },

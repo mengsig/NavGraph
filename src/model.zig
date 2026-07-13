@@ -44,7 +44,7 @@ pub const SymbolKind = enum {
         inline for (@typeInfo(SymbolKind).@"enum".fields) |f| {
             if (std.mem.eql(u8, t, @field(SymbolKind, f.name).tag())) return true;
         }
-        inline for (.{ "function", "func", "constant", "variable", "interface" }) |a| {
+        inline for (.{ "function", "func", "constant", "variable", "interface", "module" }) |a| {
             if (std.mem.eql(u8, t, a)) return true;
         }
         return false;
@@ -390,6 +390,7 @@ test "SymbolKind.validName accepts every tag and alias, rejects typos" {
     try std.testing.expect(SymbolKind.validName("func"));
     try std.testing.expect(SymbolKind.validName("variable"));
     try std.testing.expect(SymbolKind.validName("interface"));
+    try std.testing.expect(SymbolKind.validName("module"));
     try std.testing.expect(!SymbolKind.validName("xyz123"));
     try std.testing.expect(!SymbolKind.validName("fns"));
 }

@@ -16,6 +16,7 @@ const build_options = @import("build_options");
 const language = @import("language.zig");
 const model = @import("model.zig");
 const parser = @import("parser.zig");
+const workspace_path = @import("workspace_path.zig");
 
 const Language = language.Language;
 const ParsedSymbol = parser.ParsedSymbol;
@@ -89,7 +90,7 @@ pub const Store = struct {
 /// absent, unreadable, wrong-version, or corrupt — every such case is a safe
 /// full rebuild rather than an error.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, root_dir: std.Io.Dir) ?Store {
-    const bytes = root_dir.readFileAlloc(io, cache_path, gpa, .limited(max_cache_bytes)) catch return null;
+    const bytes = workspace_path.readFileAlloc(root_dir, io, cache_path, gpa, .limited(max_cache_bytes)) catch return null;
     var store = Store{ .gpa = gpa, .bytes = bytes, .entries = .empty };
     indexEntries(&store) catch {
         store.deinit();
@@ -289,8 +290,19 @@ pub fn write(
     try putU32(gpa, &buf, @intCast(files.len));
     for (files, stats) |file, stat| try writeFile(gpa, &buf, file, stat, symbols);
 
-    try root_dir.createDirPath(io, cache_dir);
-    try root_dir.writeFile(io, .{ .sub_path = cache_path, .data = buf.items });
+    root_dir.createDir(io, cache_dir, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => |e| return e,
+    };
+    // Do not follow a repository-controlled `.navgraph` symlink/junction.
+    // Write through an unnamed/random temporary and atomically replace the
+    // basename, so an existing `cache` symlink is replaced rather than opened.
+    var dir = try root_dir.openDir(io, cache_dir, .{ .follow_symlinks = false });
+    defer dir.close(io);
+    var atomic = try dir.createFileAtomic(io, "cache", .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, buf.items);
+    try atomic.replace(io);
 }
 
 fn writeFile(

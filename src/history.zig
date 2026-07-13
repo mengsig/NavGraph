@@ -34,7 +34,10 @@ const ChurnEntry = struct {
 };
 
 pub fn history(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, selector: []const u8, opts: query.Options) !bool {
-    std.debug.assert(root.len > 0);
+    return historyAt(w, io, idx, .{ .path = root }, selector, opts);
+}
+
+pub fn historyAt(w: *Writer, io: std.Io, idx: *const Index, root: gitutil.Root, selector: []const u8, opts: query.Options) !bool {
     std.debug.assert(selector.len > 0);
     const ids = try resolveSymbols(idx, selector);
     defer idx.gpa.free(ids);
@@ -80,7 +83,10 @@ pub fn history(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, sele
 }
 
 pub fn blame(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, selector: []const u8, opts: query.Options) !bool {
-    std.debug.assert(root.len > 0);
+    return blameAt(w, io, idx, .{ .path = root }, selector, opts);
+}
+
+pub fn blameAt(w: *Writer, io: std.Io, idx: *const Index, root: gitutil.Root, selector: []const u8, opts: query.Options) !bool {
     std.debug.assert(selector.len > 0);
     const ids = try resolveSymbols(idx, selector);
     defer idx.gpa.free(ids);
@@ -123,7 +129,10 @@ pub fn blame(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, select
 }
 
 pub fn churn(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, filter: []const u8, opts: query.Options) !bool {
-    std.debug.assert(root.len > 0);
+    return churnAt(w, io, idx, .{ .path = root }, filter, opts);
+}
+
+pub fn churnAt(w: *Writer, io: std.Io, idx: *const Index, root: gitutil.Root, filter: []const u8, opts: query.Options) !bool {
     std.debug.assert(opts.history_last > 0);
     const result = runChurn(idx.gpa, io, root, opts) catch |err| {
         if (opts.format == .json) try gitErrorJson(w, "churn", @errorName(err)) else try w.print("navgraph: churn failed ({s})\n", .{@errorName(err)});
@@ -146,7 +155,7 @@ pub fn churn(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, filter
     return churnText(w, idx, entries, opts);
 }
 
-fn runHistory(gpa: std.mem.Allocator, io: std.Io, root: []const u8, idx: *const Index, id: SymbolId, last: u32) !std.process.RunResult {
+fn runHistory(gpa: std.mem.Allocator, io: std.Io, root: gitutil.Root, idx: *const Index, id: SymbolId, last: u32) !std.process.RunResult {
     std.debug.assert(id < idx.graph.symbols.len);
     std.debug.assert(last > 0);
     const sym = idx.graph.symbols[id];
@@ -156,22 +165,20 @@ fn runHistory(gpa: std.mem.Allocator, io: std.Io, root: []const u8, idx: *const 
     const last_arg = try std.fmt.allocPrint(gpa, "{d}", .{last});
     defer gpa.free(last_arg);
     const argv = [_][]const u8{ "git", "-c", "core.quotePath=false", "log", "--no-ext-diff", "--no-textconv", "--no-color", "--date=short", "--format=NG:%H%x00%an%x00%ad%x00%s", "-n", last_arg, range };
-    return gitutil.run(gpa, io, root, &argv);
+    return gitutil.runAt(gpa, io, root, &argv);
 }
 
-fn runBlame(gpa: std.mem.Allocator, io: std.Io, root: []const u8, idx: *const Index, id: SymbolId) !std.process.RunResult {
+fn runBlame(gpa: std.mem.Allocator, io: std.Io, root: gitutil.Root, idx: *const Index, id: SymbolId) !std.process.RunResult {
     std.debug.assert(id < idx.graph.symbols.len);
-    std.debug.assert(root.len > 0);
     const sym = idx.graph.symbols[id];
     const file = idx.graph.files[sym.file];
     const range = try std.fmt.allocPrint(gpa, "{d},{d}", .{ symbolStartLine(sym, file.text), sym.endLine(file.text) });
     defer gpa.free(range);
     const argv = [_][]const u8{ "git", "blame", "--line-porcelain", "-L", range, "--", file.path };
-    return gitutil.run(gpa, io, root, &argv);
+    return gitutil.runAt(gpa, io, root, &argv);
 }
 
-fn runChurn(gpa: std.mem.Allocator, io: std.Io, root: []const u8, opts: query.Options) !std.process.RunResult {
-    std.debug.assert(root.len > 0);
+fn runChurn(gpa: std.mem.Allocator, io: std.Io, root: gitutil.Root, opts: query.Options) !std.process.RunResult {
     std.debug.assert(opts.history_last > 0);
     const last_arg = try std.fmt.allocPrint(gpa, "{d}", .{opts.history_last});
     defer gpa.free(last_arg);
@@ -186,7 +193,7 @@ fn runChurn(gpa: std.mem.Allocator, io: std.Io, root: []const u8, opts: query.Op
     try argv.appendSlice(gpa, &.{ "git", "-c", "core.quotePath=false", "log", "--no-ext-diff", "--no-textconv", "--no-color", "--format=NGCOMMIT:%H", "-n", last_arg, "--unified=0", "-p" });
     if (range) |value| try argv.append(gpa, value);
     try argv.append(gpa, "--");
-    return gitutil.run(gpa, io, root, argv.items);
+    return gitutil.runAt(gpa, io, root, argv.items);
 }
 
 fn parseCommits(gpa: std.mem.Allocator, text: []const u8) ![]Commit {
@@ -481,11 +488,9 @@ fn shortSha(sha: []const u8) []const u8 {
     return sha[0..@min(sha.len, 10)];
 }
 
-fn isUnbornRepository(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !bool {
-    std.debug.assert(root.len > 0);
-    std.debug.assert(std.fs.path.isAbsolute(root) or root[0] == '.');
+fn isUnbornRepository(gpa: std.mem.Allocator, io: std.Io, root: gitutil.Root) !bool {
     const argv = [_][]const u8{ "git", "rev-parse", "--verify", "--quiet", "HEAD" };
-    const result = try gitutil.run(gpa, io, root, &argv);
+    const result = try gitutil.runAt(gpa, io, root, &argv);
     defer freeRunResult(gpa, result);
     if (result.term != .exited) return false;
     return result.term.exited == 1;
@@ -640,10 +645,10 @@ test "Git patch commands disable configured external diff and textconv helpers" 
 
     var idx = try index_mod.build(testing.allocator, io, root, false);
     defer idx.deinit();
-    const history_result = try runHistory(testing.allocator, io, root, &idx, idx.lookup("run")[0], 10);
+    const history_result = try runHistory(testing.allocator, io, .{ .path = root }, &idx, idx.lookup("run")[0], 10);
     defer freeRunResult(testing.allocator, history_result);
     try testing.expect(runSucceeded(history_result));
-    const churn_result = try runChurn(testing.allocator, io, root, .{});
+    const churn_result = try runChurn(testing.allocator, io, .{ .path = root }, .{});
     defer freeRunResult(testing.allocator, churn_result);
     try testing.expect(runSucceeded(churn_result));
 }

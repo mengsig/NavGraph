@@ -17,6 +17,7 @@ const gitutil = @import("gitutil.zig");
 const cache = @import("cache.zig");
 const gitignore = @import("gitignore.zig");
 const impls_mod = @import("impls.zig");
+const workspace_path = @import("workspace_path.zig");
 
 const Writer = std.Io.Writer;
 const Index = index_mod.Index;
@@ -245,6 +246,7 @@ pub fn kindAllowed(kind: model.SymbolKind, filter: []const u8) bool {
         if (kind == .interface and std.mem.eql(u8, t, "interface")) return true;
         if (kind == .constant and std.mem.eql(u8, t, "constant")) return true;
         if (kind == .variable and std.mem.eql(u8, t, "variable")) return true;
+        if (kind == .module and std.mem.eql(u8, t, "module")) return true;
     }
     return false;
 }
@@ -525,7 +527,34 @@ pub const StatusReport = struct {
 /// Report the in-memory index snapshot, cache use, filesystem freshness, and
 /// diagnostics that can make an apparently missing symbol or edge unreliable.
 pub fn status(w: *Writer, io: std.Io, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    var report = try collectStatus(idx, io, filter, opts);
+    return statusWithRoot(w, io, idx, filter, opts, null);
+}
+
+pub fn statusInRoot(
+    w: *Writer,
+    io: std.Io,
+    idx: *const Index,
+    root_dir: std.Io.Dir,
+    canonical_root: []const u8,
+    single_file_target: ?[]const u8,
+    filter: []const u8,
+    opts: Options,
+) !bool {
+    return statusWithRoot(w, io, idx, filter, opts, .{
+        .dir = root_dir,
+        .canonical = canonical_root,
+        .single_file_target = single_file_target,
+    });
+}
+
+const StatusRoot = struct {
+    dir: std.Io.Dir,
+    canonical: []const u8,
+    single_file_target: ?[]const u8,
+};
+
+fn statusWithRoot(w: *Writer, io: std.Io, idx: *const Index, filter: []const u8, opts: Options, bound_root: ?StatusRoot) !bool {
+    var report = try collectStatus(idx, io, filter, opts, bound_root);
     defer report.deinit(idx.gpa);
     if (opts.format == .json) return json_out.status(w, idx, filter, report, opts);
     if (opts.format == .jsonl) return json_out.statusJsonl(w, idx, filter, report, opts);
@@ -535,7 +564,7 @@ pub fn status(w: *Writer, io: std.Io, idx: *const Index, filter: []const u8, opt
     return true;
 }
 
-fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Options) !StatusReport {
+fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Options, bound_root: ?StatusRoot) !StatusReport {
     std.debug.assert(idx.graph.files.len == idx.file_stats.len);
     std.debug.assert(opts.limit > 0);
     var report = StatusReport{ .changes = &.{} };
@@ -552,7 +581,7 @@ fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Option
     for (idx.skipped_dirs) |path| {
         if (filter.len == 0 or matchesFilter(path, filter)) report.skipped += 1;
     }
-    report.changes = try collectStatusChanges(idx, io, filter, opts, &report.root_error);
+    report.changes = try collectStatusChanges(idx, io, filter, opts, bound_root, &report.root_error);
     return report;
 }
 
@@ -663,18 +692,38 @@ fn collectStatusChanges(
     io: std.Io,
     filter: []const u8,
     opts: Options,
+    bound_root: ?StatusRoot,
     root_error: *[]const u8,
 ) ![]StatusChange {
     var changes: std.ArrayList(StatusChange) = .empty;
     errdefer changes.deinit(idx.gpa);
-    var dir = openSnapshotRoot(io, idx.root) catch |err| {
-        root_error.* = @errorName(err);
-        return changes.toOwnedSlice(idx.gpa);
+    var owned_dir: ?std.Io.Dir = null;
+    const dir = if (bound_root) |root|
+        root.dir
+    else blk: {
+        owned_dir = openSnapshotRoot(io, idx.root) catch |err| {
+            root_error.* = @errorName(err);
+            return changes.toOwnedSlice(idx.gpa);
+        };
+        break :blk owned_dir.?;
     };
-    defer dir.close(io);
+    defer if (owned_dir) |owned| owned.close(io);
     for (idx.graph.files, idx.file_stats) |file, snapshot| {
         if (!statusFileSelected(file, filter, opts)) continue;
-        const current = dir.statFile(io, file.path, .{}) catch |err| {
+        const current = if (bound_root) |root| current: {
+            var opened = (if (root.single_file_target) |target|
+                workspace_path.openFileKnownTarget(dir, io, root.canonical, file.path, target)
+            else
+                workspace_path.openFileKnownRoot(dir, io, root.canonical, file.path)) catch |err| {
+                try changes.append(idx.gpa, .{ .file = file.id, .kind = .unavailable, .error_name = @errorName(err) });
+                continue;
+            };
+            defer opened.close(io);
+            break :current opened.stat(io) catch |err| {
+                try changes.append(idx.gpa, .{ .file = file.id, .kind = .unavailable, .error_name = @errorName(err) });
+                continue;
+            };
+        } else dir.statFile(io, file.path, .{}) catch |err| {
             try changes.append(idx.gpa, .{ .file = file.id, .kind = .unavailable, .error_name = @errorName(err) });
             continue;
         };
@@ -884,7 +933,39 @@ pub const ReadPage = struct {
 /// config files and files under ignored dirs are reachable too. Returns whether
 /// at least one source line was printed.
 pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, spec: []const u8, opts: Options) !bool {
-    std.debug.assert(root.len > 0);
+    return readLinesWithRoot(w, io, idx, .{ .path = root }, spec, opts);
+}
+
+pub fn readLinesInRoot(
+    w: *Writer,
+    io: std.Io,
+    idx: *const Index,
+    root_dir: std.Io.Dir,
+    canonical_root: []const u8,
+    single_file: ?[]const u8,
+    single_file_target: ?[]const u8,
+    spec: []const u8,
+    opts: Options,
+) !bool {
+    return readLinesWithRoot(w, io, idx, .{ .bound = .{
+        .dir = root_dir,
+        .canonical = canonical_root,
+        .single_file = single_file,
+        .single_file_target = single_file_target,
+    } }, spec, opts);
+}
+
+const SourceRoot = union(enum) {
+    path: []const u8,
+    bound: struct {
+        dir: std.Io.Dir,
+        canonical: []const u8,
+        single_file: ?[]const u8,
+        single_file_target: ?[]const u8,
+    },
+};
+
+fn readLinesWithRoot(w: *Writer, io: std.Io, idx: *const Index, root: SourceRoot, spec: []const u8, opts: Options) !bool {
     std.debug.assert(spec.len > 0);
     // Empty `ranges` means the whole file; one or more means `file:A-B,C-D` — a
     // batched read that pulls several disjoint slices in one call (a symbol and
@@ -899,15 +980,44 @@ pub fn readLines(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, sp
     };
     const path = parsed.path;
     const ranges = parsed.ranges;
+    workspace_path.validateRelative(path) catch |err| {
+        try renderReadContainmentError(w, opts.format, err, path);
+        return false;
+    };
+    if (root == .bound) {
+        if (root.bound.single_file) |allowed| {
+            if (!std.mem.eql(u8, path, allowed)) {
+                try renderReadError(w, opts.format, "path_outside_root", "server is scoped to one source file", path);
+                return false;
+            }
+        }
+    }
     var owned: ?[]u8 = null;
     defer if (owned) |b| idx.gpa.free(b);
     const text = indexedText(idx, path) orelse blk: {
-        var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
-            try renderReadError(w, opts.format, "cannot_open_root", "cannot open repository root", root);
-            return false;
+        var owned_dir: ?std.Io.Dir = null;
+        const rd = switch (root) {
+            .path => |root_path| opened: {
+                owned_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch {
+                    try renderReadError(w, opts.format, "cannot_open_root", "cannot open repository root", root_path);
+                    return false;
+                };
+                break :opened owned_dir.?;
+            },
+            .bound => |bound| bound.dir,
         };
-        defer rd.close(io);
-        const bytes = rd.readFileAlloc(io, path, idx.gpa, .limited(max_read_bytes)) catch {
+        defer if (owned_dir) |dir| dir.close(io);
+        const bytes = switch (root) {
+            .path => workspace_path.readFileAlloc(rd, io, path, idx.gpa, .limited(max_read_bytes)),
+            .bound => |bound| if (bound.single_file_target) |target|
+                workspace_path.readFileAllocKnownTarget(rd, io, bound.canonical, path, target, idx.gpa, .limited(max_read_bytes))
+            else
+                workspace_path.readFileAllocKnownRoot(rd, io, bound.canonical, path, idx.gpa, .limited(max_read_bytes)),
+        } catch |err| {
+            if (isReadContainmentError(err)) {
+                try renderReadContainmentError(w, opts.format, err, path);
+                return false;
+            }
             try renderReadError(w, opts.format, "no_such_file", "give a readable path relative to the repository root", path);
             return false;
         };
@@ -937,17 +1047,40 @@ pub fn readLinesStandalone(
         try renderReadError(w, opts.format, readSpecErrorCode(err), readSpecErrorMessage(err), value);
         return false;
     };
+    workspace_path.validateRelative(parsed.path) catch |err| {
+        try renderReadContainmentError(w, opts.format, err, parsed.path);
+        return false;
+    };
     var rd = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
         try renderReadError(w, opts.format, "cannot_open_root", "cannot open repository root", root);
         return false;
     };
     defer rd.close(io);
-    const text = rd.readFileAlloc(io, parsed.path, allocator, .limited(max_read_bytes)) catch {
+    const text = workspace_path.readFileAlloc(rd, io, parsed.path, allocator, .limited(max_read_bytes)) catch |err| {
+        if (isReadContainmentError(err)) {
+            try renderReadContainmentError(w, opts.format, err, parsed.path);
+            return false;
+        }
         try renderReadError(w, opts.format, "no_such_file", "give a readable path relative to the repository root", parsed.path);
         return false;
     };
     defer allocator.free(text);
     return renderBoundedSourcePage(w, allocator, parsed.path, text, parsed.ranges, opts);
+}
+
+fn isReadContainmentError(err: anyerror) bool {
+    return err == error.EmptyPath or err == error.AbsolutePath or err == error.ParentTraversal or err == error.OutsideRoot;
+}
+
+fn renderReadContainmentError(w: *Writer, format: OutputFormat, err: anyerror, path: []const u8) !void {
+    const message = switch (err) {
+        error.AbsolutePath => "absolute source paths are outside the repository authority boundary",
+        error.ParentTraversal => "source paths containing '..' are outside the repository authority boundary",
+        error.OutsideRoot => "source path resolves through a symlink outside the repository root",
+        error.EmptyPath => "source path must not be empty",
+        else => unreachable,
+    };
+    try renderReadError(w, format, "path_outside_root", message, path);
 }
 
 fn renderReadError(w: *Writer, format: OutputFormat, code: []const u8, message: []const u8, value: []const u8) !void {
@@ -3343,8 +3476,12 @@ fn printEventSite(w: *Writer, idx: *const Index, site: EventSite) !void {
 /// overlaps, turning a line-oriented diff into a symbol-oriented review.
 /// Returns whether at least one changed symbol was reported.
 pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []const u8, opts: Options) !bool {
+    return diffAt(w, io, idx, .{ .path = root }, ref, opts);
+}
+
+pub fn diffAt(w: *Writer, io: std.Io, idx: *const Index, root: gitutil.Root, ref: []const u8, opts: Options) !bool {
     const spec = if (ref.len != 0) ref else "HEAD";
-    const result = runGitDiff(idx.gpa, io, root, spec) catch |err| {
+    const result = runGitDiffAt(idx.gpa, io, root, spec) catch |err| {
         const msg = try std.fmt.allocPrint(idx.gpa, "could not run git diff ({s})", .{@errorName(err)});
         defer idx.gpa.free(msg);
         try emitError(w, opts.format, msg);
@@ -3373,11 +3510,14 @@ pub fn diff(w: *Writer, io: std.Io, idx: *const Index, root: []const u8, ref: []
 /// (caller frees stdout/stderr). `--unified=0` keeps hunks tight so a ripple in
 /// one function isn't attributed to its neighbor via shared context lines.
 pub fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const u8) !std.process.RunResult {
-    std.debug.assert(root.len > 0);
+    return runGitDiffAt(gpa, io, .{ .path = root }, ref);
+}
+
+pub fn runGitDiffAt(gpa: std.mem.Allocator, io: std.Io, root: gitutil.Root, ref: []const u8) !std.process.RunResult {
     std.debug.assert(ref.len > 0);
     if (!gitutil.validRef(ref)) return error.InvalidGitRef;
     const argv = [_][]const u8{ "git", "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "--no-color", ref, "--" };
-    return gitutil.run(gpa, io, root, &argv);
+    return gitutil.runAt(gpa, io, root, &argv);
 }
 
 /// `git diff` intentionally omits untracked files. They are nevertheless part
@@ -3388,7 +3528,7 @@ pub fn runGitDiff(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ref: []c
 fn patchWithUntracked(
     gpa: std.mem.Allocator,
     io: std.Io,
-    root: []const u8,
+    root: gitutil.Root,
     idx: *const Index,
     tracked_patch: []const u8,
 ) ![]u8 {
@@ -3397,7 +3537,7 @@ fn patchWithUntracked(
     try combined.appendSlice(gpa, tracked_patch);
 
     const list_argv = [_][]const u8{ "git", "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z", "--" };
-    const listed = try gitutil.run(gpa, io, root, &list_argv);
+    const listed = try gitutil.runAt(gpa, io, root, &list_argv);
     defer gpa.free(listed.stdout);
     defer gpa.free(listed.stderr);
     if (listed.term != .exited or listed.term.exited != 0) return error.GitUntrackedListFailed;
@@ -3409,7 +3549,7 @@ fn patchWithUntracked(
             "git",           "-c",          "core.quotePath=false", "diff", "--no-index", "--no-ext-diff",
             "--no-textconv", "--unified=0", "--no-color",           "--",   "/dev/null",  path,
         };
-        const untracked = try gitutil.run(gpa, io, root, &diff_argv);
+        const untracked = try gitutil.runAt(gpa, io, root, &diff_argv);
         defer gpa.free(untracked.stdout);
         defer gpa.free(untracked.stderr);
         if (untracked.term != .exited or (untracked.term.exited != 0 and untracked.term.exited != 1))
@@ -4914,6 +5054,7 @@ test "kindAllowed matches tags, aliases, and empty-is-all" {
     try std.testing.expect(!kindAllowed(.function, "struct"));
     try std.testing.expect(!kindAllowed(.method, "fn"));
     try std.testing.expect(kindAllowed(.method, "method"));
+    try std.testing.expect(kindAllowed(.module, "module"));
     // Whitespace around a comma token is tolerated.
     try std.testing.expect(kindAllowed(.@"enum", "fn, enum"));
 }

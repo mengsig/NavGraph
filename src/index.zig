@@ -10,6 +10,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const language = @import("language.zig");
 const parser = @import("parser.zig");
+const workspace_path = @import("workspace_path.zig");
 const api = @import("api.zig");
 const cache = @import("cache.zig");
 const imports = @import("imports.zig");
@@ -110,6 +111,7 @@ const Builder = struct {
     arena: std.mem.Allocator,
     io: std.Io,
     root_dir: std.Io.Dir,
+    root_real_path: []const u8,
     files: std.ArrayList(model.SourceFile),
     symbols: std.ArrayList(model.Symbol),
     /// Per-file (mtime, size) aligned 1:1 with `files`, used to write the cache.
@@ -129,14 +131,6 @@ const Builder = struct {
 /// the refreshed cache is written back.
 pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cache: bool) !Index {
     std.debug.assert(root_path.len > 0);
-    const arena_box = try gpa.create(std.heap.ArenaAllocator);
-    arena_box.* = std.heap.ArenaAllocator.init(gpa);
-    errdefer {
-        arena_box.deinit();
-        gpa.destroy(arena_box);
-    }
-    const arena = arena_box.allocator();
-
     // `-C <path>` normally names a directory. If it names a single file, index
     // just that file (rooted at its parent dir) instead of erroring with NotDir —
     // so `outline -C src/parser.zig` scopes to one file.
@@ -148,12 +142,38 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         break :dir try std.Io.Dir.cwd().openDir(io, dir_part, .{ .iterate = true });
     };
     defer root_dir.close(io);
+    return buildOpenDir(gpa, io, root_dir, root_path, single_file, null, use_cache);
+}
 
+/// Build from an already-open authority directory. Long-lived servers use this
+/// entry point so startup and reload index exactly the directory handle they
+/// retain, even if the pathname used to open it is later replaced or retargeted.
+pub fn buildOpenDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    root_label: []const u8,
+    single_file: ?[]const u8,
+    single_file_target: ?[]const u8,
+    use_cache: bool,
+) !Index {
+    std.debug.assert(root_label.len > 0);
+    const arena_box = try gpa.create(std.heap.ArenaAllocator);
+    arena_box.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer {
+        arena_box.deinit();
+        gpa.destroy(arena_box);
+    }
+    const arena = arena_box.allocator();
+
+    var root_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_real_len = try root_dir.realPath(io, &root_real_buf);
     var b = Builder{
         .gpa = gpa,
         .arena = arena,
         .io = io,
         .root_dir = root_dir,
+        .root_real_path = try arena.dupe(u8, root_real_buf[0..root_real_len]),
         .files = .empty,
         .symbols = .empty,
         .stats = .empty,
@@ -173,8 +193,9 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
     defer path_buf.deinit(gpa);
     if (single_file) |f| {
         // An explicitly-named file is indexed directly (no .gitignore pruning).
-        try maybeAddFile(&b, f);
+        try addFile(&b, f, single_file_target, single_file_target != null);
     } else {
+        std.debug.assert(single_file_target == null);
         try collectDir(&b, root_dir, &path_buf);
     }
 
@@ -194,7 +215,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         .callers = &.{},
         .file_imports = &.{},
         .import_outcomes = &.{},
-        .root = try arena.dupe(u8, root_path),
+        .root = try arena.dupe(u8, root_label),
         .file_stats = try arena.dupe(cache.FileStat, b.stats.items),
         .cache_snapshot = .{
             .enabled = use_cache,
@@ -255,7 +276,7 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
 });
 
 fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
-    try loadGitignore(b, dir, path_buf.items);
+    try loadGitignore(b, path_buf.items);
     var it = dir.iterate();
     const base_len = path_buf.items.len;
     while (try it.next(b.io)) |entry| {
@@ -279,9 +300,16 @@ fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerr
 /// after `.gitignore`, so (last-match-wins) it can both add ignores git doesn't
 /// have and re-include (`!pattern`) something `.gitignore` — or the built-in
 /// skip set — prunes.
-fn loadGitignore(b: *Builder, dir: std.Io.Dir, base: []const u8) !void {
-    inline for (.{ ".gitignore", ".navgraphignore" }) |ignore_file| {
-        if (dir.readFileAlloc(b.io, ignore_file, b.arena, .limited(max_gitignore_bytes))) |text| {
+fn loadGitignore(b: *Builder, base: []const u8) !void {
+    for ([_][]const u8{ ".gitignore", ".navgraphignore" }) |ignore_file| {
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = if (base.len == 0)
+            ignore_file
+        else
+            std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base, ignore_file }) catch continue;
+        if (workspace_path.openFileKnownRoot(b.root_dir, b.io, b.root_real_path, path)) |file| {
+            defer file.close(b.io);
+            const text = workspace_path.readOpenedFileAlloc(file, b.io, b.arena, .limited(max_gitignore_bytes)) catch continue;
             try b.ignore.addFile(try b.arena.dupe(u8, base), text);
         } else |_| {}
     }
@@ -305,7 +333,10 @@ fn enterDir(b: *Builder, parent: std.Io.Dir, name: []const u8, path_buf: *std.Ar
     // A git-ignored directory is pruned silently: its skip is expected, not a
     // could-be-source surprise worth reporting.
     if (b.ignore.isIgnored(path_buf.items, true)) return;
-    var sub = parent.openDir(b.io, name, .{ .iterate = true }) catch return;
+    // Refuse a directory entry that became a symlink after iteration. Reads
+    // themselves are still resolved from b.root_dir, but avoiding traversal
+    // here also prevents outside ignore files from influencing the walk.
+    var sub = parent.openDir(b.io, name, .{ .iterate = true, .follow_symlinks = false }) catch return;
     defer sub.close(b.io);
     try collectDir(b, sub, path_buf);
 }
@@ -364,11 +395,44 @@ fn noteSkippedMinified(b: *Builder, path: []const u8) !void {
 }
 
 fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
+    return addFile(b, rel_path, null, false);
+}
+
+/// Add one source through the descriptor that was both authority-checked and
+/// read. Directory traversal is best-effort because files can legitimately
+/// disappear while walking. A long-lived single-file authority is strict:
+/// deletion, retarget, stat, or read failure aborts the fresh build so reload
+/// preserves the previous coherent snapshot.
+fn addFile(
+    b: *Builder,
+    rel_path: []const u8,
+    expected_target: ?[]const u8,
+    strict: bool,
+) !void {
     const lang = language.detect(rel_path);
     if (lang == .unknown) return;
     if (b.ignore.isIgnored(rel_path, false)) return;
     if (isMinifiedName(rel_path)) return noteSkippedMinified(b, rel_path);
-    const stat = statOf(b, rel_path) orelse return;
+    // Open, contain-check, stat, and read through one descriptor. In
+    // particular, never stat a pathname and then reopen it: an attacker can
+    // swap an ordinary source for an outside symlink between those operations.
+    var file = (if (expected_target) |target|
+        workspace_path.openFileKnownTarget(b.root_dir, b.io, b.root_real_path, rel_path, target)
+    else
+        workspace_path.openFileKnownRoot(b.root_dir, b.io, b.root_real_path, rel_path)) catch |err| {
+        if (strict) return err;
+        return;
+    };
+    defer file.close(b.io);
+    const file_stat = file.stat(b.io) catch |err| {
+        if (strict) return err;
+        return;
+    };
+    const stat = cache.FileStat{
+        .mtime_ns = file_stat.mtime.nanoseconds,
+        .ctime_ns = file_stat.ctime.nanoseconds,
+        .size = file_stat.size,
+    };
 
     if (b.store) |*s| {
         if (s.restore(b.arena, rel_path, stat)) |hit| {
@@ -378,7 +442,10 @@ fn maybeAddFile(b: *Builder, rel_path: []const u8) !void {
             return;
         }
     }
-    const text = b.root_dir.readFileAlloc(b.io, rel_path, b.arena, .limited(max_file_bytes)) catch return;
+    const text = workspace_path.readOpenedFileAlloc(file, b.io, b.arena, .limited(max_file_bytes)) catch |err| {
+        if (strict) return err;
+        return;
+    };
     std.debug.assert(text.len <= std.math.maxInt(u32));
     // A minified/bundled artifact (one enormous line) indexes as thousands of
     // meaningless one-letter symbols that pollute `hot`/`unused`/`search` — a
@@ -407,13 +474,6 @@ fn isMinifiedText(text: []const u8) bool {
     if (text.len < 4096) return false;
     const lines = 1 + std.mem.count(u8, text, "\n");
     return text.len / lines > 300;
-}
-
-/// (mtime, size) of `rel_path`, or null when the file cannot be stat'd (e.g. it
-/// vanished between directory iteration and here).
-fn statOf(b: *Builder, rel_path: []const u8) ?cache.FileStat {
-    const st = b.root_dir.statFile(b.io, rel_path, .{}) catch return null;
-    return .{ .mtime_ns = st.mtime.nanoseconds, .ctime_ns = st.ctime.nanoseconds, .size = st.size };
 }
 
 const ParsedFile = struct {

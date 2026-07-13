@@ -14,6 +14,7 @@ const json_out = @import("json_out.zig");
 const viz = @import("viz.zig");
 const capabilities = @import("capabilities.zig");
 const agent_api = @import("agent_api.zig");
+const workspace_path = @import("workspace_path.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -32,8 +33,8 @@ pub fn main(init: std.process.Init) !void {
     const args = argv[1..];
     // Bare `navgraph` (no args) prints help and succeeds.
     if (args.len == 0) {
-        try cli.usage(out);
-        try out.flush();
+        cli.usage(out) catch std.process.exit(141);
+        out.flush() catch std.process.exit(141);
         return;
     }
     const parsed = cli.parse(args) catch |err| {
@@ -52,17 +53,17 @@ pub fn main(init: std.process.Init) !void {
     };
     if (parsed.command == .help) {
         if (parsed.arg.len == 0) {
-            try cli.usage(out);
+            cli.usage(out) catch std.process.exit(141);
         } else {
-            _ = try cli.usageCommand(out, parsed.arg);
+            _ = cli.usageCommand(out, parsed.arg) catch std.process.exit(141);
         }
-        try out.flush();
+        out.flush() catch std.process.exit(141);
         return;
     }
     if (parsed.command == .capabilities) {
-        try capabilities.writeManifest(out);
-        try out.writeByte('\n');
-        try out.flush();
+        capabilities.writeManifest(out) catch std.process.exit(141);
+        out.writeByte('\n') catch std.process.exit(141);
+        out.flush() catch std.process.exit(141);
         return;
     }
     if (parsed.command == .read) {
@@ -75,6 +76,36 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (parsed.command == .serve) {
+        var authority = RootAuthority.open(gpa, io, parsed.root) catch |err| {
+            try out.print("navgraph: failed to bind server root '{s}': {s}\n", .{ parsed.root, @errorName(err) });
+            try out.flush();
+            std.process.exit(1);
+        };
+        var authority_owned = true;
+        errdefer if (authority_owned) authority.deinit();
+        var idx = index_mod.buildOpenDir(
+            gpa,
+            io,
+            authority.dir,
+            parsed.root,
+            authority.single_file,
+            authority.single_file_target,
+            parsed.use_cache,
+        ) catch |err| {
+            try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
+            try out.flush();
+            std.process.exit(1);
+        };
+        defer idx.deinit();
+        var session = try ServerSession.initBound(gpa, io, &idx, parsed.root, parsed.use_cache, authority);
+        authority_owned = false;
+        defer session.deinit();
+        try serve(out, &session);
+        try out.flush();
+        return;
+    }
+
     var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
@@ -84,14 +115,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer idx.deinit();
-
-    if (parsed.command == .serve) {
-        var session = try ServerSession.init(gpa, io, &idx, parsed.root, parsed.use_cache);
-        defer session.deinit();
-        try serve(out, &session);
-        try out.flush();
-        return;
-    }
 
     const found = dispatchHardBudget(out, io, &idx, parsed) catch |err| switch (err) {
         // Downstream closed the pipe (`navgraph … | head`). That's a normal way
@@ -111,11 +134,48 @@ pub fn main(init: std.process.Init) !void {
 /// Run the parsed command; true when at least one real result row was printed
 /// (notes, suggestions, and empty JSON arrays don't count).
 fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !bool {
+    return dispatchWithAuthority(out, io, idx, parsed, null);
+}
+
+fn dispatchWithAuthority(
+    out: *std.Io.Writer,
+    io: std.Io,
+    idx: *index_mod.Index,
+    parsed: cli.Parsed,
+    authority: ?*const RootAuthority,
+) !bool {
     return switch (parsed.command) {
         .outline => try query.outline(out, idx, parsed.arg, parsed.options),
         .files => try query.listFiles(out, idx, parsed.arg, parsed.options),
-        .status => try query.status(out, io, idx, parsed.arg, parsed.options),
-        .read => try query.readLines(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .status => if (authority) |root| bound: {
+            var canonical_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const canonical = try root.canonicalPath(&canonical_buf);
+            break :bound try query.statusInRoot(
+                out,
+                io,
+                idx,
+                root.dir,
+                canonical,
+                root.single_file_target,
+                parsed.arg,
+                parsed.options,
+            );
+        } else try query.status(out, io, idx, parsed.arg, parsed.options),
+        .read => if (authority) |root| bound: {
+            var canonical_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const canonical = try root.canonicalPath(&canonical_buf);
+            break :bound try query.readLinesInRoot(
+                out,
+                io,
+                idx,
+                root.dir,
+                canonical,
+                root.single_file,
+                root.single_file_target,
+                parsed.arg,
+                parsed.options,
+            );
+        } else try query.readLines(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .strings => try query.strings(out, idx, parsed.arg, parsed.options),
         .def => try query.showDef(out, idx, parsed.arg, parsed.options),
         .docs => try workflow.docs(out, idx, parsed.arg, parsed.options),
@@ -137,12 +197,27 @@ fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.
         .flow => try query.flow(out, idx, parsed.arg, parsed.options),
         .taint => try taint.run(out, idx, parsed.arg, parsed.options),
         .reaches => try workflow.reaches(out, idx, parsed.arg, parsed.options),
-        .affected => try workflow.affected(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .affected => if (authority) |root|
+            try workflow.affectedAt(out, io, idx, .{ .dir = root.dir }, parsed.arg, parsed.options)
+        else
+            try workflow.affected(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .hot => try query.hot(out, idx, parsed.arg, parsed.options),
-        .diff => try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
-        .history => try history_mod.history(out, io, idx, parsed.root, parsed.arg, parsed.options),
-        .blame => try history_mod.blame(out, io, idx, parsed.root, parsed.arg, parsed.options),
-        .churn => try history_mod.churn(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .diff => if (authority) |root|
+            try query.diffAt(out, io, idx, .{ .dir = root.dir }, parsed.arg, parsed.options)
+        else
+            try query.diff(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .history => if (authority) |root|
+            try history_mod.historyAt(out, io, idx, .{ .dir = root.dir }, parsed.arg, parsed.options)
+        else
+            try history_mod.history(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .blame => if (authority) |root|
+            try history_mod.blameAt(out, io, idx, .{ .dir = root.dir }, parsed.arg, parsed.options)
+        else
+            try history_mod.blame(out, io, idx, parsed.root, parsed.arg, parsed.options),
+        .churn => if (authority) |root|
+            try history_mod.churnAt(out, io, idx, .{ .dir = root.dir }, parsed.arg, parsed.options)
+        else
+            try history_mod.churn(out, io, idx, parsed.root, parsed.arg, parsed.options),
         .todos => try workflow.todos(out, idx, parsed.arg, parsed.options),
         .edits => try workflow.edits(out, idx, parsed.arg, parsed.options),
         .rename => try workflow.rename(out, io, idx, parsed.root, parsed.arg, parsed.arg2, parsed.options),
@@ -165,10 +240,20 @@ const CapturedDispatch = struct {
 /// measures the real rendering (signatures, source, JSON escaping, metadata and
 /// all) and compacts/re-renders until the complete value fits.
 fn dispatchHardBudget(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !bool {
-    if (parsed.options.budget == 0 or parsed.command == .read) return dispatch(out, io, idx, parsed);
+    return dispatchHardBudgetWithAuthority(out, io, idx, parsed, null);
+}
+
+fn dispatchHardBudgetWithAuthority(
+    out: *std.Io.Writer,
+    io: std.Io,
+    idx: *index_mod.Index,
+    parsed: cli.Parsed,
+    authority: ?*const RootAuthority,
+) !bool {
+    if (parsed.options.budget == 0 or parsed.command == .read) return dispatchWithAuthority(out, io, idx, parsed, authority);
     const hard_limit = parsed.options.budget;
 
-    const initial = try captureDispatch(idx.gpa, io, idx, parsed);
+    const initial = try captureDispatch(idx.gpa, io, idx, parsed, authority);
     defer idx.gpa.free(initial.bytes);
     if (initial.bytes.len <= hard_limit) {
         try out.writeAll(initial.bytes);
@@ -191,7 +276,7 @@ fn dispatchHardBudget(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, pa
     while (true) {
         compact.options.limit = cap;
         compact.options.max_nodes = cap;
-        const rendered = try captureDispatch(idx.gpa, io, idx, compact);
+        const rendered = try captureDispatch(idx.gpa, io, idx, compact, authority);
         defer idx.gpa.free(rendered.bytes);
         const annotated = try annotateHardBudget(idx.gpa, rendered.bytes, parsed.options.format, hard_limit, initial.bytes.len);
         defer idx.gpa.free(annotated);
@@ -210,12 +295,18 @@ fn dispatchHardBudget(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, pa
     return found;
 }
 
-fn captureDispatch(allocator: std.mem.Allocator, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !CapturedDispatch {
+fn captureDispatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    idx: *index_mod.Index,
+    parsed: cli.Parsed,
+    authority: ?*const RootAuthority,
+) !CapturedDispatch {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
     defer aw.deinit();
-    const found = try dispatch(&aw.writer, io, idx, parsed);
+    const found = try dispatchWithAuthority(&aw.writer, io, idx, parsed, authority);
     return .{ .bytes = try allocator.dupe(u8, aw.written()), .found = found };
 }
 
@@ -271,11 +362,63 @@ fn hardBudgetOnly(allocator: std.mem.Allocator, format: query.OutputFormat, budg
     return allocator.dupe(u8, rendered[0..@min(rendered.len, budget)]);
 }
 
+const RootAuthority = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    single_file: ?[]u8,
+    single_file_target: ?[]u8,
+
+    fn open(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !RootAuthority {
+        std.debug.assert(root.len > 0);
+        var single_file: ?[]u8 = null;
+        errdefer if (single_file) |file| gpa.free(file);
+        var single_file_target: ?[]u8 = null;
+        errdefer if (single_file_target) |target| gpa.free(target);
+        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| opened: {
+            if (err != error.NotDir) return err;
+            single_file = try gpa.dupe(u8, std.fs.path.basename(root));
+            const parent = std.fs.path.dirname(root) orelse ".";
+            break :opened try std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
+        };
+        errdefer dir.close(io);
+        var canonical_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const canonical_len = try dir.realPath(io, &canonical_buf);
+        if (single_file) |path| {
+            var file = try workspace_path.openFileKnownRoot(dir, io, canonical_buf[0..canonical_len], path);
+            defer file.close(io);
+            var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const target = try workspace_path.openedRelativePath(file, io, canonical_buf[0..canonical_len], &target_buf);
+            single_file_target = try gpa.dupe(u8, target);
+        }
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .dir = dir,
+            .single_file = single_file,
+            .single_file_target = single_file_target,
+        };
+    }
+
+    fn canonicalPath(self: *const RootAuthority, buffer: []u8) ![]const u8 {
+        const len = try self.dir.realPath(self.io, buffer);
+        return buffer[0..len];
+    }
+
+    fn deinit(self: *RootAuthority) void {
+        self.dir.close(self.io);
+        if (self.single_file) |file| self.gpa.free(file);
+        if (self.single_file_target) |target| self.gpa.free(target);
+        self.* = undefined;
+    }
+};
+
 const ServerSession = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     idx: *index_mod.Index,
     root: []u8,
+    authority: RootAuthority,
     use_cache: bool,
     snapshot_id: u64,
 
@@ -286,6 +429,19 @@ const ServerSession = struct {
         root: []const u8,
         use_cache: bool,
     ) !ServerSession {
+        var authority = try RootAuthority.open(gpa, io, root);
+        errdefer authority.deinit();
+        return initBound(gpa, io, idx, root, use_cache, authority);
+    }
+
+    fn initBound(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        idx: *index_mod.Index,
+        root: []const u8,
+        use_cache: bool,
+        authority_value: RootAuthority,
+    ) !ServerSession {
         std.debug.assert(root.len > 0);
         std.debug.assert(idx.gpa.ptr == gpa.ptr);
         return .{
@@ -293,12 +449,17 @@ const ServerSession = struct {
             .io = io,
             .idx = idx,
             .root = try gpa.dupe(u8, root),
+            // Ownership transfers only after every fallible field above has
+            // initialized. The caller retains and cleans authority_value when
+            // this function returns an error.
+            .authority = authority_value,
             .use_cache = use_cache,
             .snapshot_id = agent_api.snapshotFingerprint(idx),
         };
     }
 
     fn deinit(self: *ServerSession) void {
+        self.authority.deinit();
         self.gpa.free(self.root);
         self.* = undefined;
     }
@@ -306,7 +467,15 @@ const ServerSession = struct {
     fn reload(self: *ServerSession, use_cache: bool) !void {
         std.debug.assert(self.root.len > 0);
         std.debug.assert(self.idx.gpa.ptr == self.gpa.ptr);
-        var fresh = try index_mod.build(self.gpa, self.io, self.root, use_cache);
+        var fresh = try index_mod.buildOpenDir(
+            self.gpa,
+            self.io,
+            self.authority.dir,
+            self.root,
+            self.authority.single_file,
+            self.authority.single_file_target,
+            use_cache,
+        );
         const fresh_snapshot_id = agent_api.snapshotFingerprint(&fresh);
         const old = self.idx.*;
         self.idx.* = fresh;
@@ -641,7 +810,7 @@ fn runAgentTool(
     defer raw_buf.deinit(session.gpa);
     var raw_writer: std.Io.Writer.Allocating = .fromArrayList(session.gpa, &raw_buf);
     defer raw_writer.deinit();
-    const found = dispatch(&raw_writer.writer, session.io, session.idx, request.parsed) catch |err| {
+    const found = dispatchWithAuthority(&raw_writer.writer, session.io, session.idx, request.parsed, &session.authority) catch |err| {
         try rpcError(out, id, -32603, @errorName(err));
         return true;
     };
@@ -669,7 +838,7 @@ fn dispatchServerResult(out: *std.Io.Writer, session: *ServerSession, id: ?std.j
     defer buf.deinit(session.gpa);
     var aw: std.Io.Writer.Allocating = .fromArrayList(session.gpa, &buf);
     defer aw.deinit();
-    const found = dispatchHardBudget(&aw.writer, session.io, session.idx, request) catch |err| {
+    const found = dispatchHardBudgetWithAuthority(&aw.writer, session.io, session.idx, request, &session.authority) catch |err| {
         try rpcError(out, id, -32603, @errorName(err));
         return;
     };

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Error = error{InvalidGitRef};
+pub const Root = union(enum) { path: []const u8, dir: std.Io.Dir };
 
 pub fn validRef(ref: []const u8) bool {
     if (ref.len == 0 or ref[0] == '-') return false;
@@ -15,19 +16,32 @@ pub fn validLowerBoundRef(ref: []const u8) bool {
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, root: []const u8, argv: []const []const u8) !std.process.RunResult {
-    std.debug.assert(root.len > 0);
+    return runAt(gpa, io, .{ .path = root }, argv);
+}
+
+pub fn runAt(gpa: std.mem.Allocator, io: std.Io, root: Root, argv: []const []const u8) !std.process.RunResult {
     std.debug.assert(argv.len >= 2);
     std.debug.assert(std.mem.eql(u8, argv[0], "git"));
-    var cwd_path = root;
-    var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch |err| dir: {
-        if (err != error.NotDir) return err;
-        cwd_path = std.fs.path.dirname(root) orelse ".";
-        break :dir try std.Io.Dir.cwd().openDir(io, cwd_path, .{});
+    var owned_dir: ?std.Io.Dir = null;
+    const dir = switch (root) {
+        .dir => |bound| bound,
+        .path => |path| opened: {
+            std.debug.assert(path.len > 0);
+            owned_dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch |err| parent: {
+                if (err != error.NotDir) return err;
+                break :parent try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{});
+            };
+            break :opened owned_dir.?;
+        },
     };
-    root_dir.close(io);
+    defer if (owned_dir) |owned| owned.close(io);
     return std.process.run(gpa, io, .{
         .argv = argv,
-        .cwd = .{ .path = cwd_path },
+        // Keep the descriptor open through the child lifetime. In addition to
+        // server calls (which already supply a retained directory), this binds
+        // one-shot calls before spawn instead of validating a pathname and then
+        // reopening that mutable spelling inside the child.
+        .cwd = .{ .dir = dir },
         .stdout_limit = std.Io.Limit.limited(32 * 1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(4 * 1024 * 1024),
     });

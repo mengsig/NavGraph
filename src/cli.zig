@@ -255,7 +255,15 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
             const option_desc = registry.optionDescriptor(option);
             try w.writeAll("  ");
             if (option == .format) {
-                try w.writeAll("-j, --json | --jsonl  (text is the default)\n");
+                try w.writeAll("-j, --json");
+                if (registry.supportsOutput(desc.command, .jsonl)) try w.writeAll(" | --jsonl");
+                if (desc.outputs.len == 1 and desc.outputs[0] == .json) {
+                    try w.writeAll("  (JSON is always emitted)\n");
+                } else if (registry.supportsOutput(desc.command, .html)) {
+                    try w.writeAll("  (html is the default)\n");
+                } else {
+                    try w.writeAll("  (text is the default)\n");
+                }
                 continue;
             }
             if (option == .tests) {
@@ -266,9 +274,9 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
                 try w.writeAll("-p, --vis <all|public|private>; --public; --private; --no-private\n");
                 continue;
             }
-            for (option_desc.flags, 0..) |flag, i| {
+            for (option_desc.spellings, 0..) |spelling, i| {
                 if (i != 0) try w.writeAll(", ");
-                try w.writeAll(flag);
+                try w.writeAll(spelling.flag);
             }
             const values = commandOptionValues(desc, option);
             if (option_desc.value_kind != .boolean) {
@@ -290,6 +298,7 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
                 try w.writeByte('>');
             }
             if (option_desc.minimum) |minimum| try w.print("  (min {d})", .{minimum});
+            if (option_desc.value_separator) |separator| try w.print("  (repeat with '{s}')", .{separator});
             try w.writeByte('\n');
         }
     }
@@ -443,7 +452,7 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         while (it.next()) |raw_kind| {
             const t = std.mem.trim(u8, raw_kind, " ");
             if (!model.SymbolKind.validName(t))
-                return fail(error.BadValue, "unknown kind '{s}' for -k (known: fn,method,class,struct,enum,interface,type,variable,constant,field,macro,module,route,test)", .{t});
+                return fail(error.BadValue, "unknown kind '{s}' for -k (run `navgraph help outline` for the published values)", .{t});
         }
         out.options.kinds = val;
         return f.next(i);
@@ -686,6 +695,27 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
             return fail(error.Usage, "{s} requires option '{s}'", .{ @tagName(parsed.command), registry.optionDescriptor(option).name });
         }
     }
+    for (registry.descriptor(parsed.command).dependencies) |dependency| {
+        if (!parsed.used_options.contains(dependency.option)) continue;
+        const trigger = registry.optionDescriptor(dependency.option).name;
+        const required = registry.optionDescriptor(dependency.requires).name;
+        if (!parsed.used_options.contains(dependency.requires)) {
+            return fail(error.Usage, "option '{s}' requires option '{s}'", .{ trigger, required });
+        }
+        if (dependency.required_value) |expected| {
+            if (!optionMatchesValue(parsed, dependency.requires, expected)) {
+                return fail(error.Usage, "option '{s}' requires option '{s}' to have the advertised value", .{ trigger, required });
+            }
+        }
+    }
+    for (registry.descriptor(parsed.command).conflicts) |conflict| {
+        if (parsed.used_options.contains(conflict.first) and parsed.used_options.contains(conflict.second)) {
+            return fail(error.Usage, "options '{s}' and '{s}' are mutually exclusive", .{
+                registry.optionDescriptor(conflict.first).name,
+                registry.optionDescriptor(conflict.second).name,
+            });
+        }
+    }
     if (opts.impls and parsed.command != .calls and parsed.command != .callers and
         parsed.command != .neighbors and parsed.command != .path and parsed.command != .reaches and parsed.command != .affected)
     {
@@ -740,6 +770,19 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         if (parsed.command != .hot and (opts.sort == .fan_in or opts.sort == .fan_in_exact or opts.sort == .fan_out or opts.sort == .fan_out_exact))
             return fail(error.BadValue, "outline/search --sort expects line|name|span|callers|callees", .{});
     }
+}
+
+fn optionMatchesValue(parsed: Parsed, option: registry.Option, expected: registry.FixedValue) bool {
+    return switch (expected) {
+        .boolean => |value| switch (option) {
+            .refs => parsed.options.refs == value,
+            else => false,
+        },
+        .string => |value| switch (option) {
+            .format => std.mem.eql(u8, @tagName(parsed.options.format), value),
+            else => false,
+        },
+    };
 }
 
 fn parseCursor(s: []const u8) ParseError!u32 {
@@ -800,9 +843,28 @@ test "capabilities is a no-positional metadata command with version aliases" {
 test "descriptor applicability rejects accepted-but-meaningless flag combinations" {
     try std.testing.expectError(error.Usage, parse(&.{ "def", "x", "--no-recurse" }));
     try std.testing.expectEqual(@as(u32, 10), (try parse(&.{ "read", "x.zig", "--limit", "10" })).options.limit);
+    try std.testing.expectError(error.Usage, parse(&.{ "read", "x.zig", "--no-cache" }));
     try std.testing.expectError(error.Usage, parse(&.{ "serve", "--json" }));
     try std.testing.expect((try parse(&.{ "outline", "src", "--no-recurse" })).options.no_recurse);
     try std.testing.expect((try parse(&.{ "rename", "Old", "New", "--preview" })).options.preview);
+}
+
+test "descriptor dependencies and conflicts are enforced by the parser" {
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "needle", "--writers" }));
+    try std.testing.expect(std.mem.indexOf(u8, diag(), "requires option 'refs'") != null);
+    try std.testing.expect((try parse(&.{ "search", "needle", "--refs", "--writers" })).options.writers);
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "needle", "--after", "v1:1" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "needle", "--json", "--after", "v1:1" }));
+    try std.testing.expect((try parse(&.{ "search", "needle", "--jsonl", "--after", "v1:1" })).options.after_set);
+    try std.testing.expectError(error.Usage, parse(&.{ "search", "needle", "--refs", "--duplicates" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "routes", "--orphan-calls", "--clients" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "flow", "node", "--writers", "--readers" }));
+}
+
+test "fixed visibility spellings realize their advertised values" {
+    try std.testing.expectEqual(query.Vis.public, (try parse(&.{ "outline", "--public" })).options.visibility);
+    try std.testing.expectEqual(query.Vis.public, (try parse(&.{ "outline", "--no-private" })).options.visibility);
+    try std.testing.expectEqual(query.Vis.private, (try parse(&.{ "outline", "--private" })).options.visibility);
 }
 
 test "help lists every canonical command from the registry" {
@@ -1147,6 +1209,14 @@ test "usageCommand renders concise registry-derived argument and option help" {
     try testing.expect(std.mem.indexOf(u8, out, "-l, --limit <N>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--after <v1:N>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") == null);
+
+    const capabilities_start = aw.written().len;
+    try testing.expect(try usageCommand(&aw.writer, "capabilities"));
+    const capabilities_help = aw.written()[capabilities_start..];
+    try testing.expect(std.mem.indexOf(u8, capabilities_help, "OUTPUT: json") != null);
+    try testing.expect(std.mem.indexOf(u8, capabilities_help, "-j, --json  (JSON is always emitted)") != null);
+    try testing.expect(std.mem.indexOf(u8, capabilities_help, "--jsonl") == null);
+    try testing.expect(std.mem.indexOf(u8, capabilities_help, "text is the default") == null);
 }
 
 test "parse: default option values on a bare command" {

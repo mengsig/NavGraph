@@ -106,54 +106,78 @@ pub const Option = enum {
 
 pub const ValueKind = enum { boolean, string, integer, enumeration, cursor };
 
+pub const FixedValue = union(enum) {
+    boolean: bool,
+    string: []const u8,
+};
+
+pub const FlagSpelling = struct {
+    flag: []const u8,
+    takes_value: bool,
+    fixed_value: ?FixedValue = null,
+};
+
+fn valueFlag(flag: []const u8) FlagSpelling {
+    return .{ .flag = flag, .takes_value = true };
+}
+
+fn trueFlag(flag: []const u8) FlagSpelling {
+    return .{ .flag = flag, .takes_value = false, .fixed_value = .{ .boolean = true } };
+}
+
+fn fixedFlag(flag: []const u8, value: []const u8) FlagSpelling {
+    return .{ .flag = flag, .takes_value = false, .fixed_value = .{ .string = value } };
+}
+
 pub const OptionDescriptor = struct {
     option: Option,
     name: []const u8,
-    flags: []const []const u8,
+    spellings: []const FlagSpelling,
     value_kind: ValueKind,
     values: []const []const u8 = &.{},
+    value_separator: ?[]const u8 = null,
     minimum: ?u32 = null,
 };
 
 pub const option_descriptors = [_]OptionDescriptor{
-    .{ .option = .root, .name = "root", .flags = &.{ "-C", "--root" }, .value_kind = .string },
-    .{ .option = .no_cache, .name = "no_cache", .flags = &.{"--no-cache"}, .value_kind = .boolean },
-    .{ .option = .verbosity, .name = "verbosity", .flags = &.{ "-v", "--verbosity" }, .value_kind = .enumeration, .values = &.{ "names", "sig", "doc", "full" } },
-    .{ .option = .depth, .name = "depth", .flags = &.{ "-d", "--depth" }, .value_kind = .integer, .minimum = 0 },
-    .{ .option = .limit, .name = "limit", .flags = &.{ "-l", "--limit" }, .value_kind = .integer, .minimum = 1 },
-    .{ .option = .budget, .name = "budget", .flags = &.{"--budget"}, .value_kind = .integer, .minimum = 64 },
-    .{ .option = .max_nodes, .name = "max_nodes", .flags = &.{"--max-nodes"}, .value_kind = .integer, .minimum = 1 },
-    .{ .option = .summary, .name = "summary", .flags = &.{"--summary"}, .value_kind = .boolean },
-    .{ .option = .strict, .name = "strict", .flags = &.{ "-s", "--strict" }, .value_kind = .boolean },
-    .{ .option = .format, .name = "format", .flags = &.{ "-j", "--json", "--jsonl" }, .value_kind = .enumeration, .values = &.{ "text", "json", "jsonl" } },
-    .{ .option = .after, .name = "after", .flags = &.{"--after"}, .value_kind = .cursor },
-    .{ .option = .refs, .name = "refs", .flags = &.{ "-r", "--refs" }, .value_kind = .boolean },
-    .{ .option = .kind, .name = "kind", .flags = &.{ "-k", "--kind" }, .value_kind = .string },
-    .{ .option = .sort, .name = "sort", .flags = &.{"--sort"}, .value_kind = .enumeration, .values = &.{ "path", "symbols", "line", "name", "span", "callers", "callees", "fan_in", "fan_in_exact", "fan_out", "fan_out_exact", "commits", "lines" } },
-    .{ .option = .tests, .name = "tests", .flags = &.{ "-t", "--tests", "--no-tests", "--tests-only" }, .value_kind = .enumeration, .values = &.{ "with", "without", "only" } },
-    .{ .option = .exact, .name = "exact", .flags = &.{ "-e", "--exact" }, .value_kind = .boolean },
-    .{ .option = .no_recurse, .name = "no_recurse", .flags = &.{"--no-recurse"}, .value_kind = .boolean },
-    .{ .option = .visibility, .name = "visibility", .flags = &.{ "-p", "--vis", "--public", "--private", "--no-private" }, .value_kind = .enumeration, .values = &.{ "all", "public", "private" } },
-    .{ .option = .writers, .name = "writers", .flags = &.{ "-w", "--writers" }, .value_kind = .boolean },
-    .{ .option = .readers, .name = "readers", .flags = &.{"--readers"}, .value_kind = .boolean },
-    .{ .option = .unread, .name = "unread", .flags = &.{ "-u", "--unread" }, .value_kind = .boolean },
-    .{ .option = .on_type, .name = "on_type", .flags = &.{"--on-type"}, .value_kind = .string },
-    .{ .option = .to, .name = "to", .flags = &.{"--to"}, .value_kind = .string },
-    .{ .option = .duplicates, .name = "duplicates", .flags = &.{"--duplicates"}, .value_kind = .boolean },
-    .{ .option = .members, .name = "members", .flags = &.{"--members"}, .value_kind = .boolean },
-    .{ .option = .impls, .name = "impls", .flags = &.{ "-i", "--impls" }, .value_kind = .boolean },
-    .{ .option = .overrides, .name = "overrides", .flags = &.{"--overrides"}, .value_kind = .boolean },
-    .{ .option = .from_tests, .name = "from_tests", .flags = &.{"--from-tests"}, .value_kind = .boolean },
-    .{ .option = .since, .name = "since", .flags = &.{"--since"}, .value_kind = .string },
-    .{ .option = .last, .name = "last", .flags = &.{"--last"}, .value_kind = .integer, .minimum = 1 },
-    .{ .option = .preview, .name = "preview", .flags = &.{"--preview"}, .value_kind = .boolean },
-    .{ .option = .exact_source, .name = "exact_source", .flags = &.{"--exact-source"}, .value_kind = .boolean },
-    .{ .option = .clients, .name = "clients", .flags = &.{"--clients"}, .value_kind = .boolean },
-    .{ .option = .unhit, .name = "unhit", .flags = &.{"--unhit"}, .value_kind = .boolean },
-    .{ .option = .orphan_calls, .name = "orphan_calls", .flags = &.{ "--orphan-calls", "--orphan", "--orphans" }, .value_kind = .boolean },
-    .{ .option = .handler, .name = "handler", .flags = &.{"--handler"}, .value_kind = .string },
-    .{ .option = .no_public, .name = "no_public", .flags = &.{"--no-public"}, .value_kind = .boolean },
-    .{ .option = .follow_imports, .name = "follow_imports", .flags = &.{"--follow-imports"}, .value_kind = .boolean },
+    .{ .option = .root, .name = "root", .spellings = &.{ valueFlag("-C"), valueFlag("--root") }, .value_kind = .string },
+    .{ .option = .no_cache, .name = "no_cache", .spellings = &.{trueFlag("--no-cache")}, .value_kind = .boolean },
+    .{ .option = .verbosity, .name = "verbosity", .spellings = &.{ valueFlag("-v"), valueFlag("--verbosity") }, .value_kind = .enumeration, .values = &.{ "names", "sig", "doc", "full" } },
+    .{ .option = .depth, .name = "depth", .spellings = &.{ valueFlag("-d"), valueFlag("--depth") }, .value_kind = .integer, .minimum = 0 },
+    .{ .option = .limit, .name = "limit", .spellings = &.{ valueFlag("-l"), valueFlag("--limit") }, .value_kind = .integer, .minimum = 1 },
+    .{ .option = .budget, .name = "budget", .spellings = &.{valueFlag("--budget")}, .value_kind = .integer, .minimum = 64 },
+    .{ .option = .max_nodes, .name = "max_nodes", .spellings = &.{valueFlag("--max-nodes")}, .value_kind = .integer, .minimum = 1 },
+    .{ .option = .summary, .name = "summary", .spellings = &.{trueFlag("--summary")}, .value_kind = .boolean },
+    .{ .option = .strict, .name = "strict", .spellings = &.{ trueFlag("-s"), trueFlag("--strict") }, .value_kind = .boolean },
+    .{ .option = .format, .name = "format", .spellings = &.{ fixedFlag("-j", "json"), fixedFlag("--json", "json"), fixedFlag("--jsonl", "jsonl") }, .value_kind = .enumeration, .values = &.{ "text", "json", "jsonl" } },
+    .{ .option = .after, .name = "after", .spellings = &.{valueFlag("--after")}, .value_kind = .cursor },
+    .{ .option = .refs, .name = "refs", .spellings = &.{ trueFlag("-r"), trueFlag("--refs") }, .value_kind = .boolean },
+    .{ .option = .kind, .name = "kind", .spellings = &.{ valueFlag("-k"), valueFlag("--kind") }, .value_kind = .enumeration, .values = &.{ "fn", "function", "func", "method", "class", "struct", "enum", "iface", "interface", "type", "var", "variable", "const", "constant", "field", "macro", "mod", "module", "import", "route", "mount", "test", "sym" }, .value_separator = "," },
+    .{ .option = .sort, .name = "sort", .spellings = &.{valueFlag("--sort")}, .value_kind = .enumeration, .values = &.{ "path", "symbols", "line", "name", "span", "callers", "callees", "fan_in", "fan_in_exact", "fan_out", "fan_out_exact", "commits", "lines" } },
+    .{ .option = .tests, .name = "tests", .spellings = &.{ valueFlag("-t"), valueFlag("--tests"), fixedFlag("--no-tests", "without"), fixedFlag("--tests-only", "only") }, .value_kind = .enumeration, .values = &.{ "with", "without", "only" } },
+    .{ .option = .exact, .name = "exact", .spellings = &.{ trueFlag("-e"), trueFlag("--exact") }, .value_kind = .boolean },
+    .{ .option = .no_recurse, .name = "no_recurse", .spellings = &.{trueFlag("--no-recurse")}, .value_kind = .boolean },
+    .{ .option = .visibility, .name = "visibility", .spellings = &.{ valueFlag("-p"), valueFlag("--vis"), fixedFlag("--public", "public"), fixedFlag("--private", "private"), fixedFlag("--no-private", "public") }, .value_kind = .enumeration, .values = &.{ "all", "public", "private" } },
+    .{ .option = .writers, .name = "writers", .spellings = &.{ trueFlag("-w"), trueFlag("--writers") }, .value_kind = .boolean },
+    .{ .option = .readers, .name = "readers", .spellings = &.{trueFlag("--readers")}, .value_kind = .boolean },
+    .{ .option = .unread, .name = "unread", .spellings = &.{ trueFlag("-u"), trueFlag("--unread") }, .value_kind = .boolean },
+    .{ .option = .on_type, .name = "on_type", .spellings = &.{valueFlag("--on-type")}, .value_kind = .string },
+    .{ .option = .to, .name = "to", .spellings = &.{valueFlag("--to")}, .value_kind = .string },
+    .{ .option = .duplicates, .name = "duplicates", .spellings = &.{trueFlag("--duplicates")}, .value_kind = .boolean },
+    .{ .option = .members, .name = "members", .spellings = &.{trueFlag("--members")}, .value_kind = .boolean },
+    .{ .option = .impls, .name = "impls", .spellings = &.{ trueFlag("-i"), trueFlag("--impls") }, .value_kind = .boolean },
+    .{ .option = .overrides, .name = "overrides", .spellings = &.{trueFlag("--overrides")}, .value_kind = .boolean },
+    .{ .option = .from_tests, .name = "from_tests", .spellings = &.{trueFlag("--from-tests")}, .value_kind = .boolean },
+    .{ .option = .since, .name = "since", .spellings = &.{valueFlag("--since")}, .value_kind = .string },
+    .{ .option = .last, .name = "last", .spellings = &.{valueFlag("--last")}, .value_kind = .integer, .minimum = 1 },
+    .{ .option = .preview, .name = "preview", .spellings = &.{trueFlag("--preview")}, .value_kind = .boolean },
+    .{ .option = .exact_source, .name = "exact_source", .spellings = &.{trueFlag("--exact-source")}, .value_kind = .boolean },
+    .{ .option = .clients, .name = "clients", .spellings = &.{trueFlag("--clients")}, .value_kind = .boolean },
+    .{ .option = .unhit, .name = "unhit", .spellings = &.{trueFlag("--unhit")}, .value_kind = .boolean },
+    .{ .option = .orphan_calls, .name = "orphan_calls", .spellings = &.{ trueFlag("--orphan-calls"), trueFlag("--orphan"), trueFlag("--orphans") }, .value_kind = .boolean },
+    .{ .option = .handler, .name = "handler", .spellings = &.{valueFlag("--handler")}, .value_kind = .string },
+    .{ .option = .no_public, .name = "no_public", .spellings = &.{trueFlag("--no-public")}, .value_kind = .boolean },
+    .{ .option = .follow_imports, .name = "follow_imports", .spellings = &.{trueFlag("--follow-imports")}, .value_kind = .boolean },
 };
 
 pub const CommandDescriptor = struct {
@@ -164,16 +188,32 @@ pub const CommandDescriptor = struct {
     options: []const Option = &.{},
     required_options: []const Option = &.{},
     option_value_overrides: []const OptionValueOverride = &.{},
+    dependencies: []const OptionDependency = &.{},
+    conflicts: []const OptionConflict = &.{},
     outputs: []const OutputMode,
     access: Access,
     requires_index: bool,
     server_available: bool = true,
+    cache_effect: CacheEffect = .may_read_write,
 };
 
 pub const OptionValueOverride = struct {
     option: Option,
     values: []const []const u8,
 };
+
+pub const OptionDependency = struct {
+    option: Option,
+    requires: Option,
+    required_value: ?FixedValue = null,
+};
+
+pub const OptionConflict = struct {
+    first: Option,
+    second: Option,
+};
+
+pub const CacheEffect = enum { none, may_read_write };
 
 const no_args = [_]Argument{};
 const help_args = [_]Argument{.{ .name = "command", .kind = .command_name, .required = false }};
@@ -203,18 +243,36 @@ const outline_sort_values = [_]OptionValueOverride{.{ .option = .sort, .values =
 const files_sort_values = [_]OptionValueOverride{.{ .option = .sort, .values = &.{ "path", "symbols" } }};
 const hot_sort_values = [_]OptionValueOverride{.{ .option = .sort, .values = &.{ "fan_in", "fan_in_exact", "fan_out", "fan_out_exact", "span" } }};
 const churn_sort_values = [_]OptionValueOverride{.{ .option = .sort, .values = &.{ "commits", "lines" } }};
+const jsonl_after_dependency = [_]OptionDependency{.{ .option = .after, .requires = .format, .required_value = .{ .string = "jsonl" } }};
+const search_dependencies = [_]OptionDependency{
+    .{ .option = .after, .requires = .format, .required_value = .{ .string = "jsonl" } },
+    .{ .option = .writers, .requires = .refs },
+    .{ .option = .readers, .requires = .refs },
+    .{ .option = .unread, .requires = .refs },
+    .{ .option = .on_type, .requires = .refs },
+};
+const search_conflicts = [_]OptionConflict{
+    .{ .first = .writers, .second = .readers },
+    .{ .first = .duplicates, .second = .refs },
+};
+const flow_conflicts = [_]OptionConflict{.{ .first = .writers, .second = .readers }};
+const route_conflicts = [_]OptionConflict{
+    .{ .first = .orphan_calls, .second = .clients },
+    .{ .first = .orphan_calls, .second = .unhit },
+    .{ .first = .orphan_calls, .second = .handler },
+};
 
 /// Every command appears exactly once. Option lists describe documented,
 /// semantically effective applicability rather than every no-op combination the
 /// historical parser happened to accept.
 pub const command_descriptors = [_]CommandDescriptor{
-    .{ .command = .outline, .name = "outline", .aliases = &.{"o"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .format, .after, .kind, .sort, .tests, .no_recurse, .visibility }, .option_value_overrides = &outline_sort_values, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .outline, .name = "outline", .aliases = &.{"o"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .format, .after, .kind, .sort, .tests, .no_recurse, .visibility }, .option_value_overrides = &outline_sort_values, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .def, .name = "def", .aliases = &.{"show"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .format, .visibility }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .docs, .name = "docs", .aliases = &.{"doc"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .calls, .name = "calls", .aliases = &.{"callees"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .callers, .name = "callers", .aliases = &.{"uses"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .tests, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .search, .name = "search", .aliases = &.{"grep"}, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .refs, .kind, .sort, .tests, .exact, .visibility, .writers, .readers, .unread, .on_type, .duplicates }, .option_value_overrides = &outline_sort_values, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .routes, .name = "routes", .aliases = &.{"api"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .clients, .unhit, .orphan_calls, .handler }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .search, .name = "search", .aliases = &.{"grep"}, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .refs, .kind, .sort, .tests, .exact, .visibility, .writers, .readers, .unread, .on_type, .duplicates }, .option_value_overrides = &outline_sort_values, .dependencies = &search_dependencies, .conflicts = &search_conflicts, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .routes, .name = "routes", .aliases = &.{"api"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .clients, .unhit, .orphan_calls, .handler }, .conflicts = &route_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .events, .name = "events", .aliases = &.{ "dispatch", "bus" }, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .conforms, .name = "conforms", .aliases = &.{ "impls", "implements" }, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .hierarchy, .name = "hierarchy", .aliases = &.{"hier"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .overrides }, .outputs = &text_json, .access = .read_only, .requires_index = true },
@@ -225,28 +283,28 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .imports, .name = "imports", .arguments = &optional_filter, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .importers, .name = "importers", .arguments = &file_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .path, .name = "path", .arguments = &path_args, .options = &.{ .root, .no_cache, .verbosity, .strict, .format, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .flow, .name = "flow", .aliases = &.{"dataflow"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .writers, .readers, .unread, .on_type, .to }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .flow, .name = "flow", .aliases = &.{"dataflow"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .writers, .readers, .unread, .on_type, .to }, .conflicts = &flow_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .taint, .name = "taint", .aliases = &.{"security"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .strict, .format, .to }, .required_options = &.{.to}, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .reaches, .name = "reaches", .aliases = &.{"reachable"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .tests, .impls, .from_tests }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .affected, .name = "affected", .aliases = &.{"impact"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .impls, .since }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .hot, .name = "hot", .aliases = &.{"central"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .sort, .tests }, .option_value_overrides = &hot_sort_values, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .reaches, .name = "reaches", .aliases = &.{"reachable"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .tests, .impls, .from_tests }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .affected, .name = "affected", .aliases = &.{"impact"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .impls, .since }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .hot, .name = "hot", .aliases = &.{"central"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .sort, .tests }, .option_value_overrides = &hot_sort_values, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .diff, .name = "diff", .aliases = &.{"changed"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .format, .exact_source }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .history, .name = "history", .aliases = &.{"hist"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .last }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .blame, .name = "blame", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .churn, .name = "churn", .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .sort, .since, .last }, .option_value_overrides = &churn_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .collisions, .name = "collisions", .aliases = &.{"duplicates"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .kind, .tests, .visibility, .members }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .files, .name = "files", .aliases = &.{"manifest"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .sort, .no_recurse }, .option_value_overrides = &files_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .status, .name = "status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .after, .no_recurse }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .no_cache, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .status, .name = "status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .after, .no_recurse }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = false, .cache_effect = .none },
     .{ .command = .strings, .name = "strings", .aliases = &.{ "str", "literals" }, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .todos, .name = "todos", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .after }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .edits, .name = "edits", .aliases = &.{"edit-sites"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .format, .after }, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .rename, .name = "rename", .arguments = &rename_args, .options = &.{ .root, .no_cache, .format, .preview }, .outputs = &text_json, .access = .mutating, .requires_index = true },
+    .{ .command = .todos, .name = "todos", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .edits, .name = "edits", .aliases = &.{"edit-sites"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .rename, .name = "rename", .arguments = &rename_args, .options = &.{ .root, .no_cache, .format, .preview }, .outputs = &text_json, .access = .mutating, .requires_index = true, .server_available = false },
     .{ .command = .coverage, .name = "coverage", .aliases = &.{"cov"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
-    .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false },
+    .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
     .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
-    .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false },
+    .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false, .cache_effect = .none },
 };
 
 pub fn parseCommand(name: []const u8) ?Command {
@@ -267,7 +325,7 @@ pub fn optionDescriptor(option: Option) *const OptionDescriptor {
 
 pub fn parseOptionFlag(flag: []const u8) ?Option {
     for (&option_descriptors) |desc| {
-        for (desc.flags) |spelling| if (std.mem.eql(u8, flag, spelling)) return desc.option;
+        for (desc.spellings) |spelling| if (std.mem.eql(u8, flag, spelling.flag)) return desc.option;
     }
     return null;
 }
@@ -306,10 +364,19 @@ test "option registry covers enum order exactly and command references are valid
     for (&option_descriptors, 0..) |desc, ordinal| {
         try std.testing.expectEqual(@as(usize, @intFromEnum(desc.option)), ordinal);
         try std.testing.expectEqualStrings(@tagName(desc.option), desc.name);
-        try std.testing.expect(desc.flags.len > 0);
-        for (desc.flags) |flag| {
-            try std.testing.expect((try flags.fetchPut(std.testing.allocator, flag, {})) == null);
-            try std.testing.expectEqual(desc.option, parseOptionFlag(flag).?);
+        try std.testing.expect(desc.spellings.len > 0);
+        for (desc.spellings) |spelling| {
+            try std.testing.expect((try flags.fetchPut(std.testing.allocator, spelling.flag, {})) == null);
+            try std.testing.expectEqual(desc.option, parseOptionFlag(spelling.flag).?);
+            try std.testing.expect(spelling.takes_value == (spelling.fixed_value == null));
+            if (desc.value_kind == .boolean) {
+                try std.testing.expect(!spelling.takes_value);
+                try std.testing.expect(spelling.fixed_value.? == .boolean and spelling.fixed_value.?.boolean);
+            }
+        }
+        if (desc.value_separator) |separator| {
+            try std.testing.expect(separator.len != 0);
+            try std.testing.expect(desc.values.len != 0);
         }
         var applies_to: usize = 0;
         for (&command_descriptors) |command| {
@@ -318,6 +385,7 @@ test "option registry covers enum order exactly and command references are valid
         try std.testing.expect(applies_to > 0);
     }
     for (&command_descriptors) |command| {
+        if (command.server_available) try std.testing.expect(command.access == .read_only or command.command == .capabilities);
         var seen = std.EnumSet(Option).initEmpty();
         for (command.options) |option| {
             try std.testing.expect(!seen.contains(option));
@@ -328,6 +396,28 @@ test "option registry covers enum order exactly and command references are valid
         for (command.option_value_overrides) |override| {
             try std.testing.expect(hasOption(command.command, override.option));
             try std.testing.expect(override.values.len > 0);
+        }
+        for (command.dependencies) |dependency| {
+            try std.testing.expect(hasOption(command.command, dependency.option));
+            try std.testing.expect(hasOption(command.command, dependency.requires));
+            try std.testing.expect(dependency.option != dependency.requires);
+            if (dependency.required_value) |value| switch (value) {
+                .boolean => try std.testing.expect(optionDescriptor(dependency.requires).value_kind == .boolean),
+                .string => |expected| {
+                    const required = optionDescriptor(dependency.requires);
+                    try std.testing.expect(required.value_kind == .enumeration or required.value_kind == .string);
+                    var supported = required.values.len == 0;
+                    for (required.values) |candidate| {
+                        if (std.mem.eql(u8, candidate, expected)) supported = true;
+                    }
+                    try std.testing.expect(supported);
+                },
+            };
+        }
+        for (command.conflicts) |conflict| {
+            try std.testing.expect(hasOption(command.command, conflict.first));
+            try std.testing.expect(hasOption(command.command, conflict.second));
+            try std.testing.expect(conflict.first != conflict.second);
         }
     }
 }

@@ -172,6 +172,23 @@ pub fn build(b: *std.Build) void {
     const contract_step = b.step("contract", "Run black-box agent and polyglot corpus contracts");
     contract_step.dependOn(&contract_cmd.step);
 
+    // The shell contract covers real corpus behavior. This generated companion
+    // consumes the executable's own capability JSON and synthesizes invalid and
+    // valid argv, catching descriptor/parser drift without duplicating flags.
+    const manifest_contract_exe = b.addExecutable(.{
+        .name = "manifest-contract",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/manifest-contract.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const manifest_contract_cmd = b.addRunArtifact(manifest_contract_exe);
+    manifest_contract_cmd.addArtifactArg(exe);
+    manifest_contract_cmd.addDirectoryArg(b.path("."));
+    manifest_contract_cmd.setCwd(b.path("."));
+    contract_step.dependOn(&manifest_contract_cmd.step);
+
     const efficiency_cmd = b.addSystemCommand(&.{"sh"});
     efficiency_cmd.addFileArg(b.path("tests/efficiency-contract.sh"));
     efficiency_cmd.addArtifactArg(exe);
@@ -180,6 +197,7 @@ pub fn build(b: *std.Build) void {
     const efficiency_step = b.step("efficiency", "Check deterministic agent-context compression budgets");
     efficiency_step.dependOn(&efficiency_cmd.step);
     test_step.dependOn(&contract_cmd.step);
+    test_step.dependOn(&manifest_contract_cmd.step);
     test_step.dependOn(&efficiency_cmd.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
