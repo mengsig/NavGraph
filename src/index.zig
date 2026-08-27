@@ -1198,6 +1198,10 @@ fn importTarget(idx: *const Index, file: FileId, binding: []const u8) ?FileId {
 
 fn hasNonLocalImportBinding(idx: *const Index, file: FileId, binding: []const u8) bool {
     if (binding.len == 0) return false;
+    // Only a language whose import forms we actually resolve can *prove* a
+    // binding is non-local. For Rust `use` (unmodelled) every binding looks
+    // non-local, and the guard silently deleted every cross-file call edge.
+    if (!idx.graph.files[file].language.resolvesImportBindings()) return false;
     for (idx.importOutcomesOf(file)) |outcome| {
         if (outcome.status == .resolved_local or outcome.binding.len == 0) continue;
         if (std.mem.eql(u8, outcome.binding, binding)) return true;
@@ -2511,6 +2515,48 @@ test "checked-in Rust corpus parents a cross-file nominal impl on its type" {
         saw_impl = true;
     }
     try testing.expect(saw_impl);
+}
+
+test "checked-in Rust corpus: `use` bindings keep their cross-file call edges" {
+    // Regression: the non-local-import guard fired on Rust `use` bindings, which
+    // the indexer does not model, deleting every Rust cross-file call edge.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    defer idx.deinit();
+
+    const run = idx.lookup("run")[0];
+    const parse_str = idx.lookup("parse_str")[0];
+    const tokenize = idx.lookup("tokenize")[0];
+
+    // `use parser::parse_str;` then `parse_str(src)` in main.rs::run.
+    try testing.expectEqual(run, idx.callersOf(parse_str)[0]);
+    // `use crate::lexer::{tokenize, Token};` then `tokenize(src)` in parse_str.
+    try testing.expectEqual(parse_str, idx.callersOf(tokenize)[0]);
+}
+
+test "a JS import binding still blocks the global-name fallback" {
+    // The guard's original purpose: an imported `run` must not bind to an
+    // unrelated workspace `run`. Scoping it by language must not lose this.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "local.js", .data =
+        \\export function run() { return 1; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.js", .data =
+        \\import run from "some-external-pkg";
+        \\export function boot() { return run(); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const local_run = idx.lookup("run")[0];
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(local_run).len);
 }
 
 test "Rust cross-file impl parenting survives a warm cache restore" {
