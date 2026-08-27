@@ -127,16 +127,22 @@ line), not a regression, and floors were lowered to match with `--lower-floors
 
 | language | what moved | why |
 |---|---|---|
-| cpp | edge P 41.66→38.46, edge R 18.75→17.64 | F4 gave `Weights::operator()`'s out-of-line definition its real name, adding edges the golden was missing while it was misnamed |
-| csharp | edge R 51.51→49.27 | F5 added the `InventoryService.InventoryService -> Product` generic-arg edge, matching the sibling `List<T>` sites already recorded |
+| cpp | edge P 41.66→38.46, edge R 18.75→17.64 | matched stayed 15 throughout - F12's dedupe-key change (`{from,to}` string pair → `{sym.id, ref.target}`) is entirely what moved this row, splitting `Analyzer.measure`'s edges 6→9 (produced) and `tricky_run -> Analyzer.measure` 1→3 (expected 80→85). F4 renamed one definition (`Weights::operator()`'s out-of-line name); no cpp edge names it, and F4 alone changed nothing here (re-verified by re-measuring at each intermediate commit) |
+| csharp | edge R 51.51→49.27 | expected grew by three, from two fixes: +1 from F5 (`InventoryService.InventoryService -> Product`), +2 from F12 splitting the merged `TrickyRunner.Run -> Ledger.Post` [217,218,219] into three `to_line`-qualified edges |
 | go | def R 80.00→79.20, edge R 47.36→45.00 | F8 added the missing `Auditor.Describer` embedded-field definition; F5 added `NewMemoryStore`'s three missing body edges |
-| java | edge P 78.94→77.92, edge R 61.22→55.04 | F5 added nine constructor-call edges the corpus's own pattern already covered at other `new X(...)` sites; F10's two added call-site lines and F12's key split shifted the produced count by one |
+| java | edge P 78.94→77.92, edge R 61.22→55.04 | expected grew by eleven, not nine: F5 added nine constructor-call edges the corpus's own pattern already covered at other `new X(...)` sites (98→107), and F12's key split added two more by splitting the merged `Tricky.run -> Ledger.post` [186,187,190] into three `to_line`-qualified edges (107→109); F12 alone (not F5, and not F10's line-only additions) also shifted produced 76→77, moving precision |
 | javascript | edge R 75.40→73.01 | F5 added the renamed-import edge (`syncAll -> formatStatus`) and `TaggedLedger`'s `super(...)` constructor edge, both patterns already recorded elsewhere in the corpus |
-| lua | def P 92.72→90.90, def R 68.00→66.66, edge R 63.04→54.71 | F3 corrected six wrong lines/parents, and one previously-coincidental def match no longer lines up with the corrected line (a real miss, not a new one); F5 added six missing edges the corpus's own "is the call site covered" rule required |
+| lua | def P 92.72→90.90, def R 68.00→66.66, edge R 63.04→54.71 | F3 corrected six wrong lines/parents, and one previously-coincidental def match no longer lines up with the corrected line (a real miss, not a new one); F5 added SEVEN missing edges, not six - the six the coldstart listed plus `M.run -> M.limits.clampers.hard` [186], which only became expressible after F3 renamed the definition it targets |
 | python | edge R 85.40→86.02 | F6 dropped two bogus edges from a decorator's own parameter (net -1 after F12 split one merged overload edge into two) - recall rose because the denominator shrank on a corrected golden |
-| ruby | def R 75.00→67.50, edge R 23.21→20.96 | F9 added the eight missing `attr_accessor` writer definitions the corpus's own notes require, growing both denominators |
+| ruby | def R 75.00→67.50, edge R 23.21→20.96 | F9 added the eight missing `attr_accessor` writer definitions (def denominator only, 72→80); the edge denominator grew separately, 56→62, from F5's six new heuristic edges - F9 added no edge |
 | typescript | def R 56.30→56.77 (up), edge R 45.45→44.64 (down) | F11 dropped the one spurious `PostList.pending` definition, raising def R; F12's overload/field-accessor key split gave one merged edge its own separate line-disambiguated pair, growing the edge denominator by one |
 | c, csharp (def), rust, zig | unchanged | no F-fix touched these goldens' scored def/edge counts |
+
+Re-derived by re-measuring at every intermediate commit between `b69f397` and
+`4b51658`, not by reading the diffs and guessing which fix caused which
+delta - five of the ten rows above (cpp, csharp, java, ruby, lua) named the
+wrong fix, or the right fix with the wrong count, in the version of this
+table that shipped with fix round 1.
 
 Floors were lowered for exactly the fourteen metrics that dropped above (cpp
 edge P + edge R, csharp edge R, go def R + edge R, java edge P + edge R,
