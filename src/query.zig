@@ -2578,7 +2578,7 @@ pub fn flowPathBetweenIds(idx: *const Index, ids: []const SymbolId, sinks: []con
 }
 
 /// The number of distinct resolved callees (outgoing edges) of `sym`.
-fn fanOut(sym: model.Symbol) u32 {
+pub fn fanOut(sym: model.Symbol) u32 {
     var out: u32 = 0;
     for (sym.refs) |ref| {
         if (ref.target != invalid) out += 1;

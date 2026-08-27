@@ -104,7 +104,20 @@ pub fn pathFromUri(gpa: std.mem.Allocator, uri: []const u8) ![]u8 {
 pub fn writeUri(w: *std.Io.Writer, abs_path: []const u8) !void {
     try w.writeAll("file://");
     if (abs_path.len == 0 or abs_path[0] != '/') try w.writeByte('/');
-    for (abs_path) |c| {
+    try escapePath(w, abs_path);
+}
+
+/// Write the `file://` URI of `rel_path` under `root_abs`, without materializing
+/// the joined path — the hot path for every symbol in a payload.
+pub fn writeUriIn(w: *std.Io.Writer, root_abs: []const u8, rel_path: []const u8) !void {
+    try writeUri(w, root_abs);
+    if (rel_path.len == 0) return;
+    if (!std.mem.endsWith(u8, root_abs, "/")) try w.writeByte('/');
+    try escapePath(w, rel_path);
+}
+
+fn escapePath(w: *std.Io.Writer, path: []const u8) !void {
+    for (path) |c| {
         if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-_.~/:", c) != null) {
             try w.writeByte(c);
         } else {
@@ -191,6 +204,21 @@ test "writeUri escapes and round-trips through pathFromUri" {
     const back = try pathFromUri(testing.allocator, aw.written());
     defer testing.allocator.free(back);
     try testing.expectEqualStrings("/home/my dir/a+b.zig", back);
+}
+
+test "writeUriIn joins a root and a relative path into one URI" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeUriIn(&aw.writer, "/w/repo", "src/a b.zig");
+    try testing.expectEqualStrings("file:///w/repo/src/a%20b.zig", aw.written());
+
+    aw.clearRetainingCapacity();
+    try writeUriIn(&aw.writer, "/w/repo/", "src/a.zig");
+    try testing.expectEqualStrings("file:///w/repo/src/a.zig", aw.written());
+
+    aw.clearRetainingCapacity();
+    try writeUriIn(&aw.writer, "/w/repo", "");
+    try testing.expectEqualStrings("file:///w/repo", aw.written());
 }
 
 test "relativeTo strips the root and rejects paths outside it" {

@@ -179,11 +179,13 @@ fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
 
-/// The 0-based `enc` column where `name` occurs on 1-based `line`, or 0 when it
-/// is not found. Used to point a `Location` at the name rather than the margin.
-pub fn columnOfName(text: []const u8, line_1based: u32, name: []const u8, enc: Encoding) u32 {
-    if (line_1based == 0 or name.len == 0) return 0;
-    const line = lineSlice(text, line_1based - 1) orelse return 0;
+/// The 0-based `enc` column of the whole-word occurrence of `name` on 1-based
+/// `line`, or null when the line does not contain it. Lets a `Location` point at
+/// the name rather than the margin, and lets the caller tell "column 0" from
+/// "not found".
+pub fn columnOfName(text: []const u8, line_1based: u32, name: []const u8, enc: Encoding) ?u32 {
+    if (line_1based == 0 or name.len == 0) return null;
+    const line = lineSlice(text, line_1based - 1) orelse return null;
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, line, from, name)) |at| {
         const before_ok = at == 0 or !lexer.isIdentCont(line[at - 1]);
@@ -192,7 +194,7 @@ pub fn columnOfName(text: []const u8, line_1based: u32, name: []const u8, enc: E
         if (before_ok and after_ok) return byteToColumn(line[0..at], enc);
         from = at + 1;
     }
-    return 0;
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,12 +298,13 @@ test "identifierAt selects the last word of a dotted chain, not the whole chain"
 
 test "columnOfName finds a whole-word occurrence in the negotiated encoding" {
     const text = "const x = 1;\n    h\u{e9}llo(run);\n";
-    try testing.expectEqual(@as(u32, 6), columnOfName(text, 1, "x", .utf8));
+    try testing.expectEqual(@as(u32, 6), columnOfName(text, 1, "x", .utf8).?);
     // `run` sits after a 2-byte é on line 2.
-    try testing.expectEqual(@as(u32, 10), columnOfName(text, 2, "run", .utf16));
-    try testing.expectEqual(@as(u32, 11), columnOfName(text, 2, "run", .utf8));
-    // Not found, or a substring of a longer word, falls back to column 0.
-    try testing.expectEqual(@as(u32, 0), columnOfName(text, 1, "nope", .utf8));
-    try testing.expectEqual(@as(u32, 0), columnOfName(text, 2, "ell", .utf8));
-    try testing.expectEqual(@as(u32, 0), columnOfName(text, 0, "x", .utf8));
+    try testing.expectEqual(@as(u32, 10), columnOfName(text, 2, "run", .utf16).?);
+    try testing.expectEqual(@as(u32, 11), columnOfName(text, 2, "run", .utf8).?);
+    // Absent, a substring of a longer word, or an out-of-range line: not found.
+    try testing.expect(columnOfName(text, 1, "nope", .utf8) == null);
+    try testing.expect(columnOfName(text, 2, "ell", .utf8) == null);
+    try testing.expect(columnOfName(text, 0, "x", .utf8) == null);
+    try testing.expect(columnOfName(text, 99, "x", .utf8) == null);
 }
