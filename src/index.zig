@@ -497,6 +497,19 @@ fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile
     return .{ .symbols = try b.arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
 }
 
+/// Write the parse-health warning for `rel_path` into `w`, or nothing when the
+/// file tokenized cleanly. Kept apart from the stderr sink so tests cover the
+/// message and its assertions without writing to the test binary's stderr.
+fn writeParseHealthWarning(w: *std.Io.Writer, rel_path: []const u8, health: model.ParseHealth) std.Io.Writer.Error!void {
+    const from = health.desync_from orelse return;
+    std.debug.assert(rel_path.len > 0);
+    std.debug.assert(health.desync_to >= from);
+    try w.print(
+        "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
+        .{ rel_path, from, health.desync_to },
+    );
+}
+
 /// Warn on stderr that a file's tokenization desynced. Silent under test: the
 /// Zig build runner prints its `failed command:` reproduction hint whenever a
 /// test binary writes to stderr, so a fixture with a deliberately unterminated
@@ -505,13 +518,13 @@ fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile
 /// `parse_health` JSON field.
 fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
     if (builtin.is_test) return;
-    const from = health.desync_from orelse return;
-    std.debug.assert(rel_path.len > 0);
-    std.debug.assert(health.desync_to >= from);
-    std.debug.print(
-        "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
-        .{ rel_path, from, health.desync_to },
-    );
+    if (health.desync_from == null) return;
+    // Diagnostic only, and the authoritative data is on the index, so a path too
+    // long for the buffer is printed truncated rather than dropped.
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeParseHealthWarning(&w, rel_path, health) catch {};
+    std.debug.print("{s}", .{w.buffered()});
 }
 
 /// Assign global ids to `parsed`, append its symbols and the owning `SourceFile`
@@ -988,19 +1001,28 @@ fn javaInheritedMemberFrom(
 /// Precompute every Java type's declared supertypes into `Index.java_bases`.
 /// The lookup this replaces scanned the whole symbol table per unresolved Java
 /// reference, recursed 16 deep — O(references x symbols x depth), which made
-/// index build super-linear in file count. Arena-owned; dies with the index.
+/// index build super-linear in file count. The table itself is arena-owned and
+/// dies with the index; the scratch used to build it is not, and is released
+/// here.
 fn buildJavaBaseTable(idx: *Index) !void {
     const arena = idx.arena.allocator();
+    const gpa = idx.gpa;
 
     var by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(SymbolId)) = .empty;
+    defer {
+        var vit = by_name.valueIterator();
+        while (vit.next()) |list| list.deinit(gpa);
+        by_name.deinit(gpa);
+    }
     for (idx.graph.symbols) |sym| {
         if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
-        const slot = try by_name.getOrPut(arena, sym.name);
+        const slot = try by_name.getOrPut(gpa, sym.name);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
-        try slot.value_ptr.append(arena, sym.id);
+        try slot.value_ptr.append(gpa, sym.id);
     }
 
     var bases: std.ArrayListUnmanaged(SymbolId) = .empty;
+    defer bases.deinit(gpa);
     for (idx.graph.symbols) |sym| {
         if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
         bases.clearRetainingCapacity();
@@ -1015,7 +1037,7 @@ fn buildJavaBaseTable(idx: *Index) !void {
                 if (imported) |target_file| {
                     if (idx.graph.symbols[cid].file != target_file) continue;
                 }
-                try bases.append(arena, cid);
+                try bases.append(gpa, cid);
             }
         }
         if (bases.items.len == 0) continue;
@@ -3088,25 +3110,18 @@ test "checked-in Java corpus resolves lexical, static-import, and inherited memb
     try testing.expectEqual(model.ResolutionReason.inheritance, cents_ref.resolution_reason);
 }
 
-test "Java inherited-member resolution stays linear in symbol count" {
-    // Regression (perf): the inherited-member lookup scanned the whole symbol
-    // table per unresolved Java reference, so index build went quadratic in
-    // project size (4,192 files: 120 ms -> 4.4 s warm). Kept deliberately
-    // file-light so the bound measures resolution, not file I/O: the pre-fix
-    // scan needs seconds here, the precomputed table milliseconds.
+/// Write a Java corpus of `groups` files, each declaring `per_group` subclasses
+/// of a shared `Base`, and return how long indexing it took in milliseconds.
+/// Deliberately file-light so the timing measures resolution, not file I/O.
+fn javaInheritanceBuildMs(tmp: *std.testing.TmpDir, groups: usize, per_group: usize) !i64 {
     const testing = std.testing;
     const io = testing.io;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
     try tmp.dir.writeFile(io, .{ .sub_path = "Base.java", .data =
         \\public class Base {
         \\    public int shared() { return 1; }
         \\}
     });
 
-    const groups = 60;
-    const per_group = 40;
     var source: std.ArrayListUnmanaged(u8) = .empty;
     defer source.deinit(testing.allocator);
     var name_buf: [64]u8 = undefined;
@@ -3135,8 +3150,58 @@ test "Java inherited-member resolution stays linear in symbol count" {
     // Every subclass still reaches the inherited member — the table is a
     // speedup, not a drop in recall.
     const shared = idx.lookup("shared")[0];
-    try testing.expectEqual(@as(usize, groups * per_group), idx.callersOf(shared).len);
-    try testing.expect(elapsed_ms < 1500);
+    try testing.expectEqual(groups * per_group, idx.callersOf(shared).len);
+    return @intCast(elapsed_ms);
+}
+
+test "Java inherited-member resolution stays linear in symbol count" {
+    // Regression (perf): the inherited-member lookup scanned the whole symbol
+    // table per unresolved Java reference, so index build went quadratic in
+    // project size (4,192 files: 120 ms -> 4.4 s warm).
+    //
+    // Bound is a ratio measured in this same run, not wall-clock: a saturated
+    // runner slows both builds together, so the assertion does not drift with
+    // machine load (F6). Ten times the symbols is ten times the work when
+    // linear and a hundred times when quadratic; 3x slack over linear separates
+    // them with room to spare, and the floor keeps a sub-millisecond baseline
+    // from making the bound meaningless.
+    const testing = std.testing;
+    const per_group = 40;
+    const small_groups = 6;
+    const groups = 60;
+
+    var small_tmp = testing.tmpDir(.{ .iterate = true });
+    defer small_tmp.cleanup();
+    const small_ms = try javaInheritanceBuildMs(&small_tmp, small_groups, per_group);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const elapsed_ms = try javaInheritanceBuildMs(&tmp, groups, per_group);
+
+    const scale: i64 = groups / small_groups;
+    const linear_bound = 3 * scale * small_ms + 50;
+    try testing.expect(elapsed_ms <= linear_bound);
+}
+
+test "the parse-health warning names the file and the desynced line range" {
+    // Regression (F7): the whole diagnostic was `if (builtin.is_test) return;`,
+    // so nothing exercised its assertions or its message. The stderr *sink* is
+    // still silent under test — a test binary that writes to stderr makes the
+    // build runner print its `failed command:` hint on a green run.
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    try writeParseHealthWarning(&w, "src/broken.zig", .{ .desync_from = 12, .desync_to = 40 });
+    const written = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, written, "src/broken.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "lines 12-40") != null);
+
+    // A clean file writes nothing at all.
+    var clean_buf: [256]u8 = undefined;
+    var clean: std.Io.Writer = .fixed(&clean_buf);
+    try writeParseHealthWarning(&clean, "src/ok.zig", .{});
+    try testing.expectEqual(@as(usize, 0), clean.buffered().len);
 }
 
 test "the precomputed Java supertype table records declared bases only" {
