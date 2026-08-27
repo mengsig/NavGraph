@@ -157,3 +157,21 @@ Takeaways:
 
 Raw data: `results.json` alongside this file's measurement run is not checked
 in (regenerate with the commands above); the table here is the record.
+
+## Cross-compile matrix
+
+`zig build -Dtree-sitter=all -Doptimize=ReleaseFast -Dtarget=<t>`, each output
+verified with `file`:
+
+| target | result |
+| --- | --- |
+| `aarch64-macos` | OK — Mach-O 64-bit arm64 executable |
+| `x86_64-macos` | OK — Mach-O 64-bit x86_64 executable |
+| `aarch64-linux` | OK — ELF 64-bit LSB executable, ARM aarch64, statically linked |
+| `x86_64-linux-musl` | OK — ELF 64-bit LSB executable, x86-64, statically linked |
+
+All four link the tree-sitter runtime and all three grammars with no changes
+needed to `build.zig` — `addCSourceFile`/`addIncludePath` on the cross target's
+own module already cross-compile the C sources via zig's bundled clang, and
+`.linkage = .static` keeps the single-binary property `-Dtree-sitter=none`
+already had.
