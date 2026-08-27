@@ -218,10 +218,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| accuracy_cmd.addArgs(args);
     const accuracy_step = b.step("bench", "Score the indexer against the golden accuracy corpora");
     accuracy_step.dependOn(&accuracy_cmd.step);
+
+    // White-box tests inside accuracy-bench.zig itself (the floor ratchet,
+    // ratioBp) - not covered by mod_tests/exe_tests, which only root at
+    // src/root.zig and src/main.zig.
+    const accuracy_bench_tests = b.addTest(.{ .root_module = accuracy_bench_exe.root_module });
+    const run_accuracy_bench_tests = b.addRunArtifact(accuracy_bench_tests);
+    run_accuracy_bench_tests.setCwd(b.path("."));
+
     test_step.dependOn(&contract_cmd.step);
     test_step.dependOn(&manifest_contract_cmd.step);
     test_step.dependOn(&efficiency_cmd.step);
     test_step.dependOn(&accuracy_cmd.step);
+    test_step.dependOn(&run_accuracy_bench_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

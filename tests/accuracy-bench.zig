@@ -167,7 +167,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
         std.debug.print(
-            "usage: accuracy-bench <repo-root> [--update-floors] [--propose <fixture-root>] [-j]\n",
+            "usage: accuracy-bench <repo-root> [--update-floors [--lower-floors --reason \"<why>\"]] " ++
+                "[--propose <fixture-root>] [-j]\n",
             .{},
         );
         return BenchError.UsageError;
@@ -185,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
     const results = try scoreAll(gpa, arena, io, repo, opts.repo_root);
 
     if (opts.update_floors) {
-        try writeFloors(arena, io, repo, results);
+        try writeFloors(gpa, arena, io, repo, results, opts.lower_floors, opts.reason);
         try report(out, results, null, opts.json);
         try out.flush();
         return;
@@ -200,6 +201,10 @@ pub fn main(init: std.process.Init) !void {
 const Options = struct {
     repo_root: []const u8,
     update_floors: bool = false,
+    /// Accept a re-record that measures below a language's recorded floor.
+    /// Only meaningful with `update_floors`, and only together with `reason`.
+    lower_floors: bool = false,
+    reason: ?[]const u8 = null,
     propose: ?[]const u8 = null,
     json: bool = false,
 };
@@ -212,6 +217,12 @@ fn parseArgs(args: []const []const u8) !Options {
         const a = args[i];
         if (std.mem.eql(u8, a, "--update-floors")) {
             opts.update_floors = true;
+        } else if (std.mem.eql(u8, a, "--lower-floors")) {
+            opts.lower_floors = true;
+        } else if (std.mem.eql(u8, a, "--reason")) {
+            i += 1;
+            if (i >= args.len) return BenchError.UsageError;
+            opts.reason = args[i];
         } else if (std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--json")) {
             opts.json = true;
         } else if (std.mem.eql(u8, a, "--propose")) {
@@ -220,6 +231,10 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.propose = args[i];
         } else return BenchError.UsageError;
     }
+    // --lower-floors always needs its reason printed, and only makes sense
+    // alongside the re-record it would otherwise silently affect.
+    if (opts.lower_floors and (opts.reason == null or !opts.update_floors)) return BenchError.UsageError;
+    if (opts.reason != null and !opts.lower_floors) return BenchError.UsageError;
     return opts;
 }
 
@@ -729,7 +744,52 @@ fn loadFloors(arena: std.mem.Allocator, io: std.Io, repo: std.Io.Dir) !Floors {
     };
 }
 
-fn writeFloors(arena: std.mem.Allocator, io: std.Io, repo: std.Io.Dir, results: []const LanguageResult) !void {
+/// One metric's ratchet outcome: the measurement fell below the prior floor.
+/// Recorded whether or not the drop was accepted, so it is always visible.
+const FloorDrop = struct {
+    language: []const u8,
+    metric: []const u8,
+    existing_bp: u32,
+    measured_bp: u32,
+};
+
+/// Never returns below `existing_bp` unless `allow_lower`; either way, a drop
+/// is appended to `drops` so it cannot pass through silently.
+fn ratchetMetric(
+    gpa: std.mem.Allocator,
+    drops: *std.ArrayList(FloorDrop),
+    language: []const u8,
+    metric: []const u8,
+    existing_bp: u32,
+    measured_bp: u32,
+    allow_lower: bool,
+) !u32 {
+    if (measured_bp >= existing_bp) return measured_bp;
+    try drops.append(gpa, .{ .language = language, .metric = metric, .existing_bp = existing_bp, .measured_bp = measured_bp });
+    return if (allow_lower) measured_bp else existing_bp;
+}
+
+/// Re-record floors from `results`. Ratchet-only by default: each metric
+/// takes the max of its prior recorded floor and this measurement, and a
+/// metric that would have dropped is kept at its prior value and reported
+/// rather than silently overwritten. `allow_lower` (paired with `reason`)
+/// accepts a drop instead, and reports it with the reason.
+fn writeFloors(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    repo: std.Io.Dir,
+    results: []const LanguageResult,
+    allow_lower: bool,
+    reason: ?[]const u8,
+) !void {
+    // A first `--update-floors` run (or a floors.json wiped by hand) has
+    // nothing to ratchet against; treat every metric as a fresh floor.
+    const prior = loadFloors(arena, io, repo) catch Floors{ .floors = &.{} };
+
+    var drops: std.ArrayList(FloorDrop) = .empty;
+    defer drops.deinit(gpa);
+
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(arena);
     var w: std.Io.Writer.Allocating = .fromArrayList(arena, &buf);
@@ -738,21 +798,56 @@ fn writeFloors(arena: std.mem.Allocator, io: std.Io, repo: std.Io.Dir, results: 
     try o.writeAll("{\n  \"floors\": [\n");
     for (results, 0..) |r, i| {
         if (i != 0) try o.writeAll(",\n");
+        const measured = Floor{
+            .language = r.language,
+            .def_precision_bp = r.defs.precisionBp(),
+            .def_recall_bp = r.defs.recallBp(),
+            .edge_precision_bp = r.edges.precisionBp(),
+            .edge_recall_bp = r.edges.recallBp(),
+            .exact_agreement_bp = r.exactAgreementBp(),
+        };
+        const merged = if (floorFor(prior, r.language)) |existing| Floor{
+            .language = r.language,
+            .def_precision_bp = try ratchetMetric(gpa, &drops, r.language, "def precision", existing.def_precision_bp, measured.def_precision_bp, allow_lower),
+            .def_recall_bp = try ratchetMetric(gpa, &drops, r.language, "def recall", existing.def_recall_bp, measured.def_recall_bp, allow_lower),
+            .edge_precision_bp = try ratchetMetric(gpa, &drops, r.language, "edge precision", existing.edge_precision_bp, measured.edge_precision_bp, allow_lower),
+            .edge_recall_bp = try ratchetMetric(gpa, &drops, r.language, "edge recall", existing.edge_recall_bp, measured.edge_recall_bp, allow_lower),
+            .exact_agreement_bp = try ratchetMetric(gpa, &drops, r.language, "exact agreement", existing.exact_agreement_bp, measured.exact_agreement_bp, allow_lower),
+        } else measured;
         try o.print(
             "    {{ \"language\": \"{s}\", \"def_precision_bp\": {d}, \"def_recall_bp\": {d}, " ++
                 "\"edge_precision_bp\": {d}, \"edge_recall_bp\": {d}, \"exact_agreement_bp\": {d} }}",
             .{
-                r.language,
-                r.defs.precisionBp(),
-                r.defs.recallBp(),
-                r.edges.precisionBp(),
-                r.edges.recallBp(),
-                r.exactAgreementBp(),
+                merged.language,
+                merged.def_precision_bp,
+                merged.def_recall_bp,
+                merged.edge_precision_bp,
+                merged.edge_recall_bp,
+                merged.exact_agreement_bp,
             },
         );
     }
     try o.writeAll("\n  ]\n}\n");
     try repo.writeFile(io, .{ .sub_path = golden_dir_path ++ "/" ++ floors_file, .data = w.written() });
+
+    if (drops.items.len == 0) return;
+    if (allow_lower) {
+        std.debug.print("accuracy-bench: lowered {d} floor(s) (--reason: {s})\n", .{ drops.items.len, reason.? });
+    } else {
+        std.debug.print(
+            "accuracy-bench: kept {d} floor(s) at their recorded value; the measurement regressed " ++
+                "and --lower-floors was not passed\n",
+            .{drops.items.len},
+        );
+    }
+    for (drops.items) |d| {
+        const e = fmtBp(d.existing_bp);
+        const m = fmtBp(d.measured_bp);
+        std.debug.print(
+            "  {s} {s}: {d}.{d:0>2}% -> {d}.{d:0>2}%\n",
+            .{ d.language, d.metric, e.whole, e.frac, m.whole, m.frac },
+        );
+    }
 }
 
 fn floorFor(floors: Floors, language: []const u8) ?Floor {
@@ -971,4 +1066,104 @@ test "ratioBp truncates and treats an empty expectation as perfect" {
     try std.testing.expectEqual(@as(u32, 10000), ratioBp(0, 0));
     try std.testing.expectEqual(@as(u32, 0), ratioBp(0, 7));
     try std.testing.expectEqual(@as(u32, 6666), ratioBp(2, 3));
+}
+
+test "ratchetMetric: a raised floor survives, a regression is kept unless allowed" {
+    const gpa = std.testing.allocator;
+    var drops: std.ArrayList(FloorDrop) = .empty;
+    defer drops.deinit(gpa);
+
+    // A wave that measures higher: the raised value is recorded, no drop.
+    try std.testing.expectEqual(@as(u32, 9500), try ratchetMetric(gpa, &drops, "go", "def recall", 9000, 9500, false));
+    try std.testing.expectEqual(@as(usize, 0), drops.items.len);
+
+    // Re-recording with that raised floor as the new prior: it survives a
+    // run that measures the same value again (the exact bug in the report -
+    // `--update-floors` used to overwrite unconditionally and erase this).
+    try std.testing.expectEqual(@as(u32, 9500), try ratchetMetric(gpa, &drops, "go", "def recall", 9500, 9500, false));
+    try std.testing.expectEqual(@as(usize, 0), drops.items.len);
+
+    // A regression without --lower-floors: the prior (higher) floor is kept,
+    // and the drop is recorded so it is never silent.
+    try std.testing.expectEqual(@as(u32, 9500), try ratchetMetric(gpa, &drops, "go", "def recall", 9500, 9000, false));
+    try std.testing.expectEqual(@as(usize, 1), drops.items.len);
+    try std.testing.expectEqual(@as(u32, 9500), drops.items[0].existing_bp);
+    try std.testing.expectEqual(@as(u32, 9000), drops.items[0].measured_bp);
+
+    // The same regression with allow_lower: the measured (lower) value wins,
+    // and it is still recorded as a drop (the reason gets printed for it).
+    try std.testing.expectEqual(@as(u32, 9000), try ratchetMetric(gpa, &drops, "go", "def recall", 9500, 9000, true));
+    try std.testing.expectEqual(@as(usize, 2), drops.items.len);
+}
+
+test "violations: a regression in any one of the five metrics fails the gate" {
+    const floor = Floor{
+        .language = "go",
+        .def_precision_bp = 9000,
+        .def_recall_bp = 9000,
+        .edge_precision_bp = 9000,
+        .edge_recall_bp = 9000,
+        .exact_agreement_bp = 9000,
+    };
+    const floors = Floors{ .floors = &.{floor} };
+
+    const at_floor = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 90, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 90, .actual = 100, .expected = 100 },
+        .exact_agree = 81, // 81/90 = 9000bp
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 0), violations(&.{at_floor}, floors));
+
+    const def_precision_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 89, .actual = 100, .expected = 89 }, // P 8900, R 10000
+        .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .exact_agree = 100,
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{def_precision_regressed}, floors));
+
+    const def_recall_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 89, .actual = 89, .expected = 100 }, // P 10000, R 8900
+        .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .exact_agree = 100,
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{def_recall_regressed}, floors));
+
+    const edge_precision_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 89, .actual = 100, .expected = 89 }, // P 8900, R 10000
+        .exact_agree = 89,
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{edge_precision_regressed}, floors));
+
+    const edge_recall_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 89, .actual = 89, .expected = 100 }, // P 10000, R 8900
+        .exact_agree = 89,
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{edge_recall_regressed}, floors));
+
+    const exact_agreement_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .exact_agree = 89, // 89/100 = 8900bp
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{exact_agreement_regressed}, floors));
 }
