@@ -79,7 +79,7 @@
   "edges": [
     {"from": "lib/book.rb:Book.from_hash", "to": "lib/book.rb:Book.initialize", "exact": false, "lines": [30], "verified": "manual"},
     {"from": "lib/book.rb:Book.from_hash", "to": "lib/book.rb:Ebook", "exact": true, "lines": [29], "verified": "manual"},
-    {"from": "lib/book.rb:Book.lend", "to": "lib/book.rb:Book.available?", "exact": true, "lines": [52], "verified": "manual"},
+    {"from": "lib/book.rb:Book.lend", "to": "lib/book.rb:Book.available?", "exact": false, "lines": [52], "verified": "manual"},
     {"from": "lib/book.rb:Book.lend", "to": "lib/book.rb:Identifiable.identifier", "exact": true, "lines": [53], "verified": "manual"},
     {"from": "lib/book.rb:Book.to_row", "to": "lib/book.rb:Identifiable.identifier", "exact": true, "lines": [58], "verified": "manual"},
     {"from": "lib/book.rb:Identifiable.identifier", "to": "lib/book.rb:Identifiable.prefix", "exact": false, "lines": [11], "verified": "manual"},
