@@ -47,12 +47,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !u8 {
     }, opts.root);
     defer server.deinit();
 
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(gpa);
+    var stream: Stream = .{};
+    defer stream.deinit(gpa);
     var chunk: [read_chunk]u8 = undefined;
 
     while (true) {
-        if (try pump(gpa, &server, &pending)) |code| return code;
+        if (try pump(gpa, &server, &stream)) |code| return code;
 
         const n = readSome(io, &server, &chunk) catch |err| switch (err) {
             error.Timeout => {
@@ -62,9 +62,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !u8 {
             error.EndOfStream => return 0,
             else => return err,
         };
-        try pending.appendSlice(gpa, chunk[0..n]);
+        try stream.pending.appendSlice(gpa, chunk[0..n]);
     }
 }
+
+/// The stdin byte stream between reads: the bytes that do not yet form a whole
+/// frame, and the framing state needed to resync across reads.
+const Stream = struct {
+    pending: std.ArrayList(u8) = .empty,
+    reader: rpc.Reader = .{},
+
+    fn deinit(self: *Stream, gpa: std.mem.Allocator) void {
+        self.pending.deinit(gpa);
+    }
+};
 
 /// Read the next bytes from stdin, waiting no longer than the soonest scheduled
 /// deadline so a debounce or watch tick is never starved by an idle client.
@@ -78,14 +89,19 @@ fn readSome(io: std.Io, server: *handlers.Server, buf: []u8) !usize {
     return result.file_read_streaming;
 }
 
-/// Dispatch every complete frame in `pending`, then drop what was consumed.
+/// Dispatch every complete frame in the stream, then drop what was consumed.
 /// Returns an exit code once the client has said `exit`.
-fn pump(gpa: std.mem.Allocator, server: *handlers.Server, pending: *std.ArrayList(u8)) !?u8 {
+fn pump(gpa: std.mem.Allocator, server: *handlers.Server, stream: *Stream) !?u8 {
+    const pending = &stream.pending;
     var consumed: usize = 0;
     while (true) {
-        switch (rpc.nextFrame(pending.items[consumed..], max_body_bytes)) {
-            .incomplete => break,
+        switch (stream.reader.next(pending.items[consumed..], max_body_bytes)) {
+            .incomplete => |partial| {
+                consumed += partial.drop;
+                break;
+            },
             .malformed => |bad| {
+                std.debug.assert(bad.consumed != 0); // else this loop would spin
                 consumed += bad.consumed;
                 server.log.print(.err, "malformed frame ({s}), resyncing", .{@errorName(bad.err)});
                 try reportParseError(gpa, server, @errorName(bad.err));
@@ -191,15 +207,15 @@ const project = [_][2][]const u8{
 fn feed(
     gpa: std.mem.Allocator,
     server: *handlers.Server,
-    pending: *std.ArrayList(u8),
+    stream: *Stream,
     bytes: []const u8,
     chunk: usize,
 ) !void {
     var i: usize = 0;
     while (i < bytes.len) {
         const end = @min(i + chunk, bytes.len);
-        try pending.appendSlice(gpa, bytes[i..end]);
-        _ = try pump(gpa, server, pending);
+        try stream.pending.appendSlice(gpa, bytes[i..end]);
+        _ = try pump(gpa, server, stream);
         i = end;
     }
 }
@@ -216,21 +232,21 @@ fn framed(gpa: std.mem.Allocator, bodies: []const []const u8) ![]u8 {
 test "the loop reassembles a frame split across many reads" {
     const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
     defer ts.deinit();
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(testing.allocator);
+    var stream: Stream = .{};
+    defer stream.deinit(testing.allocator);
 
-    const stream = try framed(testing.allocator, &.{
+    const bytes = try framed(testing.allocator, &.{
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
         ,
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
         ,
         \\{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}
     });
-    defer testing.allocator.free(stream);
+    defer testing.allocator.free(bytes);
 
     // One byte at a time: every partial header and partial body must be held.
-    try feed(testing.allocator, &ts.server, &pending, stream, 1);
-    try testing.expectEqual(@as(usize, 0), pending.items.len);
+    try feed(testing.allocator, &ts.server, &stream, bytes, 1);
+    try testing.expectEqual(@as(usize, 0), stream.pending.items.len);
 
     var res = try ts.responseFor(2);
     defer res.deinit();
@@ -240,10 +256,10 @@ test "the loop reassembles a frame split across many reads" {
 test "several frames arriving in one read are all dispatched" {
     const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
     defer ts.deinit();
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(testing.allocator);
+    var stream: Stream = .{};
+    defer stream.deinit(testing.allocator);
 
-    const stream = try framed(testing.allocator, &.{
+    const bytes = try framed(testing.allocator, &.{
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
         ,
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
@@ -252,8 +268,8 @@ test "several frames arriving in one read are all dispatched" {
         ,
         \\{"jsonrpc":"2.0","id":3,"method":"navgraph/search","params":{"query":"helper"}}
     });
-    defer testing.allocator.free(stream);
-    try feed(testing.allocator, &ts.server, &pending, stream, stream.len);
+    defer testing.allocator.free(bytes);
+    try feed(testing.allocator, &ts.server, &stream, bytes, bytes.len);
 
     var status = try ts.responseFor(2);
     defer status.deinit();
@@ -267,17 +283,17 @@ test "a malformed frame is answered and the server keeps serving" {
     const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
     defer ts.deinit();
     try ts.start();
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(testing.allocator);
+    var stream: Stream = .{};
+    defer stream.deinit(testing.allocator);
 
     const good = try framed(testing.allocator, &.{
         \\{"jsonrpc":"2.0","id":4,"method":"navgraph/status","params":{}}
     });
     defer testing.allocator.free(good);
-    const stream = try std.mem.concat(testing.allocator, u8, &.{ "Content-Type: junk\r\n\r\n", good });
-    defer testing.allocator.free(stream);
+    const bytes = try std.mem.concat(testing.allocator, u8, &.{ "Content-Type: junk\r\n\r\n", good });
+    defer testing.allocator.free(bytes);
 
-    try feed(testing.allocator, &ts.server, &pending, stream, 7);
+    try feed(testing.allocator, &ts.server, &stream, bytes, 7);
     // The bad header block produced a parse error...
     try testing.expect(std.mem.indexOf(u8, ts.out.written(), "-32700") != null);
     // ...and the frame behind it was still served.
@@ -286,19 +302,98 @@ test "a malformed frame is answered and the server keeps serving" {
     try testing.expect(res.value.object.get("result") != null);
 }
 
+/// A malformed frame *with a body* must not swallow the frames behind it: the
+/// body is skipped, not re-read as headers. Feeds the stream in `chunk`-byte
+/// reads so the resync is exercised across read boundaries too.
+fn expectServesBehind(bad: []const u8, chunk: usize) !void {
+    const gpa = testing.allocator;
+    const ts = try handlers.TestServer.init(gpa, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var stream: Stream = .{};
+    defer stream.deinit(gpa);
+
+    const good = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":77,"method":"navgraph/status","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+    });
+    defer gpa.free(good);
+    const bytes = try std.mem.concat(gpa, u8, &.{ bad, good });
+    defer gpa.free(bytes);
+
+    try stream.pending.appendSlice(gpa, bytes);
+    // `exit` is behind the garbage: reaching it proves the stream resynced.
+    try testing.expectEqual(@as(u8, 1), (try pump(gpa, &ts.server, &stream)).?);
+    try testing.expect(std.mem.indexOf(u8, ts.out.written(), "-32700") != null);
+    var res = try ts.responseFor(77);
+    defer res.deinit();
+    try testing.expect(res.value.object.get("result") != null);
+
+    // Same stream, one byte at a time.
+    const ts2 = try handlers.TestServer.init(gpa, testing.io, &project);
+    defer ts2.deinit();
+    try ts2.start();
+    var slow: Stream = .{};
+    defer slow.deinit(gpa);
+    try feed(gpa, &ts2.server, &slow, bytes, chunk);
+    var res2 = try ts2.responseFor(77);
+    defer res2.deinit();
+    try testing.expect(res2.value.object.get("result") != null);
+}
+
+test "a malformed frame with a body never desyncs the connection" {
+    // The reviewer's repro: one bad header, then a request that must be answered.
+    try expectServesBehind("Content-Length: abc\r\n\r\n{}", 1);
+    try expectServesBehind("Content-Length: -5\r\n\r\n{}", 3);
+    try expectServesBehind("Content-Type: x\r\n\r\n{}", 5);
+    // A JSON body is full of colons; none may be mistaken for a header.
+    try expectServesBehind(
+        "Content-Length: xx\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"navgraph/status\"}",
+        7,
+    );
+    // A body we refuse to buffer at all.
+    try expectServesBehind("Content-Length: 999999999\r\n\r\n{\"a\":1}", 11);
+    // Header bytes that never terminate.
+    try expectServesBehind("x" ** (rpc.max_header_bytes + 16), 1024);
+}
+
+test "a run of garbage is answered once, not once per read" {
+    const gpa = testing.allocator;
+    const ts = try handlers.TestServer.init(gpa, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var stream: Stream = .{};
+    defer stream.deinit(gpa);
+
+    const junk = "garbage\r\n" ** 512;
+    const good = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":8,"method":"navgraph/status","params":{}}
+    });
+    defer gpa.free(good);
+    const bytes = try std.mem.concat(gpa, u8, &.{ junk, good });
+    defer gpa.free(bytes);
+    try feed(gpa, &ts.server, &stream, bytes, 64);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ts.out.written(), "-32700"));
+    var res = try ts.responseFor(8);
+    defer res.deinit();
+    try testing.expect(res.value.object.get("result") != null);
+}
+
 test "a frame whose body is bogus JSON gets -32700 and does not stop the loop" {
     const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
     defer ts.deinit();
     try ts.start();
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(testing.allocator);
+    var stream: Stream = .{};
+    defer stream.deinit(testing.allocator);
 
-    const stream = try framed(testing.allocator, &.{
+    const bytes = try framed(testing.allocator, &.{
         "{not json at all",
         \\{"jsonrpc":"2.0","id":5,"method":"navgraph/status","params":{}}
     });
-    defer testing.allocator.free(stream);
-    try feed(testing.allocator, &ts.server, &pending, stream, 13);
+    defer testing.allocator.free(bytes);
+    try feed(testing.allocator, &ts.server, &stream, bytes, 13);
 
     try testing.expect(std.mem.indexOf(u8, ts.out.written(), "-32700") != null);
     var res = try ts.responseFor(5);
@@ -310,18 +405,18 @@ test "exit stops the loop and reports the shutdown-aware code" {
     const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
     defer ts.deinit();
     try ts.start();
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(testing.allocator);
+    var stream: Stream = .{};
+    defer stream.deinit(testing.allocator);
 
-    const stream = try framed(testing.allocator, &.{
+    const bytes = try framed(testing.allocator, &.{
         \\{"jsonrpc":"2.0","method":"exit"}
         ,
         // Never reached: the loop stops at `exit`.
         \\{"jsonrpc":"2.0","id":6,"method":"navgraph/status","params":{}}
     });
-    defer testing.allocator.free(stream);
-    try pending.appendSlice(testing.allocator, stream);
-    try testing.expectEqual(@as(u8, 1), (try pump(testing.allocator, &ts.server, &pending)).?);
+    defer testing.allocator.free(bytes);
+    try stream.pending.appendSlice(testing.allocator, bytes);
+    try testing.expectEqual(@as(u8, 1), (try pump(testing.allocator, &ts.server, &stream)).?);
     try testing.expectError(error.NoSuchResponse, ts.responseFor(6));
 }
 
@@ -329,8 +424,8 @@ test "end-to-end: an unsaved edit adds a caller, and closing the buffer reverts 
     const gpa = testing.allocator;
     const ts = try handlers.TestServer.init(gpa, testing.io, &project);
     defer ts.deinit();
-    var pending: std.ArrayList(u8) = .empty;
-    defer pending.deinit(gpa);
+    var stream: Stream = .{};
+    defer stream.deinit(gpa);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -342,7 +437,7 @@ test "end-to-end: an unsaved edit adds a caller, and closing the buffer reverts 
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
     });
     defer gpa.free(boot);
-    try feed(gpa, &ts.server, &pending, boot, 64);
+    try feed(gpa, &ts.server, &stream, boot, 64);
 
     const uri = try ts.uri(alloc, "app.zig");
     const edited =
@@ -354,7 +449,7 @@ test "end-to-end: an unsaved edit adds a caller, and closing the buffer reverts 
         \\{"jsonrpc":"2.0","id":2,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
     });
     defer gpa.free(before);
-    try feed(gpa, &ts.server, &pending, before, 64);
+    try feed(gpa, &ts.server, &stream, before, 64);
     var base = try ts.responseFor(2);
     defer base.deinit();
     try testing.expectEqual(@as(i64, 2), base.value.object.get("result").?.object
@@ -373,7 +468,7 @@ test "end-to-end: an unsaved edit adds a caller, and closing the buffer reverts 
         \\{"jsonrpc":"2.0","id":3,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
     });
     defer gpa.free(editing);
-    try feed(gpa, &ts.server, &pending, editing, 64);
+    try feed(gpa, &ts.server, &stream, editing, 64);
 
     var edited_blast = try ts.responseFor(3);
     defer edited_blast.deinit();
@@ -404,7 +499,7 @@ test "end-to-end: an unsaved edit adds a caller, and closing the buffer reverts 
         \\{"jsonrpc":"2.0","id":4,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
     });
     defer gpa.free(closing);
-    try feed(gpa, &ts.server, &pending, closing, 64);
+    try feed(gpa, &ts.server, &stream, closing, 64);
 
     var reverted = try ts.responseFor(4);
     defer reverted.deinit();

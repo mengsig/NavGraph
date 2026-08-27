@@ -99,6 +99,20 @@ disappears again when the buffer is closed.
 A malformed *notification* gets no reply, per JSON-RPC. Nothing a client can
 send kills the server.
 
+### Resynchronizing
+
+A frame the server cannot parse costs exactly that frame. The reader does not
+resume at the offending header line — a malformed frame's body would then be
+read back as headers, and a JSON body has enough colons in it to look like
+headers forever — it hunts forward for the next `Content-Length:` instead,
+across as many reads as that takes. So the request behind a bad header is still
+answered, and `shutdown` / `exit` always land.
+
+One run of garbage produces one `-32700`, however many reads it spans, so a bad
+client cannot turn one bad header into a storm of replies. Limits that surface
+this way: a body over 32 MiB and a header block over 8 KiB are both refused
+without being buffered.
+
 ## Shared result shapes
 
 ```

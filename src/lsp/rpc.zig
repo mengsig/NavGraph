@@ -85,8 +85,84 @@ pub const Extract = union(enum) {
     incomplete,
     frame: Frame,
     /// The frame was unusable. `consumed` is the resync point: drop that many
-    /// bytes and keep serving.
+    /// bytes and keep serving. Always non-zero, so a reader always progresses.
     malformed: struct { consumed: usize, err: FrameError },
+};
+
+/// The header every frame starts with, and so the only place a frame can begin
+/// again once the stream has lost sync.
+const frame_marker = "Content-Length:";
+
+const Resync = union(enum) {
+    /// A frame can begin at this offset; sync is regained.
+    at: usize,
+    /// No frame boundary in sight: drop this many bytes and keep hunting.
+    drop: usize,
+};
+
+/// Find the next frame boundary in `buf` after the stream lost sync.
+///
+/// The marker is matched anywhere, not only at a line start: a real stream puts
+/// the next header directly after the previous body's last byte. Bytes at the
+/// end that could still grow into the marker are held back for the next read.
+fn resync(buf: []const u8) Resync {
+    var i: usize = 0;
+    while (i + frame_marker.len <= buf.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(buf[i .. i + frame_marker.len], frame_marker)) return .{ .at = i };
+    }
+    var keep = @min(frame_marker.len - 1, buf.len);
+    while (keep > 0) : (keep -= 1) {
+        if (std.ascii.eqlIgnoreCase(buf[buf.len - keep ..], frame_marker[0..keep])) break;
+    }
+    return .{ .drop = buf.len - keep };
+}
+
+/// Pulls frames out of a growing byte stream, resynchronizing when it goes bad.
+///
+/// Stateful because a resync can span many reads: `nextFrame` alone can only
+/// say that the bytes in front of it are garbage, and re-reading a malformed
+/// frame's body as headers is what lets one bad header swallow every frame
+/// behind it. The reader keeps hunting for the next `Content-Length:` across
+/// reads instead, so a client is never left waiting on a request that arrived.
+pub const Reader = struct {
+    resyncing: bool = false,
+
+    pub const Result = union(enum) {
+        /// Need more bytes. Drop `drop` of them meanwhile (garbage being
+        /// skipped); the rest is a partial frame and must be kept.
+        incomplete: struct { drop: usize },
+        frame: Frame,
+        /// Sync was just lost. `consumed` bytes are garbage and it is always
+        /// non-zero, so a reader driving this in a loop always progresses.
+        /// Reported once per run of garbage: the reads that follow, until the
+        /// stream resyncs, come back `incomplete`.
+        malformed: struct { consumed: usize, err: FrameError },
+    };
+
+    pub fn next(self: *Reader, buf: []const u8, max_body: usize) Result {
+        var at: usize = 0;
+        if (self.resyncing) {
+            switch (resync(buf)) {
+                .at => |i| {
+                    at = i;
+                    self.resyncing = false;
+                },
+                .drop => |n| return .{ .incomplete = .{ .drop = n } },
+            }
+        }
+        return switch (nextFrame(buf[at..], max_body)) {
+            .incomplete => .{ .incomplete = .{ .drop = at } },
+            .frame => |f| .{ .frame = .{ .body = f.body, .consumed = at + f.consumed } },
+            .malformed => |bad| blk: {
+                self.resyncing = true;
+                // Only the byte the bad frame starts on is consumed here; the
+                // rest goes to `resync`. Consuming what `nextFrame` parsed
+                // would eat a header that had merged with the garbage in front
+                // of it, and consuming nothing would spin.
+                break :blk .{ .malformed = .{ .consumed = at + 1, .err = bad.err } };
+            },
+        };
+    }
 };
 
 /// Extract one LSP frame from the front of `buf`.
@@ -94,6 +170,10 @@ pub const Extract = union(enum) {
 /// Tolerates `\n` as well as `\r\n` line endings (some clients and every hand-
 /// written test script use bare `\n`), ignores headers other than
 /// `Content-Length`, and matches the header name case-insensitively.
+///
+/// Every failure resynchronizes to the next plausible frame boundary rather
+/// than to the offending header line: a malformed frame's body must never be
+/// re-read as headers, or one bad header swallows every frame behind it.
 pub fn nextFrame(buf: []const u8, max_body: usize) Extract {
     var content_len: ?usize = null;
     var pos: usize = 0;
@@ -126,6 +206,8 @@ pub fn nextFrame(buf: []const u8, max_body: usize) Extract {
         return .{ .malformed = .{ .consumed = pos, .err = error.MissingContentLength } };
     };
     if (len > max_body) {
+        // Refused without buffering, so the declared length cannot be used to
+        // find the boundary either: the reader resynchronizes on the header.
         return .{ .malformed = .{ .consumed = pos, .err = error.BodyTooLarge } };
     }
     if (buf.len - pos < len) return .incomplete;
@@ -256,8 +338,92 @@ test "nextFrame rejects a header block with no Content-Length" {
     const got = nextFrame("Content-Type: x\r\n\r\n{}", 1 << 20);
     try testing.expect(got == .malformed);
     try testing.expectEqual(FrameError.MissingContentLength, got.malformed.err);
-    // Resync point is just past the blank line, so the body is retried as a frame.
+    // Only the header block is reported consumed; the body is the Reader's to
+    // skip, because reading it back as headers is what desyncs the stream.
     try testing.expectEqual(@as(usize, 19), got.malformed.consumed);
+}
+
+/// Drive `bad` followed by a good frame through a `Reader` in `chunk`-byte
+/// reads, as a pipe delivers it. Returns how many times sync was lost.
+fn resyncCount(bad: []const u8, chunk: usize) !u32 {
+    const good = "Content-Length: 2\r\n\r\n{}";
+    var buf: [16 * 1024]u8 = undefined;
+    const stream = try std.fmt.bufPrint(&buf, "{s}{s}", .{ bad, good });
+
+    var reader: Reader = .{};
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+    var losses: u32 = 0;
+    var served = false;
+
+    var sent: usize = 0;
+    while (sent < stream.len) {
+        const end = @min(sent + chunk, stream.len);
+        try pending.appendSlice(testing.allocator, stream[sent..end]);
+        sent = end;
+        var consumed: usize = 0;
+        while (true) {
+            switch (reader.next(pending.items[consumed..], 1 << 20)) {
+                .incomplete => |partial| {
+                    consumed += partial.drop;
+                    break;
+                },
+                .malformed => |m| {
+                    try testing.expect(m.consumed != 0); // else the loop spins
+                    consumed += m.consumed;
+                    losses += 1;
+                },
+                .frame => |f| {
+                    try testing.expectEqualStrings("{}", f.body);
+                    served = true;
+                    consumed += f.consumed;
+                },
+            }
+        }
+        std.mem.copyForwards(u8, pending.items, pending.items[consumed..]);
+        pending.shrinkRetainingCapacity(pending.items.len - consumed);
+    }
+    try testing.expect(served);
+    return losses;
+}
+
+test "a malformed frame with a body never swallows the frame behind it" {
+    // Each shape the reviewer wedged the server with, at several read sizes.
+    const shapes = [_][]const u8{
+        "Content-Length: abc\r\n\r\n{}",
+        "Content-Length: -5\r\n\r\n{}",
+        "Content-Type: x\r\n\r\n{}",
+        "Content-Length: 999999999\r\n\r\n{\"a\":1}",
+        // A JSON body is full of colons; none may be read as a header.
+        "Content-Length: xx\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\"}",
+        "garbage\r\n\r\n{\"a\":1}",
+        "x" ** (max_header_bytes + 16),
+    };
+    for (shapes) |bad| {
+        for ([_]usize{ 1, 3, 64, 8192 }) |chunk| {
+            const losses = try resyncCount(bad, chunk);
+            // Sync is lost once and reported once, however the bytes arrive.
+            try testing.expectEqual(@as(u32, 1), losses);
+        }
+    }
+}
+
+test "a well-formed stream never enters resync" {
+    var reader: Reader = .{};
+    const stream = "Content-Length: 2\r\n\r\n{}Content-Length: 4\r\n\r\n[1,2]";
+    const first = reader.next(stream, 1 << 20);
+    try testing.expectEqualStrings("{}", first.frame.body);
+    const second = reader.next(stream[first.frame.consumed..], 1 << 20);
+    try testing.expectEqualStrings("[1,2", second.frame.body);
+    try testing.expect(!reader.resyncing);
+}
+
+test "resync holds back a truncated header instead of dropping it" {
+    // Nothing that could still become a header: drop it all.
+    try testing.expectEqual(@as(usize, 13), resync("garbage\r\n\r\n{}").drop);
+    // A header cut in half by the read boundary is kept for the next read.
+    try testing.expectEqual(@as(usize, 11), resync("garbage\r\n\r\nContent-Len").drop);
+    try testing.expectEqual(@as(usize, 2), resync("{}Content-Length: 2\r\n\r\n{}").at);
 }
 
 test "nextFrame rejects a header line without a colon and a non-numeric length" {
