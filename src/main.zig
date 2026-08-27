@@ -4,6 +4,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const cli = @import("cli.zig");
 const index_mod = @import("index.zig");
+const backends = @import("backends.zig");
 const query = @import("query.zig");
 const workflow = @import("workflow.zig");
 const hierarchy = @import("hierarchy.zig");
@@ -104,13 +105,14 @@ pub fn main(init: std.process.Init) !void {
             authority.single_file,
             authority.single_file_target,
             parsed.use_cache,
+            parsed.backend,
         ) catch |err| {
             try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
             try out.flush();
             std.process.exit(1);
         };
         defer idx.deinit();
-        var session = try ServerSession.initBound(gpa, io, &idx, parsed.root, parsed.use_cache, authority);
+        var session = try ServerSession.initBound(gpa, io, &idx, parsed.root, parsed.use_cache, parsed.backend, authority);
         authority_owned = false;
         defer session.deinit();
         try serve(out, &session);
@@ -118,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache) catch |err| {
+    var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache, parsed.backend) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
         // The diagnostic is the product contract. Returning the error from
@@ -448,6 +450,8 @@ const ServerSession = struct {
     root: []u8,
     authority: RootAuthority,
     use_cache: bool,
+    /// Parser backend this session was started with; reloads must reuse it.
+    backend: backends.Choice,
     snapshot_id: u64,
 
     fn init(
@@ -456,10 +460,11 @@ const ServerSession = struct {
         idx: *index_mod.Index,
         root: []const u8,
         use_cache: bool,
+        backend: backends.Choice,
     ) !ServerSession {
         var authority = try RootAuthority.open(gpa, io, root);
         errdefer authority.deinit();
-        return initBound(gpa, io, idx, root, use_cache, authority);
+        return initBound(gpa, io, idx, root, use_cache, backend, authority);
     }
 
     fn initBound(
@@ -468,6 +473,7 @@ const ServerSession = struct {
         idx: *index_mod.Index,
         root: []const u8,
         use_cache: bool,
+        backend: backends.Choice,
         authority_value: RootAuthority,
     ) !ServerSession {
         std.debug.assert(root.len > 0);
@@ -482,6 +488,7 @@ const ServerSession = struct {
             // this function returns an error.
             .authority = authority_value,
             .use_cache = use_cache,
+            .backend = backend,
             .snapshot_id = agent_api.snapshotFingerprint(idx),
         };
     }
@@ -503,6 +510,7 @@ const ServerSession = struct {
             self.authority.single_file,
             self.authority.single_file_target,
             use_cache,
+            self.backend,
         );
         const fresh_snapshot_id = agent_api.snapshotFingerprint(&fresh);
         const old = self.idx.*;
@@ -965,7 +973,7 @@ fn sampleFixture(io: std.Io) !SampleFixture {
     try writeSampleProject(io, tmp.dir);
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const idx = try index_mod.build(std.testing.allocator, io, root, false);
+    const idx = try index_mod.build(std.testing.allocator, io, root, false, .auto);
     return .{ .tmp = tmp, .idx = idx };
 }
 
@@ -994,7 +1002,7 @@ fn ambiguousFixture(io: std.Io) !SampleFixture {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const idx = try index_mod.build(std.testing.allocator, io, root, false);
+    const idx = try index_mod.build(std.testing.allocator, io, root, false, .auto);
     return .{ .tmp = tmp, .idx = idx };
 }
 
@@ -1098,7 +1106,7 @@ test "index honors .navgraphignore: prune a source dir, re-include a built-in sk
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(std.testing.allocator, io, root, false);
+    var idx = try index_mod.build(std.testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var saw_app = false;
@@ -1434,7 +1442,7 @@ test "phase 4 hierarchy exceptions and taint dispatch" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const hierarchy_out = try dispatchOwned(testing.allocator, io, &idx, .{ .command = .hierarchy, .arg = "AppError", .options = .{ .format = .json, .hierarchy_overrides = true } });
@@ -1561,7 +1569,7 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1593,7 +1601,7 @@ test "typed MCP facade covers six read-only surfaces with a stable bounded envel
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1653,7 +1661,7 @@ test "typed MCP relations abstain before ambiguous calls and path traversal" {
     const io = testing.io;
     var fx = try ambiguousFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1706,7 +1714,7 @@ test "MCP identity and capability surfaces share the live manifest contract" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1791,7 +1799,7 @@ test "server reload atomically refreshes requests and notifications" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1836,9 +1844,9 @@ test "failed server reload preserves the previous index" {
     try tmp.dir.writeFile(io, .{ .sub_path = "only.zig", .data = "pub fn stillIndexed() void {}\n" });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/only.zig", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &idx, root, false);
+    var session = try ServerSession.init(testing.allocator, io, &idx, root, false, .auto);
     defer session.deinit();
     try testing.expectEqual(@as(usize, 1), idx.lookup("stillIndexed").len);
     try tmp.dir.deleteFile(io, "only.zig");

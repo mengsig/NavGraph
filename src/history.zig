@@ -580,7 +580,7 @@ test "history blame and churn run against a real repository" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     try initTestRepository(io, root);
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     try testing.expectEqual(@as(usize, 1), idx.lookup("run").len);
 
@@ -643,7 +643,7 @@ test "Git patch commands disable configured external diff and textconv helpers" 
     try testing.expect(runSucceeded(diff_result));
     try testing.expect(std.mem.indexOf(u8, diff_result.stdout, "+++ b/app.py") != null);
 
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     const history_result = try runHistory(testing.allocator, io, .{ .path = root }, &idx, idx.lookup("run")[0], 10);
     defer freeRunResult(testing.allocator, history_result);
@@ -664,7 +664,7 @@ test "churn JSON reports result truncation" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     const entries = [_]ChurnEntry{
         .{ .id = idx.lookup("first")[0], .commits = 2, .lines = 3 },
@@ -693,7 +693,7 @@ test "churn treats an unborn repository as empty history" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     try runGitTest(io, root, &.{ "git", "init", "--quiet" });
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(testing.allocator);

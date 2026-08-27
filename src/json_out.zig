@@ -2114,7 +2114,7 @@ test "json output is well-formed and escapes control characters" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Render `calls run --json -v doc` into a growable buffer and check shape.
@@ -2158,7 +2158,7 @@ test "json carries modifiers and the strings verb is well-formed" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // `def value -j`: kind stays "method"; modifiers carries "getter".
@@ -2226,7 +2226,7 @@ fn tjWriter() std.Io.Writer.Allocating {
 fn tjBuild(tmp: *std.testing.TmpDir) !Index {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    return index_mod.build(std.testing.allocator, std.testing.io, root, false);
+    return index_mod.build(std.testing.allocator, std.testing.io, root, false, .auto);
 }
 
 /// Parse `s` as a JSON document, proving it is well-formed. Caller must

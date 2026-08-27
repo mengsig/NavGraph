@@ -5,6 +5,7 @@ const std = @import("std");
 const query = @import("query.zig");
 const render = @import("render.zig");
 const model = @import("model.zig");
+const backends = @import("backends.zig");
 pub const registry = @import("command_registry.zig");
 
 pub const Command = registry.Command;
@@ -29,6 +30,9 @@ pub const Parsed = struct {
     /// Use the incremental on-disk cache (`.navgraph/cache`). Disabled by
     /// `--no-cache` for a guaranteed-clean rebuild.
     use_cache: bool = true,
+    /// Parser backend (`--backend`). `auto` follows the per-language table in
+    /// `backends.zig`; `tree-sitter` forces a grammar wherever one is linked in.
+    backend: backends.Choice = .auto,
 };
 
 pub const ParseError = error{ Usage, UnknownFlag, MissingValue, BadValue };
@@ -156,6 +160,7 @@ const usage_text =
     \\  --jsonl [--after v1:N]                 Stream stable, cursor-pageable JSON rows;
     \\                                         read accepts --after in text or JSON
     \\  --no-cache                             Ignore the .navgraph/cache and rebuild
+    \\  --backend <auto|heuristic|tree-sitter> Symbol-extraction backend (default auto)
     \\  --no-public                            unused: drop exported symbols (possible public API)
     \\  --follow-imports                       unused: disambiguate same-name symbols by
     \\                                         import reachability (finds unused code masked
@@ -648,6 +653,15 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.used_options.insert(.no_cache);
         out.use_cache = false;
         return i;
+    }
+    if (eqAny(f.name, &.{"--backend"})) {
+        out.used_options.insert(.backend);
+        const v = try f.value(args, i, "--backend");
+        out.backend = backends.Choice.fromName(v) orelse
+            return fail(error.BadValue, "--backend expects auto, heuristic or tree-sitter (got '{s}')", .{v});
+        if (!backends.available(out.backend))
+            return fail(error.BadValue, "--backend tree-sitter: this build links no grammars (build with -Dtree-sitter=all)", .{});
+        return f.next(i);
     }
     if (eqAny(f.name, &.{"--no-public"})) {
         out.used_options.insert(.no_public);

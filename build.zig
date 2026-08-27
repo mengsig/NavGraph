@@ -70,8 +70,13 @@ pub fn build(b: *std.Build) void {
     // build graph invoke git (which would be non-hermetic and fail in source
     // archives). The source fingerprint remains authoritative when omitted.
     build_opts.addOption([]const u8, "revision", b.option([]const u8, "revision", "source revision embedded in capability metadata") orelse "");
+    const grammars = selectGrammars(b);
+    build_opts.addOption(bool, "ts_python", grammars.python);
+    build_opts.addOption(bool, "ts_typescript", grammars.typescript);
+    build_opts.addOption(bool, "ts_tsx", grammars.tsx);
     const build_opts_mod = build_opts.createModule();
     mod.addImport("build_options", build_opts_mod);
+    linkTreeSitter(b, mod, target, grammars);
 
     const exe = b.addExecutable(.{
         .name = "navgraph",
@@ -219,18 +224,33 @@ pub fn build(b: *std.Build) void {
 /// if the tree can't be read for any reason we return 0 — the cache still works,
 /// it just falls back to the coarser layout-magic guard.
 fn srcFingerprint(b: *std.Build) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    // `src/queries/**.scm` is @embedFile'd into the tree-sitter backend, so a
+    // query edit changes parse output without touching any .zig file — it must
+    // be keyed too, or a stale cache masks the change.
+    hashTree(b, &hasher, "src", ".zig") catch return 0;
+    hashTree(b, &hasher, "src", ".scm") catch return 0;
+    return hasher.final();
+}
+
+/// Fold every `<root>/**` file ending in `ext` (path + contents) into `hasher`.
+/// A missing root contributes nothing, so an optional tree is not an error.
+fn hashTree(b: *std.Build, hasher: *std.hash.Wyhash, root: []const u8, ext: []const u8) !void {
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, "src", .{ .iterate = true }) catch return 0;
+    var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
     defer dir.close(io);
 
     // Collect paths first and sort them, so the hash is independent of the
     // filesystem's directory-iteration order (which is not stable across runs).
-    var walker = dir.walk(b.allocator) catch return 0;
+    var walker = try dir.walk(b.allocator);
     defer walker.deinit();
     var paths: std.ArrayList([]const u8) = .empty;
-    while (walker.next(io) catch return 0) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        paths.append(b.allocator, b.allocator.dupe(u8, entry.path) catch return 0) catch return 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ext)) continue;
+        try paths.append(b.allocator, try b.allocator.dupe(u8, entry.path));
     }
     std.mem.sort([]const u8, paths.items, {}, struct {
         fn lt(_: void, a: []const u8, c: []const u8) bool {
@@ -238,11 +258,114 @@ fn srcFingerprint(b: *std.Build) u64 {
         }
     }.lt);
 
-    var hasher = std.hash.Wyhash.init(0);
     for (paths.items) |p| {
+        hasher.update(root);
         hasher.update(p); // path renames must also change the key
-        const data = dir.readFileAlloc(io, p, b.allocator, .unlimited) catch return 0;
-        hasher.update(data);
+        hasher.update(try dir.readFileAlloc(io, p, b.allocator, .unlimited));
     }
-    return hasher.final();
+}
+
+/// Which tree-sitter grammars this build links in. Each costs binary size
+/// (python +0.45 MB, typescript +1.4 MB, tsx +1.4 MB stripped), so the set is a
+/// build-time choice rather than "everything, always".
+const Grammars = struct {
+    python: bool,
+    typescript: bool,
+    tsx: bool,
+
+    fn any(self: Grammars) bool {
+        return self.python or self.typescript or self.tsx;
+    }
+};
+
+/// Parse `-Dtree-sitter=<all|none|comma list>`. Default is every grammar the
+/// repo ships. An unrecognised name is a hard build error rather than a silently
+/// dropped grammar — a typo must not quietly ship a heuristic-only binary.
+fn selectGrammars(b: *std.Build) Grammars {
+    const raw = b.option(
+        []const u8,
+        "tree-sitter",
+        "tree-sitter grammars to link: all | none | comma list of python,typescript,tsx (default: all)",
+    ) orelse "all";
+    if (std.mem.eql(u8, raw, "all")) return .{ .python = true, .typescript = true, .tsx = true };
+    if (std.mem.eql(u8, raw, "none")) return .{ .python = false, .typescript = false, .tsx = false };
+
+    var sel = Grammars{ .python = false, .typescript = false, .tsx = false };
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |name_raw| {
+        const name = std.mem.trim(u8, name_raw, " ");
+        if (name.len == 0) continue;
+        if (std.mem.eql(u8, name, "python")) {
+            sel.python = true;
+        } else if (std.mem.eql(u8, name, "typescript")) {
+            sel.typescript = true;
+        } else if (std.mem.eql(u8, name, "tsx")) {
+            sel.tsx = true;
+        } else {
+            std.debug.panic(
+                "-Dtree-sitter: unknown grammar '{s}' (expected all, none, or a comma list of python,typescript,tsx)",
+                .{name},
+            );
+        }
+    }
+    return sel;
+}
+
+/// Compile the tree-sitter runtime and the selected grammars into one static
+/// library and link it into `mod`. Always ReleaseSmall and stripped regardless
+/// of the project's optimize mode: the generated parser tables are the dominant
+/// binary-size cost and nothing in them benefits from ReleaseFast.
+fn linkTreeSitter(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    grammars: Grammars,
+) void {
+    if (!grammars.any()) return;
+    const runtime = b.lazyDependency("tree_sitter", .{}) orelse return;
+
+    const lib = b.addLibrary(.{
+        .name = "tree-sitter",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = .ReleaseSmall,
+            .strip = true,
+            .link_libc = true,
+        }),
+    });
+    // gnu11, not c11: lib/src/unicode.h and parser.c use le16toh/be16toh and
+    // fdopen unguarded, which strict ISO hides.
+    lib.root_module.addCSourceFile(.{ .file = runtime.path("vendor/tree-sitter/lib/src/lib.c"), .flags = &.{"-std=gnu11"} });
+    lib.root_module.addIncludePath(runtime.path("vendor/tree-sitter/lib/include"));
+    lib.root_module.addIncludePath(runtime.path("vendor/tree-sitter/lib/src"));
+
+    if (grammars.python) {
+        if (b.lazyDependency("tree_sitter_python", .{})) |dep|
+            addGrammar(b, lib, dep, "src", true);
+    }
+    if (grammars.typescript or grammars.tsx) {
+        if (b.lazyDependency("tree_sitter_typescript", .{})) |dep| {
+            if (grammars.typescript) addGrammar(b, lib, dep, "typescript/src", true);
+            if (grammars.tsx) addGrammar(b, lib, dep, "tsx/src", true);
+        }
+    }
+    mod.linkLibrary(lib);
+}
+
+/// Add one generated grammar (`<sub>/parser.c`, plus `scanner.c` when the
+/// grammar has an external scanner) to `lib`.
+fn addGrammar(
+    b: *std.Build,
+    lib: *std.Build.Step.Compile,
+    dep: *std.Build.Dependency,
+    sub: []const u8,
+    has_scanner: bool,
+) void {
+    const flags = &.{"-std=gnu11"};
+    lib.root_module.addCSourceFile(.{ .file = dep.path(b.pathJoin(&.{ sub, "parser.c" })), .flags = flags });
+    if (has_scanner)
+        lib.root_module.addCSourceFile(.{ .file = dep.path(b.pathJoin(&.{ sub, "scanner.c" })), .flags = flags });
+    // Generated parsers include "tree_sitter/parser.h" from their own src dir.
+    lib.root_module.addIncludePath(dep.path(sub));
 }

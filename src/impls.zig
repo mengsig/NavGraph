@@ -241,7 +241,7 @@ test "build discovers structural and nominal protocol implementations" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -258,7 +258,7 @@ test "build discovers structural and nominal protocol implementations" {
 
 test "checked-in Rust cross-file impl is an exact nominal conformance" {
     const testing = std.testing;
-    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/rust_cli", false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();

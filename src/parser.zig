@@ -45,6 +45,8 @@ pub const ParsedSymbol = struct {
     receiver: []const u8 = "",
     /// Trait named by Rust's `impl Trait for Type`; empty for inherent impls.
     impl_protocol: []const u8 = "",
+    /// Declared/inferred type of this symbol (see `model.Symbol.declared_type`).
+    declared_type: []const u8 = "",
 };
 
 /// References plus local bindings collected from one symbol body.
@@ -107,53 +109,99 @@ pub fn parse(
     out: *std.ArrayList(ParsedSymbol),
 ) !ParseHealth {
     std.debug.assert(source.len <= std.math.maxInt(u32));
-    const cfg = language.configFor(lang);
-    var toks: std.ArrayList(Token) = .empty;
-    defer toks.deinit(gpa);
-    try lexer.tokenize(gpa, source, cfg, &toks);
-    std.debug.assert(toks.items.len >= 1); // always an eof token
-    const health = scanHealth(source, toks.items);
-
-    const close = try buildMatches(gpa, source, toks.items);
-    defer gpa.free(close);
-
-    var ctx = Ctx{
-        .gpa = gpa,
-        .arena = arena,
-        .source = source,
-        .cfg = cfg,
-        .toks = toks.items,
-        .close = close,
-        .out = out,
-        .ckw = switch (lang) {
-            .csharp => cs_keywords,
-            .go => go_keywords,
-            .rust => rust_keywords,
-            .ruby => ruby_keywords,
-            .java => java_keywords,
-            else => c_keywords,
-        },
-    };
-    const n: u32 = @intCast(toks.items.len - 1); // exclude eof from scans
+    var scan = try Scan.open(gpa, arena, source, lang, out);
+    defer scan.deinit(gpa);
+    const ctx = &scan.ctx;
+    const health = scanHealth(source, scan.toks.items);
+    const n: u32 = @intCast(scan.toks.items.len - 1); // exclude eof from scans
     switch (lang.family()) {
-        .zig => try parseZigScope(&ctx, 0, n, null),
-        .c, .csharp => try parseCScope(&ctx, 0, n, null),
-        .js => try parseJsScope(&ctx, 0, n, null),
-        .python => try parsePython(&ctx),
-        .lua => try parseLuaScope(&ctx, 0, n, null),
+        .zig => try parseZigScope(ctx, 0, n, null),
+        .c, .csharp => try parseCScope(ctx, 0, n, null),
+        .js => try parseJsScope(ctx, 0, n, null),
+        .python => try parsePython(ctx),
+        .lua => try parseLuaScope(ctx, 0, n, null),
         .go => {
-            try parseGoScope(&ctx, 0, n, null);
-            attachGoReceivers(&ctx);
+            try parseGoScope(ctx, 0, n, null);
+            attachGoReceivers(ctx);
         },
-        .rust => try parseRustScope(&ctx, 0, n, null, false),
-        .ruby => try parseRubyScope(&ctx, 0, n, null),
-        .java => try parseCScope(&ctx, 0, n, null),
+        .rust => try parseRustScope(ctx, 0, n, null, false),
+        .ruby => try parseRubyScope(ctx, 0, n, null),
+        .java => try parseCScope(ctx, 0, n, null),
         .other => {},
     }
-    try detectApi(&ctx, n);
-    try removeNestedReferenceOwnership(&ctx);
+    try detectApi(ctx, n);
+    try removeNestedReferenceOwnership(ctx);
     return health;
 }
+
+/// Append the framework-recognition symbols that `parse` adds as a post-pass:
+/// HTTP `route` definitions, `route_mount` directives, and the `route_call`
+/// references they attach to whichever symbol in `out` encloses each client
+/// call. Exposed for an alternative backend (`ts_backend`) that produced the
+/// definitions itself — route recognition is token/framework-shaped and is
+/// deliberately owned in one place rather than duplicated per backend.
+pub fn appendApiSymbols(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    source: []const u8,
+    lang: language.Language,
+    out: *std.ArrayList(ParsedSymbol),
+) !void {
+    std.debug.assert(source.len <= std.math.maxInt(u32));
+    var scan = try Scan.open(gpa, arena, source, lang, out);
+    defer scan.deinit(gpa);
+    try detectApi(&scan.ctx, @intCast(scan.toks.items.len - 1));
+}
+
+/// The tokenize + bracket-match setup shared by `parse` and `appendApiSymbols`.
+/// Owns the token list and the bracket table; `ctx` borrows both, so `close`
+/// must outlive every use of `ctx`.
+const Scan = struct {
+    toks: std.ArrayList(Token),
+    close: []u32,
+    ctx: Ctx,
+
+    fn open(
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        source: []const u8,
+        lang: language.Language,
+        out: *std.ArrayList(ParsedSymbol),
+    ) !Scan {
+        const cfg = language.configFor(lang);
+        var toks: std.ArrayList(Token) = .empty;
+        errdefer toks.deinit(gpa);
+        try lexer.tokenize(gpa, source, cfg, &toks);
+        std.debug.assert(toks.items.len >= 1); // always an eof token
+        const close = try buildMatches(gpa, source, toks.items);
+        return .{
+            .toks = toks,
+            .close = close,
+            .ctx = .{
+                .gpa = gpa,
+                .arena = arena,
+                .source = source,
+                .cfg = cfg,
+                .toks = toks.items,
+                .close = close,
+                .out = out,
+                .ckw = switch (lang) {
+                    .csharp => cs_keywords,
+                    .go => go_keywords,
+                    .rust => rust_keywords,
+                    .ruby => ruby_keywords,
+                    .java => java_keywords,
+                    else => c_keywords,
+                },
+            },
+        };
+    }
+
+    fn deinit(self: *Scan, gpa: std.mem.Allocator) void {
+        gpa.free(self.close);
+        self.toks.deinit(gpa);
+    }
+};
 
 /// Detect a tokenizer desync: an unterminated single-line string/char literal
 /// (opened by `"` or `'`) that ran to end-of-file. Its closing delimiter is

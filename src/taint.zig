@@ -511,7 +511,7 @@ test "taint trace reaches an inferred local-variable sink and strict excludes it
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -535,7 +535,7 @@ test "taint trace keeps a direct source-to-sink argument exact" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -577,7 +577,7 @@ test "taint does not flow a future parameter reassignment backward" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -609,7 +609,7 @@ test "taint crosses files through named multiline calls" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -632,7 +632,7 @@ test "taint JSON preserves uncapped finding counts" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(testing.allocator);
@@ -658,7 +658,7 @@ test "taint preserves the prior value through compound assignment" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -681,7 +681,7 @@ test "taint follows a generic call result into a sink" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -706,7 +706,7 @@ test "taint follows a generic receiver call into a sink" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -729,7 +729,7 @@ test "taint maps parameters after comparison defaults" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try graph_mod.build(testing.allocator, &idx, graph_mod.Selector.parse("request.json").?, graph_mod.Selector.parse("subprocess.run").?);
     defer graph.deinit();
