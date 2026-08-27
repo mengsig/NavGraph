@@ -509,9 +509,9 @@ vim.lsp.start({
 })
 ```
 
-Measured on this repo (ReleaseFast): initial index 46 ms cold / 14 ms warm,
-single-file re-index 4–10 ms, search 2.1 ms, grep 3.4 ms, blast depth 3 0.1 ms,
-34.8 MB resident at 118k lines.
+Measured on this repo (ReleaseFast): initial index 36–46 ms cold / 14–16 ms
+warm, single-file re-index 4–10 ms, search ~2 ms, grep ~3 ms, blast depth 3
+0.1 ms; ~35 MB resident at 118k lines.
 
 The full protocol — every method, its exact payload shapes, the concurrency
 model, the measured numbers and the current limitations — is in

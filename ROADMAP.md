@@ -79,9 +79,9 @@ type-annotation uses in signatures are not fully captured as edges.
    graph; an edit re-parses only that file and re-assembles it. Watching is an
    mtime poll (portable, no `inotify`), and the whole server is single-threaded
    so the graph needs no lock. Measured on this repo (ReleaseFast): initial
-   index 46 ms cold / 14 ms warm, single-file re-index 4–10 ms, search 2.1 ms,
-   grep 3.4 ms, blast depth 3 0.1 ms; 34.8 MB resident at 118k lines. Protocol
-   and numbers: [`docs/lsp.md`](docs/lsp.md).
+   index 36–46 ms cold / 14–16 ms warm, single-file re-index 4–10 ms, search
+   ~2 ms, grep ~3 ms, blast depth 3 0.1 ms; ~35 MB resident at 118k lines.
+   Protocol and numbers: [`docs/lsp.md`](docs/lsp.md).
    - *Still open:* the remaining verb mirrors (`neighbors`/`path`/`outline`/
      `hot`/`unused`/`diff`/`routes`/`events`/`imports`/`importers`/`graph`) —
      one adapter function each.

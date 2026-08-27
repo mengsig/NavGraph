@@ -277,34 +277,36 @@ currently-edited file.
 ## Measured performance
 
 Zig 0.16.0, `-Doptimize=ReleaseFast`, Linux x86-64. "server" is the `ms` the
-server reports in `navgraph/indexed`; "round-trip" is measured by a client over
-the pipe. Query figures are the best of seven round trips.
+server reports in `navgraph/indexed`; query figures are the best of seven round
+trips over the pipe. Ranges span two independent runs — cold-cache indexing in
+particular varies with page-cache warmth.
 
 | Measurement | This repo (30 files, ~23k lines) | 59k-line tree (250 files) | 118k-line tree (500 files) |
 | --- | --- | --- | --- |
-| Initial index, cold cache | **46 ms** | 67 ms | 129 ms |
-| Initial index, warm cache | **14 ms** | 36 ms | — |
+| Initial index, cold cache | **36–46 ms** | 67–107 ms | 96–129 ms |
+| Initial index, warm cache | **14–16 ms** | 31–36 ms | — |
 | Single-file re-index (debounce excluded) | **4–10 ms** | **7–19 ms** | — |
-| `navgraph/search` | **2.1 ms** | 3.2 ms | — |
-| `navgraph/grep` (literal) | **3.4 ms** | 6.6 ms | — |
-| `navgraph/blast` depth 3 | **0.1 ms** | 0.5 ms | — |
-| `navgraph/callers` depth 2 | **0.1 ms** | 0.1 ms | — |
-| Peak resident memory | 10.8 MB | 20.5 MB | **34.8 MB** |
+| `navgraph/search` | **1.2–2.1 ms** | 3.2 ms | — |
+| `navgraph/grep` (literal) | **1.9–3.4 ms** | 6.4–6.6 ms | — |
+| `navgraph/blast` depth 3 | **0.1 ms** | 0.4–0.5 ms | — |
+| `navgraph/callers` depth 2 | **≤ 0.1 ms** | 0.2 ms | — |
+| Peak resident memory | 10.8 MB | 20.5 MB | **34.8–36.1 MB** |
 
-Against the v1 targets: initial index of this repo < 1 s (46 ms), single-file
+Against the v1 targets: initial index of this repo < 1 s (36–46 ms), single-file
 re-index < 100 ms on a 50k-line tree (7–19 ms), search / grep / blast(3) each
-< 30 ms (≤ 3.4 ms), resident memory < 200 MB at 100k lines (34.8 MB).
+< 30 ms (≤ 3.4 ms), resident memory < 200 MB at 100k lines (≈ 35 MB).
 
-**Targeted re-resolution was measured and not needed.** A re-index re-parses
+**Targeted re-resolution was measured and is not needed.** A re-index re-parses
 only the changed file and re-assembles the graph from the already-parsed rest;
-full reference re-resolution over a 59k-line tree costs single-digit
-milliseconds, an order of magnitude inside the budget. Restricting resolution to
-the files affected by a changed definition would add real complexity (and a new
-correctness surface) to buy nothing measurable, so the simple whole-graph
+full reference re-resolution over a 59k-line tree costs single-digit to low-tens
+of milliseconds, an order of magnitude inside the budget. Restricting resolution
+to the files affected by a changed definition would add real complexity (and a
+new correctness surface) to buy nothing measurable, so the simple whole-graph
 re-assembly stands.
 
-Re-run the numbers with a client that drives the binary over a pipe; the figures
-above come from `-Doptimize=ReleaseFast` on a warm page cache.
+Reproduce with a client that drives the binary over a pipe: `initialize` →
+`initialized`, read the `ms` from `navgraph/indexed`, then time
+`didChange` → `navgraph/status` round trips and the query methods.
 
 ## Limitations
 
