@@ -56,14 +56,15 @@ pub const Language = enum {
     }
 
     /// True where `T(...)` legitimately invokes the type itself — a Python/Ruby
-    /// class call, a C++/Java/C#/Rust constructor, a JS factory, a Go conversion
-    /// (`models.WidgetID(n)`). Elsewhere a *call* bound to a type is always a
-    /// mis-binding. Go's own `a.store.Stats()` hazard is kept out at its source:
-    /// a package qualifier must head its receiver chain (`goPackageTarget`).
+    /// class call, a C++/Java/C#/Rust constructor, a JS factory. Elsewhere a
+    /// *call* bound to a type is always a mis-binding. Go is excluded even
+    /// though it spells conversion as a call: `goPackageTarget` records
+    /// `models.WidgetID(n)` as a `.type_use`, so nothing is lost and a Go local
+    /// shadowing a package can no longer produce an exact call to a type.
     pub fn callMayTargetType(self: Language) bool {
         return switch (self) {
-            .python, .ruby, .javascript, .typescript, .tsx, .cpp, .csharp, .java, .rust, .go => true,
-            .zig, .c, .lua, .unknown => false,
+            .python, .ruby, .javascript, .typescript, .tsx, .cpp, .csharp, .java, .rust => true,
+            .zig, .c, .go, .lua, .unknown => false,
         };
     }
 

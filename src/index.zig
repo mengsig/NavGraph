@@ -782,7 +782,7 @@ fn buildGoPackageTable(idx: *Index) !void {
     }
 }
 
-/// Resolve a Go package-qualified call (`caddy.Load(...)`) to a top-level
+/// Resolve a Go package-qualified reference (`caddy.Load(...)`) to a top-level
 /// definition in one of the files declaring `package <qualifier>`. Exact when
 /// exactly one package file defines the name; a cross-package name collision
 /// binds the first hit as ambiguous.
@@ -793,6 +793,11 @@ fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference)
     // package name; the receiver-scoped paths own that, and letting the package
     // answer bound the call to the package's `struct Stats`.
     if (ref.receiver_root.len != 0) return false;
+    // A local named like an imported package shadows it — ordinary Go
+    // (`store := cache.New()`, `for _, store := range xs`). The binding is the
+    // evidence, typed or not; the same guard fronts the type-qualifier and
+    // imported-container branches in `resolveQualified`.
+    if (isLocalBinding(from, ref.qualifier)) return false;
     const files = idx.go_packages.get(ref.qualifier) orelse return false;
     var found: SymbolId = invalid;
     var hits: u32 = 0;
@@ -804,6 +809,9 @@ fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference)
         if (found == invalid) found = t;
     }
     if (found == invalid) return false;
+    // `pkg.Type(x)` is a conversion, not a call: keep the edge, but as the type
+    // use it is, so the call graph never carries a call bound to a non-callable.
+    if (ref.kind == .call and isContainer(idx.graph.symbols[found])) ref.kind = .type_use;
     ref.target = found;
     ref.exact = hits == 1;
     ref.resolution_status = if (ref.exact) .exact else .ambiguous;
@@ -2587,10 +2595,12 @@ test "go: a composite-literal field key is not a reference to a same-named packa
     try testing.expect(refByQual(new_api, "", "store") == null);
 }
 
-test "go: a package-qualified type conversion keeps its edge" {
-    // Regression (F5): `models.WidgetID(n)` is a Go conversion. Refusing every
-    // call-to-a-type threw it away; the `a.store.Stats()` hazard it guarded is
-    // held off instead by requiring the package qualifier to head its chain.
+test "go: a package-qualified type conversion is a type use, never a call" {
+    // Regression (F5/F1): `models.WidgetID(n)` is a Go conversion. Refusing
+    // every call-to-a-type threw the edge away; keeping it as a *call* put a
+    // call on a non-callable and made Go a callMayTargetType language, which
+    // re-opened the exact-call-to-a-type class the PR was blocked for. The edge
+    // is kept, reclassified.
     const testing = std.testing;
     var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
     defer idx.deinit();
@@ -2599,10 +2609,205 @@ test "go: a package-qualified type conversion keeps its edge" {
     try testing.expectEqual(model.SymbolKind.type, idx.graph.symbols[widget_id].kind);
     const parse_id = idx.graph.symbols[idx.lookup("parseID")[0]];
     const ref = refByQual(parse_id, "models", "WidgetID").?;
-    try testing.expectEqual(model.RefKind.call, ref.kind);
+    try testing.expectEqual(model.RefKind.type_use, ref.kind);
     try testing.expectEqual(widget_id, ref.target);
     try testing.expect(ref.exact);
     try testing.expectEqual(model.ResolutionReason.go_package, ref.resolution_reason);
+    // No call edge anywhere in the project binds to a non-callable.
+    for (idx.graph.symbols) |sym| {
+        for (sym.refs) |r| {
+            if (r.kind != .call or r.target == invalid) continue;
+            const t = idx.graph.symbols[r.target];
+            try testing.expect(isCallable(t) or mayHoldCallable(t.kind));
+        }
+    }
+}
+
+test "go: a local shadowing a package wins, and no call binds to a type" {
+    // Regression (F1): a Go local named like an imported package
+    // (`store`, `models`) bound the call to the *package* — including to the
+    // package's `struct Stats` / `type WidgetID`, `exact`, so `--strict` could
+    // not drop it. Two roots: `goPackageTarget` ignored local bindings, and
+    // `for _, x := range` / `x, err :=` / `if x, ok :=` produced no binding at
+    // all. Rows below cover both, plus the receiver-chain cases they must not
+    // regress.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "store");
+    try tmp.dir.createDirPath(io, "models");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/store.go", .data =
+        \\package store
+        \\
+        \\type Store struct{ n int }
+        \\
+        \\type Stats struct{ Hits int }
+        \\
+        \\func (s *Store) Get() int { return s.n }
+        \\
+        \\func (s *Store) Stats() Stats { return Stats{} }
+        \\
+        \\func Get() int { return 7 }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/models.go", .data =
+        \\package models
+        \\
+        \\type WidgetID int
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "cache/cache.go", .data =
+        \\package cache
+        \\
+        \\type Cache struct{ n int }
+        \\
+        \\func (c *Cache) Get() int { return c.n }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data =
+        \\package main
+        \\
+        \\import (
+        \\    "app/cache"
+        \\    "app/models"
+        \\    "app/store"
+        \\)
+        \\
+        \\type API struct {
+        \\    store *store.Store
+        \\}
+        \\
+        \\type Other struct {
+        \\    store *cache.Cache
+        \\}
+        \\
+        \\type Local struct{ n int }
+        \\
+        \\type Reg struct{}
+        \\
+        \\func (l *Local) Stats() int { return l.n }
+        \\
+        \\func (l *Local) WidgetID(n int) int { return n }
+        \\
+        \\func build() (*cache.Cache, error) { return nil, nil }
+        \\
+        \\func widenC(store, other *Local) int { return store.Stats() }
+        \\
+        \\func widenD(models, other *Local) int { return models.WidgetID(1) }
+        \\
+        \\func rangeShadow(xs []*cache.Cache) int {
+        \\    total := 0
+        \\    for _, store := range xs {
+        \\        total += store.Get()
+        \\    }
+        \\    return total
+        \\}
+        \\
+        \\func multiShadow() int {
+        \\    store, err := build()
+        \\    _ = err
+        \\    return store.Get()
+        \\}
+        \\
+        \\func ifShadow(fs map[string]*cache.Cache) int {
+        \\    if store, ok := fs["a"]; ok {
+        \\        return store.Get()
+        \\    }
+        \\    return 0
+        \\}
+        \\
+        \\func guardShadow(xs []*Local) int {
+        \\    for _, Reg := range xs {
+        \\        return Reg.Stats()
+        \\    }
+        \\    return 0
+        \\}
+        \\
+        \\func (a *API) statsCall() int { return a.store.Stats().Hits }
+        \\
+        \\func (a *API) crossType(o *Other) int { return o.store.Get() }
+        \\
+        \\func (a *API) pkgFunc() int { return store.Get() }
+        \\
+        \\func (a *API) conversion(n int) models.WidgetID { return models.WidgetID(n) }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const Case = struct {
+        caller: []const u8,
+        qualifier: []const u8,
+        name: []const u8,
+        kind: model.RefKind = .call,
+        exact: bool,
+        /// Required target: `null` demands nothing beyond the invariants below,
+        /// `""` the sole top-level symbol named `name`, else its parent type.
+        parent: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        // Grouped Go parameters share the trailing type, so the shadowing
+        // local is typed and the right method is provable.
+        .{ .caller = "widenC", .qualifier = "store", .name = "Stats", .exact = true, .parent = "Local" },
+        .{ .caller = "widenD", .qualifier = "models", .name = "WidgetID", .exact = true, .parent = "Local" },
+        // Untyped shadowing bindings: the package must not answer, and without
+        // a type the edge may only be a heuristic guess.
+        .{ .caller = "rangeShadow", .qualifier = "store", .name = "Get", .exact = false },
+        .{ .caller = "multiShadow", .qualifier = "store", .name = "Get", .exact = false },
+        .{ .caller = "ifShadow", .qualifier = "store", .name = "Get", .exact = false },
+        .{ .caller = "guardShadow", .qualifier = "Reg", .name = "Stats", .exact = false },
+        // A conversion keeps its edge, as a type use rather than a call.
+        .{ .caller = "conversion", .qualifier = "models", .name = "WidgetID", .kind = .type_use, .exact = true, .parent = "" },
+        // Receiver-chain cases the package guard must not regress.
+        .{ .caller = "statsCall", .qualifier = "store", .name = "Stats", .exact = true, .parent = "Store" },
+        .{ .caller = "crossType", .qualifier = "store", .name = "Get", .exact = true, .parent = "Cache" },
+        // A real package qualifier still resolves: no local named `store` here.
+        .{ .caller = "pkgFunc", .qualifier = "store", .name = "Get", .exact = true, .parent = "" },
+    };
+    for (cases) |c| {
+        const caller = idx.graph.symbols[idx.lookup(c.caller)[0]];
+        const ref = refByQual(caller, c.qualifier, c.name) orelse {
+            std.debug.assert(false);
+            unreachable;
+        };
+        try testing.expectEqual(c.kind, ref.kind);
+        try testing.expectEqual(c.exact, ref.exact);
+        if (c.parent) |parent| {
+            const want = if (parent.len == 0) topLevelNamed(&idx, c.name).? else qualifiedId(&idx, parent, c.name).?;
+            try testing.expectEqual(want, ref.target);
+        }
+        // The invariant every row shares: a call never lands on a type.
+        if (ref.kind == .call and ref.target != invalid) {
+            try testing.expect(!isContainer(idx.graph.symbols[ref.target]));
+        }
+    }
+
+    // Each new binding form shadows its same-named global, so the bare
+    // identifier is a value read rather than an edge to the package or struct.
+    const shadowed = [_][2][]const u8{
+        .{ "rangeShadow", "store" },
+        .{ "multiShadow", "store" },
+        .{ "ifShadow", "store" },
+        .{ "multiShadow", "err" },
+        .{ "ifShadow", "ok" },
+        .{ "guardShadow", "Reg" },
+    };
+    for (shadowed) |pair| {
+        const caller = idx.graph.symbols[idx.lookup(pair[0])[0]];
+        try testing.expect(isLocalBinding(caller, pair[1]));
+        if (refByQual(caller, "", pair[1])) |ref| try testing.expect(ref.target == invalid);
+    }
+
+    // Project-wide: no call edge binds to a non-callable.
+    for (idx.graph.symbols) |sym| {
+        for (sym.refs) |ref| {
+            if (ref.kind != .call or ref.target == invalid) continue;
+            const target = idx.graph.symbols[ref.target];
+            try testing.expect(isCallable(target) or mayHoldCallable(target.kind));
+        }
+    }
 }
 
 test "cpp: a member call through a typed pointer resolves to that type's method" {
@@ -2731,6 +2936,18 @@ test "a bare identifier never binds to a same-named class member" {
 
     const field = qualifiedId(&idx, "Ctx", "name").?;
     try testing.expectEqual(@as(usize, 0), idx.callersOf(field).len);
+}
+
+/// The sole top-level (unparented) symbol named `name`, or null when the name
+/// is absent or shared — a test that pins a target must not pick arbitrarily.
+fn topLevelNamed(idx: *const Index, name: []const u8) ?SymbolId {
+    var found: SymbolId = invalid;
+    for (idx.lookup(name)) |id| {
+        if (idx.graph.symbols[id].parent != invalid) continue;
+        if (found != invalid) return null;
+        found = id;
+    }
+    return if (found == invalid) null else found;
 }
 
 fn qualifiedId(idx: *const Index, parent: []const u8, child: []const u8) ?SymbolId {

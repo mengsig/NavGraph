@@ -1086,6 +1086,8 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
     const close = ctx.close[open];
     if (close == sentinel) return;
     var expect_name = true;
+    // First name of the Go parameter group still waiting for its shared type.
+    var group_start = list.items.len;
     var i = open + 1;
     while (i < close) {
         if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '{')) {
@@ -1109,11 +1111,15 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
                 if (typeFromChain(ctx, i + 2, close)) |t| ty = t;
             } else if (ctx.cfg.language == .go and i + 1 < close and !ctx.isPunct(i + 1, ',')) {
                 // Go writes `name T` with no separator (`o *Other`, `w http.ResponseWriter`).
-                // A grouped `a, b int` leaves the leading names untyped, which still
-                // shadows a same-named global.
                 if (typeFromChain(ctx, i + 1, close)) |t| ty = t;
             }
             try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
+            // A Go group shares one type written after the last name
+            // (`store, other *Local`): back-fill the names that parsed untyped.
+            if (ctx.cfg.language == .go and ty.len != 0) {
+                for (list.items[group_start..]) |*b| b.type_name = ty;
+                group_start = list.items.len;
+            }
         }
         expect_name = false;
         i += 1;
@@ -1228,6 +1234,26 @@ fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Bindin
     }
 }
 
+/// Statement keywords a Go short declaration may follow directly, so the
+/// declared name is not the first token on its line.
+const go_short_decl_openers = KeywordSet.initComptime(.{
+    .{"for"}, .{"if"}, .{"switch"}, .{"case"},
+});
+
+/// Whether identifier `i` is a declared name on the left of a Go short
+/// declaration. The name list runs `ident (, ident)*` up to `:=`, and `i` must
+/// itself start a list item — statement start, a preceding statement keyword,
+/// or the list's own comma — so a call argument never looks like a declaration.
+fn goShortDeclName(ctx: *const Ctx, i: u32, hi: u32, lo: u32) bool {
+    const starts_item = i == lo or ctx.toks[i - 1].line != ctx.toks[i].line or
+        ctx.isPunct(i - 1, ',') or ctx.isPunct(i - 1, ';') or
+        (ctx.toks[i - 1].kind == .identifier and go_short_decl_openers.has(ctx.textOf(i - 1)));
+    if (!starts_item) return false;
+    var j = i + 1;
+    while (j + 1 < hi and ctx.isPunct(j, ',') and ctx.toks[j + 1].kind == .identifier) j += 2;
+    return j + 1 < hi and ctx.isPunct(j, ':') and ctx.isPunct(j + 1, '=');
+}
+
 fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
     const t = ctx.toks[i];
     if (t.kind != .identifier) return null;
@@ -1262,9 +1288,21 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
         }
         return null;
     }
+    // Go short declarations bind *every* name on the left, and start after a
+    // statement keyword as often as at line start: `x, err := f()`,
+    // `for _, x := range xs`, `if x, ok := m[k]; ok`. A missing binding here let
+    // a local shadowing an imported package resolve to the package instead.
+    if (ctx.cfg.language == .go and goShortDeclName(ctx, i, hi, lo)) {
+        if (ctx.identEql(i, "_")) return null; // blank identifier declares nothing
+        // Only the single-name form has a typeable RHS; a tuple RHS stays
+        // untyped, which still shadows a same-named package or global.
+        const single = ctx.isPunct(i + 1, ':');
+        const ty = if (single) typeFromRhs(ctx, i + 3, hi) orelse "" else "";
+        return .{ .name = ctx.textOf(i), .type_name = ty };
+    }
     const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
     if (!first_on_line) return null;
-    // Go short declaration `name := …` (tokens `:` `=`).
+    // Short declaration `name := …` (tokens `:` `=`) outside Go.
     if (ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, '=')) {
         return .{ .name = ctx.textOf(i), .type_name = typeFromRhs(ctx, i + 3, hi) orelse "" };
     }
