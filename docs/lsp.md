@@ -229,16 +229,21 @@ memory and stack, and neither half recurses. Worst case, per request:
 | --- | --- | --- |
 | Pattern length | 4096 bytes | `-32602` |
 | Group nesting | 64 | `-32602` |
-| Node visits, per line searched | 200 000 + 8 × line length | `-32002` |
+| Node visits, per grep request | 200 000 + 32 × bytes searched | `-32002` |
 | Live backtrack alternatives | 16 384 | `-32002` |
 | Live continuation frames | 16 384 | `-32002` |
 | Matcher scratch | ≈ 2 MiB, allocated once per compiled pattern | — |
 | Machine stack | constant — the parser and the matcher both walk explicit stacks | — |
 
-The step allowance scales with the line so an ordinary scan of a long line
-(a minified `.js`, `.css` or `.json`) never trips it, and a quantifier over a
+The step allowance is **pooled across the whole request**, not granted per
+line: grep runs the pattern once per line, so a per-line bound would leave the
+request itself unbounded. It grows with the bytes actually searched, so an
+honest whole-tree grep stays well inside it — seven ordinary regex greps over a
+142 000-line tree answer in about a second, including the index — while a
+pathological pattern gives up in tens of milliseconds. A quantifier over a
 single-byte body (`.*`, `a+`, `[a-z]*`) holds its whole backtrack range as one
-alternative rather than one per byte. A pattern that is quadratic in the line
+alternative rather than one per byte, so an ordinary scan of a minified `.js`,
+`.css` or `.json` line stays linear. A pattern that is quadratic in the line
 length anyway — `a+b` across 300 000 `a` — gives up with `-32002`; it never
 hangs and never takes the server down.
 

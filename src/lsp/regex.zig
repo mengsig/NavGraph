@@ -45,11 +45,16 @@ pub const max_pattern_bytes: usize = 4096;
 /// match-time bounds below mean something.
 pub const max_nesting: usize = 64;
 
-/// Node visits allowed for one `find` call: a fixed base plus an allowance per
-/// input byte, so scanning a long line never trips the budget on its length
-/// alone while a pathological pattern still stops.
+/// Node visits allowed for one compiled pattern: a fixed base, plus an
+/// allowance per byte searched that each `find` adds as it goes.
+///
+/// Pooled across calls rather than granted per call, because grep runs a
+/// pattern once per line: a per-call budget bounds each line but leaves the
+/// request itself unbounded, which is the denial of service half of the same
+/// defect. Scaling with the bytes actually searched keeps an honest whole-tree
+/// grep well inside it.
 pub const step_budget_base: u32 = 200_000;
-pub const step_budget_per_byte: u32 = 8;
+pub const step_budget_per_byte: u32 = 32;
 
 /// Live backtrack alternatives, and live continuation frames, allowed during one
 /// match attempt. Both are fixed scratch owned by the compiled `Regex`, so the
@@ -57,10 +62,7 @@ pub const step_budget_per_byte: u32 = 8;
 pub const max_backtrack: usize = 16_384;
 pub const max_conts: usize = 16_384;
 
-fn budgetFor(len: usize) u32 {
-    const n: u32 = @intCast(@min(len, std.math.maxInt(u32)));
-    return step_budget_base +| (step_budget_per_byte *| n);
-}
+
 
 const Class = struct {
     negate: bool,
@@ -108,6 +110,10 @@ pub const Regex = struct {
     /// pointer and never allocates; these bound what one match can use.
     conts: []Cont,
     stack: []Thread,
+    /// Steps left, as a one-element slice so `find` can spend from it through a
+    /// const pointer. A compiled pattern lives for one request, so this is the
+    /// request's whole allowance.
+    budget: []u32,
 
     pub fn deinit(self: *Regex) void {
         self.arena.deinit();
@@ -118,12 +124,14 @@ pub const Regex = struct {
     pub fn find(self: *const Regex, input: []const u8) MatchError!?Match {
         // Positions are u32; a line this long is not a line.
         if (input.len >= std.math.maxInt(u32)) return error.TooComplex;
+        const left = &self.budget[0];
+        left.* = left.* +| (step_budget_per_byte *| @as(u32, @intCast(input.len)));
         var m = Matcher{
             .input = input,
             .case_sensitive = self.case_sensitive,
             .conts = self.conts,
             .stack = self.stack,
-            .budget = budgetFor(input.len),
+            .left = left,
         };
         var start: u32 = 0;
         while (start <= input.len) : (start += 1) {
@@ -146,12 +154,15 @@ pub fn compile(gpa: std.mem.Allocator, pattern: []const u8, case_sensitive: bool
     const root = try p.parse();
     const conts = try alloc.alloc(Cont, max_conts);
     const stack = try alloc.alloc(Thread, max_backtrack);
+    const budget = try alloc.alloc(u32, 1);
+    budget[0] = step_budget_base;
     return .{
         .arena = arena,
         .root = root,
         .case_sensitive = case_sensitive,
         .conts = conts,
         .stack = stack,
+        .budget = budget,
     };
 }
 
@@ -454,10 +465,9 @@ const Matcher = struct {
     stack: []Thread,
     n_conts: usize = 0,
     n_stack: usize = 0,
-    /// Node visits so far, across every start position of one `find`, so the
-    /// whole call is bounded and not just each attempt.
-    steps: u32 = 0,
-    budget: u32,
+    /// Node visits still allowed. Shared with the compiled pattern, so the bound
+    /// covers the whole request and not just one attempt or one line.
+    left: *u32,
 
     /// Match `root` anchored at `start`, or null when it cannot.
     fn runFrom(m: *Matcher, root: []const Node, start: u32) MatchError!?u32 {
@@ -468,8 +478,8 @@ const Matcher = struct {
         var pos: u32 = start;
 
         while (true) {
-            m.steps += 1;
-            if (m.steps >= m.budget) return error.TooComplex;
+            if (m.left.* == 0) return error.TooComplex;
+            m.left.* -= 1;
 
             const advanced = switch (cur) {
                 .accept => return pos,
@@ -1067,3 +1077,4 @@ test "the iterative matcher agrees with the naive reference on random patterns" 
     try testing.expect(compared > 3000);
     try testing.expect(skipped < compared / 10);
 }
+
