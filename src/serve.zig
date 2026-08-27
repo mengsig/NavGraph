@@ -14,6 +14,7 @@
 pub const rpc = @import("serve/rpc.zig");
 pub const overlay = @import("serve/overlay.zig");
 pub const position = @import("serve/position.zig");
+pub const session = @import("serve/session.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
