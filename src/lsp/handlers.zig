@@ -2280,6 +2280,28 @@ test "navgraph/diff reports the roots of an unsaved overlay edit, wrapping blast
     try testing.expect(found);
 }
 
+test "navgraph/diff misses a new untracked file, matching the CLI's own gap (F12, documented limitation)" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    try ts.tmp.?.dir.writeFile(testing.io, .{ .sub_path = "brandnew.zig", .data = "pub fn brandNewFn() void {}\n" });
+    var rescan_res = try ts.request(25,
+        \\{"jsonrpc":"2.0","id":25,"method":"navgraph/rescan","params":{"full":true}}
+    );
+    rescan_res.deinit();
+
+    // git diff never lists an untracked path, and the overlay half only
+    // catches an *unsaved* edit — this file is already on disk, unopened, so
+    // neither half sees it. Documented at docs/lsp.md's Limitations.
+    var res = try ts.request(49,
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/diff","params":{}}
+    );
+    defer res.deinit();
+    const roots = (try resultOf(res)).object.get("blast").?.object.get("roots").?.array.items;
+    for (roots) |root| {
+        try testing.expect(!std.mem.eql(u8, root.object.get("name").?.string, "brandNewFn"));
+    }
+}
+
 test "navgraph/diff on a ref git rejects is a git-failed error, not an empty change set" {
     const ts = try started(testing.allocator);
     defer ts.deinit();

@@ -513,6 +513,11 @@ and requires the process to exit 0. CI runs it against the ReleaseFast build.
 - The parse cache is not written while a document is open: the live index then
   holds unsaved text, which must never be stored in a cache keyed by disk mtime.
 - No diagnostics are published — NavGraph is a navigator, not a compiler.
+- `navgraph/diff` (and `navgraph/blast`'s `{ ref }` form) misses an untracked
+  file: `git diff` never lists one, and an unsaved buffer whose text matches
+  the new file on disk looks unchanged to the overlay half too. Matches the
+  CLI's `diff`, which has the same gap. Save the file under a tracked path (or
+  `git add` it) to bring it into `diff`'s view.
 
 ## Neovim
 
