@@ -80,7 +80,7 @@ pub const Session = struct {
 
     overlays: overlay.Store,
     sources: index_mod.Sources,
-    slots: std.ArrayListUnmanaged(Slot),
+    slots: std.ArrayList(Slot),
     /// Interned path strings, stable for the session's lifetime. Every path key
     /// in `by_path`, `dirty` and `Slot.file.path` is one of these, so re-parsing
     /// a file never invalidates a key.
@@ -91,9 +91,9 @@ pub const Session = struct {
 
     /// Paths awaiting re-index, and the arenas the live index still points into.
     dirty: std.StringArrayHashMapUnmanaged(void),
-    retired: std.ArrayListUnmanaged(*Arena),
+    retired: std.ArrayList(*Arena),
     /// Scratch for the last report's `changed` list.
-    changed: std.ArrayListUnmanaged([]const u8),
+    changed: std.ArrayList([]const u8),
 
     /// Deadline (ms on the awake clock) at which pending edits must be indexed,
     /// or null when nothing is pending.

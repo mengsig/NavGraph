@@ -17,6 +17,8 @@ pub const position = @import("serve/position.zig");
 pub const session = @import("serve/session.zig");
 pub const payload = @import("serve/payload.zig");
 pub const regex = @import("serve/regex.zig");
+pub const search = @import("serve/search.zig");
+pub const queries = @import("serve/queries.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
