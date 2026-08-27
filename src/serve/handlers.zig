@@ -1595,3 +1595,138 @@ test "grep sees an unsaved buffer, and forgets it after didClose" {
     defer gone.deinit();
     try testing.expectEqual(@as(usize, 0), (try resultOf(gone)).object.get("items").?.array.items.len);
 }
+
+test "a client advertising workDoneProgress gets a progress create/begin/end" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    try ts.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":
+        \\ {"capabilities":{"window":{"workDoneProgress":true}}}}
+    );
+    try ts.send(
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+    );
+    const out = ts.out.written();
+    try testing.expect(std.mem.indexOf(u8, out, "window/workDoneProgress/create") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"begin\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"end\"") != null);
+    // The indexed notification is sent whether or not progress was requested.
+    try testing.expect(std.mem.indexOf(u8, out, "navgraph/indexed") != null);
+}
+
+test "a client without workDoneProgress gets no progress traffic" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    try testing.expect(std.mem.indexOf(u8, ts.out.written(), "$/progress") == null);
+    try testing.expect(std.mem.indexOf(u8, ts.out.written(), "navgraph/indexed") != null);
+}
+
+test "didSave and didChangeWatchedFiles re-stat and re-index the named files" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const uri = try ts.uri(alloc, "util.zig");
+
+    try ts.tmp.?.dir.writeFile(testing.io, .{
+        .sub_path = "util.zig",
+        .data = "pub const marker = \"needle-in-a-haystack\";\npub fn helper() void {}\npub fn savedLater() void {}\n",
+    });
+    _ = try ts.takeNotifications(alloc, "navgraph/indexed");
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didSave","params":{{"textDocument":{{"uri":"{s}"}}}}}}
+    , .{uri}));
+    var found = try ts.request(40,
+        \\{"jsonrpc":"2.0","id":40,"method":"navgraph/search","params":{"query":"savedLater"}}
+    );
+    defer found.deinit();
+    try testing.expectEqual(@as(usize, 1), (try resultOf(found)).object.get("items").?.array.items.len);
+    const notes = try ts.takeNotifications(alloc, "navgraph/indexed");
+    try testing.expectEqualStrings("save", notes[0].object.get("params").?.object.get("reason").?.string);
+
+    // The same file changed again, announced through the watched-files channel.
+    try ts.tmp.?.dir.writeFile(testing.io, .{
+        .sub_path = "util.zig",
+        .data = "pub const marker = \"needle-in-a-haystack\";\npub fn helper() void {}\npub fn watchedLater() void {}\n",
+    });
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{{"changes":[{{"uri":"{s}","type":2}}]}}}}
+    , .{uri}));
+    var again = try ts.request(41,
+        \\{"jsonrpc":"2.0","id":41,"method":"navgraph/search","params":{"query":"watchedLater"}}
+    );
+    defer again.deinit();
+    try testing.expectEqual(@as(usize, 1), (try resultOf(again)).object.get("items").?.array.items.len);
+}
+
+test "navgraph/search with refs finds use sites and reports their lines" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(42,
+        \\{"jsonrpc":"2.0","id":42,"method":"navgraph/search","params":{"query":"helper","refs":true}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    // The item is the *referencing* definition, with the use-site lines.
+    try testing.expectEqualStrings("mid", items[0].object.get("symbol").?.object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 9), items[0].object.get("lines").?.array.items[0].integer);
+}
+
+test "the tests scope narrows search and blast" {
+    const with_tests = [_][2][]const u8{
+        .{ "lib.zig", "pub fn subject() void {}\n" },
+        .{ "lib_test.zig", 
+            \\const lib = @import("lib.zig");
+            \\test "exercises subject" {
+            \\    lib.subject();
+            \\}
+            \\
+        },
+    };
+    const ts = try TestServer.init(testing.allocator, testing.io, &with_tests);
+    defer ts.deinit();
+    try ts.start();
+
+    var all = try ts.request(43,
+        \\{"jsonrpc":"2.0","id":43,"method":"navgraph/blast","params":{"symbol":"subject","depth":1}}
+    );
+    defer all.deinit();
+    try testing.expectEqual(@as(i64, 1), (try resultOf(all)).object.get("summary").?.object.get("tests").?.integer);
+
+    var no_tests = try ts.request(44,
+        \\{"jsonrpc":"2.0","id":44,"method":"navgraph/blast","params":{"symbol":"subject","depth":1,"tests":"without"}}
+    );
+    defer no_tests.deinit();
+    const summary = (try resultOf(no_tests)).object.get("summary").?.object;
+    try testing.expectEqual(@as(i64, 1), summary.get("symbols").?.integer); // the root alone
+    try testing.expectEqual(@as(i64, 0), summary.get("tests").?.integer);
+}
+
+test "$/cancelRequest is accepted and the next request still answers" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    try ts.send(
+        \\{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":99}}
+    );
+    var res = try ts.request(45,
+        \\{"jsonrpc":"2.0","id":45,"method":"navgraph/status","params":{}}
+    );
+    defer res.deinit();
+    try testing.expect((try resultOf(res)).object.get("files") != null);
+}
+
+test "requests before initialized report a not-initialized error" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    try ts.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    );
+    var res = try ts.request(46,
+        \\{"jsonrpc":"2.0","id":46,"method":"navgraph/status","params":{}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(@as(i64, -32600), try errorCodeOf(res));
+}
