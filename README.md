@@ -52,6 +52,22 @@ zig build -Doptimize=ReleaseFast          # -> zig-out/bin/navgraph
 zig build -Doptimize=ReleaseFast --prefix ~/.local   # installs to ~/.local/bin/navgraph
 ```
 
+### Install from a release
+
+Prebuilt `ReleaseFast` binaries (x86_64/aarch64, Linux/macOS) are attached to
+every [release](https://github.com/mengsig/NavGraph/releases):
+
+```sh
+gh release download -R mengsig/NavGraph --pattern 'navgraph-x86_64-linux.tar.gz'
+tar xzf navgraph-x86_64-linux.tar.gz
+install navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
+navgraph --version
+```
+
+Swap `x86_64-linux` for `aarch64-linux`, `x86_64-macos` or `aarch64-macos` to
+match your machine. The release also attaches a `SHA256SUMS` file (one entry
+per archive) if you want to verify the download.
+
 Run the tests:
 
 ```sh
@@ -491,11 +507,13 @@ navgraph lsp [-C|--root <dir>] [--log <file>] [--log-level error|info|debug]
 - **Standard LSP** — `definition`, `references`, `hover`, `documentSymbol`,
   `workspace/symbol`, full document sync. An open buffer's unsaved text drives
   the graph, so answers reflect what you are typing, not what is on disk.
-- **`navgraph/*`** — `status`, `symbolAt`, `blast`, `search`, `grep`, `callers`,
-  `calls`, `rescan`, plus a `navgraph/indexed` notification after every
-  re-index. `blast` is the one to reach for: the transitive callers (or callees)
-  of a symbol, a file, or everything changed since a git ref — with a per-depth
-  and per-file summary.
+- **`navgraph/*`** — the full CLI verb set over the resident graph: `status`,
+  `symbolAt`, `blast`, `search`, `grep`, `callers`, `calls`, `rescan`,
+  `neighbors`, `path`, `outline`, `hot`, `unused`, `diff`, `routes`, `events`,
+  `imports`, `importers`, `graph`, plus a `navgraph/indexed` notification after
+  every re-index. `blast` is the one to reach for: the transitive callers (or
+  callees) of a symbol, a file, or everything changed since a git ref — with a
+  per-depth and per-file summary.
 - A background mtime poll picks up changes made outside the editor (a git
   checkout, a formatter) and re-indexes them.
 
@@ -508,6 +526,11 @@ vim.lsp.start({
   root_dir = vim.fs.root(0, { ".git", "build.zig" }),
 })
 ```
+
+Or use [epicenter.nvim](https://github.com/mengsig/epicenter.nvim), the
+reference Neovim client: it wires up `navgraph lsp` plus pickers and views for
+the custom `navgraph/*` methods (blast radius, search, the call graph, …) out
+of the box.
 
 Measured on this repo (ReleaseFast): initial index 36–46 ms cold / 14–16 ms
 warm, single-file re-index 4–10 ms, search ~2 ms, grep ~3 ms, blast depth 3
