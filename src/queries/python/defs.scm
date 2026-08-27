@@ -8,6 +8,7 @@
 ; field) are refined in Zig, exactly as the heuristic scanner decides them.
 
 (function_definition name: (identifier) @name) @def.function
+(function_definition "async" @mod.async name: (identifier) @name) @def.function
 
 (decorated_definition
   definition: (function_definition name: (identifier) @name) @def.function) @decorators
@@ -40,5 +41,6 @@
 (import_statement name: (dotted_name) @path) @def.import
 (import_statement
   name: (aliased_import name: (dotted_name) @path alias: (identifier) @name)) @def.import
-(import_from_statement module_name: (dotted_name) @path) @def.import
-(import_from_statement module_name: (relative_import) @path) @def.import
+; `from mod import X` records the module edge only — it binds no module name.
+(import_from_statement module_name: (dotted_name) @from.path) @def.import
+(import_from_statement module_name: (relative_import) @from.path) @def.import

@@ -159,6 +159,7 @@ const DefCap = enum {
     init,
     recv,
     path,
+    from_path,
     decorators,
     exported,
     mod_static,
@@ -369,7 +370,10 @@ const Def = struct {
     /// A `self.x = …` capture: its owner is the enclosing class, not the
     /// constructor it is written in.
     self_field: bool,
-    /// Filled after all defs are known.
+    /// Nearest enclosing captured definition of any kind. Filled after all defs
+    /// are known; distinct from `parent_local`, which follows the heuristic
+    /// backend's narrower rule (see `resolveParents`).
+    nearest: ?u32 = null,
     parent_local: ?u32 = null,
 };
 
@@ -415,7 +419,7 @@ pub fn parse(
     defer by_node.deinit(gpa);
     for (defs.items, 0..) |d, i| try by_node.put(gpa, nodeKey(d.node), @intCast(i));
     refineFunctionValued(source, defs.items);
-    for (defs.items) |*d| d.parent_local = enclosingDef(&by_node, d.node, defs.items, d.self_field);
+    resolveParents(&by_node, defs.items);
     refineKinds(defs.items);
     try dropFunctionLocals(&defs, gpa, &by_node);
 
@@ -459,20 +463,43 @@ fn sortDefs(defs: []Def) void {
     }.lt);
 }
 
-/// Index of the nearest enclosing captured definition. A `self.x` field belongs
-/// to the class it is written on, not to the constructor that assigns it, so it
-/// skips past the enclosing callables.
-fn enclosingDef(
+/// Fill `nearest` (the innermost enclosing definition of any kind) and
+/// `parent_local`.
+///
+/// `parent_local` deliberately matches the heuristic backend: a definition is
+/// owned by an enclosing *container* (class/struct/interface/enum), never by an
+/// enclosing function, so a nested helper stays parentless and keeps resolving
+/// by its bare name. A `self.x` field is the exception — it belongs to the class
+/// it is written on, not to the constructor that assigns it.
+fn resolveParents(by_node: *const std.AutoHashMapUnmanaged(usize, u32), defs: []Def) void {
+    for (defs) |*d| d.nearest = nearestDef(by_node, d.node);
+    for (defs) |*d| {
+        if (d.self_field) {
+            d.parent_local = nearestContainer(by_node, d.node, defs);
+            continue;
+        }
+        const near = d.nearest orelse continue;
+        d.parent_local = if (isContainerKind(defs[near].kind)) near else null;
+    }
+}
+
+fn nearestDef(by_node: *const std.AutoHashMapUnmanaged(usize, u32), node: TSNode) ?u32 {
+    var cur = ts_node_parent(node);
+    while (!ts_node_is_null(cur)) : (cur = ts_node_parent(cur)) {
+        if (by_node.get(nodeKey(cur))) |idx| return idx;
+    }
+    return null;
+}
+
+fn nearestContainer(
     by_node: *const std.AutoHashMapUnmanaged(usize, u32),
     node: TSNode,
     defs: []const Def,
-    want_container: bool,
 ) ?u32 {
     var cur = ts_node_parent(node);
     while (!ts_node_is_null(cur)) : (cur = ts_node_parent(cur)) {
         const idx = by_node.get(nodeKey(cur)) orelse continue;
-        if (want_container and !isContainerKind(defs[idx].kind)) continue;
-        return idx;
+        if (isContainerKind(defs[idx].kind)) return idx;
     }
     return null;
 }
@@ -506,6 +533,7 @@ fn collectDefs(
         var decorators: ?TSNode = null;
         var recv_node: ?TSNode = null;
         var recv_ok = true;
+        var binds_nothing = false;
         var mods = Mods{};
 
         for (m.captures[0..m.capture_count]) |cap| {
@@ -516,6 +544,10 @@ fn collectDefs(
                 .type => type_node = node,
                 .init => init_node = node,
                 .path => path_node = node,
+                .from_path => {
+                    path_node = node;
+                    binds_nothing = true;
+                },
                 .decorators => decorators = node,
                 .exported => try exported_nodes.put(gpa, nodeKey(node), {}),
                 .recv => {
@@ -540,7 +572,7 @@ fn collectDefs(
         const name = if (name_node) |n|
             nodeText(source, n)
         else if (kind == .import)
-            importBinding(path)
+            (if (binds_nothing) "" else importBinding(path))
         else
             continue;
         if (name.len == 0 and kind != .import) continue;
@@ -648,9 +680,13 @@ fn refineKinds(defs: []Def) void {
     }
 }
 
+/// Kinds that own members. Deliberately the same set as `index.zig`'s
+/// `isContainer`: a symbol parented to one of these is a member, and bare-name
+/// resolution skips members. A field left parentless would compete with
+/// top-level definitions of the same name and dissolve their exact edges.
 fn isContainerKind(kind: SymbolKind) bool {
     return switch (kind) {
-        .class, .@"struct", .interface, .@"enum" => true,
+        .class, .@"struct", .interface, .@"enum", .type => true,
         else => false,
     };
 }
@@ -666,8 +702,9 @@ fn dropFunctionLocals(
     var kept: usize = 0;
     for (defs.items) |d| {
         if (d.kind == .variable or d.kind == .constant) {
-            const parent = d.parent_local;
-            if (parent != null and isCallableKind(defs.items[parent.?].kind)) continue;
+            if (d.nearest) |near| {
+                if (isCallableKind(defs.items[near].kind)) continue;
+            }
         }
         defs.items[kept] = d;
         kept += 1;
@@ -677,7 +714,7 @@ fn dropFunctionLocals(
     // Local indices moved; rebuild the node index and re-resolve every parent.
     by_node.clearRetainingCapacity();
     for (defs.items, 0..) |d, i| try by_node.put(gpa, nodeKey(d.node), @intCast(i));
-    for (defs.items) |*d| d.parent_local = enclosingDef(by_node, d.node, defs.items, d.self_field);
+    resolveParents(by_node, defs.items);
 }
 
 fn isCallableKind(kind: SymbolKind) bool {

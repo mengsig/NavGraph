@@ -9,8 +9,9 @@
   object: (identifier) @qualifier
   property: (property_identifier) @ref.call))
 (call_expression function: (member_expression
-  object: (this)
+  object: (this) @qualifier
   property: (property_identifier) @ref.call))
+(member_expression object: (this) @qualifier property: (property_identifier) @ref)
 (call_expression function: (member_expression
   object: (member_expression property: (property_identifier) @qualifier)
   property: (property_identifier) @ref.call))
