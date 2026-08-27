@@ -1,0 +1,38 @@
+name: Backends
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, tree-sitter=${{ matrix.tree-sitter }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        tree-sitter: [all, none]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          cache-key: ${{ matrix.os }}-${{ matrix.tree-sitter }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtree-sitter=${{ matrix.tree-sitter }}
+
+      # `test` already depends on the differ step (see build.zig); run differ by
+      # name too so its result is visible as its own step, not folded into test.
+      - name: Test
+        run: zig build test -Dtree-sitter=${{ matrix.tree-sitter }} --summary all
+
+      - name: Backend differ
+        run: zig build differ -Dtree-sitter=${{ matrix.tree-sitter }} --summary all
