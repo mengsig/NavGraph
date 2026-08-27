@@ -588,9 +588,11 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // Skip only a *bare* self-reference (recursion noise). A qualified call
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
-        // A JS/TS object-literal property key (`{ count: ... }`) names a field,
-        // not a reference to a same-named binding — don't emit an edge for it.
-        if (receiver.name.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
+        // A JS/TS object-literal property key (`{ count: ... }`) and a Go
+        // composite-literal field key (`API{store: s}`) name a field, not a
+        // reference to a same-named binding — don't emit an edge for either.
+        if (receiver.name.len == 0 and
+            (isJsObjectKey(ctx, i, lo, hi) or isGoLiteralFieldKey(ctx, i, lo, hi))) continue;
         const is_call = referenceCallOpen(ctx, i, hi) != null;
         if (assignment.read) {
             try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
@@ -798,6 +800,50 @@ fn isJsObjectKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
     if (i <= lo or i + 1 >= hi) return false;
     if (!ctx.isPunct(i + 1, ':')) return false;
     return ctx.isPunct(i - 1, '{') or ctx.isPunct(i - 1, ',');
+}
+
+/// Whether token `i` is a Go composite-literal field key (`&API{store: s}`): an
+/// identifier after `{` or `,` and before `:`. Such a key names a field, not a
+/// reference to a same-named package or variable. Map/slice/array literals
+/// (`map[K]V{…}`, `[]T{…}`) keep their keys — there the key is an expression.
+fn isGoLiteralFieldKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    if (ctx.cfg.language != .go) return false;
+    if (i <= lo or i + 1 >= hi) return false;
+    if (!ctx.isPunct(i + 1, ':') or ctx.isPunct(i + 2, '=')) return false;
+    if (!ctx.isPunct(i - 1, '{') and !ctx.isPunct(i - 1, ',')) return false;
+    const open = enclosingBraceOpen(ctx, i, lo) orelse return false;
+    return goLiteralTypeIsNamed(ctx, open, lo);
+}
+
+/// The `{` opening the block token `i` sits directly inside, or null when the
+/// nearest enclosing bracket is a `(`/`[` or there is none in range.
+fn enclosingBraceOpen(ctx: *const Ctx, i: u32, lo: u32) ?u32 {
+    var depth: u32 = 0;
+    var j = i;
+    while (j > lo) {
+        j -= 1;
+        if (ctx.isPunct(j, '}') or ctx.isPunct(j, ')') or ctx.isPunct(j, ']')) {
+            depth += 1;
+            continue;
+        }
+        if (!ctx.isPunct(j, '{') and !ctx.isPunct(j, '(') and !ctx.isPunct(j, '[')) continue;
+        if (depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        return if (ctx.isPunct(j, '{')) j else null;
+    }
+    return null;
+}
+
+/// Whether the composite literal opened at `open` names a plain type (`API{`,
+/// `models.Widget{`) rather than a map/slice/array whose `]` precedes the type.
+fn goLiteralTypeIsNamed(ctx: *const Ctx, open: u32, lo: u32) bool {
+    if (open == lo) return false;
+    var j = open - 1;
+    if (ctx.toks[j].kind != .identifier) return false;
+    while (j >= lo + 2 and ctx.isPunct(j - 1, '.') and ctx.toks[j - 2].kind == .identifier) j -= 2;
+    return j == lo or !ctx.isPunct(j - 1, ']');
 }
 
 fn recordRef(
@@ -1093,16 +1139,34 @@ const c_statement_keywords = KeywordSet.initComptime(.{
     .{"virtual"}, .{"operator"}, .{"default"},
 });
 
-/// Parse a C/C++ declarator `[modifiers] Type[::Q][<...>] [*&]* name` ending at
-/// `; = , ) : [ {`, returning `name -> Type`. Rejects a call or a function
-/// declaration (`name` followed by `(`) and anything without both a type and a
-/// name, so an expression statement yields nothing.
+/// Modifiers that are a complete type on their own, so the declarator may carry
+/// no type identifier at all (`long alpha = 0;`, `const auto x = f();`).
+const c_scalar_modifiers = KeywordSet.initComptime(.{
+    .{"unsigned"}, .{"signed"}, .{"long"}, .{"short"}, .{"auto"},
+});
+
+/// Whether token `i` closes a declarator (`; = , ) : [ {`). A `(` means a call
+/// or a function declaration, never a variable we can type.
+fn endsCDeclarator(ctx: *const Ctx, i: u32, limit: u32) bool {
+    if (i >= limit or ctx.toks[i].kind != .punct) return false;
+    const c = ctx.ch(i);
+    return c == ';' or c == '=' or c == ',' or c == ')' or c == ':' or c == '[' or c == '{';
+}
+
+/// Parse a C/C++ declarator `[modifiers] [Type[::Q][<...>]] [*&]* name` ending
+/// at `; = , ) : [ {`, returning `name -> Type`. A scalar modifier can be the
+/// whole type (`long alpha`), in which case the binding is untyped: it names no
+/// project type, and its job is to shadow a same-named global. Anything without
+/// a name yields nothing, so an expression statement is not a declaration.
 fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
     if (c_statement_keywords.has(ctx.textOf(start))) return null;
     var i = start;
+    var scalar = false;
     while (i < limit and ctx.toks[i].kind == .identifier and
         c_decl_modifiers.has(ctx.textOf(i))) : (i += 1)
-    {}
+    {
+        if (c_scalar_modifiers.has(ctx.textOf(i))) scalar = true;
+    }
 
     // Type chain: `A`, `a::B`, each optionally followed by `<...>`.
     var type_name: ?[]const u8 = null;
@@ -1120,21 +1184,25 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
         }
         break;
     }
-    if (type_name == null) return null;
 
+    const after_type = i;
     while (i < limit and (ctx.isPunct(i, '*') or ctx.isPunct(i, '&'))) : (i += 1) {}
-    if (i >= limit or ctx.toks[i].kind != .identifier) return null;
-    if (c_decl_modifiers.has(ctx.textOf(i)) or c_statement_keywords.has(ctx.textOf(i))) return null;
-    const name = ctx.textOf(i);
-    i += 1;
 
-    // `name(` is a call or a function declaration, never a variable we can type.
-    if (i < limit and ctx.toks[i].kind == .punct) {
-        const c = ctx.ch(i);
-        if (c == ';' or c == '=' or c == ',' or c == ')' or c == ':' or c == '[' or c == '{')
-            return .{ .name = name, .type_name = type_name.? };
+    if (i < limit and ctx.toks[i].kind == .identifier and
+        !c_decl_modifiers.has(ctx.textOf(i)) and !c_statement_keywords.has(ctx.textOf(i)))
+    {
+        if (!endsCDeclarator(ctx, i + 1, limit)) return null;
+        const name = ctx.textOf(i);
+        if (type_name) |t| return .{ .name = name, .type_name = t };
+        // `long *p;` — the modifier is the type.
+        return if (scalar) .{ .name = name, .type_name = "" } else null;
     }
-    return null;
+
+    // `long alpha = 0;` — no name followed the type chain, so what it consumed
+    // *is* the name and the scalar modifier was the type.
+    if (!scalar or i != after_type) return null;
+    const name = type_name orelse return null;
+    return if (endsCDeclarator(ctx, i, limit)) .{ .name = name, .type_name = "" } else null;
 }
 
 /// Record `name -> Type` for each C/C++ parameter in `(...)`.

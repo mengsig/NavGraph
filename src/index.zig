@@ -775,6 +775,11 @@ fn buildGoPackageTable(idx: *Index) !void {
 /// binds the first hit as ambiguous.
 fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference) bool {
     if (idx.graph.files[from.file].language != .go) return false;
+    // A package qualifier always heads its chain (`models.WidgetID(n)`). In
+    // `a.store.Stats()` the qualifier is a *field* that happens to share a
+    // package name; the receiver-scoped paths own that, and letting the package
+    // answer bound the call to the package's `struct Stats`.
+    if (ref.receiver_root.len != 0) return false;
     const files = idx.go_packages.get(ref.qualifier) orelse return false;
     var found: SymbolId = invalid;
     var hits: u32 = 0;
@@ -782,10 +787,6 @@ fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference)
         if (fid == from.file) continue; // own package is never name-qualified
         const t = topLevelIn(idx, fid, ref.name);
         if (t == invalid) continue;
-        // `a.store.Stats()` keeps only `store` as the qualifier, which also
-        // names the package. A call must not settle for the package's *type*
-        // named `Stats`; leave it for the receiver-scoped paths below.
-        if (ref.kind == .call and !isCallable(idx.graph.symbols[t])) continue;
         hits += 1;
         if (found == invalid) found = t;
     }
@@ -2476,6 +2477,110 @@ test "an express sub-router mount keeps its router handler" {
         checked = true;
     }
     try testing.expect(checked);
+}
+
+test "c: a modifier-only declarator still shadows a same-named global" {
+    // Regression (F4): `long alpha = 0;` yielded no binding, because the type
+    // loop read the *variable* as the type name. The local then failed to
+    // shadow the global `alpha`, producing four confident false call edges.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "e.c", .data =
+        \\void alpha(void) {}
+        \\void beta(void) {}
+        \\void gamma(void) {}
+        \\void delta(void) {}
+        \\
+        \\int probe(int n) {
+        \\    long alpha = 0;
+        \\    unsigned beta = 0;
+        \\    int gamma = 0;
+        \\    struct Thing *delta = 0;
+        \\    return (int)(alpha + beta + gamma + n) + (delta != 0);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const probe = idx.graph.symbols[idx.lookup("probe")[0]];
+    for (probe.refs) |ref| {
+        try testing.expect(ref.target == invalid);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |name| {
+        try testing.expect(isLocalBinding(probe, name));
+    }
+}
+
+test "cpp: an `auto` local shadows a same-named global" {
+    // Regression (F4), same declarator shape: `auto item = first;` and
+    // `const auto total = 0;` bound to the globals `item`/`total`.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.cpp", .data =
+        \\struct Item { void render(); };
+        \\void item() {}
+        \\void total() {}
+        \\void count() {}
+        \\
+        \\void draw(Item* first) {
+        \\    auto item = first;
+        \\    const auto total = 0;
+        \\    unsigned long count = 0;
+        \\    item->render();
+        \\    (void)total;
+        \\    (void)count;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const draw = idx.graph.symbols[idx.lookup("draw")[0]];
+    for ([_][]const u8{ "item", "total", "count" }) |name| {
+        try testing.expect(isLocalBinding(draw, name));
+        // No bare edge to the same-named free function.
+        if (refByQual(draw, "", name)) |ref| try testing.expect(ref.target == invalid);
+    }
+}
+
+test "go: a composite-literal field key is not a reference to a same-named package" {
+    // Regression (F5): `return &API{store: s}` bound the field key `store` to
+    // the imported package `store`.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const new_api = idx.graph.symbols[idx.lookup("NewAPI")[0]];
+    try testing.expect(refByQual(new_api, "", "store") == null);
+}
+
+test "go: a package-qualified type conversion keeps its edge" {
+    // Regression (F5): `models.WidgetID(n)` is a Go conversion. Refusing every
+    // call-to-a-type threw it away; the `a.store.Stats()` hazard it guarded is
+    // held off instead by requiring the package qualifier to head its chain.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const widget_id = idx.lookup("WidgetID")[0];
+    try testing.expectEqual(model.SymbolKind.type, idx.graph.symbols[widget_id].kind);
+    const parse_id = idx.graph.symbols[idx.lookup("parseID")[0]];
+    const ref = refByQual(parse_id, "models", "WidgetID").?;
+    try testing.expectEqual(model.RefKind.call, ref.kind);
+    try testing.expectEqual(widget_id, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionReason.go_package, ref.resolution_reason);
 }
 
 test "cpp: a member call through a typed pointer resolves to that type's method" {
