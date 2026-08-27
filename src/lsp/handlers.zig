@@ -314,7 +314,15 @@ fn positionOf(p: Params) Error!position.Position {
     };
 }
 
+/// `Scope` is `{ strict?:bool, tests?:string }` at the *top level* of
+/// `params` (`docs/lsp.md`'s `& Scope` intersection), not nested under a
+/// `scope` key — a client sending `{"scope":{"tests":"only"}}` gets its
+/// filter silently ignored otherwise, since an unrecognized key is dropped.
+/// Reject that shape outright instead (coldstart review F10).
 fn scopeOf(self: *Server, p: Params) Error!queries.Scope {
+    if (p.get("scope")) |v| {
+        if (v == .object) return error.InvalidParams;
+    }
     var scope = queries.Scope.fromConfig(self.cfg);
     scope.strict = p.boolean("strict", scope.strict);
     // An unknown scope is rejected, not dropped: answering the default question
@@ -2152,6 +2160,29 @@ test "navgraph/outline lists vm.zig's symbols" {
         if (std.mem.eql(u8, s.object.get("name").?.string, "push")) found = true;
     }
     try testing.expect(found);
+}
+
+test "a nested scope object is rejected instead of silently ignored (F10)" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+
+    // The documented contract is `Target & Scope` — `tests`/`strict` at the
+    // top level of params, not nested under a `scope` key.
+    var nested = try ts.request(52,
+        \\{"jsonrpc":"2.0","id":52,"method":"navgraph/outline","params":{"scope":{"tests":"only"}}}
+    );
+    defer nested.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(nested));
+
+    // The correctly-shaped, top-level form still works and is honored: the
+    // fixture has no test symbols, so `tests: only` finds none.
+    var top_level = try ts.request(53,
+        \\{"jsonrpc":"2.0","id":53,"method":"navgraph/outline","params":{"tests":"only"}}
+    );
+    defer top_level.deinit();
+    const files = (try resultOf(top_level)).object.get("files").?.array.items;
+    try testing.expectEqual(@as(usize, 0), files.len);
 }
 
 test "navgraph/hot ranks tokenize above the leaf push/pop methods" {
