@@ -1,7 +1,7 @@
 {
   "language": "c",
   "root": "testenv/c_lib",
-  "notes": "C. Definitions include container fields and the typedefs that introduce a name of their own (the redundant `typedef struct X X;` aliases are not repeated). `struct TrickyHeader` is file-scope: C has no nested type scope. The two functions TRICKY_DEFINE_SCALER defines are expected at the macro's use site, where clangd reports them. A call through a function-pointer member binds to the member, not to the implementation assigned into it: picking node_init out of tricky_chain needs whole-program analysis, so that edge is deliberately absent. Enum constants are excluded in every language.",
+  "notes": "C. Definitions include container fields and the typedefs that introduce a name of their own (the redundant `typedef struct X X;` aliases are not repeated). `struct TrickyHeader` is file-scope: C has no nested type scope. The two functions TRICKY_DEFINE_SCALER defines are expected at the macro's use site, where clangd reports them. A call through a function-pointer member binds to the member, not to the implementation assigned into it: picking node_init out of tricky_chain needs whole-program analysis, so that edge is deliberately absent. Enum constants are excluded in every language, and so are the type annotations on a field declaration - those are the aggregate's shape, scored as definitions, not as edges.",
   "definitions": [
     {"file": "ds.h", "name": "DS_H", "qualified": "DS_H", "kind": "macro", "line": 2, "parent": null},
     {"file": "ds.h", "name": "DS_VERSION_MAJOR", "qualified": "DS_VERSION_MAJOR", "kind": "macro", "line": 8, "parent": null},
@@ -119,6 +119,7 @@
     {"file": "vec.c", "name": "vec_free", "qualified": "vec_free", "kind": "fn", "line": 82, "parent": null}
   ],
   "edges": [
+    {"from": "iter.c:map_get_value", "to": "ds.h:DSKind", "exact": true, "lines": [88, 92], "verified": "lsp"},
     {"from": "iter.c:map_get_value", "to": "ds.h:DSValue", "exact": true, "lines": [85], "verified": "lsp"},
     {"from": "iter.c:map_get_value", "to": "map.c:map_get", "exact": true, "lines": [86], "verified": "lsp"},
     {"from": "iter.c:map_visit", "to": "ds.h:Entry", "exact": true, "lines": [70], "verified": "lsp"},
@@ -126,6 +127,7 @@
     {"from": "iter.c:vec_count_if", "to": "iter.c:at", "exact": true, "lines": [29], "verified": "lsp"},
     {"from": "iter.c:vec_iter", "to": "iter.c:vec_iter_next", "exact": true, "lines": [61], "verified": "lsp"},
     {"from": "iter.c:vec_iter", "to": "iter.h:VecIter", "exact": true, "lines": [58], "verified": "lsp"},
+    {"from": "iter.c:vec_iter_next", "to": "ds.h:DSStatus", "exact": true, "lines": [49, 53], "verified": "lsp"},
     {"from": "iter.c:vec_iter_next", "to": "iter.c:at", "exact": true, "lines": [51], "verified": "lsp"},
     {"from": "iter.c:vec_reduce", "to": "iter.c:at", "exact": true, "lines": [40], "verified": "lsp"},
     {"from": "map.c:bucket_find", "to": "ds.h:Entry", "exact": true, "lines": [23], "verified": "lsp"},
@@ -135,6 +137,7 @@
     {"from": "map.c:map_get", "to": "map.c:bucket_find", "exact": true, "lines": [66], "verified": "lsp"},
     {"from": "map.c:map_get", "to": "map.c:hash", "exact": true, "lines": [65], "verified": "lsp"},
     {"from": "map.c:map_new", "to": "ds.h:Map", "exact": true, "lines": [35], "verified": "lsp"},
+    {"from": "map.c:map_put", "to": "ds.h:DSStatus", "exact": true, "lines": [43, 49, 53, 60], "verified": "lsp"},
     {"from": "map.c:map_put", "to": "ds.h:Entry", "exact": true, "lines": [46, 51], "verified": "lsp"},
     {"from": "map.c:map_put", "to": "map.c:bucket_find", "exact": true, "lines": [46], "verified": "lsp"},
     {"from": "map.c:map_put", "to": "map.c:hash", "exact": true, "lines": [45], "verified": "lsp"},
@@ -168,13 +171,11 @@
     {"from": "stack.c:stack_free", "to": "vec.c:vec_free", "exact": true, "lines": [50], "verified": "lsp"},
     {"from": "stack.c:stack_new", "to": "stack.h:Stack", "exact": true, "lines": [8], "verified": "lsp"},
     {"from": "stack.c:stack_new", "to": "vec.c:vec_new", "exact": true, "lines": [12], "verified": "lsp"},
+    {"from": "stack.c:stack_peek", "to": "ds.h:DSStatus", "exact": true, "lines": [35], "verified": "lsp"},
     {"from": "stack.c:stack_peek", "to": "ds.h:Vec", "exact": true, "lines": [33], "verified": "lsp"},
     {"from": "stack.c:stack_peek", "to": "vec.c:vec_get", "exact": true, "lines": [37], "verified": "lsp"},
     {"from": "stack.c:stack_pop", "to": "vec.c:vec_pop", "exact": true, "lines": [28], "verified": "lsp"},
     {"from": "stack.c:stack_push", "to": "vec.c:vec_push", "exact": true, "lines": [22], "verified": "lsp"},
-    {"from": "tricky_c.c:default_ops", "to": "tricky_c.c:node_init", "exact": true, "lines": [44], "verified": "lsp"},
-    {"from": "tricky_c.c:default_ops", "to": "tricky_c.c:node_name", "exact": true, "lines": [46], "verified": "lsp"},
-    {"from": "tricky_c.c:default_ops", "to": "tricky_c.c:node_step", "exact": true, "lines": [45], "verified": "lsp"},
     {"from": "tricky_c.c:node_init", "to": "tricky_c.h:TrickyNode", "exact": true, "lines": [29], "verified": "lsp"},
     {"from": "tricky_c.c:tricky_chain", "to": "tricky_c.h:TrickyNode", "exact": true, "lines": [56], "verified": "lsp"},
     {"from": "tricky_c.c:tricky_chain", "to": "tricky_c.h:TrickyOps.init", "exact": true, "lines": [57], "verified": "manual"},
@@ -199,8 +200,11 @@
     {"from": "tricky_c.c:tricky_run", "to": "vec.c:vec_free", "exact": true, "lines": [100], "verified": "lsp"},
     {"from": "tricky_c.c:tricky_run", "to": "vec.c:vec_new", "exact": true, "lines": [95], "verified": "lsp"},
     {"from": "tricky_c.c:tricky_run", "to": "vec.c:vec_push", "exact": true, "lines": [96], "verified": "lsp"},
+    {"from": "vec.c:vec_get", "to": "ds.h:DSStatus", "exact": true, "lines": [69, 72], "verified": "lsp"},
     {"from": "vec.c:vec_get", "to": "vec.c:vec_in_bounds", "exact": true, "lines": [68], "verified": "lsp"},
     {"from": "vec.c:vec_new", "to": "ds.h:Vec", "exact": true, "lines": [8], "verified": "lsp"},
+    {"from": "vec.c:vec_pop", "to": "ds.h:DSStatus", "exact": true, "lines": [58, 62], "verified": "lsp"},
+    {"from": "vec.c:vec_push", "to": "ds.h:DSStatus", "exact": true, "lines": [47, 52], "verified": "lsp"},
     {"from": "vec.c:vec_push", "to": "vec.c:vec_grow", "exact": true, "lines": [46], "verified": "lsp"},
     {"from": "vec.c:vec_shrink_to_fit", "to": "ds.h:DS_UNUSED", "exact": true, "lines": [78], "verified": "manual"}
   ]

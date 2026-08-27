@@ -128,6 +128,7 @@
   "edges": [
     {"from": "Models.cs:DurableProduct.DurableProduct", "to": "Models.cs:Product.Product", "exact": true, "lines": [63], "verified": "manual"},
     {"from": "Models.cs:PerishableProduct.Label", "to": "Models.cs:Product.Label", "exact": true, "lines": [93], "verified": "manual"},
+    {"from": "Models.cs:PerishableProduct.PerishableProduct", "to": "Models.cs:Category", "exact": true, "lines": [80], "verified": "manual"},
     {"from": "Models.cs:PerishableProduct.PerishableProduct", "to": "Models.cs:Product.Product", "exact": true, "lines": [80], "verified": "manual"},
     {"from": "Pricing.cs:BulkPricing.PriceFor", "to": "Pricing.cs:BulkPricing.Discounted", "exact": true, "lines": [49], "verified": "manual"},
     {"from": "Program.cs:Program.Main", "to": "Models.cs:OrderLine", "exact": true, "lines": [24, 26, 27], "verified": "manual"},
@@ -140,6 +141,7 @@
     {"from": "Program.cs:Program.Main", "to": "Services.cs:InventoryService.SellableProducts", "exact": true, "lines": [33], "verified": "manual"},
     {"from": "Program.cs:Program.Main", "to": "Services.cs:OrderService", "exact": true, "lines": [22], "verified": "manual"},
     {"from": "Program.cs:Program.Main", "to": "Services.cs:OrderService.PlaceOrder", "exact": true, "lines": [30], "verified": "manual"},
+    {"from": "Program.cs:Program.SeedCatalog", "to": "Models.cs:Category", "exact": true, "lines": [42], "verified": "manual"},
     {"from": "Program.cs:Program.SeedCatalog", "to": "Models.cs:DurableProduct", "exact": true, "lines": [42], "verified": "manual"},
     {"from": "Program.cs:Program.SeedCatalog", "to": "Models.cs:PerishableProduct", "exact": true, "lines": [43], "verified": "manual"},
     {"from": "Program.cs:Program.SeedCatalog", "to": "Services.cs:InventoryService.Register", "exact": true, "lines": [44, 45], "verified": "manual"},
@@ -160,6 +162,7 @@
     {"from": "Services.cs:OrderService.PlaceOrder", "to": "Pricing.cs:IPricingStrategy.PriceFor", "exact": true, "lines": [90], "verified": "manual"},
     {"from": "Services.cs:OrderService.PlaceOrder", "to": "Services.cs:InventoryService.Find", "exact": true, "lines": [85], "verified": "manual"},
     {"from": "Tricky.cs:Box.Of", "to": "Tricky.cs:Box", "exact": true, "lines": [143], "verified": "manual"},
+    {"from": "Tricky.cs:Ledger.Entry.Direction", "to": "Tricky.cs:Ledger.Entry.Kind", "exact": true, "lines": [69], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Post", "to": "Tricky.cs:Ledger.Entry", "exact": true, "lines": [98], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Total", "to": "Tricky.cs:Adjust", "exact": true, "lines": [116], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Total", "to": "Tricky.cs:Ledger.Entry", "exact": true, "lines": [112], "verified": "manual"},
@@ -168,6 +171,9 @@
     {"from": "Tricky.cs:Slip.operator+", "to": "Tricky.cs:Slip", "exact": true, "lines": [182], "verified": "manual"},
     {"from": "Tricky.cs:TaggedSlip.Render", "to": "Tricky.cs:Slip.Render", "exact": true, "lines": [198], "verified": "manual"},
     {"from": "Tricky.cs:TaggedSlip.TaggedSlip", "to": "Tricky.cs:Slip.Slip", "exact": true, "lines": [191], "verified": "manual"},
+    {"from": "Tricky.cs:TierExtensions.Bonus", "to": "Tricky.cs:Tier", "exact": true, "lines": [41], "verified": "manual"},
+    {"from": "Tricky.cs:TierExtensions.Label", "to": "Tricky.cs:Tier", "exact": true, "lines": [36], "verified": "manual"},
+    {"from": "Tricky.cs:TrickyRunner.Run", "to": "Models.cs:Category", "exact": true, "lines": [219], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Models.cs:DurableProduct", "exact": true, "lines": [219], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Box", "exact": true, "lines": [232], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Box.Of", "exact": true, "lines": [232], "verified": "manual"},
@@ -183,6 +189,7 @@
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Slip", "exact": true, "lines": [235, 236, 237], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Slip.operator+", "exact": true, "lines": [237], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:TaggedSlip", "exact": true, "lines": [236], "verified": "manual"},
+    {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Tier", "exact": true, "lines": [228], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:TierExtensions.Label", "exact": true, "lines": [232], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:TrickyRunner.Run.Doubled", "exact": true, "lines": [227], "verified": "manual"}
   ]
