@@ -862,7 +862,7 @@ fn neighborsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Va
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
-    try queries.writeNeighbors(w, c, roots[0], try scopeOf(self, p));
+    try queries.writeNeighbors(w, c, roots, try scopeOf(self, p));
 }
 
 fn pathMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -2012,7 +2012,9 @@ test "navgraph/neighbors reports Vm.push's caller and its lack of callees" {
         \\{"jsonrpc":"2.0","id":49,"method":"navgraph/neighbors","params":{"symbol":"Vm.push"}}
     );
     defer res.deinit();
-    const r = (try resultOf(res)).object;
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    const r = items[0].object;
     try testing.expectEqualStrings("push", r.get("symbol").?.object.get("name").?.string);
     try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
     var found_run = false;
@@ -2020,6 +2022,51 @@ test "navgraph/neighbors reports Vm.push's caller and its lack of callees" {
         if (std.mem.eql(u8, c.object.get("symbol").?.object.get("name").?.string, "run")) found_run = true;
     }
     try testing.expect(found_run);
+}
+
+test "navgraph/neighbors returns an item per resolution, not just the first" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(49,
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/neighbors","params":{"symbol":"run"}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    // `run` is defined in both vm.zig and bytecode_vm.zig; both must appear,
+    // not just whichever the graph happens to index first.
+    try testing.expectEqual(@as(usize, 2), items.len);
+    var files: [2][]const u8 = undefined;
+    for (items, 0..) |item, i| files[i] = item.object.get("symbol").?.object.get("file").?.string;
+    try testing.expect(std.mem.eql(u8, files[0], "vm.zig") or std.mem.eql(u8, files[1], "vm.zig"));
+    try testing.expect(std.mem.eql(u8, files[0], "bytecode_vm.zig") or std.mem.eql(u8, files[1], "bytecode_vm.zig"));
+}
+
+test "navgraph/neighbors includes a data-read callee, unlike the tree walks (F14)" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &.{
+        .{
+            "state.zig",
+            \\pub var counter: i32 = 0;
+            \\
+            \\pub fn bump() void {
+            \\    counter += 1;
+            \\}
+            \\
+        },
+    });
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(49,
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/neighbors","params":{"symbol":"bump"}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    var found_counter = false;
+    for (items[0].object.get("callees").?.array.items) |c| {
+        if (std.mem.eql(u8, c.object.get("symbol").?.object.get("name").?.string, "counter")) found_counter = true;
+    }
+    try testing.expect(found_counter);
 }
 
 test "navgraph/path finds the call chain from eval to push" {

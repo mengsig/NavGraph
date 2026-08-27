@@ -378,7 +378,7 @@ pub fn writeBlast(
         const depth = nodes.items[cursor].depth;
         const from_id = nodes.items[cursor].id;
         if (depth >= opts.depth) continue;
-        var neighbours = Neighbours.init(idx, from_id, opts.direction);
+        var neighbours = Neighbours.init(idx, from_id, opts.direction, false);
         while (neighbours.next()) |n| {
             const sym = idx.graph.symbols[n.id];
             if (opts.scope.strict and !n.exact) continue;
@@ -500,10 +500,13 @@ const Neighbours = struct {
     refs: []const model.Reference,
     callers: []const SymbolId,
     i: usize,
+    /// Whether a plain data-read callee edge (a module `var`/`const`/field)
+    /// is yielded, or silently skipped like the CLI's non-`-r` walks do.
+    include_data_reads: bool,
 
     const Item = struct { id: SymbolId, exact: bool };
 
-    fn init(idx: *const Index, id: SymbolId, direction: Direction) Neighbours {
+    fn init(idx: *const Index, id: SymbolId, direction: Direction, include_data_reads: bool) Neighbours {
         return .{
             .idx = idx,
             .id = id,
@@ -511,6 +514,7 @@ const Neighbours = struct {
             .refs = idx.graph.symbols[id].refs,
             .callers = idx.callersOf(id),
             .i = 0,
+            .include_data_reads = include_data_reads,
         };
     }
 
@@ -526,7 +530,7 @@ const Neighbours = struct {
                 const ref = self.refs[self.i];
                 self.i += 1;
                 if (ref.target == invalid) continue;
-                if (query.isDataReadEdge(self.idx, ref)) continue;
+                if (!self.include_data_reads and query.isDataReadEdge(self.idx, ref)) continue;
                 return .{ .id = ref.target, .exact = ref.exact };
             },
         }
@@ -591,7 +595,7 @@ fn writeNode(
 
     try w.writeAll(",\"children\":[");
     var wrote: u32 = 0;
-    var it = Neighbours.init(idx, id, opts.direction);
+    var it = Neighbours.init(idx, id, opts.direction, false);
     while (it.next()) |n| {
         if (opts.direction == .callees and !opts.refs and dataRead(idx, id, n.id)) continue;
         if (opts.scope.strict and !n.exact) continue;
@@ -778,20 +782,26 @@ fn writeGrepItem(
 // Neighbors
 // ---------------------------------------------------------------------------
 
-/// Write `{symbol, callees:[{symbol,exact,lines}], callers:[...]}` for `id`,
-/// mirroring the CLI's `neighbors` but filtered through `Scope` like every
-/// other navgraph/* walk (blast, callers, calls), for a consistent contract.
-pub fn writeNeighbors(w: *Writer, ctx: Ctx, id: SymbolId, scope: Scope) !void {
-    const idx = ctx.index();
+/// Write `{items:[{symbol, callees:[{symbol,exact,lines}], callers:[...]}]}`,
+/// one entry per id in `ids` — mirrors the CLI's `neighbors -j`, which answers
+/// for every resolution of a name, not just the first (coldstart review F3).
+/// Filtered through `Scope` like every other navgraph/* walk (blast, callers,
+/// calls), for a consistent contract.
+pub fn writeNeighbors(w: *Writer, ctx: Ctx, ids: []const SymbolId, scope: Scope) !void {
     var lines: std.ArrayList(u32) = .empty;
-    defer lines.deinit(idx.gpa);
-    try w.writeAll("{\"symbol\":");
-    try payload.writeSymbolId(w, ctx, id);
-    try w.writeAll(",\"callees\":");
-    try writeNeighborSide(w, ctx, id, .callees, scope, &lines);
-    try w.writeAll(",\"callers\":");
-    try writeNeighborSide(w, ctx, id, .callers, scope, &lines);
-    try w.writeByte('}');
+    defer lines.deinit(ctx.index().gpa);
+    try w.writeAll("{\"items\":[");
+    for (ids, 0..) |id, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"symbol\":");
+        try payload.writeSymbolId(w, ctx, id);
+        try w.writeAll(",\"callees\":");
+        try writeNeighborSide(w, ctx, id, .callees, scope, &lines);
+        try w.writeAll(",\"callers\":");
+        try writeNeighborSide(w, ctx, id, .callers, scope, &lines);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
 }
 
 fn writeNeighborSide(
@@ -804,7 +814,10 @@ fn writeNeighborSide(
 ) !void {
     const idx = ctx.index();
     try w.writeByte('[');
-    var it = Neighbours.init(idx, id, direction);
+    // Unlike the tree walks (`blast`/`callers`/`calls`), always include
+    // data-read callees: the CLI's `neighbors -j` does not filter them, and
+    // `navgraph/neighbors` has no `refs` param to ask for them (F14).
+    var it = Neighbours.init(idx, id, direction, true);
     var wrote: u32 = 0;
     while (it.next()) |n| {
         if (scope.strict and !n.exact) continue;

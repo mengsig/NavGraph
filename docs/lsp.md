@@ -273,13 +273,18 @@ does not touch.
 
 ### `navgraph/neighbors`
 
-Params: `Target & Scope` → `{ symbol:Symbol, callees:[{symbol,exact,lines}],
-callers:[{symbol,exact,lines}] }`.
+Params: `Target & Scope` → `{ items:[{ symbol:Symbol,
+callees:[{symbol,exact,lines}], callers:[{symbol,exact,lines}] }] }`.
 
-Callees and callers of one symbol, one level deep, in a single view — a quicker
-"what's around this" than `blast`/`callers`/`calls`. Unlike the CLI's
-`neighbors`, both sides go through the same `Scope` (`strict`/`tests`) every
-other navgraph/* walk uses, for a consistent contract.
+Callees and callers of one symbol, one level deep, in a single view — a
+quicker "what's around this" than `blast`/`callers`/`calls`. One entry in
+`items` per definition the `Target` resolves to — a name with several
+definitions (overloads, same-named methods across files) gets an entry for
+each, exactly as the CLI's `neighbors` does, not just the first. Unlike the
+CLI, both sides go through the same `Scope` (`strict`/`tests`) every other
+navgraph/* walk uses, for a consistent contract; and unlike `blast`/`callers`/
+`calls`, plain data-read callees are always included (there is no `refs`
+param here, matching the CLI's `-j` output).
 
 ### `navgraph/path`
 
