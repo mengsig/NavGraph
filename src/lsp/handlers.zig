@@ -225,7 +225,6 @@ fn mapError(err: anyerror) MappedError {
         error.SymbolNotFound => .{ .code = .symbol_not_found, .message = "symbol not found" },
         error.FileNotIndexed => .{ .code = .invalid_params, .message = "file is not indexed" },
         error.BadPattern => .{ .code = .invalid_params, .message = "invalid pattern" },
-        error.InvalidGitPath => .{ .code = .request_failed, .message = "git reported an unusable diff path" },
         error.RegexTooComplex => .{ .code = .request_failed, .message = "regex too complex" },
         error.GitFailed => .{ .code = .request_failed, .message = "git diff failed" },
         error.WriteFailed => .{ .code = .internal_error, .message = "internal error" },
@@ -339,6 +338,17 @@ fn targetOf(self: *Server, gpa: std.mem.Allocator, p: Params) Error!queries.Targ
     if (p.str("ref")) |ref| return .{ .git_ref = ref };
     const at = (try offsetOf(self, gpa, p)) orelse return error.InvalidParams;
     return .{ .at = .{ .path = at.path, .offset = at.offset } };
+}
+
+/// `queries.resolveTarget`, recording a git failure's detail on `self` so
+/// `sendError` can surface it (a `{ref}` target shares `navgraph/diff`'s F2
+/// fix: a git error must not look like "nothing changed" or "not found").
+fn resolveTargetOrErr(self: *Server, arena: std.mem.Allocator, c: payload.Ctx, target: queries.Target) Error![]SymbolId {
+    var detail: ?[]const u8 = null;
+    return queries.resolveTarget(arena, c, target, &detail) catch |err| {
+        self.err_detail = detail;
+        return err;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +742,7 @@ fn blast(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *W
     const c = try self.ctx();
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
-    const roots = try queries.resolveTarget(arena, c, target);
+    const roots = try resolveTargetOrErr(self, arena, c, target);
     try queries.writeBlast(w, arena, c, roots, .{
         .depth = @min(p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
@@ -828,7 +838,7 @@ fn tree(
     const c = try self.ctx();
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
-    const roots = try queries.resolveTarget(arena, c, target);
+    const roots = try resolveTargetOrErr(self, arena, c, target);
     try w.writeAll("{\"root\":");
     try queries.writeTree(w, arena, c, roots[0], .{
         .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
@@ -851,7 +861,7 @@ fn neighborsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Va
     const c = try self.ctx();
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
-    const roots = try queries.resolveTarget(arena, c, target);
+    const roots = try resolveTargetOrErr(self, arena, c, target);
     try queries.writeNeighbors(w, c, roots[0], try scopeOf(self, p));
 }
 
@@ -901,12 +911,16 @@ fn diffMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, 
     try self.flushPending(arena, .change);
     const c = try self.ctx();
     const p = Params.from(params);
-    try queries.writeDiff(w, arena, c, p.str("ref") orelse "HEAD", .{
+    var detail: ?[]const u8 = null;
+    queries.writeDiff(w, arena, c, p.str("ref") orelse "HEAD", .{
         .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
         .limit = p.positive("limit", 500),
         .scope = try scopeOf(self, p),
-    });
+    }, &detail) catch |err| {
+        self.err_detail = detail;
+        return err;
+    };
 }
 
 fn routesMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -2136,6 +2150,18 @@ test "navgraph/diff reports the roots of an unsaved overlay edit, wrapping blast
         if (std.mem.eql(u8, root.object.get("name").?.string, "added")) found = true;
     }
     try testing.expect(found);
+}
+
+test "navgraph/diff on a ref git rejects is a git-failed error, not an empty change set" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(49,
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/diff","params":{"ref":"no-such-ref-xyz"}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(@as(i64, -32002), try errorCodeOf(res));
+    const message = res.value.object.get("error").?.object.get("message").?.string;
+    try testing.expect(std.mem.indexOf(u8, message, "no-such-ref-xyz") != null);
 }
 
 test "navgraph/routes maps an HTTP route to its handler and its client caller" {

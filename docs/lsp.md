@@ -96,7 +96,7 @@ disappears again when the buffer is closed.
 | `-32602` | Bad params: a missing/ill-typed field, an unknown `direction` or `tests` scope, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. |
 | `-32603` | Internal failure (allocation, IO). |
 | `-32001` | A `Target` that resolves to nothing — `{"code": -32001, "message": "…: symbol not found"}`. An error object never carries `data`. |
-| `-32002` | The request could not be completed: currently only a grep regex that exhausts one of the bounds below. |
+| `-32002` | The request could not be completed: a grep regex that exhausts one of the bounds below, or a `navgraph/diff` / `{ref}` target whose `git diff` failed (bad ref, no git tree, git unavailable). |
 
 A malformed *notification* gets no reply, per JSON-RPC — with one exception: a
 body the server cannot parse at all has no id to identify it as a notification,
@@ -339,7 +339,10 @@ Definitions changed since `ref` **plus** every definition in a file whose
 unsaved buffer differs from disk, wrapped as a `navgraph/blast` walk from those
 roots — the blast radius of a pending change. Unlike `navgraph/blast`'s own
 `{ ref }` target form, an empty change set is not a `-32001` error here:
-"nothing changed" is a routine answer, not a failed lookup.
+"nothing changed" is a routine answer, not a failed lookup. A `ref` git
+rejects, or a served root that is not a git tree, **is** an error —
+`-32002` with git's own message — so a mistyped ref is never reported as a
+clean tree; this also applies to `navgraph/blast`'s `{ ref }` form.
 
 ### `navgraph/routes`
 

@@ -25,9 +25,10 @@ const SymbolId = model.SymbolId;
 const invalid = model.invalid_symbol;
 const Ctx = payload.Ctx;
 
-/// `InvalidGitPath`: git reported a diff path the parser cannot use — a real
-/// failure, never reported to the editor as "nothing changed".
-pub const Error = error{ SymbolNotFound, FileNotIndexed, InvalidGitPath } || std.mem.Allocator.Error;
+/// `GitFailed`: a `{ref}` target's `git diff` did not run, or produced a patch
+/// the parser cannot use. Either way it is a real failure, never reported to
+/// the editor as "nothing changed"; the cause travels in `detail.*`.
+pub const Error = error{ SymbolNotFound, FileNotIndexed, GitFailed } || std.mem.Allocator.Error;
 
 /// The contract's `Scope`, defaulted from `initializationOptions`.
 pub const Scope = struct {
@@ -181,11 +182,14 @@ pub const Target = union(enum) {
 
 /// Resolve a target to the definitions it names. Never returns an empty slice —
 /// a target that resolves to nothing is `error.SymbolNotFound`, which the
-/// dispatcher turns into the contract's `-32001`.
+/// dispatcher turns into the contract's `-32001`. A `{ref}` target that git
+/// rejects (a bad ref, no git tree, git unavailable) is `error.GitFailed`,
+/// with `detail.*` set to the cause.
 pub fn resolveTarget(
     gpa: std.mem.Allocator,
     ctx: Ctx,
     target: Target,
+    detail: *?[]const u8,
 ) Error![]SymbolId {
     var out: std.ArrayList(SymbolId) = .empty;
     errdefer out.deinit(gpa);
@@ -201,7 +205,7 @@ pub fn resolveTarget(
             for (query.resolveIds(ctx.index(), name, &buf)) |id| try out.append(gpa, id);
         },
         .file => |path| try fileDefinitions(gpa, ctx.index(), path, &out),
-        .git_ref => |spec| try changedSince(gpa, ctx, spec, &out),
+        .git_ref => |spec| try changedSince(gpa, ctx, spec, &out, detail),
     }
     if (out.items.len == 0) return error.SymbolNotFound;
     return out.toOwnedSlice(gpa);
@@ -230,35 +234,46 @@ fn reportable(kind: model.SymbolKind) bool {
 
 /// Definitions touched since `spec` (`navgraph diff`'s rule) plus every
 /// definition in a file whose unsaved buffer differs from the copy on disk.
+/// A git failure — a bad ref, no git tree, git unavailable — is
+/// `error.GitFailed` with `detail.*` set to the cause, distinct from a clean
+/// tree (no error, an empty `out`): a failed lookup must never look like a
+/// routine "nothing changed" answer (coldstart review F2).
 fn changedSince(
     gpa: std.mem.Allocator,
     ctx: Ctx,
     spec: []const u8,
     out: *std.ArrayList(SymbolId),
+    detail: *?[]const u8,
 ) Error!void {
     const s = ctx.session;
     const idx = &s.idx;
     const ref = if (spec.len != 0) spec else "HEAD";
 
-    if (query.runGitDiff(gpa, s.io, s.root_path, ref)) |result| {
-        defer gpa.free(result.stdout);
-        defer gpa.free(result.stderr);
-        if (result.term == .exited and result.term.exited == 0) {
-            const changes = try gitdiff.parse(gpa, result.stdout);
-            defer gitdiff.freeChanges(gpa, changes);
-            for (changes) |change| {
-                const file = query.findDiffFile(idx, change.path) orelse continue;
-                var i = file.sym_start;
-                while (i < file.sym_end) : (i += 1) {
-                    const sym = idx.graph.symbols[i];
-                    if (!reportable(sym.kind)) continue;
-                    if (query.symbolTouched(sym, file.text, change.ranges)) try out.append(gpa, sym.id);
-                }
-            }
+    const result = query.runGitDiff(gpa, s.io, s.root_path, ref) catch |err| {
+        detail.* = try std.fmt.allocPrint(gpa, "git diff {s} failed: {s}", .{ ref, @errorName(err) });
+        return error.GitFailed;
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        detail.* = try std.fmt.allocPrint(gpa, "git diff {s} failed: {s}", .{
+            ref, std.mem.trim(u8, result.stderr, " \n\r\t"),
+        });
+        return error.GitFailed;
+    }
+    const changes = gitdiff.parse(gpa, result.stdout) catch |err| {
+        detail.* = try std.fmt.allocPrint(gpa, "git diff {s} produced an unusable patch: {s}", .{ ref, @errorName(err) });
+        return error.GitFailed;
+    };
+    defer gitdiff.freeChanges(gpa, changes);
+    for (changes) |change| {
+        const file = query.findDiffFile(idx, change.path) orelse continue;
+        var i = file.sym_start;
+        while (i < file.sym_end) : (i += 1) {
+            const sym = idx.graph.symbols[i];
+            if (!reportable(sym.kind)) continue;
+            if (query.symbolTouched(sym, file.text, change.ranges)) try out.append(gpa, sym.id);
         }
-    } else |_| {
-        // Not a git tree, or git is unavailable: the unsaved-buffer half of the
-        // answer still stands, so this is not a failure of the request.
     }
 
     for (s.overlays.docs.keys(), s.overlays.docs.values()) |path, text| {
@@ -983,10 +998,17 @@ pub const DiffOptions = struct {
 /// `resolveTarget`'s `{ref}` form (used by `navgraph/blast` itself), an empty
 /// change set is not an error here — "nothing changed" is a routine answer,
 /// not a failed lookup.
-pub fn writeDiff(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, ref: []const u8, opts: DiffOptions) !void {
+pub fn writeDiff(
+    w: *Writer,
+    gpa: std.mem.Allocator,
+    ctx: Ctx,
+    ref: []const u8,
+    opts: DiffOptions,
+    detail: *?[]const u8,
+) !void {
     var roots: std.ArrayList(SymbolId) = .empty;
     defer roots.deinit(gpa);
-    try changedSince(gpa, ctx, ref, &roots);
+    try changedSince(gpa, ctx, ref, &roots, detail);
 
     try w.writeAll("{\"ref\":");
     try payload.writeString(w, ref);
