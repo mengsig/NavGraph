@@ -262,7 +262,8 @@ documents are re-applied afterwards, so unsaved edits survive a rescan.
   after **every** (re)index. Clients refresh open views on it.
 - **`$/progress`** for the initial index, after a
   `window/workDoneProgress/create` request, and only when the client advertised
-  `window.workDoneProgress`.
+  `window.workDoneProgress`. The client's answer to that request is accepted
+  and dropped — a response is never replied to.
 - **`window/logMessage`** for diagnostics.
 
 ## Watching

@@ -57,6 +57,10 @@ pub const DecodeError = struct {
 
 pub const Decoded = union(enum) {
     message: Message,
+    /// The client's answer to a request *we* sent (`window/workDoneProgress/
+    /// create`). It carries an id but no method; replying to it with an error
+    /// would be a JSON-RPC violation, so it is dropped.
+    response,
     /// The body was not a usable JSON-RPC request; reply with this error unless
     /// the id is `none` (a malformed notification gets no reply, per spec).
     invalid: DecodeError,
@@ -230,6 +234,8 @@ pub fn decode(arena: std.mem.Allocator, body: []const u8) Decoded {
     const obj = parsed.object;
     const id = idOf(obj.get("id"));
     const method_val = obj.get("method") orelse {
+        // An id plus a result or an error is a response, not a broken request.
+        if (id != .none and (obj.contains("result") or obj.contains("error"))) return .response;
         return .{ .invalid = .{ .id = id, .code = .invalid_request, .message = "missing method" } };
     };
     if (method_val != .string) {
@@ -458,6 +464,19 @@ test "decode extracts id, method and params" {
     try testing.expectEqual(@as(i64, 7), got.message.id.number);
     try testing.expectEqualStrings("m", got.message.method);
     try testing.expect(got.message.params.? == .object);
+}
+
+test "decode classifies the client's answer to our request as a response" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // What VS Code and Neovim send back for window/workDoneProgress/create.
+    try testing.expect(decode(alloc, "{\"jsonrpc\":\"2.0\",\"id\":\"navgraph-progress\",\"result\":null}") == .response);
+    try testing.expect(decode(alloc, "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32601,\"message\":\"x\"}}") == .response);
+    // An id with neither is still a broken request, and is still answered.
+    try testing.expect(decode(alloc, "{\"id\":1}") == .invalid);
+    // A result with no id is nobody's response.
+    try testing.expect(decode(alloc, "{\"result\":null}") == .invalid);
 }
 
 test "decode accepts a string id and a notification without an id" {

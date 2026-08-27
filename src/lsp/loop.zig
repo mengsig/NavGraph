@@ -127,6 +127,9 @@ fn handleFrame(gpa: std.mem.Allocator, server: *handlers.Server, body: []const u
 
     switch (rpc.decode(alloc, body)) {
         .message => |msg| try server.dispatch(alloc, msg),
+        // Answering a response with an error is a protocol violation, and the
+        // only request we send carries no information we need back.
+        .response => server.log.print(.debug, "ignored response frame", .{}),
         .invalid => |bad| {
             server.log.print(.info, "bad request: {s}", .{bad.message});
             // A malformed *notification* has no id to answer, per JSON-RPC.
@@ -397,6 +400,40 @@ test "a frame whose body is bogus JSON gets -32700 and does not stop the loop" {
 
     try testing.expect(std.mem.indexOf(u8, ts.out.written(), "-32700") != null);
     var res = try ts.responseFor(5);
+    defer res.deinit();
+    try testing.expect(res.value.object.get("result") != null);
+}
+
+test "the client's answer to our progress request is never replied to" {
+    const gpa = testing.allocator;
+    const ts = try handlers.TestServer.init(gpa, testing.io, &project);
+    defer ts.deinit();
+    var stream: Stream = .{};
+    defer stream.deinit(gpa);
+
+    const boot = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"window":{"workDoneProgress":true}}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+    });
+    defer gpa.free(boot);
+    try feed(gpa, &ts.server, &stream, boot, 64);
+    // We asked the client to create a progress token, so its answer is coming.
+    try testing.expect(std.mem.indexOf(u8, ts.out.written(), "window/workDoneProgress/create") != null);
+
+    const before = ts.out.written().len;
+    const answer = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":"navgraph-progress","result":null}
+        ,
+        \\{"jsonrpc":"2.0","id":9,"method":"navgraph/status","params":{}}
+    });
+    defer gpa.free(answer);
+    try feed(gpa, &ts.server, &stream, answer, 64);
+
+    // Nothing addressed to "navgraph-progress" went back out...
+    try testing.expect(std.mem.indexOf(u8, ts.out.written()[before..], "navgraph-progress") == null);
+    // ...and the request behind it was still served.
+    var res = try ts.responseFor(9);
     defer res.deinit();
     try testing.expect(res.value.object.get("result") != null);
 }
