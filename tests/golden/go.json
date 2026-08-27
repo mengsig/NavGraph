@@ -78,6 +78,7 @@
     {"file": "tricky/tricky.go", "name": "Describer", "qualified": "Describer", "kind": "iface", "line": 49, "parent": null},
     {"file": "tricky/tricky.go", "name": "Describe", "qualified": "Describer.Describe", "kind": "method", "line": 50, "parent": "Describer"},
     {"file": "tricky/tricky.go", "name": "Auditor", "qualified": "Auditor", "kind": "iface", "line": 54, "parent": null},
+    {"file": "tricky/tricky.go", "name": "Describer", "qualified": "Auditor.Describer", "kind": "field", "line": 55, "parent": "Auditor"},
     {"file": "tricky/tricky.go", "name": "Audit", "qualified": "Auditor.Audit", "kind": "method", "line": 56, "parent": "Auditor"},
     {"file": "tricky/tricky.go", "name": "base", "qualified": "base", "kind": "struct", "line": 60, "parent": null},
     {"file": "tricky/tricky.go", "name": "owner", "qualified": "base.owner", "kind": "field", "line": 61, "parent": "base"},
