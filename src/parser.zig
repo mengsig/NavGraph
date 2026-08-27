@@ -453,6 +453,7 @@ fn enclosingSymbol(ctx: *const Ctx, off: u32, hi: u32) ?u32 {
 /// Build the bracket-matching table for `()`, `{}`, `[]`.
 fn buildMatches(gpa: std.mem.Allocator, source: []const u8, toks: []const Token) ![]u32 {
     const close = try gpa.alloc(u32, toks.len);
+    errdefer gpa.free(close); // the bracket stack below can still fail
     @memset(close, sentinel);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);

@@ -4895,3 +4895,41 @@ test "edit-requery cache stays identical to no-cache across rename add delete an
     try testing.expectEqual(@as(usize, 0), final.lookup("save").len);
     try testing.expectEqual(final.lookup("caller")[0], final.callersOf(final.lookup("twig")[0])[0]);
 }
+
+fn assembleAndFree(gpa: std.mem.Allocator, files: []const ParsedFile) !void {
+    var idx = try assemble(gpa, .{ .root_label = ".", .files = files });
+    idx.deinit();
+}
+
+test "assemble frees each allocation exactly once when one fails" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const app_src = "const util = @import(\"util.zig\");\npub fn run() void { util.helper(); }\n";
+    const util_src = "pub fn helper() void {}\n";
+    const app = try parseOne(testing.allocator, a, app_src, .zig);
+    const util = try parseOne(testing.allocator, a, util_src, .zig);
+    const files = [_]ParsedFile{
+        .{
+            .path = "app.zig",
+            .language = .zig,
+            .text = app_src,
+            .symbols = app.symbols,
+            .parse_health = app.health,
+            .stat = .{ .mtime_ns = 0, .ctime_ns = 0, .size = app_src.len },
+        },
+        .{
+            .path = "util.zig",
+            .language = .zig,
+            .text = util_src,
+            .symbols = util.symbols,
+            .parse_health = util.health,
+            .stat = .{ .mtime_ns = 0, .ctime_ns = 0, .size = util_src.len },
+        },
+    };
+    // Overlapping errdefers used to free the arena and both graph arrays twice
+    // on this path; the allocator catches that as an invalid free.
+    try testing.checkAllAllocationFailures(testing.allocator, assembleAndFree, .{&files});
+}

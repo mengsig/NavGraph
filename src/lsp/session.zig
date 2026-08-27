@@ -242,13 +242,22 @@ pub const Session = struct {
     pub fn rescan(self: *Session, full: bool) !Report {
         const start = self.nowMs();
         var sources = try index_mod.collect(self.gpa, self.io, self.root_dir, null, null, !full);
-        errdefer sources.deinit();
+
+        // Reserve the retirement slots first: this is the last step that can
+        // fail while `sources` is still ours to free. After the move below the
+        // session is its only owner, so nothing may free it from here.
+        self.retired.ensureUnusedCapacity(self.gpa, self.slots.items.len + 1) catch |err| {
+            sources.deinit();
+            return err;
+        };
 
         // Replace the whole file set, then re-apply every open document on top so
         // unsaved edits survive a rescan.
-        for (self.slots.items) |s| try self.retired.append(self.gpa, s.arena orelse continue);
+        for (self.slots.items) |s| self.retired.appendAssumeCapacity(s.arena orelse continue);
         self.slots.clearRetainingCapacity();
-        var old_sources = self.sources;
+        // The live index still points into the old sources, so they retire with
+        // the slot arenas and are freed only once the new index is installed.
+        self.retired.appendAssumeCapacity(self.sources.arena);
         self.sources = sources;
         self.used_cache = sources.cache.hits != 0;
         try self.adoptSources();
@@ -259,7 +268,6 @@ pub const Session = struct {
             try self.reparse(path);
         }
         try self.swapIndex(self.cacheWrite());
-        old_sources.deinit();
         self.dirty.clearRetainingCapacity();
         self.debounce_deadline_ms = null;
         return self.finishIndex(.rescan, start);
@@ -716,4 +724,28 @@ test "nextDeadlineMs reflects the debounce window and the watcher interval" {
     s.cfg.watch_interval_ms = 10;
     s.armWatch();
     try testing.expect(s.nextDeadlineMs().? <= 10);
+}
+
+test "a rescan that runs out of memory leaves one owner per allocation" {
+    const gpa = testing.allocator;
+    // The ownership transfer of `Sources` happens partway through a rescan.
+    // Fail at each allocation across that window: the session must still tear
+    // down with every allocation freed exactly once. It used to free the new
+    // sources on the error path while the session kept pointing at them, and
+    // leak the old ones.
+    var k: usize = 0;
+    while (k < 120) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{});
+        const alloc = failing.allocator();
+        var fx = try Fixture.init(alloc, testing.io, &sample);
+        defer fx.deinit(alloc);
+
+        try fx.session.openDocument("app.zig", "pub fn run() void {}\n");
+        _ = try fx.session.reindex(.change);
+
+        failing.fail_index = failing.alloc_index + k;
+        if (fx.session.rescan(false)) |_| {} else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
