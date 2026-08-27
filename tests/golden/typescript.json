@@ -38,7 +38,6 @@
     {"file": "src/components/PostList.tsx", "name": "PostRow", "qualified": "PostRow", "kind": "fn", "line": 15, "parent": null},
     {"file": "src/components/PostList.tsx", "name": "post", "qualified": "PostRow.post", "kind": "field", "line": 15, "parent": "PostRow"},
     {"file": "src/components/PostList.tsx", "name": "PostList", "qualified": "PostList", "kind": "fn", "line": 23, "parent": null},
-    {"file": "src/components/PostList.tsx", "name": "pending", "qualified": "PostList.pending", "kind": "const", "line": 24, "parent": "PostList"},
     {"file": "src/components/UserCard.tsx", "name": "Props", "qualified": "Props", "kind": "iface", "line": 3, "parent": null},
     {"file": "src/components/UserCard.tsx", "name": "id", "qualified": "Props.id", "kind": "field", "line": 4, "parent": "Props"},
     {"file": "src/components/UserCard.tsx", "name": "UserCard", "qualified": "UserCard", "kind": "fn", "line": 8, "parent": null},
