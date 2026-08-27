@@ -72,6 +72,11 @@ pub const Index = struct {
     /// logging.go, …). Lets a package-qualified call (`caddy.Load(...)`) resolve
     /// to the package's top-level definitions. Arena-owned.
     go_packages: std.StringHashMapUnmanaged([]const FileId) = .empty,
+    /// Java type id → the ids of the supertypes its signature declares, in
+    /// ascending id order. Precomputed once so inherited-member lookup walks a
+    /// short adjacency list instead of rescanning every symbol per reference.
+    /// Arena-owned.
+    java_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -230,6 +235,7 @@ pub fn buildOpenDir(
     attachCrossFileMethodParents(&idx);
     try buildImportTable(&idx);
     try buildGoPackageTable(&idx);
+    try buildJavaBaseTable(&idx);
     resolveReferences(&idx);
     // Persist BEFORE applying router mounts: the mount pass rewrites route
     // symbol names in place (prepending the mount prefix), and those rewritten
@@ -923,63 +929,108 @@ fn javaInheritedMemberFrom(
     for (visited[0..depth]) |seen| if (seen == type_id) return invalid;
     visited[depth] = type_id;
 
-    const subtype = idx.graph.symbols[type_id];
-    const signature = subtype.signature(idx.graph.files[subtype.file].text);
-    for (idx.graph.symbols) |base| {
-        if (base.id == type_id or !isContainer(base)) continue;
-        if (idx.graph.files[base.file].language != .java) continue;
-        if (!javaDeclaresBase(signature, base.name)) continue;
-
-        // An explicit import of the base name disambiguates same-named classes;
-        // otherwise any chosen base remains a non-exact hint at the call site.
-        if (importTarget(idx, subtype.file, base.name)) |target_file| {
-            if (base.file != target_file) continue;
-        }
-        const direct = memberOfParent(idx, base.id, name);
+    for (idx.java_bases.get(type_id) orelse return invalid) |base_id| {
+        const direct = memberOfParent(idx, base_id, name);
         if (direct.id != invalid) return direct.id;
-        const inherited = javaInheritedMemberFrom(idx, base.id, name, visited, depth + 1);
+        const inherited = javaInheritedMemberFrom(idx, base_id, name, visited, depth + 1);
         if (inherited != invalid) return inherited;
     }
     return invalid;
 }
 
-/// Whether a Java type signature declares `name` after `extends` or
-/// `implements`. Generic arguments are skipped so `extends Box<Product>` does
-/// not pretend that `Product` is itself a base class.
-fn javaDeclaresBase(signature: []const u8, name: []const u8) bool {
-    var i: usize = 0;
-    var in_bases = false;
-    var angle_depth: u32 = 0;
-    while (i < signature.len) {
-        const c = signature[i];
-        if (c == '<') {
-            angle_depth += 1;
-            i += 1;
-            continue;
-        }
-        if (c == '>') {
-            angle_depth -|= 1;
-            i += 1;
-            continue;
-        }
-        if (!isIdentByte(c)) {
-            i += 1;
-            continue;
-        }
-        const start = i;
-        i += 1;
-        while (i < signature.len and isIdentByte(signature[i])) i += 1;
-        const word = signature[start..i];
-        if (angle_depth != 0) continue;
-        if (std.mem.eql(u8, word, "extends") or std.mem.eql(u8, word, "implements")) {
-            in_bases = true;
-            continue;
-        }
-        if (in_bases and std.mem.eql(u8, word, "permits")) return false;
-        if (in_bases and std.mem.eql(u8, word, name)) return true;
+/// Precompute every Java type's declared supertypes into `Index.java_bases`.
+/// The lookup this replaces scanned the whole symbol table per unresolved Java
+/// reference, recursed 16 deep — O(references x symbols x depth), which made
+/// index build super-linear in file count. Arena-owned; dies with the index.
+fn buildJavaBaseTable(idx: *Index) !void {
+    const arena = idx.arena.allocator();
+
+    var by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(SymbolId)) = .empty;
+    for (idx.graph.symbols) |sym| {
+        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        const slot = try by_name.getOrPut(arena, sym.name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(arena, sym.id);
     }
-    return false;
+
+    var bases: std.ArrayListUnmanaged(SymbolId) = .empty;
+    for (idx.graph.symbols) |sym| {
+        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        bases.clearRetainingCapacity();
+        var it = JavaBaseIterator{ .signature = sym.signature(idx.graph.files[sym.file].text) };
+        while (it.next()) |base_name| {
+            const candidates = by_name.get(base_name) orelse continue;
+            // An explicit import of the base name disambiguates same-named
+            // classes; otherwise any chosen base stays a non-exact hint.
+            const imported = importTarget(idx, sym.file, base_name);
+            for (candidates.items) |cid| {
+                if (cid == sym.id) continue;
+                if (imported) |target_file| {
+                    if (idx.graph.symbols[cid].file != target_file) continue;
+                }
+                try bases.append(arena, cid);
+            }
+        }
+        if (bases.items.len == 0) continue;
+        // Ascending, deduped: the scan this replaces visited candidate bases in
+        // symbol-id order and took the first that resolved the member.
+        std.mem.sort(SymbolId, bases.items, {}, std.sort.asc(SymbolId));
+        var unique: usize = 0;
+        for (bases.items) |id| {
+            if (unique != 0 and bases.items[unique - 1] == id) continue;
+            bases.items[unique] = id;
+            unique += 1;
+        }
+        try idx.java_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
+    }
 }
+
+/// Iterates the type names a Java signature declares after `extends` /
+/// `implements`. Generic arguments are skipped so `extends Box<Product>` does
+/// not pretend `Product` is a base; a `permits` clause ends the list.
+const JavaBaseIterator = struct {
+    signature: []const u8,
+    i: usize = 0,
+    in_bases: bool = false,
+    angle_depth: u32 = 0,
+    stopped: bool = false,
+
+    fn next(self: *JavaBaseIterator) ?[]const u8 {
+        while (!self.stopped and self.i < self.signature.len) {
+            const c = self.signature[self.i];
+            if (c == '<') {
+                self.angle_depth += 1;
+                self.i += 1;
+                continue;
+            }
+            if (c == '>') {
+                self.angle_depth -|= 1;
+                self.i += 1;
+                continue;
+            }
+            if (!isIdentByte(c)) {
+                self.i += 1;
+                continue;
+            }
+            const start = self.i;
+            self.i += 1;
+            while (self.i < self.signature.len and isIdentByte(self.signature[self.i])) self.i += 1;
+            const word = self.signature[start..self.i];
+            if (self.angle_depth != 0) continue;
+            if (std.mem.eql(u8, word, "extends") or std.mem.eql(u8, word, "implements")) {
+                self.in_bases = true;
+                continue;
+            }
+            if (!self.in_bases) continue;
+            if (std.mem.eql(u8, word, "permits")) {
+                self.stopped = true;
+                return null;
+            }
+            return word;
+        }
+        return null;
+    }
+};
 
 fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
@@ -2476,6 +2527,90 @@ test "checked-in Java corpus resolves lexical, static-import, and inherited memb
     try testing.expect(!cents_ref.exact);
     try testing.expectEqual(model.ResolutionStatus.inferred, cents_ref.resolution_status);
     try testing.expectEqual(model.ResolutionReason.inheritance, cents_ref.resolution_reason);
+}
+
+test "Java inherited-member resolution stays linear in symbol count" {
+    // Regression (perf): the inherited-member lookup scanned the whole symbol
+    // table per unresolved Java reference, so index build went quadratic in
+    // project size (4,192 files: 120 ms -> 4.4 s warm). Kept deliberately
+    // file-light so the bound measures resolution, not file I/O: the pre-fix
+    // scan needs seconds here, the precomputed table milliseconds.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Base.java", .data =
+        \\public class Base {
+        \\    public int shared() { return 1; }
+        \\}
+    });
+
+    const groups = 60;
+    const per_group = 40;
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    var name_buf: [64]u8 = undefined;
+    for (0..groups) |g| {
+        source.clearRetainingCapacity();
+        for (0..per_group) |c| {
+            try source.print(testing.allocator,
+                \\class C{d}_{d} extends Base {{
+                \\    public int use{d}_{d}() {{ return shared(); }}
+                \\}}
+                \\
+            , .{ g, c, g, c });
+        }
+        const sub_path = try std.fmt.bufPrint(&name_buf, "Group{d}.java", .{g});
+        try tmp.dir.writeFile(io, .{ .sub_path = sub_path, .data = source.items });
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
+
+    // Every subclass still reaches the inherited member — the table is a
+    // speedup, not a drop in recall.
+    const shared = idx.lookup("shared")[0];
+    try testing.expectEqual(@as(usize, groups * per_group), idx.callersOf(shared).len);
+    try testing.expect(elapsed_ms < 1500);
+}
+
+test "the precomputed Java supertype table records declared bases only" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Base.java", .data = "public class Base {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Mixin.java", .data = "public interface Mixin {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Boxed.java", .data = "public class Boxed {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Sub.java", .data =
+        \\public class Sub extends Base implements Mixin {
+        \\    Box<Boxed> held;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const sub = idx.lookup("Sub")[0];
+    const bases = idx.java_bases.get(sub).?;
+    try testing.expectEqual(@as(usize, 2), bases.len);
+    // Ascending symbol-id order, and `Boxed` (a generic argument) is not a base.
+    var names: [2][]const u8 = undefined;
+    for (bases, 0..) |id, i| names[i] = idx.graph.symbols[id].name;
+    try testing.expect(std.mem.eql(u8, names[0], "Base") or std.mem.eql(u8, names[1], "Base"));
+    try testing.expect(std.mem.eql(u8, names[0], "Mixin") or std.mem.eql(u8, names[1], "Mixin"));
+    try testing.expect(bases[0] < bases[1]);
+    // A type with no `extends`/`implements` has no entry at all.
+    try testing.expect(idx.java_bases.get(idx.lookup("Base")[0]) == null);
 }
 
 test "Java overloads never make an arbitrary bare member edge exact" {
