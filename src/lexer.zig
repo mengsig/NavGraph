@@ -71,11 +71,14 @@ const Lexer = struct {
     }
 };
 
-fn isIdentStart(c: u8) bool {
+/// Whether `c` can begin an identifier. The single definition of what navgraph
+/// treats as a name — shared by the tokenizer and the editor server.
+pub fn isIdentStart(c: u8) bool {
     return std.ascii.isAlphabetic(c) or c == '_' or c == '$' or c == '@' or c >= 0x80;
 }
 
-fn isIdentCont(c: u8) bool {
+/// Whether `c` can continue an identifier.
+pub fn isIdentCont(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '$' or c >= 0x80;
 }
 
