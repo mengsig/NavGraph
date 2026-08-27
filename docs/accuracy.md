@@ -308,6 +308,12 @@ start at the baseline above, so the gate only ever catches a regression. After a
 which is what locks the gain in. Never lower a floor to make a build pass: a
 number that went down is the finding - unless the golden it is measured
 against changed underneath it (a correction, not a regression), in which case
-`--update-floors --lower-floors --reason "<why>"` records the drop
-deliberately, with the reason committed alongside it so a later reader can
-tell a golden correction from an indexer regression at a glance.
+`--update-floors --lower-floors --reason "<why>"` accepts the drop
+deliberately and prints the reason alongside every metric it moved - `floors.json`
+itself has no room for prose, so the reason is not persisted there; put it in
+the commit message and this file's fix-round table, the way every prior round
+has, so a later reader can tell a golden correction from an indexer regression
+at a glance. `--lower-floors` accepts every drop in the run, not a chosen
+subset, so a real regression riding along with a batch of golden corrections
+has no distinguishing mark beyond that printed line - read it before
+committing.

@@ -258,8 +258,9 @@ fn parseArgs(args: []const []const u8) !Options {
         } else return BenchError.UsageError;
     }
     // --lower-floors always needs its reason printed, and only makes sense
-    // alongside the re-record it would otherwise silently affect.
-    if (opts.lower_floors and (opts.reason == null or !opts.update_floors)) return BenchError.UsageError;
+    // alongside the re-record it would otherwise silently affect. An empty
+    // reason would print nothing useful, so it doesn't count as one.
+    if (opts.lower_floors and (opts.reason == null or opts.reason.?.len == 0 or !opts.update_floors)) return BenchError.UsageError;
     if (opts.reason != null and !opts.lower_floors) return BenchError.UsageError;
     return opts;
 }
@@ -1023,6 +1024,7 @@ fn writeFloors(
     // A first `--update-floors` run (or a floors.json wiped by hand) has
     // nothing to ratchet against; treat every metric as a fresh floor.
     const prior = loadFloors(arena, io, repo) catch Floors{ .floors = &.{} };
+    warnDroppedLanguages(prior, results);
 
     var drops: std.ArrayList(FloorDrop) = .empty;
     defer drops.deinit(gpa);
@@ -1088,6 +1090,23 @@ fn writeFloors(
             "  {s} {s}: {d}.{d:0>2}% -> {d}.{d:0>2}%\n",
             .{ d.language, d.metric, e.whole, e.frac, m.whole, m.frac },
         );
+    }
+}
+
+/// `writeFloors` only ever writes an entry for a language in `results`
+/// (today's golden files), so renaming or deleting a golden silently drops
+/// its recorded floor on the next re-record - unlike every other kind of
+/// drop, `ratchetMetric` never sees it. Surfaced here instead.
+fn warnDroppedLanguages(prior: Floors, results: []const LanguageResult) void {
+    for (prior.floors) |f| {
+        for (results) |r| {
+            if (std.mem.eql(u8, r.language, f.language)) break;
+        } else {
+            std.debug.print(
+                "accuracy-bench: {s} had a recorded floor but no golden file today; its floor was dropped\n",
+                .{f.language},
+            );
+        }
     }
 }
 
