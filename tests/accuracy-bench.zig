@@ -135,10 +135,12 @@ const LanguageResult = struct {
     edges: Score,
     /// Of the matched edges, how many agree with the golden `exact` flag.
     exact_agree: usize,
-    /// Call-site recall within matched edges: `matched` is how many of the
-    /// golden `lines` a produced edge also names, `expected` their total,
-    /// `actual` the produced total (informational only - `lines` is
-    /// hand-verified ground truth, not itself a floor-checked count).
+    /// Call-site recall over every golden edge, matched or not: `expected`
+    /// is every golden edge's `lines` total (a missed edge contributes its
+    /// full count as unmatched sites), `matched` how many of them a produced
+    /// edge also names, `actual` the produced total for matched edges only
+    /// (informational: `lines` is hand-verified ground truth). Floored as a
+    /// sixth metric (`site_recall_bp`) alongside the other five.
     sites: Score = .{},
     findings: []const Finding,
 
@@ -568,11 +570,13 @@ fn pushKeyOnce(
 
 /// Match edges on (from, to). Matched edges additionally contribute to the
 /// exact-flag agreement rate; a disagreement is reported but still a match,
-/// because the endpoints are right and only the confidence bit is wrong. They
-/// also contribute to call-site recall: `lines` is hand-verified ground
-/// truth, so a matched edge missing one of its golden lines is a real,
-/// distinct miss (the dependency was found; not every site that causes it
-/// was), reported but - like exactness - not disqualifying the edge match.
+/// because the endpoints are right and only the confidence bit is wrong. Every
+/// golden edge, matched or not, contributes its `lines` to call-site recall:
+/// `lines` is hand-verified ground truth, so a matched edge missing one of
+/// its golden lines is a real, distinct miss (reported but - like exactness -
+/// not disqualifying the edge match), and a missed edge is a miss on every
+/// one of its sites (otherwise the metric would only ever measure edges edge
+/// recall already found).
 fn scoreEdges(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -605,6 +609,11 @@ fn scoreEdges(
 
     var score = Score{ .actual = actual.len, .expected = golden.len };
     for (golden) |g| {
+        // Every golden call site counts toward the denominator whether or not
+        // the edge itself matched - otherwise site recall only ever measures
+        // edges edge recall already found, and reads 100% while whole
+        // multi-site edges are still missing.
+        sites.expected += g.lines.len;
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ g.from, g.to });
         const candidates: []const usize = if (produced.get(key)) |l| l.items else &.{};
         const hit = pickCandidate(actual, candidates, g) orelse {
