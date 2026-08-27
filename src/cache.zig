@@ -27,7 +27,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE10";
+const magic = "NGCACHE11";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -147,6 +147,7 @@ fn skipSymbol(cur: *Cursor) !void {
     while (r < ref_count) : (r += 1) {
         _ = try cur.getStr(); // name
         _ = try cur.getStr(); // qualifier
+        _ = try cur.getStr(); // receiver_root
         _ = try cur.getU32(); // line
         _ = try cur.getU8(); // kind
         _ = try cur.getU8(); // write
@@ -232,6 +233,7 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
     for (refs) |*ref| {
         const name = try arena.dupe(u8, try cur.getStr());
         const qualifier = try arena.dupe(u8, try cur.getStr());
+        const receiver_root = try arena.dupe(u8, try cur.getStr());
         const line = try cur.getU32();
         const kind = try cur.getRefKind();
         const is_write = try cur.getU8() != 0;
@@ -245,6 +247,7 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
         ref.* = .{
             .name = name,
             .qualifier = qualifier,
+            .receiver_root = receiver_root,
             .line = line,
             .kind = kind,
             .write = is_write,
@@ -353,6 +356,7 @@ fn writeSymbol(
     for (sym.refs) |ref| {
         try putStr(gpa, buf, ref.name);
         try putStr(gpa, buf, ref.qualifier);
+        try putStr(gpa, buf, ref.receiver_root);
         try putU32(gpa, buf, ref.line);
         try buf.append(gpa, @intFromEnum(ref.kind));
         try buf.append(gpa, @intFromBool(ref.write));
@@ -568,6 +572,7 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
 const TestRef = struct {
     name: []const u8 = "",
     qualifier: []const u8 = "",
+    receiver_root: []const u8 = "",
     line: u32 = 1,
     kind: u8 = 0,
     write: bool = false,
@@ -608,6 +613,7 @@ fn encSym(
     for (refs) |r| {
         try putStr(a, buf, r.name);
         try putStr(a, buf, r.qualifier);
+        try putStr(a, buf, r.receiver_root);
         try putU32(a, buf, r.line);
         try putU8(a, buf, r.kind);
         try putU8(a, buf, @intFromBool(r.write));
@@ -682,6 +688,7 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
     for (expected.refs, got.refs) |er, gr| {
         try t.expectEqualStrings(er.name, gr.name);
         try t.expectEqualStrings(er.qualifier, gr.qualifier);
+        try t.expectEqualStrings(er.receiver_root, gr.receiver_root);
         try t.expectEqual(er.line, gr.line);
         try t.expectEqual(er.kind, gr.kind);
         try t.expectEqual(er.write, gr.write);

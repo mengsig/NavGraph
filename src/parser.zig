@@ -50,7 +50,9 @@ pub const ParsedSymbol = struct {
 /// References plus local bindings collected from one symbol body.
 const BodyInfo = struct {
     refs: []Reference,
-    bindings: []const Binding,
+    /// Mutable so a language that discovers an extra binding after the body scan
+    /// (the Go method receiver) can grow the slice instead of abandoning it.
+    bindings: []Binding,
 };
 
 const sentinel: u32 = std.math.maxInt(u32);
@@ -567,31 +569,34 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (t.kind != .identifier) continue;
         const name = t.text(ctx.source);
         if (name.len < 2 or kw.has(name)) continue;
-        const member_qualifier = memberQualifier(ctx, i, lo);
+        const receiver = memberQualifier(ctx, i, lo);
         // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
         // `.{ .value = x }`) are labels, not references to a same-named symbol.
         // Keeping them as bare refs lets a unique unrelated definition become
         // an "exact" call/read edge later, which is especially dangerous in
         // strict agent queries. Preserve real receivers such as `value.field`
         // and `make().field`.
-        if (isZigReceiverlessMember(ctx, i, lo, member_qualifier)) continue;
+        if (isZigReceiverlessMember(ctx, i, lo, receiver.name)) continue;
         const assignment = assignmentAccess(ctx, i, hi);
-        const qualifier = if (assignment.write and member_qualifier.len == 0)
+        const qualifier = if (assignment.write and receiver.name.len == 0)
             enclosingCallQualifier(ctx, i, lo)
         else
-            member_qualifier;
+            receiver.name;
+        // Only a real member access has a chain to walk: a constructor-keyword
+        // qualifier is synthesised, not read off the token stream.
+        const root = if (receiver.name.len != 0) receiverChainRoot(ctx, receiver.tok, lo) else "";
         // Skip only a *bare* self-reference (recursion noise). A qualified call
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
         // A JS/TS object-literal property key (`{ count: ... }`) names a field,
         // not a reference to a same-named binding — don't emit an edge for it.
-        if (member_qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
+        if (receiver.name.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
         const is_call = referenceCallOpen(ctx, i, hi) != null;
         if (assignment.read) {
-            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, is_call, false);
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
         }
         if (assignment.write) {
-            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, false, true);
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, false, true);
         }
     }
     // Keep the distinct-line list only when a ref spans more than one line; a
@@ -692,15 +697,23 @@ fn enclosingCallQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     return "";
 }
 
+/// The receiver of a member access: its identifier text plus the token index it
+/// sits at, so the chain can be walked one link further back. `name` is "" when
+/// token `i` is not a member access.
+const Receiver = struct {
+    name: []const u8 = "",
+    tok: u32 = 0,
+};
+
 /// If token `i` is the trailing member of a member access, return the receiver
-/// identifier; otherwise "".
-fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+/// identifier; otherwise an empty `Receiver`.
+fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) Receiver {
     std.debug.assert(lo <= i);
     std.debug.assert(i < ctx.toks.len);
     // `recv.name`
     if (i >= lo + 2 and ctx.isPunct(i - 1, '.')) {
         if (ctx.toks[i - 2].kind == .identifier) {
-            if (ctx.cfg.language != .zig or !zig_keywords.has(ctx.textOf(i - 2))) return ctx.textOf(i - 2);
+            if (ctx.cfg.language != .zig or !zig_keywords.has(ctx.textOf(i - 2))) return ident(ctx, i - 2);
         }
         if (ctx.isPunct(i - 2, '>')) return genericReceiver(ctx, i - 2, lo);
     }
@@ -709,14 +722,14 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     if (ctx.cfg.language == .lua and i >= lo + 2 and ctx.isPunct(i - 1, ':') and
         ctx.toks[i - 2].kind == .identifier)
     {
-        return ctx.textOf(i - 2);
+        return ident(ctx, i - 2);
     }
     // Zig postfix unwrap/deref: `opt.?.name` / `ptr.*.name`.
     if (ctx.cfg.language == .zig and i >= lo + 4 and ctx.isPunct(i - 1, '.') and
         (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '*')) and ctx.isPunct(i - 3, '.') and
         ctx.toks[i - 4].kind == .identifier)
     {
-        return ctx.textOf(i - 4);
+        return ident(ctx, i - 4);
     }
     // Two-punct member operators, receiver two tokens back:
     //   `recv?.name` / `recv!.name` — JS/TS optional-chaining & non-null assertion
@@ -725,17 +738,38 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     if (i >= lo + 3) {
         if (ctx.toks[i - 3].kind == .identifier) {
             if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
-                return ctx.textOf(i - 3);
-            if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
-            if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
+                return ident(ctx, i - 3);
+            if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ident(ctx, i - 3);
+            if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ident(ctx, i - 3);
         }
         if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':') and ctx.isPunct(i - 3, '>'))
             return genericReceiver(ctx, i - 3, lo);
     }
-    return "";
+    return .{};
 }
 
-fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) []const u8 {
+fn ident(ctx: *const Ctx, i: u32) Receiver {
+    return .{ .name = ctx.textOf(i), .tok = i };
+}
+
+/// The identifier heading the receiver chain that ends at token `tok`
+/// (`a.store` at `store` -> "a"), or "" when `tok` already heads the chain.
+/// Walks the same member-access shapes `memberQualifier` recognises, one link
+/// at a time; each step moves strictly left, so the walk terminates.
+fn receiverChainRoot(ctx: *const Ctx, tok: u32, lo: u32) []const u8 {
+    var cursor = tok;
+    var root: []const u8 = "";
+    while (cursor > lo) {
+        const prev = memberQualifier(ctx, cursor, lo);
+        if (prev.name.len == 0) break;
+        std.debug.assert(prev.tok < cursor);
+        root = prev.name;
+        cursor = prev.tok;
+    }
+    return root;
+}
+
+fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) Receiver {
     std.debug.assert(lo <= close);
     std.debug.assert(ctx.isPunct(close, '>'));
     var depth: u32 = 1;
@@ -746,12 +780,12 @@ fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) []const u8 {
         if (!ctx.isPunct(cursor, '<')) continue;
         depth -= 1;
         if (depth != 0) continue;
-        if (cursor > lo and ctx.toks[cursor - 1].kind == .identifier) return ctx.textOf(cursor - 1);
+        if (cursor > lo and ctx.toks[cursor - 1].kind == .identifier) return ident(ctx, cursor - 1);
         if (cursor >= lo + 3 and ctx.isPunct(cursor - 1, ':') and ctx.isPunct(cursor - 2, ':') and ctx.toks[cursor - 3].kind == .identifier)
-            return ctx.textOf(cursor - 3);
-        return "";
+            return ident(ctx, cursor - 3);
+        return .{};
     }
-    return "";
+    return .{};
 }
 
 /// Whether token `i` is a JS/TS object-literal property key: an identifier
@@ -774,6 +808,7 @@ fn recordRef(
     seen: *std.StringHashMap(u32),
     name: []const u8,
     qualifier: []const u8,
+    receiver_root: []const u8,
     line: u32,
     offset: u32,
     is_call: bool,
@@ -783,9 +818,11 @@ fn recordRef(
     std.debug.assert(offset < ctx.source.len);
     std.debug.assert(!is_call or !write);
     // Direction participates in deduplication so a read and write of the same
-    // member retain separate source lines and access modes.
-    var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}\x00{c}", .{ qualifier, name, if (write) @as(u8, 'w') else 'r' }) catch name;
+    // member retain separate source lines and access modes. So does the chain
+    // root: `a.store.Get()` and `o.store.Get()` reach different objects and must
+    // resolve independently.
+    var key_buf: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}\x00{s}\x00{c}", .{ receiver_root, qualifier, name, if (write) @as(u8, 'w') else 'r' }) catch name;
     if (seen.get(key)) |idx| {
         var r = &refs.items[idx];
         r.count += 1;
@@ -801,6 +838,7 @@ fn recordRef(
     try refs.append(ctx.gpa, .{
         .name = name,
         .qualifier = qualifier,
+        .receiver_root = receiver_root,
         .line = line,
         .kind = if (is_call) .call else .read,
         .write = write,
@@ -980,7 +1018,7 @@ const factory_names = std.StaticStringMap(void).initComptime(.{
 
 /// Scan a body for `const/var/let NAME [: T] = ...` and `NAME = T(...)` and
 /// record inferred `NAME -> T` bindings used for receiver resolution.
-fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]const Binding {
+fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]Binding {
     var list: std.ArrayList(Binding) = .empty;
     defer list.deinit(ctx.gpa);
     if (params_open != sentinel) {
@@ -1023,6 +1061,11 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
             var ty: []const u8 = "";
             if (ctx.isPunct(i + 1, ':')) {
                 if (typeFromChain(ctx, i + 2, close)) |t| ty = t;
+            } else if (ctx.cfg.language == .go and i + 1 < close and !ctx.isPunct(i + 1, ',')) {
+                // Go writes `name T` with no separator (`o *Other`, `w http.ResponseWriter`).
+                // A grouped `a, b int` leaves the leading names untyped, which still
+                // shadows a same-named global.
+                if (typeFromChain(ctx, i + 1, close)) |t| ty = t;
             }
             try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
         }
@@ -1170,6 +1213,8 @@ fn inferDeclType(ctx: *const Ctx, name_i: u32, hi: u32) ?[]const u8 {
     const j = name_i + 1;
     if (ctx.isPunct(j, ':')) return typeFromChain(ctx, j + 1, hi);
     if (ctx.isPunct(j, '=')) return typeFromRhs(ctx, j + 1, hi);
+    // Go `var x T` / `var x *T`: the type follows the name with no separator.
+    if (ctx.cfg.language == .go) return typeFromChain(ctx, j, hi);
     return null;
 }
 
@@ -1210,8 +1255,10 @@ fn typeFromRhs(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
 }
 
 fn isRhsSkip(ctx: *const Ctx, i: u32) bool {
+    // `&` leads Go/Rust address-of construction (`store := &Cache{}`), which
+    // names the same type as the plain literal.
     return ctx.identEql(i, "new") or ctx.identEql(i, "try") or
-        ctx.identEql(i, "await") or ctx.identEql(i, "comptime");
+        ctx.identEql(i, "await") or ctx.identEql(i, "comptime") or ctx.isPunct(i, '&');
 }
 
 fn emit(ctx: *Ctx, sym: ParsedSymbol) !u32 {
@@ -3418,11 +3465,14 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     var j = func_i + 1;
     var is_method = false;
     var receiver: []const u8 = "";
+    var receiver_name: []const u8 = "";
     // Optional receiver: `func (r T) Name(...)`.
     if (j < hi and ctx.isPunct(j, '(')) {
         const rc = ctx.close[j];
         if (rc == sentinel) return func_i;
         receiver = goReceiverType(ctx, j, rc);
+        if (rc > j + 1 and ctx.toks[j + 1].kind == .identifier and !std.mem.eql(u8, ctx.textOf(j + 1), receiver))
+            receiver_name = ctx.textOf(j + 1);
         j = rc + 1;
         is_method = true;
     }
@@ -3445,6 +3495,7 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     const body = try collectRefs(ctx, params_open, body_open + 1, body_close, name, go_keywords);
     _ = try emit(ctx, .{
         .name = name,
+        .bindings = try withGoReceiverBinding(ctx, body.bindings, receiver_name, receiver),
         .kind = if (is_method) .method else .function,
         .line = ctx.toks[name_i].line,
         .span_start = lineStartOffset(ctx, func_i),
@@ -3454,10 +3505,19 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         .exported = goExported(name),
         .parent_local = parent,
         .refs = body.refs,
-        .bindings = body.bindings,
         .receiver = receiver,
     });
     return body_close + 1;
+}
+
+/// `bindings` plus the Go method receiver as a typed local (`func (a *API)` ->
+/// `a -> API`). Appended last so a body local of the same name shadows it, and
+/// it is what lets `a.store.Get()` reach the receiver type's field table.
+fn withGoReceiverBinding(ctx: *Ctx, bindings: []Binding, name: []const u8, type_name: []const u8) ![]Binding {
+    if (name.len == 0 or type_name.len == 0) return bindings;
+    const grown = try ctx.arena.realloc(bindings, bindings.len + 1);
+    grown[grown.len - 1] = .{ .name = name, .type_name = type_name };
+    return grown;
 }
 
 /// A Go-modules major-version import segment: `v2`, `v10`, ….

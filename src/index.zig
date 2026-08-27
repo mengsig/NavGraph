@@ -1100,7 +1100,7 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             }
         }
         // No such member on the own class (inherited/mixin): heuristic below.
-    } else if (receiverType(idx, from, ref.qualifier)) |type_name| {
+    } else if (receiverType(idx, from, ref)) |type_name| {
         const m = memberOfType(idx, from.file, type_name, ref.name);
         if (m.id != invalid) {
             ref.target = m.id;
@@ -1469,22 +1469,60 @@ fn isSelfReceiver(qualifier: []const u8) bool {
 }
 
 /// The type name a *named* receiver identifier refers to inside `from`'s body: a
-/// local `var -> type` binding. `self`/`this` are handled separately (scoped by
-/// the concrete parent id, see `memberOfParent`).
-fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[]const u8 {
-    // Return only a *typed* binding: bindings now also carry untyped locals and
-    // parameters (name-only, empty type) to shadow same-named globals in bare
-    // resolution, but those give no receiver type to scope a member access by.
+/// local `var -> type` binding, or a field of the type heading the receiver
+/// chain. `self`/`this` are handled separately (scoped by the concrete parent
+/// id, see `memberOfParent`).
+fn receiverType(idx: *const Index, from: model.Symbol, ref: *const model.Reference) ?[]const u8 {
+    // A binding for the qualifier always answers, even an untyped one: bindings
+    // carry name-only locals and parameters to shadow same-named globals, and a
+    // local `store := &Cache{}` provably shadows a field `store *Store`. Letting
+    // the field table answer past it produced a confidently-wrong exact edge.
     for (from.bindings) |b| {
-        if (std.mem.eql(u8, b.name, qualifier) and b.type_name.len > 0) return b.type_name;
+        if (!std.mem.eql(u8, b.name, ref.qualifier)) continue;
+        return if (b.type_name.len > 0) b.type_name else null;
     }
-    // A field of the enclosing type. `a.store.Get()` keeps only `store` as the
-    // qualifier, so the declaring type's field table is the type evidence.
-    if (from.parent == invalid) return null;
-    for (idx.graph.symbols[from.parent].bindings) |b| {
-        if (std.mem.eql(u8, b.name, qualifier) and b.type_name.len > 0) return b.type_name;
+    // `a.store.Get()` keeps only `store` as the qualifier, so the field table of
+    // the type at the head of the chain is the type evidence. It answers only
+    // for a chain whose head has a known type — a bare `store.Get()` (a package
+    // qualifier) or `o.store.Get()` on another struct must not borrow the
+    // enclosing type's fields.
+    const owner = chainRootType(idx, from, ref.receiver_root) orelse return null;
+    for (idx.graph.symbols[owner].bindings) |b| {
+        if (std.mem.eql(u8, b.name, ref.qualifier) and b.type_name.len > 0) return b.type_name;
     }
     return null;
+}
+
+/// The container symbol whose field table a receiver chain rooted at `root`
+/// should be read from: the enclosing type for `self`/`this`, else the declared
+/// type of a typed local (a method receiver is one). Null when the qualifier
+/// heads the chain, or the head's type is unknown or ambiguous.
+fn chainRootType(idx: *const Index, from: model.Symbol, root: []const u8) ?SymbolId {
+    if (root.len == 0) return null;
+    if (isSelfReceiver(root)) return if (from.parent == invalid) null else from.parent;
+    for (from.bindings) |b| {
+        if (!std.mem.eql(u8, b.name, root)) continue;
+        if (b.type_name.len == 0) return null;
+        return uniqueContainerNamed(idx, from.file, b.type_name);
+    }
+    return null;
+}
+
+/// The container type named `name`, preferring one declared in `from_file`.
+/// Null when no container has that name, or several files do and none is local
+/// — an arbitrary pick would manufacture a field table for the wrong type.
+fn uniqueContainerNamed(idx: *const Index, from_file: FileId, name: []const u8) ?SymbolId {
+    const candidates = idx.by_name.get(name) orelse return null;
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
+    for (candidates) |cid| {
+        const cand = idx.graph.symbols[cid];
+        if (!isContainer(cand)) continue;
+        if (cand.file == from_file) return cid;
+        matches += 1;
+        if (found == invalid) found = cid;
+    }
+    return if (matches == 1) found else null;
 }
 
 /// The member named `name` defined directly on the exact type `parent_id`. This
@@ -2209,6 +2247,169 @@ test "go: a call never binds to a type that shares the package-qualified name" {
         checked = true;
     }
     try testing.expect(checked);
+}
+
+test "go: a shadowing local and another struct's field both beat the field table" {
+    // Regression (F1): the enclosing type's field table answered for *any*
+    // qualifier without a typed binding, so `store.Get()` bound to the
+    // enclosing `API.store` even when the chain reached a different object.
+    // Both mis-binds were marked exact, so `--strict` could not drop them.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data =
+        \\package app
+        \\
+        \\type Store struct{}
+        \\
+        \\func (s *Store) Get() int { return 1 }
+        \\
+        \\type Cache struct{}
+        \\
+        \\func (c *Cache) Get() int { return 2 }
+        \\
+        \\type API struct {
+        \\    store *Store
+        \\}
+        \\
+        \\type Other struct {
+        \\    store *Cache
+        \\}
+        \\
+        \\func (a *API) shadowed() int {
+        \\    store := &Cache{}
+        \\    return store.Get()
+        \\}
+        \\
+        \\func (a *API) declared() int {
+        \\    var store *Cache
+        \\    return store.Get()
+        \\}
+        \\
+        \\func (a *API) crossType(o *Other) int {
+        \\    return o.store.Get()
+        \\}
+        \\
+        \\func (a *API) direct() int {
+        \\    return a.store.Get()
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const store_get = qualifiedId(&idx, "Store", "Get").?;
+    const cache_get = qualifiedId(&idx, "Cache", "Get").?;
+
+    // A local of a known type wins over the same-named field, in both spellings
+    // that used to yield an untyped binding (`:= &T{}` and `var x *T`).
+    for ([_][]const u8{ "shadowed", "declared" }) |caller| {
+        const sym = idx.graph.symbols[qualifiedId(&idx, "API", caller).?];
+        const ref = refByQual(sym, "store", "Get").?;
+        try testing.expectEqual(cache_get, ref.target);
+        try testing.expect(ref.exact);
+    }
+
+    // The chain head is another struct, so its field table answers, not API's.
+    const cross = idx.graph.symbols[qualifiedId(&idx, "API", "crossType").?];
+    const cross_ref = refByQual(cross, "store", "Get").?;
+    try testing.expectEqualStrings("o", cross_ref.receiver_root);
+    try testing.expectEqual(cache_get, cross_ref.target);
+    try testing.expect(cross_ref.exact);
+
+    // The receiver's own field still resolves exactly (the F-9 fix is kept).
+    const direct = idx.graph.symbols[qualifiedId(&idx, "API", "direct").?];
+    const direct_ref = refByQual(direct, "store", "Get").?;
+    try testing.expectEqualStrings("a", direct_ref.receiver_root);
+    try testing.expectEqual(store_get, direct_ref.target);
+    try testing.expect(direct_ref.exact);
+    try testing.expectEqual(model.ResolutionReason.typed_receiver, direct_ref.resolution_reason);
+}
+
+test "cpp: a same-named field on another class never yields a wrong exact edge" {
+    // F1 analogue. C++ classes carry no field table, so the only outcomes
+    // allowed are the right method or a non-exact guess — never a confident
+    // edge to the enclosing class's `store`.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.cpp", .data =
+        \\struct Store { int get() { return 1; } };
+        \\struct Cache { int get() { return 2; } };
+        \\struct Other { Cache* store; };
+        \\struct API {
+        \\    Store* store;
+        \\    int shadowed() { Cache* store = new Cache(); return store->get(); }
+        \\    int crossType(Other* o) { return o->store->get(); }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const cache_get = qualifiedId(&idx, "Cache", "get").?;
+    const shadowed = idx.graph.symbols[qualifiedId(&idx, "API", "shadowed").?];
+    const shadowed_ref = refByQual(shadowed, "store", "get").?;
+    try testing.expectEqual(cache_get, shadowed_ref.target);
+    try testing.expect(shadowed_ref.exact);
+
+    const cross = idx.graph.symbols[qualifiedId(&idx, "API", "crossType").?];
+    const cross_ref = refByQual(cross, "store", "get").?;
+    try testing.expectEqualStrings("o", cross_ref.receiver_root);
+    try testing.expect(cross_ref.target == cache_get or !cross_ref.exact);
+}
+
+test "python: a same-named attribute on another object never yields a wrong exact edge" {
+    // F1 analogue, same contract as the C++ case.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\class Store:
+        \\    def get(self):
+        \\        return 1
+        \\
+        \\class Cache:
+        \\    def get(self):
+        \\        return 2
+        \\
+        \\class API:
+        \\    def __init__(self):
+        \\        self.store = Store()
+        \\
+        \\    def shadowed(self):
+        \\        store = Cache()
+        \\        return store.get()
+        \\
+        \\    def cross_type(self, o):
+        \\        return o.store.get()
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const cache_get = qualifiedId(&idx, "Cache", "get").?;
+    const shadowed = idx.graph.symbols[qualifiedId(&idx, "API", "shadowed").?];
+    const shadowed_ref = refByQual(shadowed, "store", "get").?;
+    try testing.expectEqual(cache_get, shadowed_ref.target);
+    try testing.expect(shadowed_ref.exact);
+
+    const cross = idx.graph.symbols[qualifiedId(&idx, "API", "cross_type").?];
+    const cross_ref = refByQual(cross, "store", "get").?;
+    try testing.expectEqualStrings("o", cross_ref.receiver_root);
+    try testing.expect(cross_ref.target == cache_get or !cross_ref.exact);
 }
 
 test "cpp: a member call through a typed pointer resolves to that type's method" {
