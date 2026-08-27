@@ -1354,7 +1354,7 @@ test "ratchetMetric: a raised floor survives, a regression is kept unless allowe
     try std.testing.expectEqual(@as(usize, 2), drops.items.len);
 }
 
-test "violations: a regression in any one of the five metrics fails the gate" {
+test "violations: a regression in any one of the six metrics fails the gate" {
     const floor = Floor{
         .language = "go",
         .def_precision_bp = 9000,
@@ -1362,6 +1362,7 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .edge_precision_bp = 9000,
         .edge_recall_bp = 9000,
         .exact_agreement_bp = 9000,
+        .site_recall_bp = 9000,
     };
     const floors = Floors{ .floors = &.{floor} };
 
@@ -1371,6 +1372,7 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .defs = .{ .matched = 90, .actual = 100, .expected = 100 },
         .edges = .{ .matched = 90, .actual = 100, .expected = 100 },
         .exact_agree = 81, // 81/90 = 9000bp
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 0), violations(&.{at_floor}, floors));
@@ -1381,6 +1383,7 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .defs = .{ .matched = 89, .actual = 100, .expected = 89 }, // P 8900, R 10000
         .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
         .exact_agree = 100,
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 1), violations(&.{def_precision_regressed}, floors));
@@ -1391,6 +1394,7 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .defs = .{ .matched = 89, .actual = 89, .expected = 100 }, // P 10000, R 8900
         .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
         .exact_agree = 100,
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 1), violations(&.{def_recall_regressed}, floors));
@@ -1401,6 +1405,7 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
         .edges = .{ .matched = 89, .actual = 100, .expected = 89 }, // P 8900, R 10000
         .exact_agree = 89,
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 1), violations(&.{edge_precision_regressed}, floors));
@@ -1411,6 +1416,7 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
         .edges = .{ .matched = 89, .actual = 89, .expected = 100 }, // P 10000, R 8900
         .exact_agree = 89,
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 1), violations(&.{edge_recall_regressed}, floors));
@@ -1421,7 +1427,194 @@ test "violations: a regression in any one of the five metrics fails the gate" {
         .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
         .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
         .exact_agree = 89, // 89/100 = 8900bp
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 1), violations(&.{exact_agreement_regressed}, floors));
+
+    const site_recall_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .exact_agree = 100,
+        .sites = .{ .matched = 89, .actual = 100, .expected = 100 }, // R 8900
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{site_recall_regressed}, floors));
+}
+
+test "pickCandidate: a single candidate is unambiguous; several need from_line/to_line" {
+    const actual = [_]Edge{
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{1}, .from_line = 10, .to_line = 20 },
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{2}, .from_line = 15, .to_line = 20 },
+    };
+    const both = [_]usize{ 0, 1 };
+    const one = [_]usize{0};
+
+    // One candidate is taken even with no disambiguator set on the golden edge.
+    try std.testing.expectEqual(@as(?usize, 0), pickCandidate(
+        &actual,
+        &one,
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{1}, .verified = "manual" },
+    ));
+
+    // Two candidates: from_line picks the matching one.
+    try std.testing.expectEqual(@as(?usize, 0), pickCandidate(
+        &actual,
+        &both,
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{1}, .verified = "manual", .from_line = 10 },
+    ));
+    try std.testing.expectEqual(@as(?usize, 1), pickCandidate(
+        &actual,
+        &both,
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{2}, .verified = "manual", .from_line = 15 },
+    ));
+
+    // No candidates at all.
+    try std.testing.expectEqual(@as(?usize, null), pickCandidate(
+        &actual,
+        &.{},
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{1}, .verified = "manual" },
+    ));
+
+    // A from_line naming no produced definition matches nothing - never a
+    // wrong pick.
+    try std.testing.expectEqual(@as(?usize, null), pickCandidate(
+        &actual,
+        &both,
+        .{ .from = "f:A.m", .to = "f:B.m", .exact = true, .lines = &.{1}, .verified = "manual", .from_line = 999 },
+    ));
+}
+
+test "validateGolden rejects a duplicate edge row and an unsorted lines array" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const defs = [_]GoldenDef{
+        .{ .file = "a.go", .name = "A", .qualified = "A", .kind = "fn", .line = 1 },
+        .{ .file = "a.go", .name = "B", .qualified = "B", .kind = "fn", .line = 2 },
+    };
+
+    // A plain copy-paste duplicate: same from/to/lines/exact, no from_line/to_line
+    // to even claim it's an overload sibling.
+    {
+        const edges = [_]GoldenEdge{
+            .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{1}, .verified = "manual" },
+            .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{1}, .verified = "manual" },
+        };
+        const g = Golden{ .language = "go", .root = ".", .definitions = &defs, .edges = &edges };
+        try testing.expectError(BenchError.GoldenInvalid, validateGolden(gpa, arena, "test.json", g));
+    }
+
+    // Out-of-order lines.
+    {
+        const edges = [_]GoldenEdge{
+            .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{ 2, 1 }, .verified = "manual" },
+        };
+        const g = Golden{ .language = "go", .root = ".", .definitions = &defs, .edges = &edges };
+        try testing.expectError(BenchError.GoldenInvalid, validateGolden(gpa, arena, "test.json", g));
+    }
+
+    // Duplicate lines.
+    {
+        const edges = [_]GoldenEdge{
+            .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{ 1, 1 }, .verified = "manual" },
+        };
+        const g = Golden{ .language = "go", .root = ".", .definitions = &defs, .edges = &edges };
+        try testing.expectError(BenchError.GoldenInvalid, validateGolden(gpa, arena, "test.json", g));
+    }
+
+    // A single, unambiguous edge with an ascending lines array is valid.
+    {
+        const edges = [_]GoldenEdge{
+            .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{ 1, 2 }, .verified = "manual" },
+        };
+        const g = Golden{ .language = "go", .root = ".", .definitions = &defs, .edges = &edges };
+        try validateGolden(gpa, arena, "test.json", g);
+    }
+}
+
+test "validateGolden allows repeated (from, to) pairs distinguished by from_line/to_line" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two overloads of B sharing a file:qualified key, called from two sites.
+    const defs = [_]GoldenDef{
+        .{ .file = "a.go", .name = "A", .qualified = "A", .kind = "fn", .line = 1 },
+        .{ .file = "a.go", .name = "B", .qualified = "B", .kind = "fn", .line = 10 },
+        .{ .file = "a.go", .name = "B", .qualified = "B", .kind = "fn", .line = 20 },
+    };
+    const edges = [_]GoldenEdge{
+        .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{2}, .verified = "manual", .to_line = 10 },
+        .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{3}, .verified = "manual", .to_line = 20 },
+    };
+    const g = Golden{ .language = "go", .root = ".", .definitions = &defs, .edges = &edges };
+    try validateGolden(gpa, arena, "test.json", g);
+
+    // The same pair, but neither entry says which B it names - rejected even
+    // though the two rows differ (this is exactly what a careless duplicate
+    // of an unambiguous edge looks like once it's no longer identical).
+    const undisambiguated = [_]GoldenEdge{
+        .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{2}, .verified = "manual", .to_line = 10 },
+        .{ .from = "a.go:A", .to = "a.go:B", .exact = true, .lines = &.{3}, .verified = "manual" },
+    };
+    const g2 = Golden{ .language = "go", .root = ".", .definitions = &defs, .edges = &undisambiguated };
+    try testing.expectError(BenchError.GoldenInvalid, validateGolden(gpa, arena, "test.json", g2));
+}
+
+test "writeFloors round-trips through the file and the ratchet governs re-recording" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, golden_dir_path);
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 90, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 90, .actual = 100, .expected = 100 },
+        .exact_agree = 81,
+        .sites = .{ .matched = 90, .actual = 100, .expected = 100 },
+        .findings = &.{},
+    };
+
+    // First record: no prior floors.json, so every metric is a fresh floor.
+    try writeFloors(gpa, arena, io, tmp.dir, &.{result}, false, null);
+    var floors = try loadFloors(arena, io, tmp.dir);
+    try testing.expectEqual(@as(usize, 1), floors.floors.len);
+    try testing.expectEqualStrings("go", floors.floors[0].language);
+    try testing.expectEqual(@as(u32, 9000), floors.floors[0].def_precision_bp);
+    try testing.expectEqual(@as(u32, 9000), floors.floors[0].site_recall_bp);
+
+    // A regression without --lower-floors is kept at the recorded value.
+    const regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 50, .actual = 100, .expected = 100 },
+        .edges = result.edges,
+        .exact_agree = result.exact_agree,
+        .sites = result.sites,
+        .findings = &.{},
+    };
+    try writeFloors(gpa, arena, io, tmp.dir, &.{regressed}, false, null);
+    floors = try loadFloors(arena, io, tmp.dir);
+    try testing.expectEqual(@as(u32, 9000), floors.floors[0].def_precision_bp);
+
+    // The same regression with --lower-floors accepts the drop.
+    try writeFloors(gpa, arena, io, tmp.dir, &.{regressed}, true, "test drop");
+    floors = try loadFloors(arena, io, tmp.dir);
+    try testing.expectEqual(@as(u32, 5000), floors.floors[0].def_precision_bp);
 }
