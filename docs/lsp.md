@@ -1,6 +1,6 @@
 # NavGraph editor protocol — v1
 
-`navgraph serve` (alias `navgraph lsp`) runs NavGraph as a resident editor
+`navgraph lsp` runs NavGraph as a resident editor
 server: the whole code graph stays in memory, an edit re-indexes in single-digit
 milliseconds, and blast-radius / search / call-graph queries answer in under a
 millisecond.
@@ -9,7 +9,7 @@ It is a standard LSP server (a subset) **plus** custom `navgraph/*` methods.
 Neovim's built-in client (`vim.lsp.start`) is the reference client.
 
 ```
-navgraph serve [--root <dir>] [--log <file>] [--log-level error|info|debug]
+navgraph lsp [--root <dir>] [--log <file>] [--log-level error|info|debug]
 ```
 
 - **Transport** — JSON-RPC 2.0 over stdio with LSP framing
@@ -313,7 +313,7 @@ above come from `-Doptimize=ReleaseFast` on a warm page cache.
   `importers`, `graph`. Per the contract they are **not** advertised in
   `experimental.navgraph.methods` until they land — a client should read that
   list rather than assume. Adding one is a single adapter function plus a table
-  entry in `src/serve/handlers.zig`.
+  entry in `src/lsp/handlers.zig`.
 - Symbol ids are per-generation (see above).
 - `textDocument/definition` returns the resolved definition first, then the
   other same-name candidates, so an ambiguous name still offers every choice.
@@ -331,7 +331,7 @@ vim.api.nvim_create_autocmd("FileType", {
     if not root then return end
     vim.lsp.start({
       name = "navgraph",
-      cmd = { "navgraph", "serve" },
+      cmd = { "navgraph", "lsp" },
       root_dir = root,
       init_options = { depth = 3, debounceMs = 120 },
     }, { bufnr = args.buf })
@@ -346,7 +346,7 @@ vim.api.nvim_create_autocmd("FileType", {
 
 ## Implementation map
 
-`src/serve/` — each layer depends only on the ones below it.
+`src/lsp/` — each layer depends only on the ones below it.
 
 | File | Responsibility |
 | --- | --- |

@@ -207,8 +207,8 @@ list of flags that actually *do* something is `navgraph capabilities -j`
 | `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild. Accepted by `read`, which never uses the cache either way. |
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
 | `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
-| `--log <file>`                | `serve`: write diagnostics to `<file>` (default: stderr).  |
-| `--log-level <error\|info\|debug>` | `serve`: diagnostic verbosity (default: `error`).  |
+| `--log <file>`                | `lsp`: write diagnostics to `<file>` (default: stderr).    |
+| `--log-level <error\|info\|debug>` | `lsp`: diagnostic verbosity (default: `error`).    |
 
 **Patterns.** A name or filter containing `*` is a glob: `def 'Ba*'` lists
 `Bays` and `Bananas`, `search '*_handler'` anchors on the whole name,
@@ -478,14 +478,14 @@ method Server.start (self):  app/server.py:15
 
 ## Editor integration
 
-`navgraph serve` runs NavGraph as a long-lived editor server: a standard LSP
+`navgraph lsp` runs NavGraph as a long-lived editor server: a standard LSP
 server (a subset) plus custom `navgraph/*` methods that expose the graph verbs.
 The whole graph stays in memory, an edit re-indexes in single-digit
 milliseconds, and blast-radius / search / call-graph queries answer in well
 under a millisecond.
 
 ```
-navgraph serve [--root <dir>] [--log <file>] [--log-level error|info|debug]
+navgraph lsp [--root <dir>] [--log <file>] [--log-level error|info|debug]
 ```
 
 - **Standard LSP** — `definition`, `references`, `hover`, `documentSymbol`,
@@ -504,7 +504,7 @@ Neovim, with the built-in client:
 ```lua
 vim.lsp.start({
   name = "navgraph",
-  cmd = { "navgraph", "serve" },
+  cmd = { "navgraph", "lsp" },
   root_dir = vim.fs.root(0, { ".git", "build.zig" }),
 })
 ```

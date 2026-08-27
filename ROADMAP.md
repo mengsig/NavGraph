@@ -70,9 +70,9 @@ type-annotation uses in signatures are not fully captured as edges.
    `NGCACHE5`) plus a content-hash of the indexer source invalidate the whole
    cache on any format/logic change or corruption (safe rebuild, never a crash).
 
-6. **Daemon / LSP / MCP mode.** ✅ *Done (LSP).* `navgraph serve` (alias `lsp`)
-   is a resident editor server over stdio: LSP framing + JSON-RPC 2.0, the
-   standard subset (`definition`/`references`/`hover`/`documentSymbol`/
+6. **Daemon / LSP / MCP mode.** ✅ *Done.* `navgraph serve` is the MCP surface;
+   `navgraph lsp` is a resident editor server over stdio: LSP framing +
+   JSON-RPC 2.0, the standard subset (`definition`/`references`/`hover`/`documentSymbol`/
    `workspace/symbol`, full document sync) plus custom `navgraph/*` methods
    (`status`/`symbolAt`/`blast`/`search`/`grep`/`callers`/`calls`/`rescan` and a
    `navgraph/indexed` notification). An open buffer's unsaved text drives the
@@ -84,7 +84,7 @@ type-annotation uses in signatures are not fully captured as edges.
    and numbers: [`docs/lsp.md`](docs/lsp.md).
    - *Still open:* the remaining verb mirrors (`neighbors`/`path`/`outline`/
      `hot`/`unused`/`diff`/`routes`/`events`/`imports`/`importers`/`graph`) —
-     one adapter function each — and an MCP front end over the same adapters.
+     one adapter function each.
 
 7. **`--json` output.** ✅ *Done.* `src/json_out.zig` mirrors every verb
    (`outline`/`def`/`calls`/`callers`/`search`/`routes`/`events`/`neighbors`/

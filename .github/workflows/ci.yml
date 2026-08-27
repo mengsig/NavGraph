@@ -34,11 +34,12 @@ jobs:
         run: zig build test --summary all
 
       # The server owns stdout: anything else printed there corrupts the
-      # protocol stream, so a bare `serve` session must produce only frames.
+      # protocol stream, so a bare `lsp` session must produce only frames.
       - name: Editor server speaks the protocol
         shell: bash
         run: |
           set -euo pipefail
+          tmp="${RUNNER_TEMP:-/tmp}"
           frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
           {
             frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
@@ -46,12 +47,12 @@ jobs:
             frame '{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}'
             frame '{"jsonrpc":"2.0","id":3,"method":"shutdown"}'
             frame '{"jsonrpc":"2.0","method":"exit"}'
-          } > session.lsp
-          ./zig-out/bin/navgraph serve --root . < session.lsp > session.out
-          grep -q '"protocolVersion":1' session.out
-          grep -q '"method":"navgraph/indexed"' session.out
-          grep -q '"id":3,"result":null' session.out
+          } > "$tmp/session.lsp"
+          ./zig-out/bin/navgraph lsp --root . < "$tmp/session.lsp" > "$tmp/session.out"
+          grep -q '"protocolVersion":1' "$tmp/session.out"
+          grep -q '"method":"navgraph/indexed"' "$tmp/session.out"
+          grep -q '"id":3,"result":null' "$tmp/session.out"
           # Every byte on stdout belongs to a frame: the stream starts with a
           # header and holds one per reply.
-          head -c 16 session.out | grep -q 'Content-Length'
-          test "$(grep -c 'Content-Length' session.out)" -ge 4
+          head -c 16 "$tmp/session.out" | grep -q 'Content-Length'
+          test "$(grep -c 'Content-Length' "$tmp/session.out")" -ge 4

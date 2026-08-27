@@ -15,7 +15,7 @@ const viz = @import("viz.zig");
 const capabilities = @import("capabilities.zig");
 const agent_api = @import("agent_api.zig");
 const workspace_path = @import("workspace_path.zig");
-const lsp = @import("serve.zig");
+const lsp = @import("lsp.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;

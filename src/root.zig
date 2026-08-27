@@ -29,7 +29,7 @@ pub const command_registry = @import("command_registry.zig");
 pub const capabilities = @import("capabilities.zig");
 pub const workspace_path = @import("workspace_path.zig");
 pub const cli = @import("cli.zig");
-pub const serve = @import("serve.zig");
+pub const lsp = @import("lsp.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

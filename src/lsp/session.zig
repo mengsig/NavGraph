@@ -128,7 +128,7 @@ pub const Session = struct {
             .files = sources.files,
             .skipped_dirs = sources.skipped_dirs,
             .cache = sources.cache,
-            .cache_write = if (sources.cache_stale) .{ .io = io, .dir = root_dir } else null,
+            .cache_write = if (sources.cache.enabled and sources.cache_stale) .{ .io = io, .dir = root_dir } else null,
         });
         errdefer idx.deinit();
         sources.cache_stale = idx.cache_snapshot.rewrite != .written;
@@ -462,11 +462,13 @@ pub const Session = struct {
         self.retired.clearRetainingCapacity();
     }
 
-    /// The cache refresh to fold into the next assembly, or null. The cache is
-    /// never written while a document is open: the index then carries unsaved
-    /// editor text, which must not become what the next CLI run reads back.
+    /// The cache refresh to fold into the next assembly, or null. Two rules:
+    /// a walk that ignored the cache (`rescan --full`) does not write one back,
+    /// and the cache is never written while a document is open — the index then
+    /// carries unsaved editor text, which must not become what a CLI run reads.
     fn cacheWrite(self: *const Session) ?index_mod.CacheWrite {
-        if (!self.sources.cache_stale or self.overlays.count() != 0) return null;
+        if (!self.sources.cache.enabled or !self.sources.cache_stale) return null;
+        if (self.overlays.count() != 0) return null;
         return .{ .io = self.io, .dir = self.root_dir };
     }
 
