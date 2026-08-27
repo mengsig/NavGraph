@@ -133,7 +133,7 @@
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.each_title", "exact": true, "lines": [179], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.initialize", "exact": true, "lines": [169], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.post", "exact": true, "lines": [170, 173], "verified": "manual"},
-    {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Rankable.rank", "exact": false, "lines": [191], "verified": "manual"},
+    {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Rankable.rank", "exact": true, "lines": [191], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Scaler", "exact": true, "lines": [181], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.TaggedLedger", "exact": true, "lines": [172], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.TaggedLedger.initialize", "exact": true, "lines": [172], "verified": "manual"},
