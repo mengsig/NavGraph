@@ -34,25 +34,11 @@ jobs:
         run: zig build test --summary all
 
       # The server owns stdout: anything else printed there corrupts the
-      # protocol stream, so a bare `lsp` session must produce only frames.
+      # protocol stream. The driver replays a hostile session into the shipped
+      # ReleaseFast binary — a 20k-deep regex, an ordinary pattern over a 300k
+      # character line, a malformed header with a body — and then checks that
+      # stdout is an exact frame stream ending at EOF, that the requests behind
+      # each of those were answered, that navgraph/blast returned its own
+      # result shape, and that the process exited 0.
       - name: Editor server speaks the protocol
-        shell: bash
-        run: |
-          set -euo pipefail
-          tmp="${RUNNER_TEMP:-/tmp}"
-          frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
-          {
-            frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
-            frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
-            frame '{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}'
-            frame '{"jsonrpc":"2.0","id":3,"method":"shutdown"}'
-            frame '{"jsonrpc":"2.0","method":"exit"}'
-          } > "$tmp/session.lsp"
-          ./zig-out/bin/navgraph lsp --root . < "$tmp/session.lsp" > "$tmp/session.out"
-          grep -q '"protocolVersion":1' "$tmp/session.out"
-          grep -q '"method":"navgraph/indexed"' "$tmp/session.out"
-          grep -q '"id":3,"result":null' "$tmp/session.out"
-          # Every byte on stdout belongs to a frame: the stream starts with a
-          # header and holds one per reply.
-          head -c 16 "$tmp/session.out" | grep -q 'Content-Length'
-          test "$(grep -c 'Content-Length' "$tmp/session.out")" -ge 4
+        run: zig build smoke -Doptimize=ReleaseFast

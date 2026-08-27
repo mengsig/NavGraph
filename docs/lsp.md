@@ -344,6 +344,16 @@ Reproduce with a client that drives the binary over a pipe: `initialize` →
 `initialized`, read the `ms` from `navgraph/indexed`, then time
 `didChange` → `navgraph/status` round trips and the query methods.
 
+## Hostile input
+
+`zig build smoke` replays a hostile session into the built binary and checks
+what comes back: a 20 000-deep regex, an ordinary pattern over a 300 000
+character line, and a malformed header with a body — each followed by a request
+that must still be answered. It then walks stdout as an exact frame stream
+(every byte inside a frame, the last ending at EOF), requires a
+`navgraph/blast` result shape that only the `navgraph/*` handlers can produce,
+and requires the process to exit 0. CI runs it against the ReleaseFast build.
+
 ## Limitations
 
 - **Not yet implemented** (a stacked follow-up): `navgraph/neighbors`, `path`,

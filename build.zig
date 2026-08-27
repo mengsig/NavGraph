@@ -157,9 +157,27 @@ pub fn build(b: *std.Build) void {
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
+    // Drives the real binary through a hostile LSP session: a crash, a hang or
+    // a desync in the editor server is not visible from an in-process test.
+    const smoke = b.addExecutable(.{
+        .name = "lsp-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/lsp_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_smoke = b.addRunArtifact(smoke);
+    run_smoke.addArtifactArg(exe);
+    _ = run_smoke.addOutputDirectoryArg("lsp-smoke-root");
+    run_smoke.expectExitCode(0);
+    const smoke_step = b.step("smoke", "Drive the built server through a hostile LSP session");
+    smoke_step.dependOn(&run_smoke.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_smoke.step);
 
     // Real executable/corpus contracts live outside the white-box test roots.
     // Named steps remain independently runnable, and the main `test` gate also
