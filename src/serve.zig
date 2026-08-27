@@ -1,4 +1,4 @@
-//! NavGraph editor server (`navgraph serve` / `navgraph lsp`): a resident
+//! NavGraph editor server (`navgraph lsp`): a resident
 //! LSP server over stdio that keeps the whole code graph in memory.
 //!
 //! Layering, outermost first — each layer depends only on the ones below it:
@@ -19,6 +19,11 @@ pub const payload = @import("serve/payload.zig");
 pub const regex = @import("serve/regex.zig");
 pub const search = @import("serve/search.zig");
 pub const queries = @import("serve/queries.zig");
+pub const handlers = @import("serve/handlers.zig");
+pub const loop = @import("serve/loop.zig");
+
+pub const Options = loop.Options;
+pub const run = loop.run;
 
 test {
     @import("std").testing.refAllDecls(@This());

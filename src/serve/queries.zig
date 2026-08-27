@@ -23,7 +23,9 @@ const SymbolId = model.SymbolId;
 const invalid = model.invalid_symbol;
 const Ctx = payload.Ctx;
 
-pub const Error = error{ SymbolNotFound, FileNotIndexed } || std.mem.Allocator.Error;
+/// `InvalidGitPath`: git reported a diff path the parser cannot use — a real
+/// failure, never reported to the editor as "nothing changed".
+pub const Error = error{ SymbolNotFound, FileNotIndexed, InvalidGitPath } || std.mem.Allocator.Error;
 
 /// The contract's `Scope`, defaulted from `initializationOptions`.
 pub const Scope = struct {
@@ -213,9 +215,15 @@ fn fileDefinitions(
     const file = idx.graph.files[file_id];
     var i = file.sym_start;
     while (i < file.sym_end) : (i += 1) {
-        if (idx.graph.symbols[i].kind == .import) continue;
+        if (!reportable(idx.graph.symbols[i].kind)) continue;
         try out.append(gpa, i);
     }
+}
+
+/// Whether a symbol is a definition the protocol reports. Import records and
+/// router-mount directives are index bookkeeping the CLI hides too.
+fn reportable(kind: model.SymbolKind) bool {
+    return kind != .import and kind != .route_mount;
 }
 
 /// Definitions touched since `spec` (`navgraph diff`'s rule) plus every
@@ -241,7 +249,7 @@ fn changedSince(
                 var i = file.sym_start;
                 while (i < file.sym_end) : (i += 1) {
                     const sym = idx.graph.symbols[i];
-                    if (sym.kind == .import) continue;
+                    if (!reportable(sym.kind)) continue;
                     if (query.symbolTouched(sym, file.text, change.ranges)) try out.append(gpa, sym.id);
                 }
             }
@@ -258,7 +266,7 @@ fn changedSince(
         var i = file.sym_start;
         while (i < file.sym_end) : (i += 1) {
             const sym = idx.graph.symbols[i];
-            if (sym.kind == .import) continue;
+            if (!reportable(sym.kind)) continue;
             if (!contains(out.items, sym.id)) try out.append(gpa, sym.id);
         }
     }
@@ -627,7 +635,7 @@ fn writeChildSymbols(w: *Writer, ctx: Ctx, file: model.SourceFile, parent: Symbo
     var i = file.sym_start;
     while (i < file.sym_end) : (i += 1) {
         const sym = idx.graph.symbols[i];
-        if (sym.parent != parent or sym.kind == .import) continue;
+        if (sym.parent != parent or !reportable(sym.kind)) continue;
         if (wrote != 0) try w.writeByte(',');
         wrote += 1;
         try w.writeAll("{\"name\":");
@@ -667,6 +675,7 @@ pub fn lspSymbolKind(kind: model.SymbolKind) u8 {
         .module => 2,
         .import => 2,
         .route => 12,
+        .route_mount => 2,
         .test_case => 12,
         .unknown => 13,
     };

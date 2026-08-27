@@ -113,6 +113,7 @@ pub const Session = struct {
         root_path: []const u8,
         cfg: Config,
     ) !Session {
+        const start_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
         var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
         errdefer root_dir.close(io);
         const root_abs = try root_dir.realPathFileAlloc(io, ".", gpa);
@@ -121,13 +122,16 @@ pub const Session = struct {
         var sources = try index_mod.collect(gpa, io, root_dir, null, null, true);
         errdefer sources.deinit();
 
+        // No document can be open yet, so the first walk is always safe to cache.
         var idx = try index_mod.assemble(gpa, .{
             .root_label = root_path,
             .files = sources.files,
             .skipped_dirs = sources.skipped_dirs,
             .cache = sources.cache,
+            .cache_write = if (sources.cache_stale) .{ .io = io, .dir = root_dir } else null,
         });
         errdefer idx.deinit();
+        sources.cache_stale = idx.cache_snapshot.rewrite != .written;
 
         var self = Session{
             .gpa = gpa,
@@ -155,8 +159,7 @@ pub const Session = struct {
         };
         errdefer self.deinitOwned();
         try self.adoptSources();
-        self.edges = countEdges(&self.idx);
-        self.indexed_at_unix_ms = @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+        _ = self.finishIndex(.initial, start_ms);
         self.armWatch();
         return self;
     }
@@ -226,7 +229,9 @@ pub const Session = struct {
             try self.changed.append(self.gpa, path);
             try self.reparse(path);
         }
-        try self.swapIndex();
+        // An edit-driven re-index never refreshes the on-disk cache: what it
+        // assembles reflects editor buffers, not what a CLI run would parse.
+        try self.swapIndex(null);
         self.dirty.clearRetainingCapacity();
         self.debounce_deadline_ms = null;
         return self.finishIndex(reason, start);
@@ -245,6 +250,7 @@ pub const Session = struct {
         self.slots.clearRetainingCapacity();
         var old_sources = self.sources;
         self.sources = sources;
+        self.used_cache = sources.cache.hits != 0;
         try self.adoptSources();
 
         self.changed.clearRetainingCapacity();
@@ -252,7 +258,7 @@ pub const Session = struct {
             try self.changed.append(self.gpa, path);
             try self.reparse(path);
         }
-        try self.swapIndex();
+        try self.swapIndex(self.cacheWrite());
         old_sources.deinit();
         self.dirty.clearRetainingCapacity();
         self.debounce_deadline_ms = null;
@@ -432,7 +438,9 @@ pub const Session = struct {
     }
 
     /// Assemble a new index over the current slots and retire the old one.
-    fn swapIndex(self: *Session) !void {
+    /// `cache_write` refreshes `.navgraph/cache` from the new graph; `cacheWrite`
+    /// decides when that is allowed.
+    fn swapIndex(self: *Session, cache_write: ?index_mod.CacheWrite) !void {
         const files = try self.gpa.alloc(index_mod.ParsedFile, self.slots.items.len);
         defer self.gpa.free(files);
         for (self.slots.items, files) |slot, *f| f.* = slot.file;
@@ -442,14 +450,24 @@ pub const Session = struct {
             .files = files,
             .skipped_dirs = self.sources.skipped_dirs,
             .cache = self.sources.cache,
+            .cache_write = cache_write,
         });
         errdefer next.deinit();
         try self.reindexPathTable();
 
         self.idx.deinit();
         self.idx = next;
+        if (cache_write != null) self.sources.cache_stale = next.cache_snapshot.rewrite != .written;
         for (self.retired.items) |a| destroyArena(self.gpa, a);
         self.retired.clearRetainingCapacity();
+    }
+
+    /// The cache refresh to fold into the next assembly, or null. The cache is
+    /// never written while a document is open: the index then carries unsaved
+    /// editor text, which must not become what the next CLI run reads back.
+    fn cacheWrite(self: *const Session) ?index_mod.CacheWrite {
+        if (!self.sources.cache_stale or self.overlays.count() != 0) return null;
+        return .{ .io = self.io, .dir = self.root_dir };
     }
 
     fn finishIndex(self: *Session, reason: Reason, start_ms: i64) Report {
@@ -466,6 +484,12 @@ pub const Session = struct {
         };
     }
 
+    /// Write back the on-disk parse cache when the walk found it out of date, so
+    /// the next server or CLI start is a cache-restore rather than a full parse.
+    ///
+    /// Skipped while any document is open: the live index then holds unsaved
+    /// buffer text, which must never be written to a cache keyed by disk mtime.
+    /// The existing cache stays valid for the files that were not edited.
     fn statOf(self: *const Session, path: []const u8) ?cache.FileStat {
         const st = self.root_dir.statFile(self.io, path, .{}) catch return null;
         return .{ .mtime_ns = st.mtime.nanoseconds, .ctime_ns = st.ctime.nanoseconds, .size = st.size };
