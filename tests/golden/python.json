@@ -286,6 +286,7 @@
     {"from": "app/tricky_python.py:Ledger.blank", "to": "app/tricky_python.py:Ledger", "exact": true, "lines": [86], "verified": "lsp"},
     {"from": "app/tricky_python.py:Ledger.for_email", "to": "app/models.py:User", "exact": true, "lines": [91], "verified": "lsp"},
     {"from": "app/tricky_python.py:Ledger.post", "to": "app/tricky_python.py:Ledger.Entry", "exact": true, "lines": [99], "verified": "lsp"},
+    {"from": "app/tricky_python.py:Ledger.size", "to": "app/tricky_python.py:Ledger.size", "exact": false, "lines": [78], "from_line": 79, "to_line": 74, "verified": "manual"},
     {"from": "app/tricky_python.py:fetch_total", "to": "app/tricky_python.py:_resolve", "exact": true, "lines": [151], "verified": "lsp"},
     {"from": "app/tricky_python.py:format_all", "to": "app/tricky_python.py:Formatter.render", "exact": true, "lines": [160], "verified": "lsp"},
     {"from": "app/tricky_python.py:tagged", "to": "app/tricky_python.py:tagged.decorate", "exact": true, "lines": [49], "verified": "lsp"},
