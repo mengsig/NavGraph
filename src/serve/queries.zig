@@ -330,6 +330,8 @@ pub fn writeBlast(
     var nodes: std.ArrayList(BlastNode) = .empty;
     var seen: std.AutoHashMapUnmanaged(SymbolId, usize) = .empty;
     var edges: std.ArrayList(BlastEdge) = .empty;
+    // `query.callSiteLines` grows its output with the index's own allocator, so
+    // this scratch list must be freed with that one, not the request arena.
     var lines: std.ArrayList(u32) = .empty;
     defer {
         for (nodes.items) |*n| n.via.deinit(gpa);
@@ -337,7 +339,7 @@ pub fn writeBlast(
         seen.deinit(gpa);
         for (edges.items) |e| gpa.free(e.lines);
         edges.deinit(gpa);
-        lines.deinit(gpa);
+        lines.deinit(idx.gpa);
     }
 
     var truncated = false;
@@ -532,8 +534,9 @@ pub fn writeTree(
 ) !void {
     var visited: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
     defer visited.deinit(gpa);
+    // Freed with the index's allocator: `query.callSiteLines` grows it with that.
     var lines: std.ArrayList(u32) = .empty;
-    defer lines.deinit(gpa);
+    defer lines.deinit(ctx.index().gpa);
     try writeNode(w, gpa, ctx, id, 0, true, &.{}, opts, &visited, &lines);
 }
 

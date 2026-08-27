@@ -569,20 +569,20 @@ fn references(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, 
     const located = (try queries.locate(arena, c, at.path, at.offset)) orelse return w.writeAll("[]");
     if (located.symbol == invalid) return w.writeAll("[]");
     const include_decl = p.nested("context").boolean("includeDeclaration", false);
-    try writeReferenceLocations(w, arena, c, located.symbol, include_decl);
+    try writeReferenceLocations(w, c, located.symbol, include_decl);
 }
 
 fn writeReferenceLocations(
     w: *Writer,
-    gpa: std.mem.Allocator,
     c: payload.Ctx,
     id: SymbolId,
     include_declaration: bool,
 ) !void {
     const idx = c.index();
     const target = idx.graph.symbols[id];
+    // `query.callSiteLines` grows and frees this with the index's own allocator.
     var lines: std.ArrayList(u32) = .empty;
-    defer lines.deinit(gpa);
+    defer lines.deinit(idx.gpa);
 
     try w.writeByte('[');
     var wrote: u32 = 0;
@@ -894,3 +894,704 @@ pub const navgraph_methods = blk: {
     const out = names[0..n].*;
     break :blk out;
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// A live server over a temporary project, driven message by message.
+///
+/// Heap-allocated because the `Server` holds a pointer into this struct's own
+/// output buffer, which must not move. Shared with `loop.zig`'s tests.
+pub const TestServer = struct {
+    gpa: std.mem.Allocator,
+    tmp: ?std.testing.TmpDir,
+    root: []u8,
+    out: Writer.Allocating,
+    logged: Writer.Allocating,
+    server: Server,
+    /// Bytes of `out` already returned by `takeFrames`.
+    read_at: usize,
+
+    /// Serve a fresh temp project made of `{ path, contents }` pairs.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, files: []const [2][]const u8) !*TestServer {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        for (files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
+        const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        errdefer gpa.free(root);
+        return build(gpa, io, tmp, root);
+    }
+
+    /// Serve an existing directory in the repository (the `testenv/` fixtures).
+    pub fn initAt(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8) !*TestServer {
+        return build(gpa, io, null, try gpa.dupe(u8, root_path));
+    }
+
+    fn build(gpa: std.mem.Allocator, io: std.Io, tmp: ?std.testing.TmpDir, root: []u8) !*TestServer {
+        const self = try gpa.create(TestServer);
+        self.* = .{
+            .gpa = gpa,
+            .tmp = tmp,
+            .root = root,
+            .out = .init(gpa),
+            .logged = .init(gpa),
+            .server = undefined,
+            .read_at = 0,
+        };
+        self.server = Server.init(gpa, io, &self.out.writer, .{
+            .writer = &self.logged.writer,
+            .level = .err,
+        }, self.root);
+        return self;
+    }
+
+    pub fn deinit(self: *TestServer) void {
+        self.server.deinit();
+        self.out.deinit();
+        self.logged.deinit();
+        self.gpa.free(self.root);
+        if (self.tmp) |*t| t.cleanup();
+        self.gpa.destroy(self);
+    }
+
+    /// Bring the server up: `initialize` (utf-8 positions) then `initialized`.
+    /// The initialize response stays in the output buffer for `responseFor(1)`.
+    pub fn start(self: *TestServer) !void {
+        try self.send(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":
+            \\ {"capabilities":{"general":{"positionEncodings":["utf-8"]}}}}
+        );
+        try self.send(
+            \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+        );
+    }
+
+    /// Dispatch one raw message body.
+    pub fn send(self: *TestServer, body: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const decoded = rpc.decode(alloc, body);
+        try testing.expect(decoded == .message);
+        try self.server.dispatch(alloc, decoded.message);
+    }
+
+    /// Dispatch a request and return its parsed response. Caller owns it.
+    pub fn request(self: *TestServer, id: i64, body: []const u8) !std.json.Parsed(std.json.Value) {
+        try self.send(body);
+        return self.responseFor(id);
+    }
+
+    /// The parsed body of the newest message whose `id` matches.
+    pub fn responseFor(self: *TestServer, id: i64) !std.json.Parsed(std.json.Value) {
+        var found: ?[]const u8 = null;
+        var rest = self.out.written();
+        while (rpc.nextFrame(rest, 1 << 24) == .frame) {
+            const frame = rpc.nextFrame(rest, 1 << 24).frame;
+            if (matchesId(frame.body, id)) found = frame.body;
+            rest = rest[frame.consumed..];
+        }
+        const body = found orelse return error.NoSuchResponse;
+        return std.json.parseFromSlice(std.json.Value, self.gpa, body, .{});
+    }
+
+    /// Parsed bodies of every message written since the last call. Caller frees
+    /// the slice; each entry is owned by `arena`.
+    pub fn takeNotifications(self: *TestServer, arena: std.mem.Allocator, method: []const u8) ![]std.json.Value {
+        var out: std.ArrayList(std.json.Value) = .empty;
+        var rest = self.out.written()[self.read_at..];
+        self.read_at = self.out.written().len;
+        while (rpc.nextFrame(rest, 1 << 24) == .frame) {
+            const frame = rpc.nextFrame(rest, 1 << 24).frame;
+            rest = rest[frame.consumed..];
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, frame.body, .{}) catch continue;
+            if (parsed != .object) continue;
+            const m = parsed.object.get("method") orelse continue;
+            if (m == .string and std.mem.eql(u8, m.string, method)) try out.append(arena, parsed);
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// A `file://` URI for a path inside the served root.
+    pub fn uri(self: *TestServer, arena: std.mem.Allocator, rel: []const u8) ![]const u8 {
+        var aw: Writer.Allocating = .init(arena);
+        defer aw.deinit();
+        try overlay.writeUriIn(&aw.writer, self.server.session.?.root_abs, rel);
+        return arena.dupe(u8, aw.written());
+    }
+};
+
+fn matchesId(body: []const u8, id: i64) bool {
+    var buf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\"id\":{d},", .{id}) catch return false;
+    return std.mem.indexOf(u8, body, needle) != null;
+}
+
+/// `result` of a parsed response, or an error when the server replied with one.
+fn resultOf(parsed: std.json.Parsed(std.json.Value)) !std.json.Value {
+    if (parsed.value.object.get("error")) |_| return error.ServerReturnedError;
+    return parsed.value.object.get("result") orelse error.NoResult;
+}
+
+fn errorCodeOf(parsed: std.json.Parsed(std.json.Value)) !i64 {
+    const err = parsed.value.object.get("error") orelse return error.NoError;
+    return err.object.get("code").?.integer;
+}
+
+const project = [_][2][]const u8{
+    .{ "app.zig", 
+        \\const util = @import("util.zig");
+        \\
+        \\/// Entry point.
+        \\pub fn run() void {
+        \\    mid();
+        \\}
+        \\
+        \\fn mid() void {
+        \\    util.helper();
+        \\}
+        \\
+    },
+    .{ "util.zig", 
+        \\pub const marker = "needle-in-a-haystack";
+        \\
+        \\pub fn helper() void {}
+        \\
+    },
+};
+
+fn started(gpa: std.mem.Allocator) !*TestServer {
+    const ts = try TestServer.init(gpa, testing.io, &project);
+    errdefer ts.deinit();
+    try ts.start();
+    return ts;
+}
+
+test "initialize advertises the contract's capabilities and methods" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.responseFor(1);
+    defer res.deinit();
+    const caps = (try resultOf(res)).object.get("capabilities").?.object;
+
+    try testing.expectEqualStrings("utf-8", caps.get("positionEncoding").?.string);
+    try testing.expect(caps.get("definitionProvider").?.bool);
+    try testing.expect(caps.get("referencesProvider").?.bool);
+    try testing.expect(caps.get("hoverProvider").?.bool);
+    try testing.expect(caps.get("documentSymbolProvider").?.bool);
+    try testing.expect(caps.get("workspaceSymbolProvider").?.bool);
+    const sync = caps.get("textDocumentSync").?.object;
+    try testing.expect(sync.get("openClose").?.bool);
+    try testing.expectEqual(@as(i64, 1), sync.get("change").?.integer);
+
+    const ng = caps.get("experimental").?.object.get("navgraph").?.object;
+    try testing.expectEqual(@as(i64, protocol_version), ng.get("protocolVersion").?.integer);
+    // Only implemented methods are advertised.
+    const methods = ng.get("methods").?.array.items;
+    try testing.expectEqual(navgraph_methods.len, methods.len);
+    for (methods) |m| try testing.expect(std.mem.startsWith(u8, m.string, "navgraph/"));
+}
+
+test "initialize defaults to utf-16 when the client offers no encoding" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    var res = try ts.request(1,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    );
+    defer res.deinit();
+    const caps = (try resultOf(res)).object.get("capabilities").?.object;
+    try testing.expectEqualStrings("utf-16", caps.get("positionEncoding").?.string);
+    try testing.expectEqual(position.Encoding.utf16, ts.server.encoding);
+}
+
+test "initializationOptions override the session defaults" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    var res = try ts.request(1,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":
+        \\ {"tests":"without","strict":true,"debounceMs":7,"watch":false,"depth":99}}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(query.TestScope.without, ts.server.cfg.tests);
+    try testing.expect(ts.server.cfg.strict);
+    try testing.expectEqual(@as(u32, 7), ts.server.cfg.debounce_ms);
+    try testing.expect(!ts.server.cfg.watch);
+    // depth is clamped to the contract's maximum.
+    try testing.expectEqual(session_mod.Config.max_depth, ts.server.cfg.depth);
+}
+
+test "initialized indexes the project and always announces navgraph/indexed" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const notes = try ts.takeNotifications(arena.allocator(), "navgraph/indexed");
+    try testing.expectEqual(@as(usize, 1), notes.len);
+    const p = notes[0].object.get("params").?.object;
+    try testing.expectEqualStrings("initial", p.get("reason").?.string);
+    try testing.expectEqual(@as(i64, 2), p.get("files").?.integer);
+    try testing.expect(p.get("symbols").?.integer > 0);
+}
+
+test "an unknown method is -32601 and the server keeps serving" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var bad = try ts.request(5,
+        \\{"jsonrpc":"2.0","id":5,"method":"navgraph/nope","params":{}}
+    );
+    defer bad.deinit();
+    try testing.expectEqual(@as(i64, -32601), try errorCodeOf(bad));
+
+    var ok = try ts.request(6,
+        \\{"jsonrpc":"2.0","id":6,"method":"navgraph/status","params":{}}
+    );
+    defer ok.deinit();
+    try testing.expect((try resultOf(ok)).object.get("files").?.integer == 2);
+}
+
+test "bad params are -32602 and an unresolvable target is -32001" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var bad_dir = try ts.request(7,
+        \\{"jsonrpc":"2.0","id":7,"method":"navgraph/blast","params":{"symbol":"run","direction":"sideways"}}
+    );
+    defer bad_dir.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(bad_dir));
+
+    var missing = try ts.request(8,
+        \\{"jsonrpc":"2.0","id":8,"method":"navgraph/blast","params":{"symbol":"no_such_symbol_xyz"}}
+    );
+    defer missing.deinit();
+    try testing.expectEqual(@as(i64, -32001), try errorCodeOf(missing));
+
+    var no_query = try ts.request(9,
+        \\{"jsonrpc":"2.0","id":9,"method":"navgraph/search","params":{}}
+    );
+    defer no_query.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(no_query));
+}
+
+test "navgraph/status reports the graph, the languages and the cache flag" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(10,
+        \\{"jsonrpc":"2.0","id":10,"method":"navgraph/status","params":{}}
+    );
+    defer res.deinit();
+    const s = (try resultOf(res)).object;
+    try testing.expectEqual(@as(i64, protocol_version), s.get("protocolVersion").?.integer);
+    try testing.expectEqual(@as(i64, 2), s.get("files").?.integer);
+    try testing.expectEqual(@as(i64, 2), s.get("languages").?.object.get("zig").?.integer);
+    try testing.expectEqual(@as(i64, 0), s.get("overlays").?.integer);
+    try testing.expect(s.get("edges").?.integer > 0);
+    // ISO-8601 with a Z suffix.
+    const at = s.get("indexedAt").?.string;
+    try testing.expectEqual(@as(u8, 'Z'), at[at.len - 1]);
+    try testing.expectEqual(@as(usize, 24), at.len);
+}
+
+test "navgraph/search ranks an exact name first and reports the total" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(11,
+        \\{"jsonrpc":"2.0","id":11,"method":"navgraph/search","params":{"query":"helper"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    const items = r.get("items").?.array.items;
+    try testing.expect(items.len >= 1);
+    try testing.expectEqualStrings("helper", items[0].object.get("symbol").?.object.get("name").?.string);
+    try testing.expect(items[0].object.get("score").?.integer >= 4000);
+    try testing.expectEqual(@as(i64, @intCast(items.len)), r.get("total").?.integer);
+    // `matches` carries the byte offsets in the qualified name.
+    try testing.expectEqual(@as(usize, 6), items[0].object.get("matches").?.array.items.len);
+}
+
+test "navgraph/search honors kinds and the limit" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var only_const = try ts.request(12,
+        \\{"jsonrpc":"2.0","id":12,"method":"navgraph/search","params":{"query":"marker","kinds":["const"]}}
+    );
+    defer only_const.deinit();
+    try testing.expectEqual(@as(usize, 1), (try resultOf(only_const)).object.get("items").?.array.items.len);
+
+    var none = try ts.request(13,
+        \\{"jsonrpc":"2.0","id":13,"method":"navgraph/search","params":{"query":"marker","kinds":["fn"]}}
+    );
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(none)).object.get("items").?.array.items.len);
+
+    var capped = try ts.request(14,
+        \\{"jsonrpc":"2.0","id":14,"method":"navgraph/search","params":{"query":"e","limit":1}}
+    );
+    defer capped.deinit();
+    const r = (try resultOf(capped)).object;
+    try testing.expectEqual(@as(usize, 1), r.get("items").?.array.items.len);
+    try testing.expect(r.get("total").?.integer > 1);
+}
+
+test "navgraph/grep finds a literal, respects include globs and reports totals" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(15,
+        \\{"jsonrpc":"2.0","id":15,"method":"navgraph/grep","params":{"pattern":"needle-in-a-haystack"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    const items = r.get("items").?.array.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualStrings("util.zig", items[0].object.get("file").?.string);
+    try testing.expectEqual(@as(i64, 1), items[0].object.get("line").?.integer);
+    try testing.expect(!r.get("truncated").?.bool);
+    // The enclosing definition is reported alongside the hit.
+    try testing.expectEqualStrings("marker", items[0].object.get("enclosing").?.object.get("name").?.string);
+
+    var filtered = try ts.request(16,
+        \\{"jsonrpc":"2.0","id":16,"method":"navgraph/grep","params":{"pattern":"needle","include":["app.zig"]}}
+    );
+    defer filtered.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(filtered)).object.get("items").?.array.items.len);
+}
+
+test "navgraph/grep supports regular expressions and rejects a bad one" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(17,
+        \\{"jsonrpc":"2.0","id":17,"method":"navgraph/grep","params":{"pattern":"fn\\s+\\w+","regex":true}}
+    );
+    defer res.deinit();
+    try testing.expect((try resultOf(res)).object.get("items").?.array.items.len >= 2);
+
+    var bad = try ts.request(18,
+        \\{"jsonrpc":"2.0","id":18,"method":"navgraph/grep","params":{"pattern":"(unclosed","regex":true}}
+    );
+    defer bad.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(bad));
+}
+
+test "navgraph/callers and navgraph/calls mirror the CLI tree" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var callers = try ts.request(19,
+        \\{"jsonrpc":"2.0","id":19,"method":"navgraph/callers","params":{"symbol":"helper","depth":2}}
+    );
+    defer callers.deinit();
+    const root = (try resultOf(callers)).object.get("root").?.object;
+    try testing.expectEqualStrings("helper", root.get("symbol").?.object.get("name").?.string);
+    try testing.expect(!root.get("recursion").?.bool);
+    const children = root.get("children").?.array.items;
+    try testing.expectEqual(@as(usize, 1), children.len);
+    try testing.expectEqualStrings("mid", children[0].object.get("symbol").?.object.get("name").?.string);
+    // The edge carries its call-site line.
+    try testing.expectEqual(@as(i64, 9), children[0].object.get("lines").?.array.items[0].integer);
+    // Depth 2 reaches `run`, which calls `mid`.
+    try testing.expectEqualStrings(
+        "run",
+        children[0].object.get("children").?.array.items[0].object.get("symbol").?.object.get("name").?.string,
+    );
+
+    var calls = try ts.request(20,
+        \\{"jsonrpc":"2.0","id":20,"method":"navgraph/calls","params":{"symbol":"run","depth":2}}
+    );
+    defer calls.deinit();
+    const out = (try resultOf(calls)).object.get("root").?.object;
+    try testing.expectEqualStrings("mid", out.get("children").?.array.items[0].object.get("symbol").?.object.get("name").?.string);
+}
+
+test "navgraph/blast reports depth, via, byFile and the file target form" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(21,
+        \\{"jsonrpc":"2.0","id":21,"method":"navgraph/blast","params":{"symbol":"helper","depth":3}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqual(@as(usize, 1), r.get("roots").?.array.items.len);
+
+    const nodes = r.get("nodes").?.array.items;
+    // helper (0) <- mid (1) <- run (2).
+    try testing.expectEqual(@as(usize, 3), nodes.len);
+    var by_name = std.StringHashMap(i64).init(testing.allocator);
+    defer by_name.deinit();
+    for (nodes) |n| {
+        try by_name.put(n.object.get("symbol").?.object.get("name").?.string, n.object.get("depth").?.integer);
+    }
+    try testing.expectEqual(@as(i64, 0), by_name.get("helper").?);
+    try testing.expectEqual(@as(i64, 1), by_name.get("mid").?);
+    try testing.expectEqual(@as(i64, 2), by_name.get("run").?);
+
+    // `via` names the depth-1 neighbour each node was reached through.
+    for (nodes) |n| {
+        const via = n.object.get("via").?.array.items;
+        if (n.object.get("depth").?.integer == 0) {
+            try testing.expectEqual(@as(usize, 0), via.len);
+        } else {
+            try testing.expectEqual(@as(usize, 1), via.len);
+        }
+    }
+
+    const summary = r.get("summary").?.object;
+    try testing.expectEqual(@as(i64, 3), summary.get("symbols").?.integer);
+    try testing.expectEqual(@as(i64, 2), summary.get("files").?.integer);
+    try testing.expectEqual(@as(i64, 2), summary.get("maxDepth").?.integer);
+    try testing.expect(!summary.get("truncated").?.bool);
+    const by_depth = try depths(testing.allocator, summary);
+    defer testing.allocator.free(by_depth);
+    try testing.expectEqualSlices(i64, &.{ 1, 1, 1 }, by_depth);
+    const by_file = summary.get("byFile").?.array.items;
+    try testing.expectEqual(@as(usize, 2), by_file.len);
+    // Ranked by count desc: app.zig holds mid and run.
+    try testing.expectEqualStrings("app.zig", by_file[0].object.get("file").?.string);
+    try testing.expectEqual(@as(i64, 2), by_file[0].object.get("count").?.integer);
+}
+
+fn depths(gpa: std.mem.Allocator, summary: std.json.ObjectMap) ![]const i64 {
+    const items = summary.get("byDepth").?.array.items;
+    const out = try gpa.alloc(i64, items.len);
+    for (items, out) |v, *o| o.* = v.integer;
+    return out;
+}
+
+test "navgraph/blast truncates at the limit and honors the callees direction" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var capped = try ts.request(22,
+        \\{"jsonrpc":"2.0","id":22,"method":"navgraph/blast","params":{"symbol":"helper","depth":3,"limit":2}}
+    );
+    defer capped.deinit();
+    const summary = (try resultOf(capped)).object.get("summary").?.object;
+    try testing.expectEqual(@as(i64, 2), summary.get("symbols").?.integer);
+    try testing.expect(summary.get("truncated").?.bool);
+
+    var down = try ts.request(23,
+        \\{"jsonrpc":"2.0","id":23,"method":"navgraph/blast","params":{"symbol":"run","direction":"callees","depth":3}}
+    );
+    defer down.deinit();
+    const nodes = (try resultOf(down)).object.get("nodes").?.array.items;
+    try testing.expectEqual(@as(usize, 3), nodes.len); // run -> mid -> helper
+}
+
+test "blast over a file target unions that file's definitions" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(24,
+        \\{"jsonrpc":"2.0","id":24,"method":"navgraph/blast","params":{"file":"util.zig","depth":1}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    // marker and helper are both roots; mid is helper's caller at depth 1.
+    try testing.expectEqual(@as(usize, 2), r.get("roots").?.array.items.len);
+    try testing.expectEqual(@as(i64, 3), r.get("summary").?.object.get("symbols").?.integer);
+}
+
+test "navgraph/rescan picks up a file written outside the editor" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    try ts.tmp.?.dir.writeFile(testing.io, .{ .sub_path = "added.zig", .data = "pub fn justAdded() void {}\n" });
+    var res = try ts.request(25,
+        \\{"jsonrpc":"2.0","id":25,"method":"navgraph/rescan","params":{"full":true}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(@as(i64, 3), (try resultOf(res)).object.get("files").?.integer);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The rescan is announced like every other index.
+    const notes = try ts.takeNotifications(arena.allocator(), "navgraph/indexed");
+    try testing.expect(notes.len >= 1);
+    try testing.expectEqualStrings("rescan", notes[notes.len - 1].object.get("params").?.object.get("reason").?.string);
+}
+
+test "navgraph/symbolAt names the word, its definition and its enclosing symbol" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":26,"method":"navgraph/symbolAt","params":{{"uri":"{s}","position":{{"line":8,"character":9}}}}}}
+    , .{try ts.uri(arena.allocator(), "app.zig")});
+    var res = try ts.request(26, body);
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("helper", r.get("word").?.string);
+    try testing.expectEqualStrings("helper", r.get("symbol").?.object.get("name").?.string);
+    try testing.expectEqualStrings("util.zig", r.get("symbol").?.object.get("file").?.string);
+    try testing.expectEqualStrings("mid", r.get("enclosing").?.object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 0), r.get("candidates").?.array.items.len);
+}
+
+test "hover renders the signature, the location and the fan-in counts" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":27,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":3,"character":8}}}}}}
+    , .{try ts.uri(arena.allocator(), "app.zig")});
+    var res = try ts.request(27, body);
+    defer res.deinit();
+    const contents = (try resultOf(res)).object.get("contents").?.object;
+    try testing.expectEqualStrings("markdown", contents.get("kind").?.string);
+    const md = contents.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, md, "fn `run`") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "```zig") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "app.zig:4-6") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "← 0 callers → 1 callees") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "Entry point.") != null);
+}
+
+test "documentSymbol reflects the file's nesting and ranges" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":28,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{s}"}}}}}}
+    , .{try ts.uri(arena.allocator(), "app.zig")});
+    var res = try ts.request(28, body);
+    defer res.deinit();
+    const items = (try resultOf(res)).array.items;
+    // `run` and `mid`; the import is not a document symbol.
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqualStrings("run", items[0].object.get("name").?.string);
+    const range = items[0].object.get("range").?.object;
+    try testing.expectEqual(@as(i64, 3), range.get("start").?.object.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 5), range.get("end").?.object.get("line").?.integer);
+    const sel = items[0].object.get("selectionRange").?.object;
+    try testing.expectEqual(@as(i64, 7), sel.get("start").?.object.get("character").?.integer);
+}
+
+test "workspace/symbol returns ranked SymbolInformation" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(29,
+        \\{"jsonrpc":"2.0","id":29,"method":"workspace/symbol","params":{"query":"helper"}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).array.items;
+    try testing.expect(items.len >= 1);
+    try testing.expectEqualStrings("helper", items[0].object.get("name").?.string);
+    try testing.expect(items[0].object.get("location").?.object.get("uri") != null);
+}
+
+test "definition and references resolve real testenv sources" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vm_uri = try ts.uri(alloc, "vm.zig");
+
+    // `self.push(...)` on line 52 (0-based 51) resolves to Vm.push on line 32.
+    var def = try ts.request(30, try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","id":30,"method":"textDocument/definition","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":51,"character":22}}}}}}
+    , .{vm_uri}));
+    defer def.deinit();
+    const locs = (try resultOf(def)).array.items;
+    // The graph's own choice comes first; the generic `Stack.push` is the
+    // same-name candidate the editor is also offered.
+    try testing.expectEqual(@as(usize, 2), locs.len);
+    try testing.expectEqualStrings(vm_uri, locs[0].object.get("uri").?.string);
+    try testing.expectEqual(@as(i64, 31), locs[0].object.get("range").?.object.get("start").?.object.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 11), locs[0].object.get("range").?.object.get("start").?.object.get("character").?.integer);
+
+    // References from the definition site list every call, declaration included.
+    var refs = try ts.request(31, try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","id":31,"method":"textDocument/references","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":31,"character":11}},"context":{{"includeDeclaration":true}}}}}}
+    , .{vm_uri}));
+    defer refs.deinit();
+    const sites = (try resultOf(refs)).array.items;
+    // Declaration plus the two call sites in `run` and `apply`. bytecode_vm's
+    // `self.operands.push(...)` belongs to the generic `Stack.push`, not here.
+    try testing.expectEqual(@as(usize, 3), sites.len);
+    try testing.expectEqual(@as(i64, 31), sites[0].object.get("range").?.object.get("start").?.object.get("line").?.integer);
+
+    // symbolAt on the same position names the method and its enclosing type.
+    var at = try ts.request(32, try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","id":32,"method":"navgraph/symbolAt","params":{{"uri":"{s}","position":{{"line":51,"character":22}}}}}}
+    , .{vm_uri}));
+    defer at.deinit();
+    const r = (try resultOf(at)).object;
+    try testing.expectEqualStrings("push", r.get("word").?.string);
+    try testing.expectEqualStrings("Vm.push", r.get("symbol").?.object.get("qualified").?.string);
+    try testing.expectEqualStrings("run", r.get("enclosing").?.object.get("name").?.string);
+}
+
+test "definition returns an empty array off an identifier" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":33,"method":"textDocument/definition","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":1,"character":0}}}}}}
+    , .{try ts.uri(arena.allocator(), "app.zig")});
+    var res = try ts.request(33, body);
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(res)).array.items.len);
+}
+
+test "a document outside the workspace root is answered, not errored" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(34,
+        \\{"jsonrpc":"2.0","id":34,"method":"textDocument/documentSymbol","params":
+        \\ {"textDocument":{"uri":"file:///elsewhere/other.zig"}}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(res)).array.items.len);
+}
+
+test "shutdown then exit is a clean stop; exit alone is not" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(35,
+        \\{"jsonrpc":"2.0","id":35,"method":"shutdown"}
+    );
+    defer res.deinit();
+    try testing.expect((try resultOf(res)) == .null);
+    try ts.send(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    );
+    try testing.expectEqual(@as(u8, 0), ts.server.exit_code.?);
+
+    const bare = try started(testing.allocator);
+    defer bare.deinit();
+    try bare.send(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    );
+    try testing.expectEqual(@as(u8, 1), bare.server.exit_code.?);
+}
+
+test "grep sees an unsaved buffer, and forgets it after didClose" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const uri = try ts.uri(alloc, "util.zig");
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"pub fn helper() void {{}}\nconst unsavedToken = 1;\n"}}}}}}
+    , .{uri}));
+
+    var found = try ts.request(36,
+        \\{"jsonrpc":"2.0","id":36,"method":"navgraph/grep","params":{"pattern":"unsavedToken"}}
+    );
+    defer found.deinit();
+    try testing.expectEqual(@as(usize, 1), (try resultOf(found)).object.get("items").?.array.items.len);
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{s}"}}}}}}
+    , .{uri}));
+    var gone = try ts.request(37,
+        \\{"jsonrpc":"2.0","id":37,"method":"navgraph/grep","params":{"pattern":"unsavedToken"}}
+    );
+    defer gone.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(gone)).object.get("items").?.array.items.len);
+}

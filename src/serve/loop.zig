@@ -159,3 +159,253 @@ fn openLog(io: std.Io, path: []const u8) !?std.Io.File {
     // Truncated per run: a session's log is about that session.
     return try std.Io.Dir.cwd().createFile(io, path, .{});
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const project = [_][2][]const u8{
+    .{ "app.zig", 
+        \\const util = @import("util.zig");
+        \\
+        \\pub fn run() void {
+        \\    mid();
+        \\}
+        \\
+        \\fn mid() void {
+        \\    util.helper();
+        \\}
+        \\
+    },
+    .{ "util.zig", 
+        \\pub fn helper() void {}
+        \\
+    },
+};
+
+/// Feed `bytes` to the loop in chunks of `chunk` bytes, as a slow pipe would.
+fn feed(
+    gpa: std.mem.Allocator,
+    server: *handlers.Server,
+    pending: *std.ArrayList(u8),
+    bytes: []const u8,
+    chunk: usize,
+) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const end = @min(i + chunk, bytes.len);
+        try pending.appendSlice(gpa, bytes[i..end]);
+        _ = try pump(gpa, server, pending);
+        i = end;
+    }
+}
+
+fn framed(gpa: std.mem.Allocator, bodies: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var aw: Writer.Allocating = .fromArrayList(gpa, &out);
+    defer aw.deinit();
+    for (bodies) |b| try rpc.writeFrame(&aw.writer, b);
+    return gpa.dupe(u8, aw.written());
+}
+
+test "the loop reassembles a frame split across many reads" {
+    const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+
+    const stream = try framed(testing.allocator, &.{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}
+    });
+    defer testing.allocator.free(stream);
+
+    // One byte at a time: every partial header and partial body must be held.
+    try feed(testing.allocator, &ts.server, &pending, stream, 1);
+    try testing.expectEqual(@as(usize, 0), pending.items.len);
+
+    var res = try ts.responseFor(2);
+    defer res.deinit();
+    try testing.expectEqual(@as(i64, 2), res.value.object.get("result").?.object.get("files").?.integer);
+}
+
+test "several frames arriving in one read are all dispatched" {
+    const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+
+    const stream = try framed(testing.allocator, &.{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"navgraph/search","params":{"query":"helper"}}
+    });
+    defer testing.allocator.free(stream);
+    try feed(testing.allocator, &ts.server, &pending, stream, stream.len);
+
+    var status = try ts.responseFor(2);
+    defer status.deinit();
+    try testing.expect(status.value.object.get("result") != null);
+    var found = try ts.responseFor(3);
+    defer found.deinit();
+    try testing.expect(found.value.object.get("result").?.object.get("items").?.array.items.len >= 1);
+}
+
+test "a malformed frame is answered and the server keeps serving" {
+    const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+
+    const good = try framed(testing.allocator, &.{
+        \\{"jsonrpc":"2.0","id":4,"method":"navgraph/status","params":{}}
+    });
+    defer testing.allocator.free(good);
+    const stream = try std.mem.concat(testing.allocator, u8, &.{ "Content-Type: junk\r\n\r\n", good });
+    defer testing.allocator.free(stream);
+
+    try feed(testing.allocator, &ts.server, &pending, stream, 7);
+    // The bad header block produced a parse error...
+    try testing.expect(std.mem.indexOf(u8, ts.out.written(), "-32700") != null);
+    // ...and the frame behind it was still served.
+    var res = try ts.responseFor(4);
+    defer res.deinit();
+    try testing.expect(res.value.object.get("result") != null);
+}
+
+test "a frame whose body is bogus JSON gets -32700 and does not stop the loop" {
+    const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+
+    const stream = try framed(testing.allocator, &.{
+        "{not json at all",
+        \\{"jsonrpc":"2.0","id":5,"method":"navgraph/status","params":{}}
+    });
+    defer testing.allocator.free(stream);
+    try feed(testing.allocator, &ts.server, &pending, stream, 13);
+
+    try testing.expect(std.mem.indexOf(u8, ts.out.written(), "-32700") != null);
+    var res = try ts.responseFor(5);
+    defer res.deinit();
+    try testing.expect(res.value.object.get("result") != null);
+}
+
+test "exit stops the loop and reports the shutdown-aware code" {
+    const ts = try handlers.TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+
+    const stream = try framed(testing.allocator, &.{
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+        // Never reached: the loop stops at `exit`.
+        \\{"jsonrpc":"2.0","id":6,"method":"navgraph/status","params":{}}
+    });
+    defer testing.allocator.free(stream);
+    try pending.appendSlice(testing.allocator, stream);
+    try testing.expectEqual(@as(u8, 1), (try pump(testing.allocator, &ts.server, &pending)).?);
+    try testing.expectError(error.NoSuchResponse, ts.responseFor(6));
+}
+
+test "end-to-end: an unsaved edit adds a caller, and closing the buffer reverts it" {
+    const gpa = testing.allocator;
+    const ts = try handlers.TestServer.init(gpa, testing.io, &project);
+    defer ts.deinit();
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // initialize + initialized, so the workspace root (and its URIs) exist.
+    const boot = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8"]}}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+    });
+    defer gpa.free(boot);
+    try feed(gpa, &ts.server, &pending, boot, 64);
+
+    const uri = try ts.uri(alloc, "app.zig");
+    const edited =
+        \\const util = @import(\"util.zig\");\n\npub fn run() void {\n    mid();\n    util.helper();\n}\n\nfn mid() void {\n    util.helper();\n}\n
+    ;
+
+    // Baseline: only `mid` calls helper.
+    const before = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":2,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
+    });
+    defer gpa.free(before);
+    try feed(gpa, &ts.server, &pending, before, 64);
+    var base = try ts.responseFor(2);
+    defer base.deinit();
+    try testing.expectEqual(@as(i64, 2), base.value.object.get("result").?.object
+        .get("summary").?.object.get("symbols").?.integer);
+
+    // The editor opens the file unchanged, then types a call to helper in `run`.
+    const editing = try framed(gpa, &.{
+        try std.fmt.allocPrint(alloc,
+            \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+            \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"{s}"}}}}}}
+        , .{ uri, edited }),
+        try std.fmt.allocPrint(alloc,
+            \\{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":
+            \\ {{"uri":"{s}","version":2}},"contentChanges":[{{"text":"{s}"}}]}}}}
+        , .{ uri, edited }),
+        \\{"jsonrpc":"2.0","id":3,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
+    });
+    defer gpa.free(editing);
+    try feed(gpa, &ts.server, &pending, editing, 64);
+
+    var edited_blast = try ts.responseFor(3);
+    defer edited_blast.deinit();
+    const nodes = edited_blast.value.object.get("result").?.object.get("nodes").?.array.items;
+    // helper now has two direct callers: mid and run.
+    try testing.expectEqual(@as(usize, 3), nodes.len);
+    var saw_run = false;
+    for (nodes) |n| {
+        const sym = n.object.get("symbol").?.object;
+        if (std.mem.eql(u8, sym.get("name").?.string, "run")) {
+            saw_run = true;
+            try testing.expectEqual(@as(i64, 1), n.object.get("depth").?.integer);
+        }
+    }
+    try testing.expect(saw_run);
+
+    // The re-index was announced, naming the file that changed.
+    const notes = try ts.takeNotifications(alloc, "navgraph/indexed");
+    try testing.expect(notes.len >= 1);
+    const last = notes[notes.len - 1].object.get("params").?.object;
+    try testing.expectEqualStrings("app.zig", last.get("changedFiles").?.array.items[0].string);
+
+    // Closing the buffer drops the overlay and the graph returns to disk truth.
+    const closing = try framed(gpa, &.{
+        try std.fmt.allocPrint(alloc,
+            \\{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{s}"}}}}}}
+        , .{uri}),
+        \\{"jsonrpc":"2.0","id":4,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
+    });
+    defer gpa.free(closing);
+    try feed(gpa, &ts.server, &pending, closing, 64);
+
+    var reverted = try ts.responseFor(4);
+    defer reverted.deinit();
+    try testing.expectEqual(@as(i64, 2), reverted.value.object.get("result").?.object
+        .get("summary").?.object.get("symbols").?.integer);
+}
