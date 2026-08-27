@@ -756,3 +756,231 @@ fn writeGrepItem(
     }
     try w.writeByte('}');
 }
+
+// ---------------------------------------------------------------------------
+// Neighbors
+// ---------------------------------------------------------------------------
+
+/// Write `{symbol, callees:[{symbol,exact,lines}], callers:[...]}` for `id`,
+/// mirroring the CLI's `neighbors` but filtered through `Scope` like every
+/// other navgraph/* walk (blast, callers, calls), for a consistent contract.
+pub fn writeNeighbors(w: *Writer, ctx: Ctx, id: SymbolId, scope: Scope) !void {
+    const idx = ctx.index();
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, id);
+    try w.writeAll(",\"callees\":");
+    try writeNeighborSide(w, ctx, id, .callees, scope, &lines);
+    try w.writeAll(",\"callers\":");
+    try writeNeighborSide(w, ctx, id, .callers, scope, &lines);
+    try w.writeByte('}');
+}
+
+fn writeNeighborSide(
+    w: *Writer,
+    ctx: Ctx,
+    id: SymbolId,
+    direction: Direction,
+    scope: Scope,
+    lines: *std.ArrayList(u32),
+) !void {
+    const idx = ctx.index();
+    try w.writeByte('[');
+    var it = Neighbours.init(idx, id, direction);
+    var wrote: u32 = 0;
+    while (it.next()) |n| {
+        if (scope.strict and !n.exact) continue;
+        if (!scope.admits(idx, idx.graph.symbols[n.id])) continue;
+        const caller = if (direction == .callers) n.id else id;
+        const callee = if (direction == .callers) id else n.id;
+        try query.callSiteLines(idx, caller, callee, lines);
+        if (wrote != 0) try w.writeByte(',');
+        try w.writeAll("{\"symbol\":");
+        try payload.writeSymbolId(w, ctx, n.id);
+        try w.print(",\"exact\":{},\"lines\":", .{n.exact});
+        try payload.writeLines(w, lines.items);
+        try w.writeByte('}');
+        wrote += 1;
+    }
+    try w.writeByte(']');
+}
+
+// ---------------------------------------------------------------------------
+// Shortest path
+// ---------------------------------------------------------------------------
+
+/// Write `{path:Symbol[]}`, the shortest call path from `from_name` to
+/// `to_name` (empty when either name is unknown or no path exists).
+pub fn writePath(w: *Writer, ctx: Ctx, from_name: []const u8, to_name: []const u8) !void {
+    const idx = ctx.index();
+    var fbuf: [64]SymbolId = undefined;
+    var tbuf: [64]SymbolId = undefined;
+    const chain = try query.shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf);
+    defer idx.gpa.free(chain);
+    try w.writeAll("{\"path\":");
+    try payload.writeSymbolArray(w, ctx, chain);
+    try w.writeByte('}');
+}
+
+// ---------------------------------------------------------------------------
+// Outline
+// ---------------------------------------------------------------------------
+
+pub const OutlineOptions = struct {
+    /// Comma-separated kind tags (`fn,struct`); empty admits every kind.
+    kinds: []const u8 = "",
+    limit: u32 = 300,
+    scope: Scope,
+};
+
+/// Write `{files:[{file,lang,symbols:Symbol[]}]}` for every file whose path
+/// matches `path_filter`, in indexing order.
+pub fn writeOutline(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: OutlineOptions) !void {
+    const idx = ctx.index();
+    var shown: u32 = 0;
+    var first_file = true;
+    try w.writeAll("{\"files\":[");
+    for (idx.graph.files) |file| {
+        if (!query.matchesFilter(file.path, path_filter)) continue;
+        if (shown >= opts.limit) break;
+        if (try writeOutlineFile(w, ctx, file, opts, &shown, !first_file)) first_file = false;
+    }
+    try w.writeAll("]}");
+}
+
+fn writeOutlineFile(
+    w: *Writer,
+    ctx: Ctx,
+    file: model.SourceFile,
+    opts: OutlineOptions,
+    shown: *u32,
+    sep: bool,
+) !bool {
+    const idx = ctx.index();
+    var wrote_any = false;
+    var i = file.sym_start;
+    while (i < file.sym_end and shown.* < opts.limit) : (i += 1) {
+        const sym = idx.graph.symbols[i];
+        if (sym.kind == .import) continue;
+        if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
+        if (opts.kinds.len != 0 and !query.kindAllowed(sym.kind, opts.kinds)) continue;
+        if (!opts.scope.admits(idx, sym)) continue;
+        if (!wrote_any) {
+            if (sep) try w.writeByte(',');
+            try w.writeAll("{\"file\":");
+            try payload.writeString(w, file.path);
+            try w.print(",\"lang\":\"{s}\",\"symbols\":[", .{file.language.tag()});
+        } else {
+            try w.writeByte(',');
+        }
+        try payload.writeSymbolId(w, ctx, sym.id);
+        wrote_any = true;
+        shown.* += 1;
+    }
+    if (wrote_any) try w.writeAll("]}");
+    return wrote_any;
+}
+
+// ---------------------------------------------------------------------------
+// Hot
+// ---------------------------------------------------------------------------
+
+pub const HotOptions = struct {
+    limit: u32 = 25,
+    scope: Scope,
+};
+
+/// Write `{items:[{symbol,fanIn,fanInExact,fanInTest,fanOut,fanOutExact}]}`
+/// ranked by connectivity, over `query.collectHot`.
+pub fn writeHot(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: HotOptions) !void {
+    const idx = ctx.index();
+    const ranked = try query.collectHot(idx, path_filter, opts.scope.tests);
+    defer idx.gpa.free(ranked);
+    try w.writeAll("{\"items\":[");
+    var shown: u32 = 0;
+    for (ranked) |e| {
+        if (opts.scope.strict and e.fan_in_exact == 0 and e.fan_out_exact == 0) continue;
+        if (shown >= opts.limit) break;
+        if (shown != 0) try w.writeByte(',');
+        shown += 1;
+        try w.writeAll("{\"symbol\":");
+        try payload.writeSymbolId(w, ctx, e.id);
+        try w.print(",\"fanIn\":{d},\"fanInExact\":{d},\"fanInTest\":{d},\"fanOut\":{d},\"fanOutExact\":{d}}}", .{
+            e.fan_in, e.fan_in_exact, e.fan_in_test, e.fan_out, e.fan_out_exact,
+        });
+    }
+    try w.writeAll("]}");
+}
+
+// ---------------------------------------------------------------------------
+// Unused
+// ---------------------------------------------------------------------------
+
+pub const UnusedOptions = struct {
+    /// Drop exported symbols: they may be public API rather than dead code.
+    noPublic: bool = false,
+    /// Disambiguate same-name symbols by import reachability instead of the
+    /// (safe) family-wide name tally.
+    followImports: bool = false,
+    limit: u32 = 300,
+    scope: Scope,
+};
+
+/// Write `{items:[{symbol,testOnly}]}`: zero-caller definitions nothing calls
+/// or uses, over the CLI's own dead-code candidate logic.
+pub fn writeUnused(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: UnusedOptions) !void {
+    const idx = ctx.index();
+    var refs = try query.buildReferencedNames(idx);
+    defer refs.deinit();
+    if (opts.followImports) refs.scope = try query.buildCollisionScope(idx);
+    const cli_opts: query.Options = .{ .unused_skip_exported = opts.noPublic };
+
+    try w.writeAll("{\"items\":[");
+    var shown: u32 = 0;
+    for (idx.graph.symbols) |sym| {
+        if (!try query.isDeadCandidateScoped(idx, sym, path_filter, &refs, opts.scope.tests)) continue;
+        if (!query.deadCandidateShown(idx, sym, cli_opts, &refs)) continue;
+        if (shown != 0) try w.writeByte(',');
+        try w.writeAll("{\"symbol\":");
+        try payload.writeSymbolId(w, ctx, sym.id);
+        try w.print(",\"testOnly\":{}}}", .{refs.testsContains(query.familyOf(idx, sym), sym.name)});
+        shown += 1;
+        if (shown >= opts.limit) break;
+    }
+    try w.writeAll("]}");
+}
+
+// ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+pub const DiffOptions = struct {
+    depth: u32 = 1,
+    direction: Direction = .callers,
+    limit: u32 = 500,
+    scope: Scope,
+};
+
+/// Write `{ref, blast:{...}}`: the definitions changed since `ref` (git ref,
+/// default HEAD) plus every definition in a file whose unsaved buffer differs
+/// from disk, wrapped as a `navgraph/blast` walk from those roots. Unlike
+/// `resolveTarget`'s `{ref}` form (used by `navgraph/blast` itself), an empty
+/// change set is not an error here — "nothing changed" is a routine answer,
+/// not a failed lookup.
+pub fn writeDiff(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, ref: []const u8, opts: DiffOptions) !void {
+    var roots: std.ArrayList(SymbolId) = .empty;
+    defer roots.deinit(gpa);
+    try changedSince(gpa, ctx, ref, &roots);
+
+    try w.writeAll("{\"ref\":");
+    try payload.writeString(w, ref);
+    try w.writeAll(",\"blast\":");
+    try writeBlast(w, gpa, ctx, roots.items, .{
+        .depth = opts.depth,
+        .direction = opts.direction,
+        .limit = opts.limit,
+        .scope = opts.scope,
+    });
+    try w.writeByte('}');
+}

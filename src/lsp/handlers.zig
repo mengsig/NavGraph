@@ -836,6 +836,69 @@ fn rescan(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *
     try writeStatus(w, try self.ctx());
 }
 
+fn neighborsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const target = try targetOf(self, arena, p);
+    const roots = try queries.resolveTarget(arena, c, target);
+    try queries.writeNeighbors(w, c, roots[0], scopeOf(self, p));
+}
+
+fn pathMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const from = p.str("from") orelse return error.InvalidParams;
+    const to = p.str("to") orelse return error.InvalidParams;
+    try queries.writePath(w, c, from, to);
+}
+
+fn outlineMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeOutline(w, c, p.str("path") orelse "", .{
+        .kinds = try kindsOf(arena, p),
+        .limit = p.positive("limit", 300),
+        .scope = scopeOf(self, p),
+    });
+}
+
+fn hotMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeHot(w, c, p.str("path") orelse "", .{
+        .limit = p.positive("limit", 25),
+        .scope = scopeOf(self, p),
+    });
+}
+
+fn unusedMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeUnused(w, c, p.str("path") orelse "", .{
+        .noPublic = p.boolean("noPublic", false),
+        .followImports = p.boolean("followImports", false),
+        .limit = p.positive("limit", 300),
+        .scope = scopeOf(self, p),
+    });
+}
+
+fn diffMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeDiff(w, arena, c, p.str("ref") orelse "HEAD", .{
+        .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
+        .direction = try directionOf(p, .callers),
+        .limit = p.positive("limit", 500),
+        .scope = scopeOf(self, p),
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Method tables
 // ---------------------------------------------------------------------------
@@ -856,6 +919,12 @@ const requests = [_]Entry{
     .{ .name = "navgraph/callers", .run = callersMethod },
     .{ .name = "navgraph/calls", .run = callsMethod },
     .{ .name = "navgraph/rescan", .run = rescan },
+    .{ .name = "navgraph/neighbors", .run = neighborsMethod },
+    .{ .name = "navgraph/path", .run = pathMethod },
+    .{ .name = "navgraph/outline", .run = outlineMethod },
+    .{ .name = "navgraph/hot", .run = hotMethod },
+    .{ .name = "navgraph/unused", .run = unusedMethod },
+    .{ .name = "navgraph/diff", .run = diffMethod },
 };
 
 const notifications = [_]NotifEntry{
@@ -1859,4 +1928,138 @@ test "a call tree marks a symbol reached twice as recursion, not a second subtre
     }
     try testing.expect(node.get("recursion").?.bool);
     try testing.expectEqual(@as(usize, 2), hops);
+}
+
+// ---------------------------------------------------------------------------
+// The remaining navgraph/* mirrors, over the real testenv/ fixtures.
+// ---------------------------------------------------------------------------
+
+test "navgraph/neighbors reports Vm.push's caller and its lack of callees" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(49,
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/neighbors","params":{"symbol":"push"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("push", r.get("symbol").?.object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
+    // Vm.run calls it directly (exact); a same-named `push` elsewhere in the
+    // fixture (bytecode_vm.zig) also picks up heuristic name-collision edges.
+    var found_run = false;
+    for (r.get("callers").?.array.items) |c| {
+        if (std.mem.eql(u8, c.object.get("symbol").?.object.get("name").?.string, "run")) found_run = true;
+    }
+    try testing.expect(found_run);
+}
+
+test "navgraph/path finds the call chain from eval to push" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(50,
+        \\{"jsonrpc":"2.0","id":50,"method":"navgraph/path","params":{"from":"eval","to":"push"}}
+    );
+    defer res.deinit();
+    const chain = (try resultOf(res)).object.get("path").?.array.items;
+    try testing.expectEqual(@as(usize, 3), chain.len);
+    try testing.expectEqualStrings("eval", chain[0].object.get("name").?.string);
+    try testing.expectEqualStrings("run", chain[1].object.get("name").?.string);
+    try testing.expectEqualStrings("push", chain[2].object.get("name").?.string);
+
+    var none = try ts.request(51,
+        \\{"jsonrpc":"2.0","id":51,"method":"navgraph/path","params":{"from":"no_such_symbol_xyz","to":"push"}}
+    );
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(none)).object.get("path").?.array.items.len);
+}
+
+test "navgraph/outline lists vm.zig's symbols" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(52,
+        \\{"jsonrpc":"2.0","id":52,"method":"navgraph/outline","params":{"path":"vm.zig"}}
+    );
+    defer res.deinit();
+    // The filter is a substring match, so it also picks up bytecode_vm.zig.
+    const files = (try resultOf(res)).object.get("files").?.array.items;
+    var vm_file: ?std.json.ObjectMap = null;
+    for (files) |f| {
+        if (std.mem.eql(u8, f.object.get("file").?.string, "vm.zig")) vm_file = f.object;
+    }
+    try testing.expect(vm_file != null);
+    try testing.expectEqualStrings("zig", vm_file.?.get("lang").?.string);
+    var found = false;
+    for (vm_file.?.get("symbols").?.array.items) |s| {
+        if (std.mem.eql(u8, s.object.get("name").?.string, "push")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "navgraph/hot ranks tokenize above the leaf push/pop methods" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(53,
+        \\{"jsonrpc":"2.0","id":53,"method":"navgraph/hot","params":{}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    try testing.expect(items.len > 0);
+    try testing.expectEqualStrings("tokenize", items[0].object.get("symbol").?.object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 3), items[0].object.get("fanIn").?.integer);
+    try testing.expectEqual(@as(i64, 3), items[0].object.get("fanInExact").?.integer);
+}
+
+test "navgraph/unused finds stack.zig's private, uncalled growHint" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(54,
+        \\{"jsonrpc":"2.0","id":54,"method":"navgraph/unused","params":{}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    var found = false;
+    for (items) |it| {
+        const sym = it.object.get("symbol").?.object;
+        if (std.mem.eql(u8, sym.get("name").?.string, "growHint")) {
+            try testing.expectEqualStrings("stack.zig", sym.get("file").?.string);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "navgraph/diff reports the roots of an unsaved overlay edit, wrapping blast" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const app_uri = try ts.uri(alloc, "app.zig");
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"const util = @import(\"util.zig\");\npub fn run() void {{\n    mid();\n}}\nfn mid() void {{\n    util.helper();\n}}\nfn added() void {{}}\n"}}}}}}
+    , .{app_uri}));
+
+    var res = try ts.request(49,
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/diff","params":{}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("HEAD", r.get("ref").?.string);
+    const blast_result = r.get("blast").?.object;
+    const roots = blast_result.get("roots").?.array.items;
+    // Every non-import definition in the edited file becomes a root: an overlay
+    // diff (unlike a git diff) has no hunk-level range, so the whole file counts.
+    try testing.expect(roots.len >= 3);
+    var found = false;
+    for (roots) |root| {
+        if (std.mem.eql(u8, root.object.get("name").?.string, "added")) found = true;
+    }
+    try testing.expect(found);
 }

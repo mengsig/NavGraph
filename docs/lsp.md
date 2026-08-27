@@ -271,6 +271,68 @@ delta in `changedFiles`: files created, deleted, or re-read with new content.
 An open document is not listed — the index holds its buffer, which a rescan
 does not touch.
 
+### `navgraph/neighbors`
+
+Params: `Target & Scope` → `{ symbol:Symbol, callees:[{symbol,exact,lines}],
+callers:[{symbol,exact,lines}] }`.
+
+Callees and callers of one symbol, one level deep, in a single view — a quicker
+"what's around this" than `blast`/`callers`/`calls`. Unlike the CLI's
+`neighbors`, both sides go through the same `Scope` (`strict`/`tests`) every
+other navgraph/* walk uses, for a consistent contract.
+
+### `navgraph/path`
+
+Params: `{ from:string, to:string }` → `{ path:Symbol[] }`.
+
+The shortest call path from `from` to `to` (BFS over resolved call/use edges),
+source-first; empty when either name is unknown or no path exists. Names accept
+the same `Parent.name` / `name@path` forms as every CLI name argument.
+
+### `navgraph/outline`
+
+Params: `{ path?:string, kinds?:string[], limit?:int (300) } & Scope` →
+`{ files:[{file,lang,symbols:Symbol[]}] }`.
+
+Every visible top-level (and nested) definition per file, in indexing order.
+`path` is a substring filter over the root-relative path; `kinds` restricts to
+kind tags (`fn`, `struct`, …).
+
+### `navgraph/hot`
+
+Params: `{ path?:string, limit?:int (25) } & Scope` →
+`{ items:[{symbol,fanIn,fanInExact,fanInTest,fanOut,fanOutExact}] }`.
+
+Functions/methods ranked by connectivity — the load-bearing symbols. `*Exact`
+counts exclude heuristic (name-collision) edges; `fanInTest` is the share of
+callers living in test files. `scope.strict` drops entries whose connectivity
+is entirely heuristic.
+
+### `navgraph/unused`
+
+Params: `{ path?:string, noPublic?:bool, followImports?:bool, limit?:int (300)
+} & Scope` → `{ items:[{symbol,testOnly}] }`.
+
+Zero-caller function/method/type definitions — removal candidates, not broken
+code. `scope.tests`: `with` (default) lists code dead in the whole graph;
+`without` also flags code used only by tests (`testOnly: true`); `only` lists
+unused test helpers. `noPublic` drops exported symbols (possible public API).
+`followImports` disambiguates same-name symbols by import reachability instead
+of the safe family-wide name tally — finds dead code masked by a used
+same-name twin, at the cost of depending on import resolution.
+
+### `navgraph/diff`
+
+Params: `{ ref?:string ("HEAD"), depth?:int (1), direction?:"callers"|
+"callees" ("callers"), limit?:int (500) } & Scope` → `{ ref:string,
+blast: <the navgraph/blast result> }`.
+
+Definitions changed since `ref` **plus** every definition in a file whose
+unsaved buffer differs from disk, wrapped as a `navgraph/blast` walk from those
+roots — the blast radius of a pending change. Unlike `navgraph/blast`'s own
+`{ ref }` target form, an empty change set is not a `-32001` error here:
+"nothing changed" is a routine answer, not a failed lookup.
+
 ## Notifications (server → client)
 
 - **`navgraph/indexed`** `{ reason:"initial"|"change"|"save"|"rescan"|"watch",
@@ -375,9 +437,8 @@ and requires the process to exit 0. CI runs it against the ReleaseFast build.
 
 ## Limitations
 
-- **Not yet implemented** (a stacked follow-up): `navgraph/neighbors`, `path`,
-  `outline`, `hot`, `unused`, `diff`, `routes`, `events`, `imports`,
-  `importers`, `graph`. Per the contract they are **not** advertised in
+- **Not yet implemented** (a stacked follow-up): `navgraph/routes`, `events`,
+  `imports`, `importers`, `graph`. Per the contract they are **not** advertised in
   `experimental.navgraph.methods` until they land — a client should read that
   list rather than assume. `methods` holds only names that can be *called*;
   server→client notifications are listed separately under `notifications`. Adding one is a single adapter function plus a table
@@ -421,7 +482,7 @@ vim.api.nvim_create_autocmd("FileType", {
 | --- | --- |
 | `loop.zig` | The stdio run loop, the read deadline, logging. |
 | `handlers.zig` | The method table, `initialize` negotiation, error mapping. |
-| `queries.zig` | Target resolution, blast, call trees, hover, document symbols, grep. |
+| `queries.zig` | Target resolution, blast, call trees, hover, document symbols, grep, and every other `navgraph/*` adapter. |
 | `search.zig` | Fuzzy ranking, include globs, grep patterns. |
 | `payload.zig` | The JSON shapes above — one writer each. |
 | `session.zig` | The resident index: overlays, re-index, watching, ownership. |
