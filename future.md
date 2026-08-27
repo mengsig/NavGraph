@@ -27,6 +27,15 @@ source lines in `search --refs`.
 - **Go admin-mux route registration** (`caddyconfig/load.go` style) isn't
   recognized by `routes` (only decorator/`app.get`-style and HTTP clients).
 
+**Correction (2026-08-28).** The claim below that index work is below the noise
+floor held only at the scale it was measured at. Java inherited-member lookup
+scanned the whole symbol table per unresolved reference, recursed 16 deep, so
+index build went quadratic in project size: 4,192 files cost 4,428 ms warm
+against a 120 ms baseline. It is now a supertype map precomputed once per build
+(179 ms on the same corpus), with a bounded regression test in `src/index.zig`
+(`Java inherited-member resolution stays linear in symbol count`). Whole-project
+link passes are the thing to watch; per-file parse cost still is not.
+
 Ideas parked for when they're justified by evidence. Ordered by value-for-effort.
 Context: profiling (2026-07-07) shows NavGraph's index work on a 550-file tree is
 below the process-startup noise floor (~15 ms). The parser is a fast single-pass

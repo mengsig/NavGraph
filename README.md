@@ -501,9 +501,15 @@ Everything for one run lives in a single arena that is freed on exit.
 
 - Resolution is **heuristic**, not compiler-grade. It is type-scoped (a member
   call binds only to a member of the receiver's inferred type — `self`/`this`,
-  typed params, local `Foo{…}`/`Foo.init()` bindings) and import-aware, but a
-  call on an untracked receiver falls back to a name match, marked heuristic
-  (`?`); `--strict` drops those. Treat the graph as high-recall guidance.
+  typed params including C-family `const Shape* s`, local `Foo{…}`/`Foo.init()`
+  bindings, and fields of the enclosing type declared with one, such as Go
+  `store store.Store` behind `a.store.Get()`) and import-aware, but a call on an
+  untracked receiver falls back to a name match, marked heuristic (`?`);
+  `--strict` drops those. A call never binds to a non-callable: a type sharing
+  the method's name is not a call target where the language has no constructor
+  call. Import evidence only suppresses a name match for languages whose import
+  forms are actually resolved — Rust `use` is unmodelled, so it does not.
+  Treat the graph as high-recall guidance.
 - `affected` and `reaches --from-tests` are structural call-graph impact, not
   runtime coverage. Dynamic dispatch still needs `--impls` or may remain unknown;
   pure deletions cannot be seeded from symbols absent from the current index.
