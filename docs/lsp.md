@@ -382,10 +382,13 @@ Params: `{ path?:string } & Scope` →
 `{ path:string, nodes:int, nodesTotal:int, truncated:bool }`.
 
 Renders the same interactive HTML visualization as `navgraph graph` and writes
-it to `.navgraph/graph-<hash>.html` under the served root (`<hash>` is a
-content hash, so re-requesting the same view reuses one file). `path` is
-returned root-relative; open it in a browser. `scope.tests` selects whether
-test symbols appear in the graph (`scope.strict` has no effect here).
+it to `.navgraph/graph-<hash>.html` under the served root. `<hash>` identifies
+the *view* (the path filter and test scope), so re-requesting it overwrites
+that one file in place instead of leaving one page per edit behind. The write
+is an atomic rename that refuses to follow a symlink planted at the path, and a
+write failure is reported rather than swallowed. `path` is returned
+root-relative; open it in a browser. `scope.tests` selects whether test symbols
+appear in the graph (`scope.strict` has no effect here).
 
 The page holds at most `nodes` of `nodesTotal` symbols — the renderer's own
 node cap, which the HTML has nowhere to report. `truncated` says the view is

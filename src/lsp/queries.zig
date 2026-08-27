@@ -11,6 +11,7 @@ const query = @import("../query.zig");
 const render = @import("../render.zig");
 const gitdiff = @import("../gitdiff.zig");
 const viz = @import("../viz.zig");
+const fswrite = @import("fswrite.zig");
 const overlay = @import("overlay.zig");
 const payload = @import("payload.zig");
 const position = @import("position.zig");
@@ -1172,11 +1173,22 @@ fn fileImportsFile(idx: *const Index, src: model.FileId, target: model.FileId) b
 // ---------------------------------------------------------------------------
 
 /// Render the interactive HTML graph (over `viz.graph`) and write it to
-/// `.navgraph/graph-<hash>.html` under the served root — `<hash>` is a content
-/// hash, so an identical view (same filter, same test scope) reuses one file
-/// instead of littering a new one per request. Writes `{path, nodes, nodesTotal,
-/// truncated}`, `path` root-relative.
-pub fn writeGraphFile(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, path_filter: []const u8, scope: Scope) !void {
+/// `.navgraph/graph-<hash>.html` under the served root — `<hash>` identifies
+/// the *view* (the filter and test scope), not the content, so re-requesting
+/// the same view overwrites its one file in place rather than accumulating a
+/// new one per edit (coldstart review F7). The write goes through
+/// `fswrite.writeGuarded`: an atomic rename that never follows a symlink an
+/// untrusted repo may have planted at the (predictable) path (F1). Writes
+/// `{path}`, root-relative. On a write failure, `detail.*` names the cause
+/// for the caller to surface (F11).
+pub fn writeGraphFile(
+    w: *Writer,
+    gpa: std.mem.Allocator,
+    ctx: Ctx,
+    path_filter: []const u8,
+    scope: Scope,
+    detail: *?[]const u8,
+) !void {
     const s = ctx.session;
     var html: Writer.Allocating = .init(gpa);
     defer html.deinit();
@@ -1186,12 +1198,12 @@ pub fn writeGraphFile(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, path_filter:
     const bytes = html.written();
 
     var hasher = std.hash.Wyhash.init(0);
-    hasher.update(bytes);
+    hasher.update(path_filter);
+    hasher.update(&.{@intFromEnum(scope.tests)});
     const rel = try std.fmt.allocPrint(gpa, ".navgraph/graph-{x:0>16}.html", .{hasher.final()});
     defer gpa.free(rel);
 
-    try s.root_dir.createDirPath(s.io, ".navgraph");
-    try s.root_dir.writeFile(s.io, .{ .sub_path = rel, .data = bytes });
+    try fswrite.writeGuarded(gpa, s.io, s.root_dir, rel, bytes, detail);
 
     try w.writeAll("{\"path\":");
     try payload.writeString(w, rel);

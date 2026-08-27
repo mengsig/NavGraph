@@ -86,6 +86,11 @@ pub const Server = struct {
     shutdown_requested: bool,
     /// Set when `exit` was received; the run loop stops and returns this code.
     exit_code: ?u8,
+    /// A handler that fails with a cause richer than its error name (an OS
+    /// error, a git message) sets this before returning; `sendError` reads it
+    /// in place of the generic `mapError` message, then clears it. Arena-owned
+    /// by the same request, so it never outlives the response it describes.
+    err_detail: ?[]const u8,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, out: *Writer, log: Log, cli_root: []const u8) Server {
         return .{
@@ -99,6 +104,7 @@ pub const Server = struct {
             .encoding = .utf16,
             .session = null,
             .client_progress = false,
+            .err_detail = null,
             .shutdown_requested = false,
             .exit_code = null,
         };
@@ -156,9 +162,11 @@ pub const Server = struct {
 
     fn sendError(self: *Server, arena: std.mem.Allocator, id: rpc.Id, method: []const u8, err: anyerror) !void {
         const mapped = mapError(err);
+        const detail = self.err_detail;
+        self.err_detail = null;
         var msg: Writer.Allocating = .init(arena);
         defer msg.deinit();
-        try msg.writer.print("{s}: {s}", .{ method, mapped.message });
+        try msg.writer.print("{s}: {s}", .{ method, detail orelse mapped.message });
         var body: Writer.Allocating = .init(arena);
         defer body.deinit();
         try rpc.writeError(&body.writer, id, mapped.code, msg.written(), null);
@@ -219,6 +227,8 @@ fn mapError(err: anyerror) MappedError {
         error.BadPattern => .{ .code = .invalid_params, .message = "invalid pattern" },
         error.InvalidGitPath => .{ .code = .request_failed, .message = "git reported an unusable diff path" },
         error.RegexTooComplex => .{ .code = .request_failed, .message = "regex too complex" },
+        error.GitFailed => .{ .code = .request_failed, .message = "git diff failed" },
+        error.WriteFailed => .{ .code = .internal_error, .message = "internal error" },
         error.NotInitialized => .{ .code = .invalid_request, .message = "server not initialized" },
         error.OutOfMemory => .{ .code = .internal_error, .message = "out of memory" },
         else => .{ .code = .internal_error, .message = "internal error" },
@@ -931,7 +941,11 @@ fn graphMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value,
     try self.flushPending(arena, .change);
     const c = try self.ctx();
     const p = Params.from(params);
-    try queries.writeGraphFile(w, arena, c, p.str("path") orelse "", try scopeOf(self, p));
+    var detail: ?[]const u8 = null;
+    queries.writeGraphFile(w, arena, c, p.str("path") orelse "", try scopeOf(self, p), &detail) catch |err| {
+        self.err_detail = detail;
+        return err;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -2227,4 +2241,84 @@ test "navgraph/graph writes an HTML file under .navgraph and returns its path" {
     try testing.expect(std.mem.endsWith(u8, path, ".html"));
     const st = try ts.server.session.?.root_dir.statFile(ts.server.io, path, .{});
     try testing.expect(st.size > 0);
+}
+
+test "navgraph/graph replaces a symlink planted at the guessed path instead of writing through it" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    const root_dir = ts.server.session.?.root_dir;
+    const io = ts.server.io;
+
+    var first = try ts.request(60,
+        \\{"jsonrpc":"2.0","id":60,"method":"navgraph/graph","params":{}}
+    );
+    const path = try testing.allocator.dupe(u8, (try resultOf(first)).object.get("path").?.string);
+    first.deinit();
+    defer testing.allocator.free(path);
+
+    // Plant a symlink at the exact path the next request will guess (the view
+    // is unchanged, so the hash — and the path — repeat), pointing at a
+    // victim file outside `.navgraph/`.
+    try root_dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "PRECIOUS-ORIGINAL-CONTENT" });
+    try root_dir.deleteFile(io, path);
+    try root_dir.symLink(io, "../victim.txt", path, .{});
+
+    var second = try ts.request(61,
+        \\{"jsonrpc":"2.0","id":61,"method":"navgraph/graph","params":{}}
+    );
+    defer second.deinit();
+    const path2 = (try resultOf(second)).object.get("path").?.string;
+    try testing.expectEqualStrings(path, path2);
+
+    var buf: [64]u8 = undefined;
+    const victim = try root_dir.readFile(io, "victim.txt", &buf);
+    try testing.expectEqualStrings("PRECIOUS-ORIGINAL-CONTENT", victim);
+
+    const st = try root_dir.statFile(io, path, .{ .follow_symlinks = false });
+    try testing.expectEqual(std.Io.File.Kind.file, st.kind);
+    try testing.expect(st.size > 0);
+}
+
+test "navgraph/graph overwrites its one file per view instead of accumulating one per edit" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const app_uri = try ts.uri(alloc, "app.zig");
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"pub fn run() void {{}}\n"}}}}}}
+    , .{app_uri}));
+
+    var first = try ts.request(60,
+        \\{"jsonrpc":"2.0","id":60,"method":"navgraph/graph","params":{}}
+    );
+    const path1 = try testing.allocator.dupe(u8, (try resultOf(first)).object.get("path").?.string);
+    first.deinit();
+    defer testing.allocator.free(path1);
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":
+        \\ {{"uri":"{s}","version":2}},"contentChanges":[{{"text":"pub fn run() void {{}}\npub fn added() void {{}}\n"}}]}}}}
+    , .{app_uri}));
+
+    var second = try ts.request(61,
+        \\{"jsonrpc":"2.0","id":61,"method":"navgraph/graph","params":{}}
+    );
+    defer second.deinit();
+    const path2 = (try resultOf(second)).object.get("path").?.string;
+    // Same view (no filter, same test scope) after an edit: same file, not a
+    // second one — the edit changed the rendered bytes but not the view.
+    try testing.expectEqualStrings(path1, path2);
+
+    var navgraph_dir = try ts.server.session.?.root_dir.openDir(ts.server.io, ".navgraph", .{ .iterate = true });
+    defer navgraph_dir.close(ts.server.io);
+    var count: u32 = 0;
+    var it = navgraph_dir.iterate();
+    while (try it.next(ts.server.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "graph-")) count += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), count);
 }
