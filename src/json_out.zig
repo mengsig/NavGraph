@@ -2015,36 +2015,72 @@ fn writeEscaped(w: *Writer, c: u8) !void {
 /// Write one UTF-8 unit starting at `s[0]` as JSON-safe output and return the
 /// number of input bytes consumed. ASCII bytes are escaped (control chars, quote,
 /// backslash); a valid multi-byte UTF-8 sequence is emitted verbatim (valid UTF-8
-/// is valid JSON); an invalid or truncated byte becomes U+FFFD so the emitted JSON
-/// is always well-formed UTF-8, even when the source contains raw non-UTF-8 bytes.
+/// is valid JSON); anything else becomes U+FFFD so the emitted JSON is always
+/// well-formed UTF-8, even when the source contains raw non-UTF-8 bytes.
+///
+/// Validation goes through `std.unicode`, not a lead-byte/continuation-bit check:
+/// that check admits overlong encodings (`E0 80 8E`), surrogate halves
+/// (`ED A0 80`) and code points above U+10FFFF (`F4 A2 B6 AA`), each of which a
+/// strict decoder (Python `json`, `vim.json.decode`, Go `encoding/json`) rejects
+/// — taking the whole document down over one stray byte.
 fn writeUtf8Unit(w: *Writer, s: []const u8) !usize {
     const c = s[0];
     if (c < 0x80) {
         try writeEscaped(w, c);
         return 1;
     }
-    const len: usize = switch (c) {
-        0xC2...0xDF => 2,
-        0xE0...0xEF => 3,
-        0xF0...0xF4 => 4,
-        else => 0, // continuation byte, overlong lead (C0/C1), or 0xF5..0xFF
+    const replacement = "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
+    const len: usize = std.unicode.utf8ByteSequenceLength(c) catch {
+        try w.writeAll(replacement);
+        return 1;
     };
-    if (len >= 2 and len <= s.len) {
-        var ok = true;
-        var i: usize = 1;
-        while (i < len) : (i += 1) {
-            if (s[i] & 0xC0 != 0x80) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
+    if (len <= s.len) {
+        const decoded: ?u21 = switch (len) {
+            2 => std.unicode.utf8Decode2(s[0..2].*) catch null,
+            3 => std.unicode.utf8Decode3(s[0..3].*) catch null,
+            4 => std.unicode.utf8Decode4(s[0..4].*) catch null,
+            else => null,
+        };
+        if (decoded != null) {
             try w.writeAll(s[0..len]);
             return len;
         }
     }
-    try w.writeAll("\xEF\xBF\xBD"); // U+FFFD REPLACEMENT CHARACTER
+    try w.writeAll(replacement);
     return 1;
+}
+
+test "writeUtf8Unit replaces overlong, surrogate and out-of-range sequences" {
+    // Regression: the hand-rolled lead-byte/continuation check emitted these
+    // three classes verbatim, so one stray byte made the whole -j document
+    // undecodable to a strict JSON reader.
+    const testing = std.testing;
+    const cases = [_][]const u8{
+        "\xe0\x80\x8e", // overlong: 3 bytes encoding U+000E
+        "\xed\xa0\x80", // surrogate half U+D800
+        "\xf4\xa2\xb6\xaa", // above U+10FFFF
+        "\xc0\xaf", // overlong 2-byte slash
+        "\xf8\x88\x80\x80", // 5-byte lead, not UTF-8 at all
+        "\x80", // bare continuation byte
+        "\xe2\x9c", // truncated 3-byte sequence
+    };
+    for (cases) |bytes| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        var consumed: usize = 0;
+        while (consumed < bytes.len) consumed += try writeUtf8Unit(&aw.writer, bytes[consumed..]);
+        try testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
+        // Nothing from the invalid input survives as raw bytes.
+        try testing.expect(std.mem.indexOf(u8, aw.written(), bytes) == null);
+    }
+
+    // Valid sequences of every length are still emitted verbatim.
+    const valid = "a\xc3\xa9\xe2\x9c\x93\xf0\x9f\x8e\x89";
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var consumed: usize = 0;
+    while (consumed < valid.len) consumed += try writeUtf8Unit(&aw.writer, valid[consumed..]);
+    try testing.expectEqualStrings(valid, aw.written());
 }
 
 test "json output is well-formed and escapes control characters" {
