@@ -194,6 +194,27 @@ pub fn build(b: *std.Build) void {
     manifest_contract_cmd.setCwd(b.path("."));
     contract_step.dependOn(&manifest_contract_cmd.step);
 
+    // The backend differ runs both parser backends over the fixture trees and
+    // asserts what tree-sitter is allowed to change (see tests/backend-differ.zig).
+    // It needs the NavGraph module, so it is its own test root rather than a
+    // white-box test inside src/.
+    const differ_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/backend-differ.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "NavGraph", .module = mod },
+                .{ .name = "build_options", .module = build_opts_mod },
+            },
+        }),
+    });
+    const run_differ_tests = b.addRunArtifact(differ_tests);
+    run_differ_tests.setCwd(b.path("."));
+    const differ_step = b.step("differ", "Diff the heuristic and tree-sitter backends over the fixture trees");
+    differ_step.dependOn(&run_differ_tests.step);
+    test_step.dependOn(&run_differ_tests.step);
+
     const efficiency_cmd = b.addSystemCommand(&.{"sh"});
     efficiency_cmd.addFileArg(b.path("tests/efficiency-contract.sh"));
     efficiency_cmd.addArtifactArg(exe);

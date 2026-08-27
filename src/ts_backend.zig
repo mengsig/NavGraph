@@ -421,7 +421,7 @@ pub fn parse(
     refineFunctionValued(source, defs.items);
     resolveParents(&by_node, defs.items);
     refineKinds(defs.items);
-    try dropFunctionLocals(&defs, gpa, &by_node);
+    try dropUnowned(&defs, gpa, &by_node);
 
     const base: u32 = @intCast(out.items.len);
     try out.ensureUnusedCapacity(gpa, defs.items.len);
@@ -585,6 +585,12 @@ fn collectDefs(
             if (prev.declared_type.len == 0) prev.declared_type = declared;
             if (prev.import_path.len == 0) prev.import_path = path;
             if (prev.doc.len == 0) prev.doc = docOf(source, doc_node);
+            // A broad pattern may have matched first and left the name empty
+            // (`import x from "y"`: one pattern sees only the module string).
+            if (prev.name.len == 0 and name.len != 0) {
+                prev.name = name;
+                if (name_node) |n| prev.line = nodeLine(n);
+            }
             continue;
         }
         const span_start = lineStart(source, ts_node_start_byte(def));
@@ -691,10 +697,15 @@ fn isContainerKind(kind: SymbolKind) bool {
     };
 }
 
-/// A binding inside a function body is a local variable, not a definition — the
-/// heuristic scanner does not index those either. `self.x` fields are captured
-/// separately and are unaffected.
-fn dropFunctionLocals(
+/// Drop what the grammar sees but NavGraph does not index as a definition:
+///   * a binding inside a function body — that is a local variable, and the
+///     heuristic scanner does not index those either;
+///   * an ownerless field — the members of an anonymous object type written
+///     inline in a signature (`(props: { post: Post })`, a multi-line return
+///     type). They belong to no named type, and leaving them parentless would
+///     let a bare name in the body bind to one.
+/// `self.x` fields are owned by their class and are unaffected.
+fn dropUnowned(
     defs: *std.ArrayList(Def),
     gpa: std.mem.Allocator,
     by_node: *std.AutoHashMapUnmanaged(usize, u32),
@@ -706,6 +717,7 @@ fn dropFunctionLocals(
                 if (isCallableKind(defs.items[near].kind)) continue;
             }
         }
+        if (d.kind == .field and d.parent_local == null) continue;
         defs.items[kept] = d;
         kept += 1;
     }

@@ -25,3 +25,11 @@
 (augmented_assignment left: (attribute
   object: (identifier) @qualifier
   attribute: (identifier) @ref.readwrite))
+
+; A constructor/function keyword label is a write of that parameter or field:
+; `ItemCreate(title="Widget")` writes `ItemCreate.title`. The qualifier is the
+; callee, matching how the heuristic scanner scopes the same site.
+(call function: (identifier) @qualifier
+  arguments: (argument_list (keyword_argument name: (identifier) @ref.write)))
+(call function: (attribute attribute: (identifier) @qualifier)
+  arguments: (argument_list (keyword_argument name: (identifier) @ref.write)))

@@ -1621,11 +1621,16 @@ const MemberMatch = struct { id: SymbolId, unambiguous: bool };
 /// across files the first is returned but flagged ambiguous.
 fn memberOfType(idx: *const Index, from_file: FileId, type_name: []const u8, name: []const u8) MemberMatch {
     const candidates = idx.by_name.get(name) orelse return .{ .id = invalid, .unambiguous = false };
+    const from_lang = idx.graph.files[from_file].language.family();
     var any: SymbolId = invalid;
     var matches: u32 = 0;
     for (candidates) |cid| {
         const cand = idx.graph.symbols[cid];
         if (cand.parent == invalid) continue;
+        // A type name is not a cross-language namespace: a Python `Customer`
+        // and a TypeScript `Customer` share a spelling, not a type. The only
+        // intended cross-language edge is a route_call (`linkRoutes`).
+        if (idx.graph.files[cand.file].language.family() != from_lang) continue;
         if (!std.mem.eql(u8, idx.graph.symbols[cand.parent].name, type_name)) continue;
         if (cand.file == from_file) return .{ .id = cid, .unambiguous = true };
         matches += 1;
