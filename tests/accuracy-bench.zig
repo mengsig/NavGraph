@@ -641,7 +641,6 @@ fn scoreEdges(
             });
         }
 
-        sites.expected += g.lines.len;
         sites.actual += a.lines.len;
         var site_hit: usize = 0;
         for (g.lines) |gl| {
@@ -796,6 +795,80 @@ fn validateGolden(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []cons
         try requireLineWhenAmbiguous(path, name_count, e, e.to, e.to_line, "to");
         if (e.from_line) |l| try requireLineIsADefinition(arena, path, def_at_line, e.from, l);
         if (e.to_line) |l| try requireLineIsADefinition(arena, path, def_at_line, e.to, l);
+        try requireLinesAscendingUnique(path, e);
+    }
+    try requireEdgesDistinguishable(gpa, arena, path, g.edges);
+}
+
+/// `lines` is ground truth for call-site scoring; a stray duplicate or an
+/// out-of-order pair inflates the site counts (`extract` always emits it
+/// sorted and deduped, so a golden that doesn't match can't be honest).
+fn requireLinesAscendingUnique(path: []const u8, e: GoldenEdge) !void {
+    var i: usize = 1;
+    while (i < e.lines.len) : (i += 1) {
+        if (e.lines[i] <= e.lines[i - 1]) {
+            std.debug.print(
+                "accuracy-bench: {s}: edge {s} -> {s}: lines must be strictly ascending and deduplicated (got {d}, {d})\n",
+                .{ path, e.from, e.to, e.lines[i - 1], e.lines[i] },
+            );
+            return BenchError.GoldenInvalid;
+        }
+    }
+}
+
+/// Two golden edges sharing a (from, to) string pair are either the same
+/// overload/accessor pair's siblings - each naming which definition via
+/// from_line/to_line - or an accidental duplicate. A silent duplicate is
+/// dangerous precisely because it looks like a legitimate sibling: it
+/// inflates edge precision, recall, exact agreement AND site recall at once,
+/// and `--update-floors` would ratchet the inflated numbers in permanently.
+fn requireEdgesDistinguishable(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    path: []const u8,
+    edges: []const GoldenEdge,
+) !void {
+    var groups = std.StringHashMap(std.ArrayList(usize)).init(gpa);
+    defer {
+        var it = groups.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        groups.deinit();
+    }
+    for (edges, 0..) |e, i| {
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ e.from, e.to });
+        const slot = try groups.getOrPut(key);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(gpa, i);
+    }
+    var it = groups.valueIterator();
+    while (it.next()) |group| {
+        if (group.items.len < 2) continue;
+        for (group.items) |gi| {
+            const e = edges[gi];
+            if (e.from_line == null and e.to_line == null) {
+                std.debug.print(
+                    "accuracy-bench: {s}: edge {s} -> {s} repeats ({d} entries share this pair); " ++
+                        "set from_line or to_line on each to say which definition it names\n",
+                    .{ path, e.from, e.to, group.items.len },
+                );
+                return BenchError.GoldenInvalid;
+            }
+        }
+        for (group.items, 0..) |gi, pos| {
+            for (group.items[pos + 1 ..]) |gj| {
+                const a = edges[gi];
+                const b = edges[gj];
+                if (a.exact == b.exact and a.from_line == b.from_line and a.to_line == b.to_line and
+                    std.mem.eql(u32, a.lines, b.lines))
+                {
+                    std.debug.print(
+                        "accuracy-bench: {s}: edge {s} -> {s}: duplicate entry (same from/to/lines/exact)\n",
+                        .{ path, a.from, a.to },
+                    );
+                    return BenchError.GoldenInvalid;
+                }
+            }
+        }
     }
 }
 
