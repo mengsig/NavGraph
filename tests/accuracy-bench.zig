@@ -13,9 +13,12 @@
 //! bound to variables, fields, constants — the corpora exist to stress.
 //!
 //! Modes:
-//!   accuracy-bench <repo-root>                     score every golden vs floors
-//!   accuracy-bench <repo-root> --update-floors     rewrite floors from the run
-//!   accuracy-bench <repo-root> --propose <root>    emit a golden skeleton
+//!   accuracy-bench <repo-root>                          score every golden vs floors
+//!   accuracy-bench <repo-root> -j | --json              same, as one JSON object on stdout
+//!   accuracy-bench <repo-root> --update-floors          rewrite floors from the run (ratchet-only)
+//!   accuracy-bench <repo-root> --update-floors \
+//!     --lower-floors --reason "<why>"                   accept a measured drop, with a reason
+//!   accuracy-bench <repo-root> --propose <root>         emit a golden skeleton
 //!
 //! `--propose` reports what the indexer currently sees. That is an authoring
 //! aid, never ground truth: every entry is hand-checked against the source (and
@@ -1292,7 +1295,12 @@ fn propose(
             if (k != 0) try out.writeByte(',');
             try out.print("{d}", .{l});
         }
-        try out.writeAll("], \"verified\": \"manual\" }");
+        // Always emitted, not just when the endpoint is ambiguous today: a
+        // proposal that omits them is rejected outright the moment the
+        // author's edit makes the endpoint share a key with another
+        // definition, and there's no way to tell from `extract`'s output
+        // alone which endpoints are safe to drop it from.
+        try out.print("], \"from_line\": {d}, \"to_line\": {d}, \"verified\": \"manual\" }}", .{ e.from_line, e.to_line });
     }
     try out.writeAll("\n  ]\n}\n");
 }
