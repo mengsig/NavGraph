@@ -108,15 +108,14 @@ pub const Vis = enum {
     }
 };
 
-/// Default result cap (also a sentinel: `limit == default_limit` means "the user
-/// did not pass -l", which `hot` uses to pick its own shorter default).
+/// Default result cap when the caller asked for none.
 pub const default_limit: u32 = 300;
 /// `hot`'s brief default when no explicit `-l` was given.
 pub const hot_default: u32 = 25;
 
 /// The effective cap for `hot`: its own short default unless `-l` was given.
 pub fn hotLimit(opts: Options) u32 {
-    return if (opts.limit == default_limit) hot_default else opts.limit;
+    return if (opts.limit_set) opts.limit else hot_default;
 }
 
 fn compactCap(opts: Options, base: u32, estimated_node_bytes: u32) u32 {
@@ -141,6 +140,10 @@ pub const Options = struct {
     verbosity: render.Verbosity = .sig,
     depth: u32 = 1,
     limit: u32 = default_limit,
+    /// Whether `limit` was asked for rather than defaulted. Lists that had no
+    /// cap before `-l` was declared on them consult it, as does `hot`'s shorter
+    /// default — an explicit `-l 300` must not read as "unset".
+    limit_set: bool = false,
     /// Traversal compaction: exact node cap, approximate output-byte budget,
     /// and compact rendering for retained/pruned branches.
     max_nodes: u32 = 0,
@@ -4545,10 +4548,9 @@ fn isTestDirName(comp: []const u8) bool {
 /// List, per in-scope file, the local modules it imports (resolved edges only).
 /// Returns whether any in-scope file had imports to report.
 /// The `-l` cap for a list that had no limit before it was declared: `null`
-/// unless the user actually passed one, so default output is unchanged.
-/// `limit == default_limit` is the module-wide "unset" sentinel.
+/// unless the caller actually asked for one, so default output is unchanged.
 pub fn listCap(opts: Options) ?u32 {
-    return if (opts.limit == default_limit) null else opts.limit;
+    return if (opts.limit_set) opts.limit else null;
 }
 
 pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
@@ -6672,13 +6674,15 @@ test "parseRanges: single, comma list, empty, overflow, and a bad member" {
     try std.testing.expectError(error.TooManyRanges, parseRanges("1,2,3", &tiny));
 }
 
-test "hotLimit: short default only when -l was omitted (sentinel), else the given cap" {
-    // No -l: limit == default_limit sentinel → the brief hot_default.
+test "hotLimit: short default only when -l was omitted, else the given cap" {
+    // No -l: the brief hot_default.
     try std.testing.expectEqual(hot_default, hotLimit(.{}));
     try std.testing.expectEqual(hot_default, hotLimit(.{ .limit = default_limit }));
-    // An explicit -l overrides, even to a value below the default.
-    try std.testing.expectEqual(@as(u32, 5), hotLimit(.{ .limit = 5 }));
-    try std.testing.expectEqual(@as(u32, 1000), hotLimit(.{ .limit = 1000 }));
+    // An explicit -l overrides, even to a value below the default — and an
+    // explicit `-l 300` is a cap of 300, not the "unset" reading (F8).
+    try std.testing.expectEqual(@as(u32, 5), hotLimit(.{ .limit = 5, .limit_set = true }));
+    try std.testing.expectEqual(@as(u32, 1000), hotLimit(.{ .limit = 1000, .limit_set = true }));
+    try std.testing.expectEqual(default_limit, hotLimit(.{ .limit = default_limit, .limit_set = true }));
 }
 
 test "FileSort.parse: canonical names, aliases, and unknown rejection" {
@@ -7570,7 +7574,7 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        _ = try hot(&aw.writer, &idx, "", .{ .limit = 1 });
+        _ = try hot(&aw.writer, &idx, "", .{ .limit = 1, .limit_set = true });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "shared") != null); // rank 1
         try testing.expect(std.mem.indexOf(u8, out, "more; raise -l to see them") != null);

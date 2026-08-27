@@ -343,7 +343,7 @@ test "graph -l caps the node set but reports the total and the truncation" {
     try testing.expect(std.mem.indexOf(u8, full, "\"nodes_total\":4") != null);
     try testing.expect(std.mem.indexOf(u8, full, "\"truncated\":false") != null);
 
-    const capped = try vzRender(&idx, "", .{ .format = .json, .limit = 2 });
+    const capped = try vzRender(&idx, "", .{ .format = .json, .limit = 2, .limit_set = true });
     defer testing.allocator.free(capped);
     // Two of four nodes emitted, and the payload says so.
     try testing.expect(std.mem.indexOf(u8, capped, "\"n\":\"a\"") != null);

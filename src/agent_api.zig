@@ -140,7 +140,7 @@ fn decodeMap(obj: std.json.ObjectMap) DecodeError!Request {
     const after = try optionalCursor(obj, "after");
     const fetch_limit = cursorFetchLimit(after, limit);
     const max_bytes = try boundedInt(obj, "max_bytes", default_max_bytes, min_max_bytes, max_max_bytes);
-    var options: query.Options = .{ .format = .json, .limit = fetch_limit, .max_nodes = fetch_limit };
+    var options: query.Options = .{ .format = .json, .limit = fetch_limit, .limit_set = true, .max_nodes = fetch_limit };
     if (kinds) |value| options.kinds = value;
     if (pattern) |value| return .{
         .operation = .map,
@@ -223,6 +223,7 @@ fn decodeRelations(obj: std.json.ObjectMap) DecodeError!Request {
         .format = .json,
         .depth = depth,
         .limit = limit,
+        .limit_set = true,
         .max_nodes = limit,
         .budget = max_bytes,
         .strict = strict,
@@ -289,7 +290,7 @@ fn decodeImpact(obj: std.json.ObjectMap) DecodeError!Request {
         .parsed = .{
             .command = command,
             .arg = if (command == .edits) selector.? else since orelse "",
-            .options = .{ .format = .json, .limit = cursorFetchLimit(after, limit), .max_nodes = cursorFetchLimit(after, limit), .strict = strict },
+            .options = .{ .format = .json, .limit = cursorFetchLimit(after, limit), .limit_set = true, .max_nodes = cursorFetchLimit(after, limit), .strict = strict },
         },
         .max_bytes = max_bytes,
         .cursor_page = if (command == .diff) null else .{ .after = after orelse 0, .limit = limit },
@@ -312,7 +313,7 @@ fn decodeDiagnostics(obj: std.json.ObjectMap) DecodeError!Request {
         .parsed = .{
             .command = if (std.mem.eql(u8, analysis, "coverage")) .coverage else .status,
             .arg = path,
-            .options = .{ .format = .json, .limit = cursorFetchLimit(after, limit) },
+            .options = .{ .format = .json, .limit = cursorFetchLimit(after, limit), .limit_set = true },
         },
         .max_bytes = max_bytes,
         .cursor_page = .{ .after = after orelse 0, .limit = limit },

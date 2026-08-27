@@ -1757,8 +1757,14 @@ pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Opti
     try w.writeByte('[');
     for (idx.graph.files) |target| {
         if (!query.matchesFilter(target.path, path)) continue;
-        if (query.listCap(opts)) |cap| if (shown >= cap) break;
-        shown += 1;
+        const importers = countImporters(idx, target.id);
+        // `-l` counts files that actually have importers, exactly as the text
+        // renderer does: a target with none is nothing found in either output.
+        if (importers != 0) {
+            if (query.listCap(opts)) |cap| if (shown >= cap) continue;
+            shown += 1;
+            any_importer = true;
+        }
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -1770,12 +1776,20 @@ pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Opti
             if (wrote != 0) try w.writeByte(',');
             try writeString(w, src.path);
             wrote += 1;
-            any_importer = true;
         }
+        std.debug.assert(wrote == importers);
         try w.writeAll("]}");
     }
     try w.writeAll("]\n");
     return any_importer;
+}
+
+fn countImporters(idx: *const Index, target: model.FileId) u32 {
+    var n: u32 = 0;
+    for (idx.graph.files) |src| {
+        if (fileImports(idx, src.id, target)) n += 1;
+    }
+    return n;
 }
 
 fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool {
@@ -3329,6 +3343,42 @@ test "imports and importers json describe the file dependency edges" {
         try testing.expectEqual(@as(usize, 1), users.len);
         try testing.expect(std.mem.endsWith(u8, users[0].string, "app.zig"));
     }
+}
+
+test "importers -l counts the same files in json as in text" {
+    // Regression (F8): the json renderer counted the cap over every matched
+    // target, the text one over targets that actually have importers, so the
+    // two disagreed on what `-l N` shows.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn a() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn b() void {}
+    });
+    // Only a.zig and b.zig have importers; user.zig has none.
+    try tmp.dir.writeFile(io, .{ .sub_path = "user.zig", .data =
+        \\const a = @import("a.zig");
+        \\const b = @import("b.zig");
+        \\pub fn use() void { a.a(); b.b(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    _ = try listImporters(&aw.writer, &idx, ".zig", .{ .format = .json, .limit = 1, .limit_set = true });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+
+    var with_importers: usize = 0;
+    for (p.value.array.items) |entry| {
+        if (entry.object.get("importers").?.array.items.len != 0) with_importers += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), with_importers);
 }
 
 // --- path -----------------------------------------------------------------

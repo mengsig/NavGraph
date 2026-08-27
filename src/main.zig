@@ -300,6 +300,7 @@ fn dispatchHardBudgetWithAuthority(
     if (compact.options.max_nodes != 0) cap = @min(cap, compact.options.max_nodes);
     cap = @min(cap, @max(@as(u32, 1), hard_limit / 96));
 
+    compact.options.limit_set = true;
     while (true) {
         compact.options.limit = cap;
         compact.options.max_nodes = cap;
