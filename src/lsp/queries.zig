@@ -1136,14 +1136,20 @@ fn writeEventSite(w: *Writer, ctx: Ctx, site: query.EventSite) !void {
 // ---------------------------------------------------------------------------
 
 /// Write `{files:[{file,uri,imports:[{target,targetUri,binding}]}]}`: the
-/// local modules each in-scope file imports (resolved edges only).
-pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8) !void {
+/// local modules each in-scope file imports (resolved edges only). `limit`
+/// caps the number of *files* listed — unlike every other list method, this
+/// one had no cap at all, so an empty filter on a large tree serialized every
+/// import edge in the graph into one response (coldstart review F13).
+pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void {
     const idx = ctx.index();
     try w.writeAll("{\"files\":[");
     var first = true;
+    var shown: u32 = 0;
     for (idx.graph.files) |file| {
         const imps = idx.importsOf(file.id);
         if (imps.len == 0 or !query.matchesFilter(file.path, filter)) continue;
+        if (shown >= limit) break;
+        shown += 1;
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -1169,8 +1175,37 @@ pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8) !void {
 
 /// Write `{files:[{file,uri,importers:[{file,uri}]}]}`: files that import
 /// the file(s) matching `path` — reverse dependencies.
+///
+/// Builds one reverse-import index in a single pass over every file's
+/// (already-resolved) import list, rather than rescanning every file's
+/// imports for every matching target — O(files) instead of O(files) per
+/// target, which was quadratic in file count for a broad filter (F13). Not
+/// cached across requests: `index.zig` (generation lifecycle, cache
+/// invalidation) is out of scope for this change.
 pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8) !void {
     const idx = ctx.index();
+    const gpa = idx.gpa;
+
+    var importers_of: std.AutoHashMapUnmanaged(model.FileId, std.ArrayList(model.FileId)) = .empty;
+    defer {
+        var it = importers_of.valueIterator();
+        while (it.next()) |list| list.deinit(gpa);
+        importers_of.deinit(gpa);
+    }
+    for (idx.graph.files) |src| {
+        for (idx.importsOf(src.id)) |imp| {
+            const gop = try importers_of.getOrPut(gpa, imp.target);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            const list = gop.value_ptr;
+            // A file that imports the same target under two bindings (two
+            // edges, one src) must still appear once, matching the old
+            // per-target `fileImportsFile` bool check.
+            if (list.items.len == 0 or list.items[list.items.len - 1] != src.id) {
+                try list.append(gpa, src.id);
+            }
+        }
+    }
+
     try w.writeAll("{\"files\":[");
     var first = true;
     for (idx.graph.files) |target| {
@@ -1182,25 +1217,20 @@ pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8) !void {
         try w.writeAll(",\"uri\":\"");
         try overlay.writeUriIn(w, ctx.session.root_abs, target.path);
         try w.writeAll("\",\"importers\":[");
-        var wrote: u32 = 0;
-        for (idx.graph.files) |src| {
-            if (!fileImportsFile(idx, src.id, target.id)) continue;
-            if (wrote != 0) try w.writeByte(',');
-            try w.writeAll("{\"file\":");
-            try payload.writeString(w, src.path);
-            try w.writeAll(",\"uri\":\"");
-            try overlay.writeUriIn(w, ctx.session.root_abs, src.path);
-            try w.writeAll("\"}");
-            wrote += 1;
+        if (importers_of.get(target.id)) |list| {
+            for (list.items, 0..) |src_id, k| {
+                if (k != 0) try w.writeByte(',');
+                const src = idx.graph.files[src_id];
+                try w.writeAll("{\"file\":");
+                try payload.writeString(w, src.path);
+                try w.writeAll(",\"uri\":\"");
+                try overlay.writeUriIn(w, ctx.session.root_abs, src.path);
+                try w.writeAll("\"}");
+            }
         }
         try w.writeAll("]}");
     }
     try w.writeAll("]}");
-}
-
-fn fileImportsFile(idx: *const Index, src: model.FileId, target: model.FileId) bool {
-    for (idx.importsOf(src)) |imp| if (imp.target == target) return true;
-    return false;
 }
 
 // ---------------------------------------------------------------------------

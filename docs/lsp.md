@@ -371,11 +371,12 @@ key groups returned.
 
 ### `navgraph/imports`
 
-Params: `{ path?:string }` →
+Params: `{ path?:string, limit?:int (300) }` →
 `{ files:[{file,uri,imports:[{target,targetUri,binding}]}] }`.
 
 The local modules each in-scope file imports (resolved edges only). `path` is
-a substring filter over the importing file's path.
+a substring filter over the importing file's path. `limit` caps the number of
+files listed (each file's full import list still comes through).
 
 ### `navgraph/importers`
 

@@ -948,7 +948,8 @@ fn eventsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
 fn importsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
     try self.flushPending(arena, .change);
     const c = try self.ctx();
-    try queries.writeImports(w, c, Params.from(params).str("path") orelse "");
+    const p = Params.from(params);
+    try queries.writeImports(w, c, p.str("path") orelse "", p.positive("limit", 300));
 }
 
 fn importersMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -2379,6 +2380,50 @@ test "navgraph/imports lists app.py's local module imports" {
         if (std.mem.eql(u8, i.object.get("target").?.string, "backend/store.py")) found = true;
     }
     try testing.expect(found);
+}
+
+test "navgraph/imports honors an explicit limit on the number of files listed (F13)" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &.{
+        .{ "shared.zig", "pub fn helper() void {}\n" },
+        .{ "a.zig", "const shared = @import(\"shared.zig\");\npub fn useA() void { shared.helper(); }\n" },
+        .{ "b.zig", "const shared = @import(\"shared.zig\");\npub fn useB() void { shared.helper(); }\n" },
+    });
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(57,
+        \\{"jsonrpc":"2.0","id":57,"method":"navgraph/imports","params":{"limit":1}}
+    );
+    defer res.deinit();
+    const files = (try resultOf(res)).object.get("files").?.array.items;
+    try testing.expectEqual(@as(usize, 1), files.len);
+}
+
+test "navgraph/importers lists a file once even with two import edges to the same target (F13)" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &.{
+        .{ "mod.py", "def helper():\n    pass\n" },
+        .{
+            "user.py",
+            \\from mod import helper
+            \\from mod import helper as h2
+            \\
+            \\def use():
+            \\    helper()
+            \\    h2()
+            \\
+            ,
+        },
+    });
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(58,
+        \\{"jsonrpc":"2.0","id":58,"method":"navgraph/importers","params":{"path":"mod.py"}}
+    );
+    defer res.deinit();
+    const files = (try resultOf(res)).object.get("files").?.array.items;
+    try testing.expectEqual(@as(usize, 1), files.len);
+    const importers = files[0].object.get("importers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), importers.len);
+    try testing.expectEqualStrings("user.py", importers[0].object.get("file").?.string);
 }
 
 test "navgraph/importers lists store.py's reverse dependencies" {
