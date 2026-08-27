@@ -91,10 +91,10 @@ disappears again when the buffer is closed.
 | `-32700` | A frame body that is not JSON, or a frame the server could not parse. The server resyncs and keeps serving. |
 | `-32600` | Not a JSON-RPC request, or a request before `initialized`. |
 | `-32601` | Unknown method. |
-| `-32602` | Bad params: a missing/ill-typed field, an unknown `direction`, an uncompilable grep pattern, an unindexed file. |
+| `-32602` | Bad params: a missing/ill-typed field, an unknown `direction`, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. |
 | `-32603` | Internal failure (allocation, IO). |
 | `-32001` | A `Target` that resolves to nothing — `{"message": "…: symbol not found", …}`. |
-| `-32002` | The request could not be completed: currently only a grep regex that exhausts the backtracking budget. |
+| `-32002` | The request could not be completed: currently only a grep regex that exhausts one of the bounds below. |
 
 A malformed *notification* gets no reply, per JSON-RPC. Nothing a client can
 send kills the server.
@@ -218,8 +218,27 @@ one character.
 `regex: true` uses a small built-in engine: literals, `.`, character classes
 (`[a-z]`, `[^…]`, `\d \w \s` and their negations), groups with alternation,
 greedy and lazy `* + ? {n} {n,} {n,m}`, and the `^` `$` anchors. No
-backreferences, no lookaround, no captures. Backtracking is capped; a
-pathological pattern returns `-32002` rather than hanging.
+backreferences, no lookaround, no captures.
+
+**Bounds.** The pattern comes off the wire, so the engine is bounded in time,
+memory and stack, and neither half recurses. Worst case, per request:
+
+| Bound | Limit | Over it |
+| --- | --- | --- |
+| Pattern length | 4096 bytes | `-32602` |
+| Group nesting | 64 | `-32602` |
+| Node visits, per line searched | 200 000 + 8 × line length | `-32002` |
+| Live backtrack alternatives | 16 384 | `-32002` |
+| Live continuation frames | 16 384 | `-32002` |
+| Matcher scratch | ≈ 2 MiB, allocated once per compiled pattern | — |
+| Machine stack | constant — the parser and the matcher both walk explicit stacks | — |
+
+The step allowance scales with the line so an ordinary scan of a long line
+(a minified `.js`, `.css` or `.json`) never trips it, and a quantifier over a
+single-byte body (`.*`, `a+`, `[a-z]*`) holds its whole backtrack range as one
+alternative rather than one per byte. A pattern that is quadratic in the line
+length anyway — `a+b` across 300 000 `a` — gives up with `-32002`; it never
+hangs and never takes the server down.
 
 ### `navgraph/callers` / `navgraph/calls`
 
