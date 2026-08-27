@@ -214,6 +214,7 @@
     {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger", "to": "src/main/java/inventory/tricky/Tricky.java:Tricky.Renderable", "exact": true, "lines": [51], "verified": "manual"},
     {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.post", "to": "src/main/java/inventory/models/Product.java:Product.priceCents", "exact": true, "lines": [88], "from_line": 87, "to_line": 28, "verified": "manual"},
     {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.post", "to": "src/main/java/inventory/models/Product.java:Product.sku", "exact": true, "lines": [88], "from_line": 87, "to_line": 18, "verified": "manual"},
+    {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.post", "to": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.post", "exact": true, "lines": [88], "from_line": 87, "to_line": 81, "verified": "manual"},
     {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.post", "to": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.Entry", "exact": true, "lines": [82], "from_line": 81, "verified": "manual"},
     {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.post", "to": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.Entry.Entry", "exact": true, "lines": [82], "from_line": 81, "verified": "manual"},
     {"from": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.total", "to": "src/main/java/inventory/tricky/Tricky.java:Tricky.Ledger.Entry", "exact": true, "lines": [99], "verified": "manual"},

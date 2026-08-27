@@ -1,7 +1,7 @@
 {
   "language": "csharp",
   "root": "testenv/cs_app",
-  "notes": "C#. No C# language server is installed on this host, so every entry was read from the source by hand. Auto-properties and indexers are definitions under the name they are written with (`Ledger.this`, `Slip.operator+`); a local function is a named definition nested in its method. Property and field READS are not edges - only calls, type uses in a body, and a call through a delegate-valued member. A call that binds to an interface member through an interface-typed receiver is golden as an edge to the interface member: that is what the static type says. Two things have no representable answer here and are left out: an edge between two overloads of one name (`Ledger.Post` calling `Ledger.Post`), because from/to are the same key, and which of `Slip`'s two `Render` definitions an explicit interface implementation should be named after.",
+  "notes": "C#. No C# language server is installed on this host, so every entry was read from the source by hand. Auto-properties and indexers are definitions under the name they are written with (`Ledger.this`, `Slip.operator+`); a local function is a named definition nested in its method. Property and field READS are not edges - only calls, type uses in a body, and a call through a delegate-valued member. A call that binds to an interface member through an interface-typed receiver is golden as an edge to the interface member: that is what the static type says. One thing has no representable answer here and is left out: which of `Slip`'s two `Render` definitions an explicit interface implementation should be named after. An edge between two overloads of one name (`Ledger.Post` calling `Ledger.Post`) IS representable - `from_line`/`to_line` disambiguate each end - and is recorded at both self-call sites (:98, :103).",
   "definitions": [
     {"file": "Models.cs", "name": "Category", "qualified": "Category", "kind": "enum", "line": 6, "parent": null},
     {"file": "Models.cs", "name": "OrderStatus", "qualified": "OrderStatus", "kind": "enum", "line": 15, "parent": null},
@@ -165,6 +165,8 @@
     {"from": "Tricky.cs:Box.Of", "to": "Tricky.cs:Box", "exact": true, "lines": [143], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Entry.Direction", "to": "Tricky.cs:Ledger.Entry.Kind", "exact": true, "lines": [69], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Post", "to": "Tricky.cs:Ledger.Entry", "exact": true, "lines": [98], "from_line": 96, "verified": "manual"},
+    {"from": "Tricky.cs:Ledger.Post", "to": "Tricky.cs:Ledger.Post", "exact": true, "lines": [98], "from_line": 96, "to_line": 91, "verified": "manual"},
+    {"from": "Tricky.cs:Ledger.Post", "to": "Tricky.cs:Ledger.Post", "exact": true, "lines": [103], "from_line": 101, "to_line": 96, "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Total", "to": "Tricky.cs:Adjust", "exact": true, "lines": [116], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Total", "to": "Tricky.cs:Ledger.Entry", "exact": true, "lines": [112], "verified": "manual"},
     {"from": "Tricky.cs:Ledger.Total", "to": "Tricky.cs:Ledger._round", "exact": true, "lines": [114], "verified": "manual"},
