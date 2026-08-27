@@ -54,6 +54,10 @@ pub const CacheSnapshot = struct {
 pub const Index = struct {
     gpa: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
+    /// The parsed-source arena this Index also owns, or null when the sources
+    /// belong to a caller-held `Sources` (the resident-server path) and must
+    /// outlive it. `build` owns them; a bare `assemble` borrows them.
+    owned_sources: ?*std.heap.ArenaAllocator = null,
     graph: model.Graph,
     by_name: std.StringHashMapUnmanaged([]SymbolId),
     callers: [][]SymbolId,
@@ -86,6 +90,10 @@ pub const Index = struct {
         self.gpa.free(self.graph.symbols);
         self.arena.deinit();
         self.gpa.destroy(self.arena);
+        if (self.owned_sources) |src| {
+            src.deinit();
+            self.gpa.destroy(src);
+        }
     }
 
     /// Definitions matching `name` exactly (empty when none).
@@ -112,16 +120,70 @@ pub const Index = struct {
     }
 };
 
+/// One file's source text and parse output, owned by the `Sources` arena that
+/// produced it. Global symbol ids are *not* assigned yet — that happens in
+/// `assemble`, so the same parse output can be re-assembled after a single file
+/// is re-parsed (the resident-server path).
+pub const ParsedFile = struct {
+    /// Path relative to the walked root.
+    path: []const u8,
+    language: language.Language,
+    text: []const u8,
+    symbols: []const parser.ParsedSymbol,
+    parse_health: model.ParseHealth,
+    stat: cache.FileStat,
+};
+
+/// A finished walk: every file's parse output plus the walk's notes, all owned
+/// by one arena. An `Index` assembled from these borrows the text and parse
+/// output, so a `Sources` must outlive every `Index` assembled from it.
+pub const Sources = struct {
+    gpa: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    files: []const ParsedFile,
+    skipped_dirs: []const []const u8,
+    /// Cache state observed by this walk. `rewrite` is still `.disabled`/
+    /// `.current`; `assemble` records the outcome of the write it performs.
+    cache: CacheSnapshot,
+    /// Whether the on-disk cache differs from what this walk produced.
+    cache_stale: bool,
+
+    pub fn deinit(self: *Sources) void {
+        self.arena.deinit();
+        self.gpa.destroy(self.arena);
+    }
+};
+
+/// A `.navgraph/cache` refresh performed inside `assemble`. It must land after
+/// reference resolution but before router mounts rewrite route names in place:
+/// the mount lives in another file, so a cached prefixed name would be
+/// prefixed again on the next build.
+pub const CacheWrite = struct {
+    io: std.Io,
+    /// The walked root. `cache.write` hardens the `.navgraph` hop itself.
+    dir: std.Io.Dir,
+};
+
+/// What `assemble` needs beyond the allocator: the parse output to turn into a
+/// graph, plus the walk context that only the caller knows.
+pub const Assembly = struct {
+    /// Root as the caller names it (what the CLI prints), not necessarily a path.
+    root_label: []const u8,
+    files: []const ParsedFile,
+    /// Arena-owned by the caller, borrowed by the Index.
+    skipped_dirs: []const []const u8 = &.{},
+    cache: CacheSnapshot = .{},
+    /// Non-null to refresh the on-disk cache from this assembly.
+    cache_write: ?CacheWrite = null,
+};
+
 const Builder = struct {
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     io: std.Io,
     root_dir: std.Io.Dir,
     root_real_path: []const u8,
-    files: std.ArrayList(model.SourceFile),
-    symbols: std.ArrayList(model.Symbol),
-    /// Per-file (mtime, size) aligned 1:1 with `files`, used to write the cache.
-    stats: std.ArrayList(cache.FileStat),
+    files: std.ArrayList(ParsedFile),
     /// Loaded on-disk cache of previously parsed files (null when disabled).
     store: ?cache.Store,
     /// Count of files served from `store` (vs. freshly parsed) this build.
@@ -134,7 +196,7 @@ const Builder = struct {
 
 /// Build an index rooted at `root_path` (relative to cwd or absolute). When
 /// `use_cache` is set, unchanged files are restored from `.navgraph/cache` and
-/// the refreshed cache is written back.
+/// the refreshed cache is written back. The returned Index owns everything.
 pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cache: bool) !Index {
     std.debug.assert(root_path.len > 0);
     // `-C <path>` normally names a directory. If it names a single file, index
@@ -163,7 +225,34 @@ pub fn buildOpenDir(
     single_file_target: ?[]const u8,
     use_cache: bool,
 ) !Index {
-    std.debug.assert(root_label.len > 0);
+    var sources = try collect(gpa, io, root_dir, single_file, single_file_target, use_cache);
+    var idx = assemble(gpa, .{
+        .root_label = root_label,
+        .files = sources.files,
+        .skipped_dirs = sources.skipped_dirs,
+        .cache = sources.cache,
+        .cache_write = if (use_cache and sources.cache_stale) .{ .io = io, .dir = root_dir } else null,
+    }) catch |err| {
+        sources.deinit();
+        return err;
+    };
+    // Hand the parsed sources to the Index: from here `idx.deinit()` frees them.
+    idx.owned_sources = sources.arena;
+    return idx;
+}
+
+/// Walk `root_dir`, parse (or restore from cache) every source file, and return
+/// the per-file parse output without assembling a graph. Callers that want a
+/// ready-to-query graph use `build`/`buildOpenDir`; a resident server keeps the
+/// `Sources` and re-`assemble`s after re-parsing individual files.
+pub fn collect(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    single_file: ?[]const u8,
+    single_file_target: ?[]const u8,
+    use_cache: bool,
+) !Sources {
     const arena_box = try gpa.create(std.heap.ArenaAllocator);
     arena_box.* = std.heap.ArenaAllocator.init(gpa);
     errdefer {
@@ -181,16 +270,12 @@ pub fn buildOpenDir(
         .root_dir = root_dir,
         .root_real_path = try arena.dupe(u8, root_real_buf[0..root_real_len]),
         .files = .empty,
-        .symbols = .empty,
-        .stats = .empty,
         .store = if (use_cache) cache.load(gpa, io, root_dir) else null,
         .cache_hits = 0,
         .skipped = .empty,
         .ignore = gitignore.Matcher.init(gpa),
     };
     defer b.files.deinit(gpa);
-    defer b.symbols.deinit(gpa);
-    defer b.stats.deinit(gpa);
     defer b.skipped.deinit(gpa);
     defer b.ignore.deinit();
     defer if (b.store) |*s| s.deinit();
@@ -205,33 +290,93 @@ pub fn buildOpenDir(
         try collectDir(&b, root_dir, &path_buf);
     }
 
-    std.debug.assert(b.stats.items.len == b.files.items.len);
     std.debug.assert(b.cache_hits <= b.files.items.len);
     const loaded_entries: u32 = if (b.store) |*store| @intCast(store.entries.count()) else 0;
-    const rewrite_cache = use_cache and cacheStale(&b);
-    const graph = model.Graph{
-        .files = try gpa.dupe(model.SourceFile, b.files.items),
-        .symbols = try gpa.dupe(model.Symbol, b.symbols.items),
-    };
-    var idx = Index{
+    return .{
         .gpa = gpa,
         .arena = arena_box,
-        .graph = graph,
-        .by_name = .empty,
-        .callers = &.{},
-        .file_imports = &.{},
-        .import_outcomes = &.{},
-        .root = try arena.dupe(u8, root_label),
-        .file_stats = try arena.dupe(cache.FileStat, b.stats.items),
-        .cache_snapshot = .{
+        .files = try arena.dupe(ParsedFile, b.files.items),
+        .skipped_dirs = try arena.dupe([]const u8, b.skipped.items),
+        .cache = .{
             .enabled = use_cache,
             .loaded = b.store != null,
             .loaded_entries = loaded_entries,
             .hits = b.cache_hits,
             .rewrite = if (use_cache) .current else .disabled,
         },
-        .skipped_dirs = try arena.dupe([]const u8, b.skipped.items),
+        .cache_stale = cacheStale(&b),
     };
+}
+
+/// Assemble a queryable index from already-parsed files: assign global symbol
+/// ids, then build the name index, import table, resolved edges and reverse
+/// index. `a.files` (and the text and parse output they point at) must outlive
+/// the returned Index — `Index.owned_sources` records who frees them.
+///
+/// Every symbol's reference list is copied into the Index arena because
+/// resolution writes each ref's target in place; the caller's parse output stays
+/// pristine so it can be re-assembled any number of times.
+pub fn assemble(gpa: std.mem.Allocator, a: Assembly) !Index {
+    var total: usize = 0;
+    for (a.files) |f| total += f.symbols.len;
+    std.debug.assert(total <= std.math.maxInt(u32));
+    std.debug.assert(a.files.len <= std.math.maxInt(FileId));
+
+    // One owner from the first allocation: `idx` holds the arena and both graph
+    // arrays, so everything below unwinds through `Index.deinit` alone.
+    // Overlapping errdefers here meant a failure freed each of them twice.
+    var idx = try emptyIndex(gpa, a.root_label, a.files.len, total);
+    errdefer idx.deinit();
+    idx.skipped_dirs = a.skipped_dirs;
+    idx.cache_snapshot = a.cache;
+    const arena = idx.arena.allocator();
+    const out_files = idx.graph.files;
+    const out_symbols = idx.graph.symbols;
+
+    var next: u32 = 0;
+    for (a.files, 0..) |f, i| {
+        std.debug.assert(f.text.len <= std.math.maxInt(u32));
+        std.debug.assert((f.parse_health.desync_from == null) == (f.parse_health.desync_to == 0));
+        const file_id: FileId = @intCast(i);
+        const base = next;
+        for (f.symbols) |p| {
+            out_symbols[next] = .{
+                .id = next,
+                .file = file_id,
+                .name = p.name,
+                .kind = p.kind,
+                .line = p.line,
+                .span_start = p.span_start,
+                .span_end = p.span_end,
+                .sig_end = p.sig_end,
+                .doc = p.doc,
+                .parent = if (p.parent_local) |pl| base + pl else invalid,
+                .exported = p.exported,
+                .modifiers = p.modifiers,
+                .refs = try arena.dupe(model.Reference, p.refs),
+                .bindings = p.bindings,
+                .receiver = p.receiver,
+                .impl_protocol = p.impl_protocol,
+                .import_path = p.import_path,
+            };
+            next += 1;
+        }
+        out_files[i] = .{
+            .id = file_id,
+            .path = f.path,
+            .language = f.language,
+            .text = f.text,
+            .parse_health = f.parse_health,
+            .sym_start = base,
+            .sym_end = next,
+        };
+    }
+    std.debug.assert(next == total);
+
+    const stats = try arena.alloc(cache.FileStat, a.files.len);
+    for (a.files, stats) |f, *st| st.* = f.stat;
+    idx.file_stats = stats;
+
     try buildNameIndex(&idx);
     attachCrossFileMethodParents(&idx);
     try buildImportTable(&idx);
@@ -242,11 +387,46 @@ pub fn buildOpenDir(
     // symbol names in place (prepending the mount prefix), and those rewritten
     // names must not reach the per-file cache — the mount lives in a different
     // file, so caching the prefixed name would double-prefix on the next build.
-    if (rewrite_cache) idx.cache_snapshot.rewrite = if (persistCache(&b, &idx)) .written else .failed;
+    if (a.cache_write) |w| {
+        std.debug.assert(idx.cache_snapshot.enabled);
+        idx.cache_snapshot.rewrite = if (persistCache(w, &idx, stats)) .written else .failed;
+    }
     if (applyRouterMounts(&idx)) try rebuildNameIndex(&idx);
     linkRoutes(&idx);
     try buildCallers(&idx);
     return idx;
+}
+
+/// An `Index` that owns its arena and graph arrays but holds no content yet.
+/// Split out so `assemble` has exactly one errdefer: on success the ownership
+/// is already whole, and on failure `Index.deinit` frees everything once.
+fn emptyIndex(
+    gpa: std.mem.Allocator,
+    root_label: []const u8,
+    file_count: usize,
+    symbol_count: usize,
+) !Index {
+    const arena_box = try gpa.create(std.heap.ArenaAllocator);
+    arena_box.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer {
+        arena_box.deinit();
+        gpa.destroy(arena_box);
+    }
+    const root = try arena_box.allocator().dupe(u8, root_label);
+    const out_files = try gpa.alloc(model.SourceFile, file_count);
+    errdefer gpa.free(out_files);
+    const out_symbols = try gpa.alloc(model.Symbol, symbol_count);
+    return .{
+        .gpa = gpa,
+        .arena = arena_box,
+        .graph = .{ .files = out_files, .symbols = out_symbols },
+        .by_name = .empty,
+        .callers = &.{},
+        .file_imports = &.{},
+        .import_outcomes = &.{},
+        .root = root,
+        .skipped_dirs = &.{},
+    };
 }
 
 /// Whether the on-disk cache differs from what we just built. When every file
@@ -261,11 +441,10 @@ fn cacheStale(b: *const Builder) bool {
 
 /// Best-effort cache write. A failure here (e.g. a read-only tree) must never
 /// fail the query, so it is reported on stderr and swallowed — the cache is a
-/// pure optimization, not required for correctness.
-fn persistCache(b: *const Builder, idx: *const Index) bool {
-    std.debug.assert(idx.graph.files.len == b.stats.items.len);
-    std.debug.assert(idx.cache_snapshot.enabled);
-    cache.write(b.gpa, b.io, b.root_dir, idx.graph.files, b.stats.items, idx.graph.symbols) catch |err| {
+/// pure optimization, not required for correctness. Returns whether it landed.
+fn persistCache(w: CacheWrite, idx: *const Index, stats: []const cache.FileStat) bool {
+    std.debug.assert(idx.graph.files.len == stats.len);
+    cache.write(idx.gpa, w.io, w.dir, idx.graph.files, stats, idx.graph.symbols) catch |err| {
         std.debug.print("navgraph: cache write skipped: {s}\n", .{@errorName(err)});
         return false;
     };
@@ -483,18 +662,32 @@ fn isMinifiedText(text: []const u8) bool {
     return text.len / lines > 300;
 }
 
-const ParsedFile = struct {
+/// One file's parse output. Distinct from `ParsedFile`, which pairs this with
+/// the file's identity and stat for `assemble`.
+pub const ParseOutput = struct {
     symbols: []const parser.ParsedSymbol,
     health: model.ParseHealth,
 };
 
-fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile {
+/// Parse one file's source into the records `assemble` consumes. `arena` owns
+/// the result and every string it points at except `text`, which the caller
+/// must keep alive for as long as the records are used.
+pub fn parseOne(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    text: []const u8,
+    lang: language.Language,
+) !ParseOutput {
     std.debug.assert(text.len <= std.math.maxInt(u32));
     std.debug.assert(lang != .unknown);
     var parsed: std.ArrayList(parser.ParsedSymbol) = .empty;
-    defer parsed.deinit(b.gpa);
-    const health = try parser.parse(b.gpa, b.arena, text, lang, &parsed);
-    return .{ .symbols = try b.arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
+    defer parsed.deinit(gpa);
+    const health = try parser.parse(gpa, arena, text, lang, &parsed);
+    return .{ .symbols = try arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
+}
+
+fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParseOutput {
+    return parseOne(b.gpa, b.arena, text, lang);
 }
 
 /// Write the parse-health warning for `rel_path` into `w`, or nothing when the
@@ -527,8 +720,8 @@ fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
     std.debug.print("{s}", .{w.buffered()});
 }
 
-/// Assign global ids to `parsed`, append its symbols and the owning `SourceFile`
-/// (plus its cache stat). Shared by the fresh-parse and cache-restore paths.
+/// Record one parsed file. Global symbol ids are assigned later, in `assemble`.
+/// Shared by the fresh-parse and cache-restore paths.
 fn appendFile(
     b: *Builder,
     rel_path: []const u8,
@@ -541,40 +734,14 @@ fn appendFile(
     std.debug.assert(text.len <= std.math.maxInt(u32));
     std.debug.assert((health.desync_from == null) == (health.desync_to == 0));
     warnParseHealth(rel_path, health);
-    const base: u32 = @intCast(b.symbols.items.len);
-    const file_id: FileId = @intCast(b.files.items.len);
-    for (parsed, 0..) |p, local| {
-        const parent: SymbolId = if (p.parent_local) |pl| base + pl else invalid;
-        try b.symbols.append(b.gpa, .{
-            .id = base + @as(u32, @intCast(local)),
-            .file = file_id,
-            .name = p.name,
-            .kind = p.kind,
-            .line = p.line,
-            .span_start = p.span_start,
-            .span_end = p.span_end,
-            .sig_end = p.sig_end,
-            .doc = p.doc,
-            .parent = parent,
-            .exported = p.exported,
-            .modifiers = p.modifiers,
-            .refs = p.refs,
-            .bindings = p.bindings,
-            .receiver = p.receiver,
-            .impl_protocol = p.impl_protocol,
-            .import_path = p.import_path,
-        });
-    }
     try b.files.append(b.gpa, .{
-        .id = file_id,
         .path = try b.arena.dupe(u8, rel_path),
         .language = lang,
         .text = text,
+        .symbols = parsed,
         .parse_health = health,
-        .sym_start = base,
-        .sym_end = @intCast(b.symbols.items.len),
+        .stat = stat,
     });
-    try b.stats.append(b.gpa, stat);
 }
 
 fn rebuildNameIndex(idx: *Index) !void {
