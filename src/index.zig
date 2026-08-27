@@ -629,6 +629,16 @@ fn isContainer(sym: model.Symbol) bool {
     };
 }
 
+/// Whether a value binding of this kind may hold a function: `const f = g;` and
+/// `const router = express.Router()` are both called through their name. The
+/// index does not type values, so a call to one is kept rather than deleted.
+fn mayHoldCallable(kind: model.SymbolKind) bool {
+    return switch (kind) {
+        .variable, .constant => true,
+        else => false,
+    };
+}
+
 /// Resolve every file's import statements (arena-owned), building both the
 /// local-edge table used for graph navigation and a compact outcome table that
 /// retains external, unresolved-local, and outside-root classifications.
@@ -796,12 +806,13 @@ fn resolveReferences(idx: *Index) void {
     }
 }
 
-/// Invariant: a call site never binds to something that cannot be called.
-/// Only languages with constructor-call syntax may point a call at a type.
+/// Invariant: a call site never binds to a *type*, unless the language spells
+/// construction as a call. Values stay legal call targets — nothing here types
+/// them, and a function-valued binding is genuinely callable.
 fn dropMisboundCall(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
     if (ref.kind != .call or ref.target == invalid) return;
     const target = idx.graph.symbols[ref.target];
-    if (isCallable(target)) return;
+    if (isCallable(target) or mayHoldCallable(target.kind)) return;
     if (isContainer(target) and idx.graph.files[from.file].language.callMayTargetType()) return;
     ref.target = invalid;
     ref.exact = false;
@@ -2410,6 +2421,61 @@ test "python: a same-named attribute on another object never yields a wrong exac
     const cross_ref = refByQual(cross, "store", "get").?;
     try testing.expectEqualStrings("o", cross_ref.receiver_root);
     try testing.expect(cross_ref.target == cache_get or !cross_ref.exact);
+}
+
+test "a call through a function-valued const keeps its edge" {
+    // Regression (F2): the no-call-to-a-non-callable rule deleted every call
+    // whose target was a value, so a function alias lost its edge — including
+    // `const partMatches = exactOrGlob;` in NavGraph's own query.zig.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn exactOrGlob(a: []const u8) bool {
+        \\    return a.len > 0;
+        \\}
+        \\pub const Holder = struct {
+        \\    const alias = exactOrGlob;
+        \\    pub fn use(x: []const u8) bool {
+        \\        return alias(x);
+        \\    }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const alias = qualifiedId(&idx, "Holder", "alias").?;
+    try testing.expectEqual(model.SymbolKind.constant, idx.graph.symbols[alias].kind);
+    const use = idx.graph.symbols[qualifiedId(&idx, "Holder", "use").?];
+    const ref = refByName(use, "alias").?;
+    try testing.expectEqual(model.RefKind.call, ref.kind);
+    try testing.expectEqual(alias, ref.target);
+}
+
+test "an express sub-router mount keeps its router handler" {
+    // Regression (F2): `app.use('/admin', adminRouter)` mounts a router held in
+    // a `const`; deleting calls to values dropped the handler entirely.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/js_express", false);
+    defer idx.deinit();
+
+    var checked = false;
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind != .route or !std.mem.eql(u8, sym.name, "ANY /admin")) continue;
+        // `routeHandler` reads the route's first resolved call ref.
+        const handler = refByName(sym, "adminRouter").?;
+        try testing.expectEqual(model.RefKind.call, handler.kind);
+        try testing.expect(handler.target != invalid);
+        try testing.expectEqualStrings("adminRouter", idx.graph.symbols[handler.target].name);
+        try testing.expectEqual(model.SymbolKind.variable, idx.graph.symbols[handler.target].kind);
+        checked = true;
+    }
+    try testing.expect(checked);
 }
 
 test "cpp: a member call through a typed pointer resolves to that type's method" {
