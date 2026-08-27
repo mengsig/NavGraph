@@ -143,6 +143,16 @@ pub fn main(init: std.process.Init) !void {
     if (!found) std.process.exit(1);
 }
 
+/// Say on stderr how many graph nodes `-l` withheld.
+fn noteGraphTruncation(io: std.Io, truncation: viz.Truncation, limit: u32) !void {
+    var buf: [128]u8 = undefined;
+    var file: std.Io.File.Writer = .init(.stderr(), io, &buf);
+    try file.interface.print("navgraph: graph truncated to {d} of {d} nodes (-l {d})\n", .{
+        truncation.shown, truncation.total, limit,
+    });
+    try file.interface.flush();
+}
+
 /// Run the parsed command; true when at least one real result row was printed
 /// (notes, suggestions, and empty JSON arrays don't count).
 fn dispatch(out: *std.Io.Writer, io: std.Io, idx: *index_mod.Index, parsed: cli.Parsed) !bool {
@@ -235,7 +245,12 @@ fn dispatchWithAuthority(
         .rename => try workflow.rename(out, io, idx, parsed.root, parsed.arg, parsed.arg2, parsed.options),
         .coverage => try query.coverage(out, idx, parsed.arg, parsed.options),
         .graph => blk: {
-            try viz.graph(out, idx, parsed.arg, parsed.options);
+            const truncation = try viz.graph(out, idx, parsed.arg, parsed.options);
+            // The JSON model carries `truncated`/`nodes_total`; the HTML page has
+            // nowhere to put it and stdout must stay a valid page, so say it on
+            // stderr instead of passing a capped subgraph off as the graph.
+            if (truncation.any() and parsed.options.format != .json)
+                try noteGraphTruncation(io, truncation, parsed.options.limit);
             break :blk true; // graph always emits a page/model
         },
         .capabilities, .serve, .help => unreachable,

@@ -103,6 +103,7 @@ navgraph graph src --no-tests > graph.html   # then open graph.html in a browser
 navgraph graph                                # whole repo (tests hidden in the initial view)
 navgraph graph -C src/lexer.zig > lexer.html  # scope to a single file
 navgraph graph -j > graph.json                # raw {nodes, edges} model for other tools
+navgraph graph -j -l 200                      # capped: `nodes_total` + `truncated` say what was withheld
 ```
 
 > Tip: GitHub won't run the page's JavaScript inline, so a repo shows a
@@ -152,7 +153,7 @@ navgraph <command> [arg] [flags]
 | `edits <symbol>`   | List exact definition and resolved-reference edit sites, with source offsets. |
 | `rename <sym> <new>` | Apply a collision-checked exact rename; `--preview` emits a unified patch without writing. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
-| `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges}` JSON. Respects `--tests`. |
+| `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges, nodes_total, truncated}` JSON. `-l` caps the node set; the JSON reports the total and text says so on stderr. Respects `--tests`. |
 | `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. |
 | `help [command]`   | Show the full catalogue or concise registry-derived help for one command. |
 
