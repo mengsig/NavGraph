@@ -1718,12 +1718,16 @@ fn covPct(num: u32, den: u32) f64 {
 
 /// Returns whether any in-scope file had imports to report.
 pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    _ = opts;
     var first = true;
+    var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.files) |file| {
         const imps = idx.importsOf(file.id);
         if (imps.len == 0 or !query.matchesFilter(file.path, filter)) continue;
+        // `-l` caps emitted entries. The payload stays a bare array: a
+        // truncation envelope would be a breaking shape change for clients.
+        if (query.listCap(opts)) |cap| if (shown >= cap) break;
+        shown += 1;
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -1747,12 +1751,14 @@ pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Opti
 /// whether any importer was actually found (mirrors the text renderer, which
 /// counts a target with zero importers as nothing found).
 pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !bool {
-    _ = opts;
     var first = true;
     var any_importer = false;
+    var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.files) |target| {
         if (!query.matchesFilter(target.path, path)) continue;
+        if (query.listCap(opts)) |cap| if (shown >= cap) break;
+        shown += 1;
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");

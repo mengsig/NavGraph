@@ -77,6 +77,9 @@ pub fn graph(w: *Writer, idx: *const Index, path_filter: []const u8, opts: query
         const file = idx.graph.files[sym.file];
         if (!query.matchesFilter(file.path, path_filter)) continue;
         if (!inScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
+        // `-l` caps the node set (edges then span only surviving nodes). Only
+        // when the user asked: an unset limit still renders the whole graph.
+        if (query.listCap(opts)) |cap| if (node_ids.items.len >= cap) break;
         node_of[sym.id] = @intCast(node_ids.items.len);
         try node_ids.append(gpa, sym.id);
     }

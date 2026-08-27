@@ -22,6 +22,10 @@ pub const Parsed = struct {
     /// applicability reject historical no-op flag combinations without trying
     /// to infer intent from default-valued `query.Options` fields.
     used_options: std.EnumSet(registry.Option) = std.EnumSet(registry.Option).initEmpty(),
+    /// Global-class options named on a command that does not declare them.
+    /// Accepted and ignored so a client's standard flag set never turns a
+    /// working call into a usage error; the CLI reports them on stderr.
+    ignored_options: std.EnumSet(registry.Option) = std.EnumSet(registry.Option).initEmpty(),
     /// Use the incremental on-disk cache (`.navgraph/cache`). Disabled by
     /// `--no-cache` for a guaranteed-clean rebuild.
     use_cache: bool = true,
@@ -366,7 +370,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Parsed {
         if (command == .rename) return fail(error.Usage, "rename needs a selector and new name: navgraph rename <symbol> <new-name> [--preview]", .{});
         return fail(error.Usage, "{s} needs an argument: navgraph {s} <arg> [flags]", .{ @tagName(command), @tagName(command) });
     }
-    try validateCommandOptions(result);
+    try validateCommandOptions(&result);
     return result;
 }
 
@@ -682,12 +686,14 @@ fn splitFlag(raw: []const u8) SplitFlag {
     return .{ .name = raw, .inline_val = null };
 }
 
-fn validateCommandOptions(parsed: Parsed) ParseError!void {
+fn validateCommandOptions(parsed: *Parsed) ParseError!void {
     const opts = parsed.options;
     inline for (std.meta.fields(registry.Option)) |field| {
         const option = @field(registry.Option, field.name);
         if (parsed.used_options.contains(option) and !registry.hasOption(parsed.command, option)) {
-            return fail(error.Usage, "option '{s}' does not apply to {s}", .{ registry.optionDescriptor(option).name, @tagName(parsed.command) });
+            if (!registry.isGlobalClassOption(option))
+                return fail(error.Usage, "option '{s}' does not apply to {s}", .{ registry.optionDescriptor(option).name, @tagName(parsed.command) });
+            parsed.ignored_options.insert(option);
         }
     }
     for (registry.descriptor(parsed.command).required_options) |option| {
@@ -703,7 +709,7 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
             return fail(error.Usage, "option '{s}' requires option '{s}'", .{ trigger, required });
         }
         if (dependency.required_value) |expected| {
-            if (!optionMatchesValue(parsed, dependency.requires, expected)) {
+            if (!optionMatchesValue(parsed.*, dependency.requires, expected)) {
                 return fail(error.Usage, "option '{s}' requires option '{s}' to have the advertised value", .{ trigger, required });
             }
         }
@@ -754,6 +760,10 @@ fn validateCommandOptions(parsed: Parsed) ParseError!void {
         parsed.command == .reaches or parsed.command == .affected;
     if (compact and !compact_command)
         return fail(error.Usage, "--max-nodes/--summary require a traversal or ranked listing", .{});
+    // Applicability is lenient for global-class flags, but a command that cannot
+    // emit a format at all must still refuse it — that is an output-mode error.
+    if (opts.format == .json and !registry.supportsOutput(parsed.command, .json))
+        return fail(error.Usage, "--json is not an output mode for {s}", .{@tagName(parsed.command)});
     if (opts.format == .jsonl and !registry.supportsOutput(parsed.command, .jsonl))
         return fail(error.Usage, "--jsonl is supported by outline, search, hot, todos, reaches, affected, edits, and status", .{});
     if (opts.after_set and opts.format != .jsonl and parsed.command != .read)
@@ -836,17 +846,43 @@ test "capabilities is a no-positional metadata command with version aliases" {
     try std.testing.expectEqual(Command.capabilities, (try parse(&.{"version"})).command);
     try std.testing.expectEqual(Command.capabilities, (try parse(&.{"--version"})).command);
     try std.testing.expectError(error.Usage, parse(&.{ "capabilities", "unexpected" }));
-    try std.testing.expectError(error.Usage, parse(&.{ "capabilities", "--no-cache" }));
+    // `--no-cache` is global-class: accepted and reported, never a usage error.
+    const ignored = try parse(&.{ "capabilities", "--no-cache" });
+    try std.testing.expect(ignored.ignored_options.contains(.no_cache));
     try std.testing.expectError(error.Usage, parse(&.{ "capabilities", "--jsonl" }));
 }
 
-test "descriptor applicability rejects accepted-but-meaningless flag combinations" {
+test "descriptor applicability rejects a command-specific flag on the wrong command" {
+    // Command-specific flags stay hard usage errors: they can only be a mistake.
     try std.testing.expectError(error.Usage, parse(&.{ "def", "x", "--no-recurse" }));
+    try std.testing.expectError(error.Usage, parse(&.{ "outline", "--preview" }));
     try std.testing.expectEqual(@as(u32, 10), (try parse(&.{ "read", "x.zig", "--limit", "10" })).options.limit);
-    try std.testing.expectError(error.Usage, parse(&.{ "read", "x.zig", "--no-cache" }));
+    // A format the command cannot emit is still refused (output mode, not
+    // applicability), even though `-j` is global-class.
     try std.testing.expectError(error.Usage, parse(&.{ "serve", "--json" }));
     try std.testing.expect((try parse(&.{ "outline", "src", "--no-recurse" })).options.no_recurse);
     try std.testing.expect((try parse(&.{ "rename", "Old", "New", "--preview" })).options.preview);
+}
+
+test "a global-class flag a command does not use is accepted, ignored, and reported" {
+    // Regression: eight previously working invocations began exiting 2, which
+    // broke every client that appends a standard flag set to one argv template.
+    const cases = [_][]const [:0]const u8{
+        &.{ "read", "src/model.zig", "--no-cache" },
+        &.{ "neighbors", "readLines", "-d", "2" },
+        &.{ "imports", "-l", "500" },
+        &.{ "importers", "model.zig", "-l", "5" },
+        &.{ "graph", "-j", "-l", "500" },
+    };
+    for (cases) |argv| _ = try parse(argv); // declared now: accepted outright
+
+    // Not applicable, but never fatal: accepted, ignored, and named for stderr.
+    const def_limit = try parse(&.{ "def", "Symbol", "-l", "5" });
+    try std.testing.expect(def_limit.ignored_options.contains(.limit));
+    const def_depth = try parse(&.{ "def", "Symbol", "-d", "2" });
+    try std.testing.expect(def_depth.ignored_options.contains(.depth));
+    const docs_limit = try parse(&.{ "docs", "Symbol", "-l", "5" });
+    try std.testing.expect(docs_limit.ignored_options.contains(.limit));
 }
 
 test "descriptor dependencies and conflicts are enforced by the parser" {

@@ -51,6 +51,18 @@ pub fn main(init: std.process.Init) !void {
         try err_out.flush();
         std.process.exit(2);
     };
+    // A global-class flag the command does not use is accepted so a client's
+    // standard argv keeps working, but never silently: name it on stderr.
+    {
+        var it = parsed.ignored_options.iterator();
+        while (it.next()) |option| {
+            try err_out.print("navgraph: option '{s}' does not apply to {s}; ignored\n", .{
+                cli.registry.optionDescriptor(option).name,
+                @tagName(parsed.command),
+            });
+        }
+        try err_out.flush();
+    }
     if (parsed.command == .help) {
         if (parsed.arg.len == 0) {
             cli.usage(out) catch std.process.exit(141);

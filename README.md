@@ -158,12 +158,21 @@ navgraph <command> [arg] [flags]
 
 **Flags**
 
+Flags come in two classes. The **global-class** flags — `-v`, `-d`, `-C`, `-l`,
+`-t`, `-s`, `-r`, `-j`, `--no-cache` — are accepted on every command, so a client
+can append one standard flag set to any argv. A command that has no use for one
+ignores it and says so on stderr, keeping exit 0; the authoritative per-command
+list of flags that actually *do* something is `navgraph capabilities -j`
+(`commands[].options`). Every other flag is command-specific and is a usage error
+(exit 2) on a command that does not declare it. A format a command cannot emit
+(`serve -j`, `def --jsonl`) is likewise an error, not an ignored flag.
+
 | Flag                          | Meaning                                    |
 |-------------------------------|--------------------------------------------|
 | `-v, --verbosity <level>`     | `names` \| `sig` \| `doc` \| `full` (default `sig`). |
-| `-d, --depth <N>`             | Graph depth for call walks and `raises` propagation (default `1`). |
+| `-d, --depth <N>`             | Graph depth for call walks, `neighbors`, and `raises` propagation (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
-| `-l, --limit <N>`             | Max results (default `300`).               |
+| `-l, --limit <N>`             | Max results (default `300`). On `imports`/`importers`/`graph`, which are otherwise unbounded, it caps only when given explicitly. |
 | `--budget <bytes>`            | On commands declaring this option, a hard serialized stdout ceiling (minimum 64 bytes); results are importance-ranked, compacted, and marked/cursored when truncated. |
 | `--max-nodes <N>`             | Exact retained-node cap; `--summary` renders retained nodes at name detail and reports elision. |
 | `--since <ref>`               | Git comparison ref for `affected` or the lower history bound for `churn`. |
@@ -193,7 +202,7 @@ navgraph <command> [arg] [flags]
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
 | `--jsonl`                     | Stream one item per JSON line plus a page record. `--after v1:N` resumes from its stable ordinal cursor. Supported by `outline`, `search`, `hot`, `todos`, `reaches`, `affected`, `edits`, and `status`. |
 | `--sort <key>`                | `files`: `path|symbols`; `outline`/`search`: `line|name|span|callers|callees`; `hot`: `fan_in|fan_in_exact|fan_out|fan_out_exact|span`; `churn`: `commits|lines`. Numeric metrics rank descending with stable path/line ties. |
-| `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild.  |
+| `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild. Accepted by `read`, which never uses the cache either way. |
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
 | `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
 
