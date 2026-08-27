@@ -55,6 +55,17 @@ pub const Language = enum {
         };
     }
 
+    /// True where `T(...)` legitimately invokes the type itself — a Python/Ruby
+    /// class call, a C++/Java/C#/Rust constructor, a JS factory. Elsewhere a
+    /// *call* bound to a type is always a mis-binding (Go `a.store.Stats()`
+    /// pointed at `struct Stats` instead of the method).
+    pub fn callMayTargetType(self: Language) bool {
+        return switch (self) {
+            .python, .ruby, .javascript, .typescript, .tsx, .cpp, .csharp, .java, .rust => true,
+            .zig, .c, .go, .lua, .unknown => false,
+        };
+    }
+
     /// Family groups languages that resolve references against each other.
     pub fn family(self: Language) Family {
         return switch (self) {

@@ -605,6 +605,15 @@ fn attachCrossFileMethodParents(idx: *Index) void {
     }
 }
 
+/// Whether a call site can legitimately name this definition. Function-like
+/// macros count: `DS_ARRAY_LEN(x)` in C is a call as far as the graph cares.
+fn isCallable(sym: model.Symbol) bool {
+    return switch (sym.kind) {
+        .function, .method, .macro => true,
+        else => false,
+    };
+}
+
 fn isContainer(sym: model.Symbol) bool {
     return switch (sym.kind) {
         .class, .interface, .@"struct", .@"enum", .type => true,
@@ -755,6 +764,10 @@ fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference)
         if (fid == from.file) continue; // own package is never name-qualified
         const t = topLevelIn(idx, fid, ref.name);
         if (t == invalid) continue;
+        // `a.store.Stats()` keeps only `store` as the qualifier, which also
+        // names the package. A call must not settle for the package's *type*
+        // named `Stats`; leave it for the receiver-scoped paths below.
+        if (ref.kind == .call and !isCallable(idx.graph.symbols[t])) continue;
         hits += 1;
         if (found == invalid) found = t;
     }
@@ -770,8 +783,22 @@ fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
             resolveOne(idx, sym.*, ref);
+            dropMisboundCall(idx, sym.*, ref);
         }
     }
+}
+
+/// Invariant: a call site never binds to something that cannot be called.
+/// Only languages with constructor-call syntax may point a call at a type.
+fn dropMisboundCall(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    if (ref.kind != .call or ref.target == invalid) return;
+    const target = idx.graph.symbols[ref.target];
+    if (isCallable(target)) return;
+    if (isContainer(target) and idx.graph.files[from.file].language.callMayTargetType()) return;
+    ref.target = invalid;
+    ref.exact = false;
+    ref.resolution_status = .unresolved;
+    ref.resolution_reason = .none;
 }
 
 /// Resolve a single reference to a target definition and set its confidence.
@@ -1437,11 +1464,16 @@ fn isSelfReceiver(qualifier: []const u8) bool {
 /// local `var -> type` binding. `self`/`this` are handled separately (scoped by
 /// the concrete parent id, see `memberOfParent`).
 fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[]const u8 {
-    _ = idx;
     // Return only a *typed* binding: bindings now also carry untyped locals and
     // parameters (name-only, empty type) to shadow same-named globals in bare
     // resolution, but those give no receiver type to scope a member access by.
     for (from.bindings) |b| {
+        if (std.mem.eql(u8, b.name, qualifier) and b.type_name.len > 0) return b.type_name;
+    }
+    // A field of the enclosing type. `a.store.Get()` keeps only `store` as the
+    // qualifier, so the declaring type's field table is the type evidence.
+    if (from.parent == invalid) return null;
+    for (idx.graph.symbols[from.parent].bindings) |b| {
         if (std.mem.eql(u8, b.name, qualifier) and b.type_name.len > 0) return b.type_name;
     }
     return null;
@@ -2125,6 +2157,153 @@ test "member calls: typed receiver is exact; unknown receiver is a heuristic gue
         }
     }
     try testing.expect(checked);
+}
+
+test "go: a member call through a struct field of declared type resolves by type" {
+    // Regression (F-9): `a.store.Get(id)` where `store store.Store`. The compact
+    // reference keeps only `store` as the qualifier, so the declaring struct's
+    // field table is the receiver's only type evidence.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const store_get = qualifiedId(&idx, "Store", "Get").?;
+    const get_widget = idx.graph.symbols[qualifiedId(&idx, "API", "GetWidget").?];
+    var checked = false;
+    for (get_widget.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "Get")) continue;
+        try testing.expectEqual(store_get, ref.target);
+        // The field's declared type is known, so this is not a name guess.
+        try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "go: a call never binds to a type that shares the package-qualified name" {
+    // Regression (F-9): `a.store.Stats()` bound to `struct Stats` — the type,
+    // not the method — and was not flagged, so `--strict` kept it.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const stats_struct = idx.lookup("Stats")[0];
+    try testing.expectEqual(model.SymbolKind.@"struct", idx.graph.symbols[stats_struct].kind);
+    const store_stats = qualifiedId(&idx, "Store", "Stats").?;
+
+    const api_stats = idx.graph.symbols[qualifiedId(&idx, "API", "Stats").?];
+    var checked = false;
+    for (api_stats.refs) |ref| {
+        if (ref.kind != .call or !std.mem.eql(u8, ref.name, "Stats")) continue;
+        try testing.expect(ref.target != stats_struct);
+        try testing.expectEqual(store_stats, ref.target);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "cpp: a member call through a typed pointer resolves to that type's method" {
+    // Regression (F-9): `for (const Shape* s : shapes) s->area()`.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/cpp_app", false);
+    defer idx.deinit();
+
+    const shape_area = qualifiedId(&idx, "Shape", "area").?;
+    const shape_name = qualifiedId(&idx, "Shape", "name").?;
+    const summarize = idx.graph.symbols[idx.lookup("summarize")[0]];
+    var saw_area = false;
+    var saw_name = false;
+    for (summarize.refs) |ref| {
+        if (!std.mem.eql(u8, ref.qualifier, "s")) continue;
+        if (std.mem.eql(u8, ref.name, "area")) {
+            try testing.expectEqual(shape_area, ref.target);
+            try testing.expect(ref.exact);
+            saw_area = true;
+        } else if (std.mem.eql(u8, ref.name, "name")) {
+            try testing.expectEqual(shape_name, ref.target);
+            saw_name = true;
+        }
+    }
+    try testing.expect(saw_area and saw_name);
+}
+
+test "lua: a colon method call records its receiver and keeps the edge" {
+    // Regression (F-9): `world:step(dt)` lost its qualifier entirely, so the
+    // member call fell into bare resolution and was dropped.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/lua_game", false);
+    defer idx.deinit();
+
+    const step = qualifiedId(&idx, "Game", "step").?;
+    const update = idx.graph.symbols[idx.lookup("update")[0]];
+    var checked = false;
+    for (update.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "step")) continue;
+        try testing.expectEqualStrings("world", ref.qualifier);
+        try testing.expectEqual(step, ref.target);
+        // `world` is assigned in another function: the receiver type is a
+        // guess, so the edge must stay heuristic for `--strict`.
+        try testing.expect(!ref.exact);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "an unknown receiver still abstains when many same-named members exist" {
+    // The tightening this PR makes is *kept*: on NavGraph's own src/ it removed
+    // ~610 false `x.deinit()` edges that bound to an arbitrary same-named
+    // member. Restoring typed receivers must not bring that class back.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub const A = struct {
+        \\    pub fn deinit(self: *A) void {}
+        \\};
+        \\pub const B = struct {
+        \\    pub fn deinit(self: *B) void {}
+        \\};
+        \\pub const C = struct {
+        \\    pub fn deinit(self: *C) void {}
+        \\};
+        \\pub const D = struct {
+        \\    pub fn deinit(self: *D) void {}
+        \\};
+        \\pub const E = struct {
+        \\    pub fn deinit(self: *E) void {}
+        \\};
+        \\pub fn release(a: *A) void {
+        \\    a.deinit();
+        \\    unknown.deinit();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const a_deinit = qualifiedId(&idx, "A", "deinit").?;
+    const release = idx.graph.symbols[idx.lookup("release")[0]];
+    var saw_typed = false;
+    var saw_unknown = false;
+    for (release.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "deinit")) continue;
+        if (std.mem.eql(u8, ref.qualifier, "a")) {
+            // Known type: resolved, and exactly.
+            try testing.expectEqual(a_deinit, ref.target);
+            try testing.expect(ref.exact);
+            saw_typed = true;
+        } else if (std.mem.eql(u8, ref.qualifier, "unknown")) {
+            // Unknown receiver among many same-named members: abstain.
+            try testing.expectEqual(invalid, ref.target);
+            saw_unknown = true;
+        }
+    }
+    try testing.expect(saw_typed and saw_unknown);
 }
 
 test "a bare identifier never binds to a same-named class member" {

@@ -704,6 +704,13 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
         }
         if (ctx.isPunct(i - 2, '>')) return genericReceiver(ctx, i - 2, lo);
     }
+    // Lua method call `recv:name(...)`: the colon is sugar for passing `recv`
+    // as self, so the receiver scopes the member exactly as `recv.name` does.
+    if (ctx.cfg.language == .lua and i >= lo + 2 and ctx.isPunct(i - 1, ':') and
+        ctx.toks[i - 2].kind == .identifier)
+    {
+        return ctx.textOf(i - 2);
+    }
     // Zig postfix unwrap/deref: `opt.?.name` / `ptr.*.name`.
     if (ctx.cfg.language == .zig and i >= lo + 4 and ctx.isPunct(i - 1, '.') and
         (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '*')) and ctx.isPunct(i - 3, '.') and
@@ -976,7 +983,12 @@ const factory_names = std.StaticStringMap(void).initComptime(.{
 fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]const Binding {
     var list: std.ArrayList(Binding) = .empty;
     defer list.deinit(ctx.gpa);
-    if (params_open != sentinel) try collectParamBindings(ctx, params_open, &list);
+    if (params_open != sentinel) {
+        if (ctx.cfg.language.family() == .c)
+            try collectCParamBindings(ctx, params_open, &list)
+        else
+            try collectParamBindings(ctx, params_open, &list);
+    }
     var i = lo;
     while (i < hi) : (i += 1) {
         const b = detectBinding(ctx, i, hi, lo) orelse continue;
@@ -1019,9 +1031,103 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
     }
 }
 
+/// Leading words a C/C++ declarator may carry before its type.
+const c_decl_modifiers = KeywordSet.initComptime(.{
+    .{"const"},  .{"static"},   .{"volatile"}, .{"mutable"}, .{"register"},
+    .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
+    .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
+    .{"class"},  .{"auto"},     .{"typename"},
+});
+
+/// Words that open a statement rather than a declaration, so a run starting
+/// with one is never `Type name`.
+const c_statement_keywords = KeywordSet.initComptime(.{
+    .{"if"},     .{"for"},       .{"while"},     .{"switch"}, .{"return"},
+    .{"else"},   .{"do"},        .{"case"},      .{"goto"},   .{"break"},
+    .{"continue"}, .{"sizeof"},  .{"new"},       .{"delete"}, .{"throw"},
+    .{"try"},    .{"catch"},     .{"using"},     .{"namespace"}, .{"typedef"},
+    .{"template"}, .{"public"},  .{"private"},   .{"protected"}, .{"friend"},
+    .{"virtual"}, .{"operator"}, .{"default"},
+});
+
+/// Parse a C/C++ declarator `[modifiers] Type[::Q][<...>] [*&]* name` ending at
+/// `; = , ) : [ {`, returning `name -> Type`. Rejects a call or a function
+/// declaration (`name` followed by `(`) and anything without both a type and a
+/// name, so an expression statement yields nothing.
+fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
+    if (c_statement_keywords.has(ctx.textOf(start))) return null;
+    var i = start;
+    while (i < limit and ctx.toks[i].kind == .identifier and
+        c_decl_modifiers.has(ctx.textOf(i))) : (i += 1)
+    {}
+
+    // Type chain: `A`, `a::B`, each optionally followed by `<...>`.
+    var type_name: ?[]const u8 = null;
+    while (i < limit and ctx.toks[i].kind == .identifier) {
+        type_name = ctx.textOf(i);
+        i += 1;
+        if (i < limit and ctx.isPunct(i, '<')) {
+            const close = ctx.close[i];
+            if (close == sentinel or close >= limit) return null;
+            i = close + 1;
+        }
+        if (i + 1 < limit and ctx.isPunct(i, ':') and ctx.isPunct(i + 1, ':')) {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    if (type_name == null) return null;
+
+    while (i < limit and (ctx.isPunct(i, '*') or ctx.isPunct(i, '&'))) : (i += 1) {}
+    if (i >= limit or ctx.toks[i].kind != .identifier) return null;
+    if (c_decl_modifiers.has(ctx.textOf(i)) or c_statement_keywords.has(ctx.textOf(i))) return null;
+    const name = ctx.textOf(i);
+    i += 1;
+
+    // `name(` is a call or a function declaration, never a variable we can type.
+    if (i < limit and ctx.toks[i].kind == .punct) {
+        const c = ctx.ch(i);
+        if (c == ';' or c == '=' or c == ',' or c == ')' or c == ':' or c == '[' or c == '{')
+            return .{ .name = name, .type_name = type_name.? };
+    }
+    return null;
+}
+
+/// Record `name -> Type` for each C/C++ parameter in `(...)`.
+fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Binding)) !void {
+    const close = ctx.close[open];
+    if (close == sentinel) return;
+    var start = open + 1;
+    var i = start;
+    while (i < close) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '<')) {
+            const inner = ctx.close[i];
+            i = if (inner == sentinel or inner >= close) i + 1 else inner + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, ',')) {
+            if (cDeclarator(ctx, start, i + 1)) |b| try list.append(ctx.gpa, b);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < close) {
+        if (cDeclarator(ctx, start, close + 1)) |b| try list.append(ctx.gpa, b);
+    }
+}
+
 fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
     const t = ctx.toks[i];
     if (t.kind != .identifier) return null;
+    // C/C++ put the type before the name (`const Shape* s`), so the
+    // `const`-introduces-a-name rule below would read the *type* as the name.
+    if (ctx.cfg.language.family() == .c) {
+        if (i != lo and !ctx.isPunct(i - 1, ';') and !ctx.isPunct(i - 1, '{') and
+            !ctx.isPunct(i - 1, '}') and !ctx.isPunct(i - 1, '(') and
+            ctx.toks[i - 1].line == t.line) return null;
+        return cDeclarator(ctx, i, hi);
+    }
     const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
     if (is_decl) {
         if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
@@ -3452,6 +3558,7 @@ fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
             .exported = goExported(name),
             .parent_local = parent,
             .refs = &.{},
+            .bindings = if (is_iface) &.{} else try collectGoFieldBindings(ctx, open, close),
         });
         if (is_iface) try parseGoInterfaceMethods(ctx, open + 1, close, my);
         return close + 1;
@@ -3471,6 +3578,42 @@ fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         .refs = &.{},
     });
     return tokenAfterOffset(ctx, end, hi);
+}
+
+/// Field `name Type` pairs from a Go struct body. A method of the struct can
+/// then resolve a member access through one of its fields by the field's
+/// declared type — `a.store.Get()` where `store store.Store` — instead of
+/// guessing by method name. The compact reference model keeps only `store` as
+/// the qualifier, so the field table is the only surviving type evidence.
+fn collectGoFieldBindings(ctx: *Ctx, open: u32, close: u32) ![]const Binding {
+    var list: std.ArrayList(Binding) = .empty;
+    defer list.deinit(ctx.gpa);
+    var i = open + 1;
+    while (i < close) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier or !isLineStart(ctx, i)) continue;
+        if (go_keywords.has(ctx.textOf(i))) continue;
+        const field_line = ctx.toks[i].line;
+        const name = ctx.textOf(i);
+        var j = i + 1;
+        // `*T`, `[]T`, `map[K]V` all put the element type after the decoration.
+        while (j < close and (ctx.isPunct(j, '*') or ctx.isPunct(j, '['))) {
+            if (ctx.isPunct(j, '[')) {
+                const c = ctx.close[j];
+                j = if (c == sentinel or c >= close) close else c + 1;
+                continue;
+            }
+            j += 1;
+        }
+        if (j >= close or ctx.toks[j].kind != .identifier) continue;
+        if (ctx.toks[j].line != field_line) continue;
+        var type_name = ctx.textOf(j);
+        while (j + 2 < close and ctx.isPunct(j + 1, '.') and ctx.toks[j + 2].kind == .identifier) {
+            j += 2;
+            type_name = ctx.textOf(j);
+        }
+        try list.append(ctx.gpa, .{ .name = name, .type_name = type_name });
+    }
+    return ctx.arena.dupe(Binding, list.items);
 }
 
 /// Emit a `method` for each `Name(params) ret` signature line in a Go interface
