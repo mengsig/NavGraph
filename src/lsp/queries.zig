@@ -330,6 +330,7 @@ pub fn writeBlast(
     var nodes: std.ArrayList(BlastNode) = .empty;
     var seen: std.AutoHashMapUnmanaged(SymbolId, usize) = .empty;
     var edges: std.ArrayList(BlastEdge) = .empty;
+    var edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     // `query.callSiteLines` grows its output with the index's own allocator, so
     // this scratch list must be freed with that one, not the request arena.
     var lines: std.ArrayList(u32) = .empty;
@@ -339,6 +340,7 @@ pub fn writeBlast(
         seen.deinit(gpa);
         for (edges.items) |e| gpa.free(e.lines);
         edges.deinit(gpa);
+        edge_seen.deinit(gpa);
         lines.deinit(idx.gpa);
     }
 
@@ -380,8 +382,12 @@ pub fn writeBlast(
                 try slot.via.append(gpa, from_id);
                 if (n.exact) slot.exact = true;
             }
+            // One edge per pair: a target called on several lines yields several
+            // references, but `callSiteLines` already unions every call site.
             const caller = if (opts.direction == .callers) n.id else from_id;
             const callee = if (opts.direction == .callers) from_id else n.id;
+            const pair = (@as(u64, caller) << 32) | callee;
+            if ((try edge_seen.getOrPut(gpa, pair)).found_existing) continue;
             try query.callSiteLines(idx, caller, callee, &lines);
             try edges.append(gpa, .{
                 .from = caller,
@@ -585,7 +591,6 @@ fn writeNode(
     try w.writeAll("],\"ext\":");
     try payload.writeExternals(w, idx.graph.symbols[id], opts.scope.strict);
     try w.writeAll(",\"recursion\":false}");
-    _ = visited.remove(id);
 }
 
 /// Whether every edge from `from` to `to` is a plain data read.

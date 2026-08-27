@@ -68,7 +68,7 @@ pub const UriError = error{ NotAFileUri, BadPercentEscape };
 /// Decode a `file://` URI into a filesystem path (percent-escapes resolved).
 /// Caller owns the result. A bare path (no scheme) is accepted as-is, which is
 /// what hand-written scripts and some clients send.
-pub fn pathFromUri(gpa: std.mem.Allocator, uri: []const u8) ![]u8 {
+pub fn pathFromUri(gpa: std.mem.Allocator, uri: []const u8) (UriError || std.mem.Allocator.Error)![]u8 {
     var rest = uri;
     if (std.mem.startsWith(u8, uri, "file://")) {
         rest = uri["file://".len..];

@@ -63,17 +63,6 @@ pub const Log = struct {
 /// an internal error.
 pub const Error = anyerror;
 
-/// The failures `mapError` gives a contract-defined code.
-pub const Named = error{
-    InvalidParams,
-    MethodNotFound,
-    SymbolNotFound,
-    FileNotIndexed,
-    BadPattern,
-    RegexTooComplex,
-    NotInitialized,
-};
-
 /// A handler renders the JSON-RPC `result` value into `w`.
 const Handler = *const fn (*Server, std.mem.Allocator, ?std.json.Value, *Writer) Error!void;
 const Notifier = *const fn (*Server, std.mem.Allocator, ?std.json.Value) Error!void;
@@ -1732,4 +1721,73 @@ test "requests before initialized report a not-initialized error" {
     );
     defer res.deinit();
     try testing.expectEqual(@as(i64, -32600), try errorCodeOf(res));
+}
+
+test "blast emits one edge per caller/callee pair, listing every call site" {
+    const repeated = [_][2][]const u8{
+        .{
+            "app.zig",
+            \\pub fn target() void {}
+            \\
+            \\pub fn twice() void {
+            \\    target();
+            \\    target();
+            \\}
+            \\
+        },
+    };
+    const ts = try TestServer.init(testing.allocator, testing.io, &repeated);
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(47,
+        \\{"jsonrpc":"2.0","id":47,"method":"navgraph/blast","params":{"symbol":"target","depth":1}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    const edges = r.get("edges").?.array.items;
+    try testing.expectEqual(@as(usize, 1), edges.len);
+    // Both call sites are on the single edge.
+    const lines = try lineList(testing.allocator, edges[0].object);
+    defer testing.allocator.free(lines);
+    try testing.expectEqualSlices(i64, &.{ 4, 5 }, lines);
+    try testing.expectEqual(@as(i64, 2), r.get("summary").?.object.get("symbols").?.integer);
+}
+
+fn lineList(gpa: std.mem.Allocator, edge: std.json.ObjectMap) ![]const i64 {
+    const items = edge.get("lines").?.array.items;
+    const out = try gpa.alloc(i64, items.len);
+    for (items, out) |v, *o| o.* = v.integer;
+    return out;
+}
+
+test "a call tree marks a symbol reached twice as recursion, not a second subtree" {
+    const cyclic = [_][2][]const u8{
+        .{
+            "app.zig",
+            \\pub fn alpha() void {
+            \\    beta();
+            \\}
+            \\
+            \\pub fn beta() void {
+            \\    alpha();
+            \\}
+            \\
+        },
+    };
+    const ts = try TestServer.init(testing.allocator, testing.io, &cyclic);
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(48,
+        \\{"jsonrpc":"2.0","id":48,"method":"navgraph/calls","params":{"symbol":"alpha","depth":5}}
+    );
+    defer res.deinit();
+    var node = (try resultOf(res)).object.get("root").?.object;
+    // alpha -> beta -> alpha(recursion): terminates instead of unrolling to depth 5.
+    var hops: usize = 0;
+    while (node.get("children").?.array.items.len != 0) : (hops += 1) {
+        try testing.expect(hops < 5);
+        node = node.get("children").?.array.items[0].object;
+    }
+    try testing.expect(node.get("recursion").?.bool);
+    try testing.expectEqual(@as(usize, 2), hops);
 }
