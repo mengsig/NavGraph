@@ -85,33 +85,40 @@ missing, so this can't rot back into a silent guess.
 
 ## Baseline at this commit
 
-Percentages; the triples are matched/produced/expected. `site R` is call-site
-recall within matched edges (see "What is measured"), floored as a sixth
-metric alongside the other five; its pair is matched/expected call sites.
+Percentages; the triples are matched/produced/expected. `site P` is call-site
+precision and `site R` is call-site recall over every golden edge, matched or
+not (see "What is measured") - the sixth and seventh floored metrics
+alongside the other five; the sites triple is matched/produced/expected call
+sites.
 
-| language | def P | def R | defs | edge P | edge R | edges | exact agree | site R | sites |
-|---|---|---|---|---|---|---|---|---|---|
-| c | 98.68 | 65.78 | 75/76/114 | 100.00 | 56.81 | 50/50/88 | 100.00 | 100.00 | 54/54 |
-| cpp | 69.40 | 56.02 | 93/134/166 | 38.46 | 17.64 | 15/39/85 | 33.33 | 100.00 | 16/16 |
-| csharp | 100.00 | 71.07 | 86/86/121 | 89.47 | 49.27 | 34/38/69 | 52.94 | 100.00 | 41/41 |
-| go | 100.00 | 79.20 | 80/80/101 | 81.81 | 45.00 | 27/33/60 | 70.37 | 100.00 | 27/27 |
-| java | 100.00 | 76.25 | 106/106/139 | 77.92 | 55.04 | 60/77/109 | 41.66 | 100.00 | 67/67 |
-| javascript | 85.05 | 77.08 | 74/87/96 | 93.87 | 73.01 | 46/49/63 | 82.60 | 100.00 | 48/48 |
-| lua | 90.90 | 66.66 | 50/55/75 | 80.55 | 54.71 | 29/36/53 | 79.31 | 100.00 | 32/32 |
-| python | 96.68 | 91.14 | 175/181/192 | 90.00 | 86.02 | 117/130/136 | 75.21 | 100.00 | 120/120 |
-| ruby | 96.42 | 67.50 | 54/56/80 | 100.00 | 20.96 | 13/13/62 | 53.84 | 100.00 | 14/14 |
-| rust | 98.64 | 85.88 | 73/74/85 | 70.58 | 45.56 | 36/51/79 | 66.66 | 100.00 | 41/41 |
-| typescript | 91.78 | 56.77 | 67/73/118 | 96.15 | 44.64 | 25/26/56 | 84.00 | 100.00 | 25/25 |
-| zig | 100.00 | 72.91 | 105/105/144 | 98.36 | 63.82 | 60/61/94 | 61.66 | 100.00 | 64/64 |
-| **all** | **93.26** | **72.53** | 1038/1113/1431 | **84.90** | **53.66** | 512/603/954 | **69.33** | **100.00** | 549/549 |
+| language | def P | def R | defs | edge P | edge R | edges | exact agree | site P | site R | sites |
+|---|---|---|---|---|---|---|---|---|---|---|
+| c | 98.68 | 65.78 | 75/76/114 | 100.00 | 56.81 | 50/50/88 | 100.00 | 100.00 | 52.94 | 54/54/102 |
+| cpp | 69.40 | 56.02 | 93/134/166 | 38.46 | 17.44 | 15/39/86 | 33.33 | 100.00 | 15.84 | 16/16/101 |
+| csharp | 100.00 | 71.07 | 86/86/121 | 89.47 | 47.88 | 34/38/71 | 52.94 | 87.23 | 51.89 | 41/47/79 |
+| go | 100.00 | 79.20 | 80/80/101 | 81.81 | 45.00 | 27/33/60 | 70.37 | 100.00 | 45.00 | 27/27/60 |
+| java | 100.00 | 76.25 | 106/106/139 | 77.92 | 54.05 | 60/77/111 | 41.66 | 90.54 | 54.91 | 67/74/122 |
+| javascript | 85.05 | 77.08 | 74/87/96 | 93.87 | 70.76 | 46/49/65 | 82.60 | 100.00 | 71.64 | 48/48/67 |
+| lua | 90.90 | 66.66 | 50/55/75 | 80.55 | 54.71 | 29/36/53 | 79.31 | 96.96 | 55.17 | 32/33/58 |
+| python | 96.68 | 91.14 | 175/181/192 | 90.00 | 84.78 | 117/130/138 | 75.21 | 100.00 | 85.10 | 120/120/141 |
+| ruby | 96.42 | 67.50 | 54/56/80 | 100.00 | 20.96 | 13/13/62 | 53.84 | 100.00 | 22.22 | 14/14/63 |
+| rust | 98.64 | 85.88 | 73/74/85 | 70.58 | 42.85 | 36/51/84 | 66.66 | 97.61 | 34.16 | 41/42/120 |
+| typescript | 91.78 | 56.77 | 67/73/118 | 96.15 | 44.64 | 25/26/56 | 84.00 | 100.00 | 42.37 | 25/25/59 |
+| zig | 100.00 | 72.91 | 105/105/144 | 98.36 | 63.82 | 60/61/94 | 61.66 | 100.00 | 50.00 | 64/64/128 |
+| **all** | **93.26** | **72.53** | 1038/1113/1431 | **84.90** | **52.89** | 512/603/968 | **69.33** | **97.34** | **49.90** | 549/564/1100 |
 
 Python is the reference implementation: it is the only language where both
 recalls clear 85%. C++ is the outlier in every column. Ruby produces almost no
 edges at all. The 1113 produced definitions and 603 produced edges are what an
-agent sees today; the 1431 and 954 are what it should see. Call-site recall is
-100% everywhere: every matched edge's produced lines already cover its golden
-lines, so waves 1-8 below are entirely about missing/phantom
-definitions and edges, not about a matched edge's own line list.
+agent sees today; the 1431 and 968 are what it should see. Site precision is
+100% in nine of twelve languages, and no run ever reports a `MISS site`
+finding: every matched edge's produced lines already cover its golden lines in
+full, so waves 1-8 below are entirely about missing/phantom definitions and
+edges, not about a matched edge's own line list being wrong. Site recall is a
+different story - fix round 2's F2 redefined it over every golden edge rather
+than only matched ones, so a missing edge's whole line list now counts as
+unmatched sites and site recall tracks edge recall instead of reading a
+misleadingly perfect 100%.
 
 ### Fix round 1: baseline moved, indexer did not
 
@@ -156,13 +163,56 @@ raised floor), and `site_recall_bp` was recorded for the first time this
 round (F10 added the metric; it defaulted to 0 in every existing
 `floors.json` until now).
 
+### Fix round 2: site recall redefined, six edge denominators grew
+
+F1-F19 (`git log --oneline 500ae3f..967db94`) fixed every finding the
+merge-gate review raised over round 1's state: inverted/missing exact flags, a
+false lsp claim and a missing call site (F1); site recall redefined over
+every golden edge instead of only matched ones (F2); overload self-call and
+corpus-required edges recorded in cpp and elsewhere (F3, F4); a contradictory
+exact flag in ruby (F7); missing javascript and python getter/setter edges
+(F8, F16); `validateGolden` rejecting duplicate/unexplained repeated edge rows
+(F6); loose verified provenance corrected on four resolver-produced edges
+(F17); a usage/propose drift closed (F11); a new unit-tested site-scoring
+machinery (F14); the `--lower-floors` gap that could hide a real regression
+inside a batch of golden corrections closed (F15); site precision recorded as
+a seventh floored metric, fresh with no prior floor (F13); five wrong "why
+this floor dropped" rows in the Fix round 1 table above corrected (F5); and a
+cluster of documentation fixes both reviews raised (F9, F10, F12, F18, F19).
+None of the nineteen changed the indexer - every fix corrects a golden, the
+bench's own validation, or this file's prose.
+
+Only two kinds of measurement moved, both from denominators growing, not from
+indexer behavior: `site_recall_bp` dropped in all twelve languages, because
+F2 now counts a missing edge's whole `lines` list as unmatched sites instead
+of scoring recall only within edges that already matched (it measures what it
+was always floored to measure); and `edge_recall_bp` dropped in
+cpp/csharp/java/javascript/python/rust, because F3, F4, F7, F8 and F16 added
+edges each corpus's own stated rules already required, growing the expected
+count out from under an unchanged matched count. Def precision/recall, edge
+precision and exact agreement are unchanged in every language - this round
+added no definitions and no produced-edge behavior changed.
+
+Floors were lowered for exactly those eighteen metrics (site recall in all
+twelve languages, edge recall in the six above) with `--update-floors
+--lower-floors --reason "F1-F19 golden corrections and the site-recall
+redefinition grew recall denominators; measured drops are more-complete
+truth, not indexer regressions"`. `site_precision_bp` was recorded for the
+first time this round (F13 added the metric) with a plain `--update-floors`,
+not a lowering - there was no prior floor to ratchet against.
+
+`zig build test --summary all`: 15/15 steps, 1659/1659 tests pass. `zig build
+bench`: every language at or above its recorded floor.
+
 ## Failure classes, by what they cost
 
 Counted across all twelve languages: 374 missing definitions, 56 phantom
-definitions, 19 mis-kinded or mis-placed definitions, 442 missing edges, 91
+definitions, 19 mis-kinded or mis-placed definitions, 456 missing edges, 91
 phantom edges, 157 exactness disagreements. (Fix round 1 grew the missing/
 phantom counts by correcting goldens that were previously too small or
-mismatched - see "Fix round 1" above; it did not touch exactness.)
+mismatched, and fix round 2's F3/F4/F7/F8/F16 grew the missing-edge count
+further the same way - see "Fix round 1" and "Fix round 2" above; neither
+touched exactness.)
 
 **1. Container members are indexed for two languages out of twelve** - 242 of
 the 374 missing definitions. `field` is a first-class kind and `navgraph def
@@ -173,7 +223,7 @@ member, property and record component is absent from the graph, in ten
 languages.
 
 **2. A reference to a type is usually not an edge** - the single largest edge
-class. Of 442 missing edges, 221 point at a type
+class. Of 456 missing edges, 226 point at a type
 (`struct`/`class`/`enum`/`iface`/`type`). `var buf: [128]lexer.Token`,
 `Vec *v = malloc(...)`, `var widget models.Widget`, `class Sprite : public
 Positioned` all record nothing. Zig, C, C++, Rust and Ruby produce none at all;
@@ -254,7 +304,7 @@ plus its tests.
    recall on its own. The kind, the model and two working implementations
    already exist, so this is mostly per-language parsing. **Medium-large**, but
    splittable one language at a time.
-3. **Record type-use edges** (`parser.zig` reference collection). Class 2: 221
+3. **Record type-use edges** (`parser.zig` reference collection). Class 2: 226
    edges. The `RefKind.type_use` variant is already in the model and already
    traversed by `graph`/`calls`; the parsers simply do not emit it for a type
    named in a body. **Medium**.
@@ -351,9 +401,10 @@ that wave exists to close.
 
 ## Keeping the numbers honest
 
-`tests/golden/floors.json` records each language's six measurements - the five
-headline metrics plus `site_recall_bp` - as the floors the gate enforces. They
-start at the baseline above, so the gate only ever catches a regression. After a wave lands, re-record with
+`tests/golden/floors.json` records each language's seven measurements - the
+five headline metrics plus `site_recall_bp` and `site_precision_bp` - as the
+floors the gate enforces. They start at the baseline above, so the gate only
+ever catches a regression. After a wave lands, re-record with
 `zig build bench -- --update-floors` and commit the raised floors with the fix,
 which is what locks the gain in. Never lower a floor to make a build pass: a
 number that went down is the finding - unless the golden it is measured
