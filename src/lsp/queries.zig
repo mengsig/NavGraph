@@ -940,6 +940,9 @@ pub fn writeHot(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: HotOptions)
     const idx = ctx.index();
     const ranked = try query.collectHot(idx, path_filter, opts.scope.tests);
     defer idx.gpa.free(ranked);
+    // Same final ordering as the CLI's `hot -j`: collectHot's tie-break is by
+    // symbol id, sortHot's is by path then line. The golden parity test pins it.
+    query.sortHot(idx, ranked, .default);
     try w.writeAll("{\"items\":[");
     var shown: u32 = 0;
     for (ranked) |e| {

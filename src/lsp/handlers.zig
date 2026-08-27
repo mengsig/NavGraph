@@ -1042,6 +1042,8 @@ pub const navgraph_notifications = [_][]const u8{"navgraph/indexed"};
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const index_mod = @import("../index.zig");
+const json_out = @import("../json_out.zig");
 
 /// A live server over a temporary project, driven message by message.
 ///
@@ -2542,4 +2544,256 @@ test "navgraph/graph overwrites its one file per view instead of accumulating on
         if (std.mem.startsWith(u8, entry.name, "graph-")) count += 1;
     }
     try testing.expectEqual(@as(u32, 1), count);
+}
+
+// ---------------------------------------------------------------------------
+// Golden parity harness (F15) — for each mirrored method, the adapter and the
+// CLI's `-j` output over the same fixture must agree on membership and
+// ordering. Building the CLI's Index directly (rather than shelling out) so
+// the two sides can be compared as parsed JSON in one process.
+// ---------------------------------------------------------------------------
+
+fn namesFlat(alloc: std.mem.Allocator, arr: []const std.json.Value) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (arr) |v| try out.append(alloc, v.object.get("name").?.string);
+    return out.toOwnedSlice(alloc);
+}
+
+fn namesNested(alloc: std.mem.Allocator, arr: []const std.json.Value) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (arr) |v| try out.append(alloc, v.object.get("symbol").?.object.get("name").?.string);
+    return out.toOwnedSlice(alloc);
+}
+
+fn expectSameOrder(a: []const []const u8, b: []const []const u8) !void {
+    try testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| try testing.expectEqualStrings(x, y);
+}
+
+test "golden parity: outline/unused/hot/path/neighbors agree with the CLI's -j output (testenv/zig_vm)" {
+    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/zig_vm", false);
+    defer idx.deinit();
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // outline: flatten (file, symbol name) pairs so file grouping and
+    // per-file symbol order are both checked in one comparison.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.outline(&cli_out.writer, &idx, "", .{ .format = .json });
+        const cli_parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{});
+        var cli_flat: std.ArrayList([]const u8) = .empty;
+        for (cli_parsed.array.items) |file| {
+            const path = file.object.get("path").?.string;
+            for (file.object.get("symbols").?.array.items) |sym| {
+                try cli_flat.append(alloc, try std.fmt.allocPrint(alloc, "{s}::{s}", .{ path, sym.object.get("name").?.string }));
+            }
+        }
+
+        var res = try ts.request(1001,
+            \\{"jsonrpc":"2.0","id":1001,"method":"navgraph/outline","params":{}}
+        );
+        defer res.deinit();
+        var lsp_flat: std.ArrayList([]const u8) = .empty;
+        for ((try resultOf(res)).object.get("files").?.array.items) |file| {
+            const path = file.object.get("file").?.string;
+            for (file.object.get("symbols").?.array.items) |sym| {
+                const name = sym.object.get("name").?.string;
+                try lsp_flat.append(alloc, try std.fmt.allocPrint(alloc, "{s}::{s}", .{ path, name }));
+            }
+        }
+        try expectSameOrder(cli_flat.items, lsp_flat.items);
+    }
+
+    // unused: flat array, both sides.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.unused(&cli_out.writer, &idx, "", .{ .format = .json });
+        const cli_names = try namesFlat(alloc, (try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items);
+
+        var res = try ts.request(1002,
+            \\{"jsonrpc":"2.0","id":1002,"method":"navgraph/unused","params":{}}
+        );
+        defer res.deinit();
+        const lsp_names = try namesNested(alloc, (try resultOf(res)).object.get("items").?.array.items);
+        try expectSameOrder(cli_names, lsp_names);
+    }
+
+    // hot: flat array, default limit both sides (25), same rank ordering.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.hot(&cli_out.writer, &idx, "", .{ .format = .json });
+        const cli_names = try namesFlat(alloc, (try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items);
+
+        var res = try ts.request(1003,
+            \\{"jsonrpc":"2.0","id":1003,"method":"navgraph/hot","params":{}}
+        );
+        defer res.deinit();
+        const lsp_names = try namesNested(alloc, (try resultOf(res)).object.get("items").?.array.items);
+        try expectSameOrder(cli_names, lsp_names);
+    }
+
+    // path: eval -> Vm.push. Pinned because the fixture also holds the generic
+    // `Stack.push`; both sides refuse to walk an ambiguous endpoint, and the
+    // block below checks they refuse it the same way.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.shortestPath(&cli_out.writer, &idx, "eval", "Vm.push", .{ .format = .json });
+        const cli_names = try namesFlat(alloc, (try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items);
+
+        var res = try ts.request(1004,
+            \\{"jsonrpc":"2.0","id":1004,"method":"navgraph/path","params":{"from":"eval","to":"Vm.push"}}
+        );
+        defer res.deinit();
+        const lsp_names = try namesFlat(alloc, (try resultOf(res)).object.get("path").?.array.items);
+        try expectSameOrder(cli_names, lsp_names);
+    }
+
+    // path with an ambiguous endpoint: neither side answers "no path" — the
+    // CLI reports `ambiguous` with `candidates`, the adapter `ambiguousTo`.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.shortestPath(&cli_out.writer, &idx, "eval", "push", .{ .format = .json });
+        const cli = (try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).object;
+        try testing.expect(cli.get("ambiguous").?.bool);
+        const cli_names = try namesFlat(alloc, cli.get("candidates").?.array.items);
+
+        var res = try ts.request(1006,
+            \\{"jsonrpc":"2.0","id":1006,"method":"navgraph/path","params":{"from":"eval","to":"push"}}
+        );
+        defer res.deinit();
+        const r = (try resultOf(res)).object;
+        try testing.expectEqual(@as(usize, 0), r.get("path").?.array.items.len);
+        const lsp_names = try namesFlat(alloc, r.get("ambiguousTo").?.array.items);
+        try expectSameOrder(cli_names, lsp_names);
+    }
+
+    // neighbors: pinned for the same reason; the CLI's per-name array and the
+    // adapter's items array then line up 1:1.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.neighbors(&cli_out.writer, &idx, "Vm.push", .{ .format = .json });
+        const cli_items = (try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items;
+        try testing.expectEqual(@as(usize, 1), cli_items.len);
+        const cli_callees = try namesFlat(alloc, cli_items[0].object.get("callees").?.array.items);
+        const cli_callers = try namesFlat(alloc, cli_items[0].object.get("callers").?.array.items);
+
+        var res = try ts.request(1005,
+            \\{"jsonrpc":"2.0","id":1005,"method":"navgraph/neighbors","params":{"symbol":"Vm.push"}}
+        );
+        defer res.deinit();
+        const lsp_items = (try resultOf(res)).object.get("items").?.array.items;
+        try testing.expectEqual(@as(usize, 1), lsp_items.len);
+        const lsp_callees = try namesNested(alloc, lsp_items[0].object.get("callees").?.array.items);
+        const lsp_callers = try namesNested(alloc, lsp_items[0].object.get("callers").?.array.items);
+        try expectSameOrder(cli_callees, lsp_callees);
+        try expectSameOrder(cli_callers, lsp_callers);
+    }
+}
+
+test "golden parity: routes/events/imports/importers agree with the CLI's -j output (testenv/fullstack)" {
+    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/fullstack", false);
+    defer idx.deinit();
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
+    defer ts.deinit();
+    try ts.start();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // routes: CLI's own identity field is "route" (the symbol's name).
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.listRoutes(&cli_out.writer, &idx, "", .{ .format = .json });
+        var cli_names: std.ArrayList([]const u8) = .empty;
+        for ((try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items) |v| {
+            try cli_names.append(alloc, v.object.get("route").?.string);
+        }
+
+        var res = try ts.request(1006,
+            \\{"jsonrpc":"2.0","id":1006,"method":"navgraph/routes","params":{}}
+        );
+        defer res.deinit();
+        const lsp_names = try namesNested(alloc, (try resultOf(res)).object.get("items").?.array.items);
+        try expectSameOrder(cli_names.items, lsp_names);
+    }
+
+    // events: both sides group by "key", key-sorted with paired keys first.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.events(&cli_out.writer, &idx, "", .{ .format = .json });
+        var cli_keys: std.ArrayList([]const u8) = .empty;
+        for ((try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items) |v| {
+            try cli_keys.append(alloc, v.object.get("key").?.string);
+        }
+
+        var res = try ts.request(1007,
+            \\{"jsonrpc":"2.0","id":1007,"method":"navgraph/events","params":{}}
+        );
+        defer res.deinit();
+        var lsp_keys: std.ArrayList([]const u8) = .empty;
+        for ((try resultOf(res)).object.get("groups").?.array.items) |v| {
+            try lsp_keys.append(alloc, v.object.get("key").?.string);
+        }
+        try expectSameOrder(cli_keys.items, lsp_keys.items);
+    }
+
+    // imports: flatten (file, target) pairs.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.listImports(&cli_out.writer, &idx, "", .{ .format = .json });
+        var cli_flat: std.ArrayList([]const u8) = .empty;
+        for ((try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items) |file| {
+            const path = file.object.get("file").?.string;
+            for (file.object.get("imports").?.array.items) |imp| {
+                try cli_flat.append(alloc, try std.fmt.allocPrint(alloc, "{s}->{s}", .{ path, imp.object.get("target").?.string }));
+            }
+        }
+
+        var res = try ts.request(1008,
+            \\{"jsonrpc":"2.0","id":1008,"method":"navgraph/imports","params":{}}
+        );
+        defer res.deinit();
+        var lsp_flat: std.ArrayList([]const u8) = .empty;
+        for ((try resultOf(res)).object.get("files").?.array.items) |file| {
+            const path = file.object.get("file").?.string;
+            for (file.object.get("imports").?.array.items) |imp| {
+                try lsp_flat.append(alloc, try std.fmt.allocPrint(alloc, "{s}->{s}", .{ path, imp.object.get("target").?.string }));
+            }
+        }
+        try expectSameOrder(cli_flat.items, lsp_flat.items);
+    }
+
+    // importers: CLI's per-file list is bare path strings, the adapter's is
+    // {file,uri} objects — extract the path both ways and flatten.
+    {
+        var cli_out: Writer.Allocating = .init(alloc);
+        _ = try json_out.listImporters(&cli_out.writer, &idx, "store.py", .{ .format = .json });
+        var cli_flat: std.ArrayList([]const u8) = .empty;
+        for ((try std.json.parseFromSliceLeaky(std.json.Value, alloc, cli_out.written(), .{})).array.items) |file| {
+            const path = file.object.get("file").?.string;
+            for (file.object.get("importers").?.array.items) |imp| {
+                try cli_flat.append(alloc, try std.fmt.allocPrint(alloc, "{s}<-{s}", .{ path, imp.string }));
+            }
+        }
+
+        var res = try ts.request(1009,
+            \\{"jsonrpc":"2.0","id":1009,"method":"navgraph/importers","params":{"path":"store.py"}}
+        );
+        defer res.deinit();
+        var lsp_flat: std.ArrayList([]const u8) = .empty;
+        for ((try resultOf(res)).object.get("files").?.array.items) |file| {
+            const path = file.object.get("file").?.string;
+            for (file.object.get("importers").?.array.items) |imp| {
+                try lsp_flat.append(alloc, try std.fmt.allocPrint(alloc, "{s}<-{s}", .{ path, imp.object.get("file").?.string }));
+            }
+        }
+        try expectSameOrder(cli_flat.items, lsp_flat.items);
+    }
 }
