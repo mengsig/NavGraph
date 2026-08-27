@@ -190,7 +190,7 @@
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Slip", "exact": true, "lines": [235, 236, 237], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Slip.operator+", "exact": true, "lines": [237], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:TaggedSlip", "exact": true, "lines": [236], "verified": "manual"},
-    {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Tier", "exact": true, "lines": [228], "verified": "manual"},
+    {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:Tier", "exact": true, "lines": [228, 232], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:TierExtensions.Label", "exact": true, "lines": [232], "verified": "manual"},
     {"from": "Tricky.cs:TrickyRunner.Run", "to": "Tricky.cs:TrickyRunner.Run.Doubled", "exact": true, "lines": [227], "verified": "manual"}
   ]
