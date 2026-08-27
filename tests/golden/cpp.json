@@ -211,6 +211,7 @@
     {"from": "shapes.cpp:LabeledCircle.kind", "to": "shapes.hpp:ShapeKind", "exact": true, "lines": [88], "verified": "lsp"},
     {"from": "shapes.cpp:Rectangle.kind", "to": "shapes.hpp:ShapeKind", "exact": true, "lines": [67], "verified": "lsp"},
     {"from": "shapes.cpp:Shape.kind", "to": "shapes.hpp:ShapeKind", "exact": true, "lines": [30], "verified": "lsp"},
+    {"from": "shapes.cpp:Square.Square", "to": "shapes.hpp:Rectangle", "exact": true, "lines": [70], "verified": "lsp"},
     {"from": "shapes.cpp:Square.kind", "to": "shapes.hpp:ShapeKind", "exact": true, "lines": [77], "verified": "lsp"},
     {"from": "shapes.cpp:total_area", "to": "shapes.cpp:Shape.area", "exact": true, "lines": [97], "verified": "lsp"},
     {"from": "shapes.cpp:total_area", "to": "shapes.hpp:Shape", "exact": true, "lines": [96], "verified": "lsp"},

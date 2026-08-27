@@ -305,6 +305,7 @@
     {"from": "app/tricky_python.py:tricky_run", "to": "app/tricky_python.py:shadow_budget", "exact": true, "lines": [198], "verified": "lsp"},
     {"from": "app/tricky_python.py:tricky_run", "to": "app/tricky_python.py:tagged", "exact": true, "lines": [172], "verified": "lsp"},
     {"from": "app/tricky_python.py:tricky_run", "to": "app/tricky_python.py:tripler", "exact": true, "lines": [199], "verified": "manual"},
+    {"from": "app/tricky_python.py:tricky_run", "to": "app/utils.py:clamp", "exact": true, "lines": [190], "verified": "lsp"},
     {"from": "app/tricky_python.py:tricky_run", "to": "app/utils.py:make_paginator", "exact": true, "lines": [189], "verified": "lsp"},
     {"from": "app/utils.py:audited", "to": "app/utils.py:audited.wrapper", "exact": true, "lines": [20], "verified": "lsp"},
     {"from": "app/utils.py:make_paginator", "to": "app/utils.py:clamp", "exact": true, "lines": [29], "verified": "lsp"},
