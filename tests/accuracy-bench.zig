@@ -606,7 +606,7 @@ fn scoreAll(
             std.debug.print("accuracy-bench: {s}: invalid golden JSON ({s})\n", .{ path, @errorName(err) });
             return BenchError.GoldenInvalid;
         };
-        try validateGolden(path, parsed);
+        try validateGolden(gpa, arena, path, parsed);
         try results.append(gpa, try scoreOne(gpa, arena, io, repo_root, parsed));
     }
     return arena.dupe(LanguageResult, results.items);
@@ -614,7 +614,12 @@ fn scoreAll(
 
 /// Structural invariants a hand-authored golden must satisfy. Catching these
 /// here keeps a typo from silently deflating a language's measured recall.
-fn validateGolden(path: []const u8, g: Golden) !void {
+fn validateGolden(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, g: Golden) !void {
+    var declared = std.StringHashMap(void).init(gpa);
+    defer declared.deinit();
+    for (g.definitions) |d| {
+        try declared.put(try std.fmt.allocPrint(arena, "{s}:{s}", .{ d.file, d.qualified }), {});
+    }
     for (g.definitions) |d| {
         const expected_qualified = if (d.parent) |p|
             !std.mem.eql(u8, p, "") and
@@ -644,9 +649,11 @@ fn validateGolden(path: []const u8, g: Golden) !void {
             );
             return BenchError.GoldenInvalid;
         }
-        if (std.mem.indexOfScalar(u8, e.from, ':') == null or std.mem.indexOfScalar(u8, e.to, ':') == null) {
+        // Both ends of an edge must be definitions the same golden declares:
+        // a reference to something that is not a definition has no edge.
+        if (!declared.contains(e.from) or !declared.contains(e.to)) {
             std.debug.print(
-                "accuracy-bench: {s}: edge endpoints must be file:qualified ({s} -> {s})\n",
+                "accuracy-bench: {s}: edge endpoint is not a definition in this golden ({s} -> {s})\n",
                 .{ path, e.from, e.to },
             );
             return BenchError.GoldenInvalid;

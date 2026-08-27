@@ -126,7 +126,6 @@
   "edges": [
     {"from": "src/api/http.ts:HttpClient.get", "to": "src/api/http.ts:HttpClient.request", "exact": true, "lines": [31], "verified": "lsp"},
     {"from": "src/api/http.ts:HttpClient.post", "to": "src/api/http.ts:HttpClient.request", "exact": true, "lines": [36], "verified": "lsp"},
-    {"from": "src/api/http.ts:HttpClient.request", "to": "src/api/http.ts:HttpClient.constructor", "exact": true, "lines": [20], "verified": "lsp"},
     {"from": "src/api/http.ts:HttpClient.request", "to": "src/models/user.ts:fail", "exact": true, "lines": [25], "verified": "lsp"},
     {"from": "src/api/http.ts:HttpClient.request", "to": "src/models/user.ts:ok", "exact": true, "lines": [26], "verified": "lsp"},
     {"from": "src/api/posts.ts:PostClient", "to": "src/api/http.ts:HttpClient", "exact": true, "lines": [9], "verified": "lsp"},
@@ -156,7 +155,6 @@
     {"from": "src/tricky_ts.ts:AccountLedger", "to": "src/store/store.ts:Store", "exact": true, "lines": [68], "verified": "lsp"},
     {"from": "src/tricky_ts.ts:AccountLedger.add", "to": "src/store/store.ts:Store.set", "exact": true, "lines": [80], "verified": "lsp"},
     {"from": "src/tricky_ts.ts:AccountLedger.add", "to": "src/tricky_ts.ts:BaseLedger.add", "exact": true, "lines": [81], "verified": "lsp"},
-    {"from": "src/tricky_ts.ts:AccountLedger.describe", "to": "src/tricky_ts.ts:BaseLedger.constructor", "exact": true, "lines": [75], "verified": "lsp"},
     {"from": "src/tricky_ts.ts:AccountLedger.emit", "to": "src/tricky_ts.ts:AccountLedger.add", "exact": true, "lines": [86], "verified": "lsp"},
     {"from": "src/tricky_ts.ts:AccountLedger.pull", "to": "src/api/http.ts:HttpClient.get", "exact": true, "lines": [96], "verified": "lsp"},
     {"from": "src/tricky_ts.ts:AccountLedger.pull", "to": "src/models/user.ts:Account", "exact": true, "lines": [96], "verified": "lsp"},
