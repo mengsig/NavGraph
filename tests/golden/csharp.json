@@ -147,6 +147,7 @@
     {"from": "Program.cs:Program.SeedCatalog", "to": "Services.cs:InventoryService.Register", "exact": true, "lines": [44, 45], "verified": "manual"},
     {"from": "Services.cs:InventoryService.Find", "to": "Repository.cs:IRepository.Get", "exact": true, "lines": [29], "verified": "manual"},
     {"from": "Services.cs:InventoryService.InventoryService", "to": "Repository.cs:Repository", "exact": true, "lines": [16], "verified": "manual"},
+    {"from": "Services.cs:InventoryService.InventoryService", "to": "Models.cs:Product", "exact": true, "lines": [16], "verified": "manual"},
     {"from": "Services.cs:InventoryService.Register", "to": "Repository.cs:IRepository.Add", "exact": true, "lines": [23], "verified": "manual"},
     {"from": "Services.cs:InventoryService.Register", "to": "Services.cs:InventoryService._audit", "exact": true, "lines": [22], "verified": "manual"},
     {"from": "Services.cs:InventoryService.SellableProducts", "to": "Models.cs:Product", "exact": true, "lines": [36], "verified": "manual"},
