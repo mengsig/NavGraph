@@ -7,6 +7,7 @@
 //! returned and moved without invalidating allocator pointers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const model = @import("model.zig");
 const language = @import("language.zig");
 const parser = @import("parser.zig");
@@ -496,7 +497,14 @@ fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile
     return .{ .symbols = try b.arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
 }
 
+/// Warn on stderr that a file's tokenization desynced. Silent under test: the
+/// Zig build runner prints its `failed command:` reproduction hint whenever a
+/// test binary writes to stderr, so a fixture with a deliberately unterminated
+/// string made a fully green run read as a failure. The health data itself is
+/// unaffected — it stays on the index and is reported by `status` and the
+/// `parse_health` JSON field.
 fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
+    if (builtin.is_test) return;
     const from = health.desync_from orelse return;
     std.debug.assert(rel_path.len > 0);
     std.debug.assert(health.desync_to >= from);
