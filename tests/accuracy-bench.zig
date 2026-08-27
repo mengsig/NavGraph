@@ -102,6 +102,9 @@ const Floor = struct {
     /// Defaulted so a floors.json recorded before call-site scoring existed
     /// still parses; the next --update-floors fills in a real measurement.
     site_recall_bp: u32 = 0,
+    /// Same defaulting reason: recorded starting the round site precision was
+    /// added as a floored metric (F13) rather than left measured-and-discarded.
+    site_precision_bp: u32 = 0,
 };
 
 const Floors = struct { floors: []const Floor };
@@ -141,9 +144,11 @@ const LanguageResult = struct {
     /// Call-site recall over every golden edge, matched or not: `expected`
     /// is every golden edge's `lines` total (a missed edge contributes its
     /// full count as unmatched sites), `matched` how many of them a produced
-    /// edge also names, `actual` the produced total for matched edges only
-    /// (informational: `lines` is hand-verified ground truth). Floored as a
-    /// sixth metric (`site_recall_bp`) alongside the other five.
+    /// edge also names, `actual` the produced total for matched edges only.
+    /// Floored two ways: recall (`matched`/`expected`, sixth metric,
+    /// `site_recall_bp`) and precision (`matched`/`actual`, seventh,
+    /// `site_precision_bp` - a produced call site with no golden match is a
+    /// phantom the same way an unmatched def or edge is).
     sites: Score = .{},
     findings: []const Finding,
 
@@ -1045,6 +1050,7 @@ fn writeFloors(
             .edge_recall_bp = r.edges.recallBp(),
             .exact_agreement_bp = r.exactAgreementBp(),
             .site_recall_bp = r.sites.recallBp(),
+            .site_precision_bp = r.sites.precisionBp(),
         };
         const merged = if (floorFor(prior, r.language)) |existing| Floor{
             .language = r.language,
@@ -1054,11 +1060,12 @@ fn writeFloors(
             .edge_recall_bp = try ratchetMetric(gpa, &drops, r.language, "edge recall", existing.edge_recall_bp, measured.edge_recall_bp, allow_lower),
             .exact_agreement_bp = try ratchetMetric(gpa, &drops, r.language, "exact agreement", existing.exact_agreement_bp, measured.exact_agreement_bp, allow_lower),
             .site_recall_bp = try ratchetMetric(gpa, &drops, r.language, "site recall", existing.site_recall_bp, measured.site_recall_bp, allow_lower),
+            .site_precision_bp = try ratchetMetric(gpa, &drops, r.language, "site precision", existing.site_precision_bp, measured.site_precision_bp, allow_lower),
         } else measured;
         try o.print(
             "    {{ \"language\": \"{s}\", \"def_precision_bp\": {d}, \"def_recall_bp\": {d}, " ++
                 "\"edge_precision_bp\": {d}, \"edge_recall_bp\": {d}, \"exact_agreement_bp\": {d}, " ++
-                "\"site_recall_bp\": {d} }}",
+                "\"site_recall_bp\": {d}, \"site_precision_bp\": {d} }}",
             .{
                 merged.language,
                 merged.def_precision_bp,
@@ -1067,6 +1074,7 @@ fn writeFloors(
                 merged.edge_recall_bp,
                 merged.exact_agreement_bp,
                 merged.site_recall_bp,
+                merged.site_precision_bp,
             },
         );
     }
@@ -1130,6 +1138,7 @@ fn violations(results: []const LanguageResult, floors: Floors) usize {
         if (r.edges.recallBp() < f.edge_recall_bp) n += 1;
         if (r.exactAgreementBp() < f.exact_agreement_bp) n += 1;
         if (r.sites.recallBp() < f.site_recall_bp) n += 1;
+        if (r.sites.precisionBp() < f.site_precision_bp) n += 1;
     }
     return n;
 }
@@ -1141,7 +1150,7 @@ fn violations(results: []const LanguageResult, floors: Floors) usize {
 fn report(out: *std.Io.Writer, results: []const LanguageResult, floors: ?Floors, json: bool) !void {
     if (json) return reportJson(out, results, floors);
 
-    try out.writeAll("language      defs  P /  R   (match/got/want)   edges  P /  R   (match/got/want)  exact  site R (match/want)\n");
+    try out.writeAll("language      defs  P /  R   (match/got/want)   edges  P /  R   (match/got/want)  exact  site P /  R  (match/got/want)\n");
     var total = LanguageResult{
         .language = "TOTAL",
         .root = "",
@@ -1184,9 +1193,10 @@ fn reportRow(out: *std.Io.Writer, r: LanguageResult) !void {
     const ep = fmtBp(r.edges.precisionBp());
     const er = fmtBp(r.edges.recallBp());
     const ex = fmtBp(r.exactAgreementBp());
+    const sp = fmtBp(r.sites.precisionBp());
     const sr = fmtBp(r.sites.recallBp());
     try out.print(
-        "{s: <12}  {d: >3}.{d:0>2}/{d: >3}.{d:0>2}  ({d: >4}/{d: >4}/{d: >4})   {d: >3}.{d:0>2}/{d: >3}.{d:0>2}  ({d: >4}/{d: >4}/{d: >4})  {d: >3}.{d:0>2}  {d: >3}.{d:0>2} ({d: >4}/{d: >4})\n",
+        "{s: <12}  {d: >3}.{d:0>2}/{d: >3}.{d:0>2}  ({d: >4}/{d: >4}/{d: >4})   {d: >3}.{d:0>2}/{d: >3}.{d:0>2}  ({d: >4}/{d: >4}/{d: >4})  {d: >3}.{d:0>2}  {d: >3}.{d:0>2}/{d: >3}.{d:0>2}  ({d: >4}/{d: >4}/{d: >4})\n",
         .{
             r.language,
             dp.whole,     dp.frac, dr.whole, dr.frac,
@@ -1194,7 +1204,8 @@ fn reportRow(out: *std.Io.Writer, r: LanguageResult) !void {
             ep.whole,     ep.frac, er.whole, er.frac,
             r.edges.matched, r.edges.actual, r.edges.expected,
             ex.whole,     ex.frac,
-            sr.whole,     sr.frac, r.sites.matched, r.sites.expected,
+            sp.whole,     sp.frac, sr.whole, sr.frac,
+            r.sites.matched, r.sites.actual, r.sites.expected,
         },
     );
 }
@@ -1217,6 +1228,7 @@ fn reportFloors(out: *std.Io.Writer, results: []const LanguageResult, floors: Fl
         try reportFloorMetric(out, r.language, "edge recall", r.edges.recallBp(), f.edge_recall_bp);
         try reportFloorMetric(out, r.language, "exact agreement", r.exactAgreementBp(), f.exact_agreement_bp);
         try reportFloorMetric(out, r.language, "site recall", r.sites.recallBp(), f.site_recall_bp);
+        try reportFloorMetric(out, r.language, "site precision", r.sites.precisionBp(), f.site_precision_bp);
     }
 }
 
@@ -1247,8 +1259,8 @@ fn reportJson(out: *std.Io.Writer, results: []const LanguageResult, floors: ?Flo
             .{ r.edges.matched, r.edges.actual, r.edges.expected, r.edges.precisionBp(), r.edges.recallBp(), r.exactAgreementBp() },
         );
         try out.print(
-            ",\"sites\":{{\"matched\":{d},\"produced\":{d},\"expected\":{d},\"recall_bp\":{d}}}",
-            .{ r.sites.matched, r.sites.actual, r.sites.expected, r.sites.recallBp() },
+            ",\"sites\":{{\"matched\":{d},\"produced\":{d},\"expected\":{d},\"recall_bp\":{d},\"precision_bp\":{d}}}",
+            .{ r.sites.matched, r.sites.actual, r.sites.expected, r.sites.recallBp(), r.sites.precisionBp() },
         );
         try out.writeAll(",\"findings\":[");
         for (r.findings, 0..) |f, k| {
@@ -1373,7 +1385,7 @@ test "ratchetMetric: a raised floor survives, a regression is kept unless allowe
     try std.testing.expectEqual(@as(usize, 2), drops.items.len);
 }
 
-test "violations: a regression in any one of the six metrics fails the gate" {
+test "violations: a regression in any one of the seven metrics fails the gate" {
     const floor = Floor{
         .language = "go",
         .def_precision_bp = 9000,
@@ -1382,6 +1394,7 @@ test "violations: a regression in any one of the six metrics fails the gate" {
         .edge_recall_bp = 9000,
         .exact_agreement_bp = 9000,
         .site_recall_bp = 9000,
+        .site_precision_bp = 9000,
     };
     const floors = Floors{ .floors = &.{floor} };
 
@@ -1457,10 +1470,21 @@ test "violations: a regression in any one of the six metrics fails the gate" {
         .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
         .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
         .exact_agree = 100,
-        .sites = .{ .matched = 89, .actual = 100, .expected = 100 }, // R 8900
+        .sites = .{ .matched = 89, .actual = 89, .expected = 100 }, // P 10000, R 8900
         .findings = &.{},
     };
     try std.testing.expectEqual(@as(usize, 1), violations(&.{site_recall_regressed}, floors));
+
+    const site_precision_regressed = LanguageResult{
+        .language = "go",
+        .root = "",
+        .defs = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .edges = .{ .matched = 100, .actual = 100, .expected = 100 },
+        .exact_agree = 100,
+        .sites = .{ .matched = 89, .actual = 100, .expected = 89 }, // P 8900, R 10000
+        .findings = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 1), violations(&.{site_precision_regressed}, floors));
 }
 
 test "pickCandidate: a single candidate is unambiguous; several need from_line/to_line" {
@@ -1617,6 +1641,7 @@ test "writeFloors round-trips through the file and the ratchet governs re-record
     try testing.expectEqualStrings("go", floors.floors[0].language);
     try testing.expectEqual(@as(u32, 9000), floors.floors[0].def_precision_bp);
     try testing.expectEqual(@as(u32, 9000), floors.floors[0].site_recall_bp);
+    try testing.expectEqual(@as(u32, 9000), floors.floors[0].site_precision_bp);
 
     // A regression without --lower-floors is kept at the recorded value.
     const regressed = LanguageResult{
