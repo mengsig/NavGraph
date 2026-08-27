@@ -27,6 +27,25 @@ directives, not navigation targets), enum members (values of a type), and the
 derived `route`/`mount` symbols that belong to `navgraph routes`. A definition
 matches only when file, qualified name, kind AND line all agree.
 
+Kind follows what the per-language parser actually reports, not a uniform
+reading of the source keyword, so the same construct can gold differently
+across corpora - each is right for what that language's parser distinguishes
+today:
+- A class/interface method is `method` regardless of nesting depth EXCEPT a
+  function nested inside another function's body (a C# local function, a
+  Python closure), which is `fn` like any other free-standing callable -
+  nesting is a scoping fact, not a membership one.
+- A module-level binding is `const` when the parser can tell it's immutable
+  (Rust's `static`, without `mut`) and `var` otherwise (Rust's `static mut`, a
+  Go package-level `var`). The C# and Java parsers don't yet distinguish a
+  `const`/`final` field from an ordinary one, so both gold as `field` -
+  `TrickyRunner.Banner`'s `private const string` is not miscategorized, it is
+  golden to a real, coarser parser behavior.
+- A `delegate`/type-alias declaration is `type`.
+- Constructors are `method`: the model has no separate constructor kind, so a
+  language whose constructor is written like any other method (Java, C#,
+  C++) golds it the same way.
+
 The scored **edge** set is the call, type-use and function-valued references
 that occur in a symbol's BODY, deduped per (from, to). A type named in a
 symbol's own signature or in a field declaration is that symbol's interface, not
@@ -38,14 +57,24 @@ binds the site to exactly one definition, and heuristic when the binding is
 genuinely ambiguous; `exact` agreement is scored separately from the edge
 itself, because getting the endpoints right and the confidence wrong is a
 different bug from missing the edge. `lines` is hand-verified call-site
-ground truth, scored as call-site recall within matched edges: a sixth
-floored metric (`site_recall_bp`, ratcheted the same as the other five)
-alongside them, and every call site it names must appear among the produced
-edge's own lines or it is reported as a finding (`MISS site`).
+ground truth, scored two more ways over every golden edge (matched or not - a
+missed edge's whole `lines` list counts as unmatched sites, not zero):
+call-site recall (`site_recall_bp`) and, within matched edges, call-site
+precision (`site_precision_bp`, a produced line the golden doesn't list for
+that edge). Both are floored and ratcheted the same as the other five, for
+seven total. Every golden call site is checked against the produced edge's own
+lines and reported as a finding when it's missing (`MISS site`).
+
+`exact_agreement_bp` and `site_recall_bp` are both non-monotone in one
+direction: each divides by a count only a MATCHED edge contributes to (matched
+edges for exactness, a matched edge's own lines for site recall), so losing an
+edge match can raise either one by shrinking its denominator, and
+`ratioBp(0, 0)` scores a perfect 10000. A rising number on either metric is
+not on its own evidence of an improvement - read it next to edge recall.
 
 An edge is keyed `file:qualified` on each end - the same key defs are
 bucketed by, since overloads legitimately share it. Most edges are
-unambiguous under that key, but 34 across five languages are not: an
+unambiguous under that key, but 51 across six languages are not: an
 overload set (`Ledger.Post(string,int)` vs `Ledger.Post(Entry)`), or a field
 and the accessor it generates (`Product.sku` the field vs `Product.sku()`
 the method), share a `file:qualified` pair while naming different
@@ -242,8 +271,10 @@ plus its tests.
 8. **Declaration-syntax fixes** (`parser.zig`). Class 10, one small independent
    change each: heredoc bodies (`<<~`/`<<-`) as text, `enum class NAME`,
    `static mut NAME`, `~Dtor`, C macro bodies, `function tbl.name()` in Lua,
-   nested Lua table depth, `const` vs `var` in JS/TS. Each is a handful of lines
-   with an obvious test. **Small**, and they are the cheapest precision wins.
+   nested Lua table depth, `const` vs `var` in JS/TS, and operator-syntax call
+   sites (C++, Python, Lua don't emit them; C#, Ruby, Rust do - see "no
+   defensible golden answer" below). Each is a handful of lines with an
+   obvious test. **Small**, and they are the cheapest precision wins.
 
 Waves 1-4 alone move the two numbers that matter most: they close roughly half
 of the missing definitions and half of the missing edges, and they are the only
@@ -263,11 +294,13 @@ measures the invention:
   contrast, C's `TRICKY_DEFINE_SCALER(tricky_double, 2)` and Rust's
   `define_scaler!(scale_by_two, 2.0)` name their functions literally at the use
   site, so those ARE golden.
-- **Which of a method's two sites a call names.** In C++, a method has a
-  declaration in the header and a definition in the .cpp. Both are definitions;
-  an edge has to pick one, and there is no principled choice, so
-  `Counter::bump`'s CRTP call `static_cast<Derived*>(this)->step()` is left out
-  entirely (no resolver binds it without instantiation either).
+- **A CRTP call with no instantiation to resolve it.** `Counter::bump`'s
+  `static_cast<Derived*>(this)->step()` needs a concrete `Derived` to bind,
+  which no resolver has without instantiating the template, so it is left out
+  entirely. This is NOT the same question as which of a method's declaration
+  (header) and out-of-line definition (.cpp) a call names - that one IS
+  answerable, and `to_line` records the answer (the definition) everywhere it
+  comes up: `Vec2.magnitude` [52], `Describe.text` [73], `Describe` [101].
 - **An edge between two overloads of one name** (`Ledger.Post(string, int)`
   calling `Ledger.Post(Entry)`) is now representable - `from_line`/`to_line`
   disambiguate each end independently - and not itself a construct with no
@@ -298,6 +331,17 @@ measures the invention:
   consistent behavior, so the benchmark treats it as the model's shape rather
   than as a bug. If the operator wants namespace-qualified names, it is one
   deliberate change to the goldens and to `index.zig`, not a bug fix.
+
+Not on this list, because it has a defensible answer that just isn't applied
+everywhere yet: **operator-syntax call sites** (`a + b`, `weights[0]`,
+`ledger + blank`) ARE a dependency on the operator method, the same as any
+other call, and three corpora record them (C# `Slip.operator+`, Ruby
+`Ledger.+`/`Ledger.[]`, Rust `Cents.add`) while three don't (C++, Python,
+Lua). Each corpus is internally consistent, so nothing mis-scores today, but a
+wave that starts emitting operator-call edges is correct in the first three
+languages and generates phantoms in the other three. Tracked for wave 8
+(declaration-syntax fixes) alongside the other per-corpus inconsistencies
+that wave exists to close.
 
 ## Keeping the numbers honest
 
