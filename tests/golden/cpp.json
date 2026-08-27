@@ -116,7 +116,7 @@
     {"file": "tricky_cpp.cpp", "name": "thorough", "qualified": "Analyzer.thorough", "kind": "method", "line": 51, "parent": "Analyzer"},
     {"file": "tricky_cpp.cpp", "name": "combine", "qualified": "Analyzer.combine", "kind": "method", "line": 55, "parent": "Analyzer"},
     {"file": "tricky_cpp.cpp", "name": "step", "qualified": "StepCounter.step", "kind": "method", "line": 59, "parent": "StepCounter"},
-    {"file": "tricky_cpp.cpp", "name": "operator", "qualified": "Weights.operator", "kind": "method", "line": 64, "parent": "Weights"},
+    {"file": "tricky_cpp.cpp", "name": "operator()", "qualified": "Weights.operator()", "kind": "method", "line": 64, "parent": "Weights"},
     {"file": "tricky_cpp.cpp", "name": "text", "qualified": "Describe.text", "kind": "method", "line": 69, "parent": "Describe"},
     {"file": "tricky_cpp.cpp", "name": "text", "qualified": "Describe.text", "kind": "method", "line": 73, "parent": "Describe"},
     {"file": "tricky_cpp.cpp", "name": "kBanner", "qualified": "kBanner", "kind": "var", "line": 78, "parent": null},
