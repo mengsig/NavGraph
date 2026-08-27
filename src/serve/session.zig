@@ -546,7 +546,8 @@ pub const Fixture = struct {
 };
 
 const sample = [_][2][]const u8{
-    .{ "app.zig", 
+    .{
+        "app.zig",
         \\const util = @import("util.zig");
         \\
         \\pub fn run() void {
@@ -558,7 +559,8 @@ const sample = [_][2][]const u8{
         \\}
         \\
     },
-    .{ "util.zig", 
+    .{
+        "util.zig",
         \\pub fn helper() void {}
         \\
     },

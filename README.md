@@ -155,6 +155,7 @@ navgraph <command> [arg] [flags]
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges, nodes_total, truncated}` JSON. `-l` caps the node set; the JSON reports the total and text says so on stderr. Respects `--tests`. |
 | `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. |
+| `lsp`              | Run as a resident **editor server** (LSP over stdio) that keeps the graph in memory — see [Editor integration](#editor-integration). |
 | `help [command]`   | Show the full catalogue or concise registry-derived help for one command. |
 
 **Flags**
@@ -206,6 +207,8 @@ list of flags that actually *do* something is `navgraph capabilities -j`
 | `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild. Accepted by `read`, which never uses the cache either way. |
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
 | `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
+| `--log <file>`                | `serve`: write diagnostics to `<file>` (default: stderr).  |
+| `--log-level <error\|info\|debug>` | `serve`: diagnostic verbosity (default: `error`).  |
 
 **Patterns.** A name or filter containing `*` is a glob: `def 'Ba*'` lists
 `Bays` and `Bananas`, `search '*_handler'` anchors on the whole name,
@@ -472,6 +475,47 @@ method Server.start (self):  app/server.py:15
     fn parse (text):  app/server.py:8
     ~ ext: open, read
 ```
+
+## Editor integration
+
+`navgraph serve` runs NavGraph as a long-lived editor server: a standard LSP
+server (a subset) plus custom `navgraph/*` methods that expose the graph verbs.
+The whole graph stays in memory, an edit re-indexes in single-digit
+milliseconds, and blast-radius / search / call-graph queries answer in well
+under a millisecond.
+
+```
+navgraph serve [--root <dir>] [--log <file>] [--log-level error|info|debug]
+```
+
+- **Standard LSP** — `definition`, `references`, `hover`, `documentSymbol`,
+  `workspace/symbol`, full document sync. An open buffer's unsaved text drives
+  the graph, so answers reflect what you are typing, not what is on disk.
+- **`navgraph/*`** — `status`, `symbolAt`, `blast`, `search`, `grep`, `callers`,
+  `calls`, `rescan`, plus a `navgraph/indexed` notification after every
+  re-index. `blast` is the one to reach for: the transitive callers (or callees)
+  of a symbol, a file, or everything changed since a git ref — with a per-depth
+  and per-file summary.
+- A background mtime poll picks up changes made outside the editor (a git
+  checkout, a formatter) and re-indexes them.
+
+Neovim, with the built-in client:
+
+```lua
+vim.lsp.start({
+  name = "navgraph",
+  cmd = { "navgraph", "serve" },
+  root_dir = vim.fs.root(0, { ".git", "build.zig" }),
+})
+```
+
+Measured on this repo (ReleaseFast): initial index 46 ms cold / 14 ms warm,
+single-file re-index 4–10 ms, search 2.1 ms, grep 3.4 ms, blast depth 3 0.1 ms,
+34.8 MB resident at 118k lines.
+
+The full protocol — every method, its exact payload shapes, the concurrency
+model, the measured numbers and the current limitations — is in
+[`docs/lsp.md`](docs/lsp.md).
 
 ## How it works
 

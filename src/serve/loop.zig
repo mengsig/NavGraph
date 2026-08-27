@@ -167,7 +167,8 @@ fn openLog(io: std.Io, path: []const u8) !?std.Io.File {
 const testing = std.testing;
 
 const project = [_][2][]const u8{
-    .{ "app.zig", 
+    .{
+        "app.zig",
         \\const util = @import("util.zig");
         \\
         \\pub fn run() void {
@@ -179,7 +180,8 @@ const project = [_][2][]const u8{
         \\}
         \\
     },
-    .{ "util.zig", 
+    .{
+        "util.zig",
         \\pub fn helper() void {}
         \\
     },

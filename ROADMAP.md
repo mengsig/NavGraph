@@ -70,11 +70,21 @@ type-annotation uses in signatures are not fully captured as edges.
    `NGCACHE5`) plus a content-hash of the indexer source invalidate the whole
    cache on any format/logic change or corruption (safe rebuild, never a crash).
 
-6. **Daemon / LSP / MCP mode.** Long-running server with `inotify` file-watching
-   to keep the graph warm; agents query over a socket for near-instant
-   responses. Optionally expose as an MCP server or editor LSP.
-   - *Note:* the on-disk cache (5) already captures most of the per-call speed
-     win without the complexity of a resident process + cross-platform watcher.
+6. **Daemon / LSP / MCP mode.** ✅ *Done (LSP).* `navgraph serve` (alias `lsp`)
+   is a resident editor server over stdio: LSP framing + JSON-RPC 2.0, the
+   standard subset (`definition`/`references`/`hover`/`documentSymbol`/
+   `workspace/symbol`, full document sync) plus custom `navgraph/*` methods
+   (`status`/`symbolAt`/`blast`/`search`/`grep`/`callers`/`calls`/`rescan` and a
+   `navgraph/indexed` notification). An open buffer's unsaved text drives the
+   graph; an edit re-parses only that file and re-assembles it. Watching is an
+   mtime poll (portable, no `inotify`), and the whole server is single-threaded
+   so the graph needs no lock. Measured on this repo (ReleaseFast): initial
+   index 46 ms cold / 14 ms warm, single-file re-index 4–10 ms, search 2.1 ms,
+   grep 3.4 ms, blast depth 3 0.1 ms; 34.8 MB resident at 118k lines. Protocol
+   and numbers: [`docs/lsp.md`](docs/lsp.md).
+   - *Still open:* the remaining verb mirrors (`neighbors`/`path`/`outline`/
+     `hot`/`unused`/`diff`/`routes`/`events`/`imports`/`importers`/`graph`) —
+     one adapter function each — and an MCP front end over the same adapters.
 
 7. **`--json` output.** ✅ *Done.* `src/json_out.zig` mirrors every verb
    (`outline`/`def`/`calls`/`callers`/`search`/`routes`/`events`/`neighbors`/

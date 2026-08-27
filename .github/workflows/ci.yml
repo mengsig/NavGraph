@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          cache-key: ${{ matrix.os }}
+
+      # ReleaseFast is what the editor server ships as, and it is the mode the
+      # performance numbers in docs/lsp.md were measured in.
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Test
+        run: zig build test --summary all
+
+      # The server owns stdout: anything else printed there corrupts the
+      # protocol stream, so a bare `serve` session must produce only frames.
+      - name: Editor server speaks the protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+          {
+            frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+            frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+            frame '{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}'
+            frame '{"jsonrpc":"2.0","id":3,"method":"shutdown"}'
+            frame '{"jsonrpc":"2.0","method":"exit"}'
+          } > session.lsp
+          ./zig-out/bin/navgraph serve --root . < session.lsp > session.out
+          grep -q '"protocolVersion":1' session.out
+          grep -q '"method":"navgraph/indexed"' session.out
+          grep -q '"id":3,"result":null' session.out
+          # Every byte on stdout belongs to a frame: the stream starts with a
+          # header and holds one per reply.
+          head -c 16 session.out | grep -q 'Content-Length'
+          test "$(grep -c 'Content-Length' session.out)" -ge 4

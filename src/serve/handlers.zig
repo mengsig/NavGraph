@@ -1042,7 +1042,8 @@ fn errorCodeOf(parsed: std.json.Parsed(std.json.Value)) !i64 {
 }
 
 const project = [_][2][]const u8{
-    .{ "app.zig", 
+    .{
+        "app.zig",
         \\const util = @import("util.zig");
         \\
         \\/// Entry point.
@@ -1055,7 +1056,8 @@ const project = [_][2][]const u8{
         \\}
         \\
     },
-    .{ "util.zig", 
+    .{
+        "util.zig",
         \\pub const marker = "needle-in-a-haystack";
         \\
         \\pub fn helper() void {}
@@ -1678,7 +1680,8 @@ test "navgraph/search with refs finds use sites and reports their lines" {
 test "the tests scope narrows search and blast" {
     const with_tests = [_][2][]const u8{
         .{ "lib.zig", "pub fn subject() void {}\n" },
-        .{ "lib_test.zig", 
+        .{
+            "lib_test.zig",
             \\const lib = @import("lib.zig");
             \\test "exercises subject" {
             \\    lib.subject();
