@@ -196,9 +196,32 @@ pub fn build(b: *std.Build) void {
     efficiency_cmd.setCwd(b.path("."));
     const efficiency_step = b.step("efficiency", "Check deterministic agent-context compression budgets");
     efficiency_step.dependOn(&efficiency_cmd.step);
+
+    // Accuracy benchmark: scores the indexer against the hand-verified golden
+    // corpora in tests/golden/. It links the graph engine directly (the JSON
+    // command surfaces drop kinds, so scoring through them would exempt the
+    // constructs the corpora exist to stress).
+    const accuracy_bench_exe = b.addExecutable(.{
+        .name = "accuracy-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/accuracy-bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "NavGraph", .module = mod }},
+        }),
+    });
+    const accuracy_cmd = b.addSystemCommand(&.{"sh"});
+    accuracy_cmd.addFileArg(b.path("tests/accuracy.sh"));
+    accuracy_cmd.addArtifactArg(accuracy_bench_exe);
+    accuracy_cmd.addDirectoryArg(b.path("."));
+    accuracy_cmd.setCwd(b.path("."));
+    if (b.args) |args| accuracy_cmd.addArgs(args);
+    const accuracy_step = b.step("bench", "Score the indexer against the golden accuracy corpora");
+    accuracy_step.dependOn(&accuracy_cmd.step);
     test_step.dependOn(&contract_cmd.step);
     test_step.dependOn(&manifest_contract_cmd.step);
     test_step.dependOn(&efficiency_cmd.step);
+    test_step.dependOn(&accuracy_cmd.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
