@@ -42,12 +42,17 @@ const Def = struct {
 };
 
 /// A reference edge, keyed `file:qualified` on both ends. `lines` holds every
-/// distinct 1-based line the reference occurs on, ascending.
+/// distinct 1-based line the reference occurs on, ascending. `from_line` and
+/// `to_line` are the endpoints' own declaration lines - not scored directly,
+/// but what disambiguates two produced edges that share a `file:qualified`
+/// pair (an overload set, or a field and its generated accessor).
 const Edge = struct {
     from: []const u8,
     to: []const u8,
     exact: bool,
     lines: []const u32,
+    from_line: u32,
+    to_line: u32,
 };
 
 const GoldenDef = struct {
@@ -65,6 +70,12 @@ const GoldenEdge = struct {
     exact: bool,
     lines: []const u32,
     verified: []const u8,
+    /// Required whenever `from`'s (or `to`'s) `file:qualified` key is shared
+    /// by more than one definition in this golden - an overload set, or a
+    /// field and the accessor it generates - so the edge names exactly one
+    /// of them instead of scoring as a match against any.
+    from_line: ?u32 = null,
+    to_line: ?u32 = null,
 };
 
 const Golden = struct {
@@ -330,10 +341,14 @@ fn extract(gpa: std.mem.Allocator, arena: std.mem.Allocator, idx: *const index_m
         });
     }
 
-    // Edges are deduped per (from, to): a caller hitting the same target on
-    // several lines is one dependency with several sites. The merged edge is
-    // exact only when every contributing reference resolved exactly, matching
-    // what `--strict` traversal would be willing to follow.
+    // Edges are deduped per (from symbol, to symbol) - not per (from, to)
+    // string pair: two overloads (or a field and its generated accessor)
+    // share a `file:qualified` key but are different definitions, so a call
+    // into each stays a distinct edge even though their .from/.to strings
+    // match. A caller hitting the SAME target symbol on several lines is
+    // still one dependency with several sites. The merged edge is exact only
+    // when every contributing reference resolved exactly, matching what
+    // `--strict` traversal would be willing to follow.
     var edge_at = std.StringHashMap(usize).init(gpa);
     defer edge_at.deinit();
     var edges: std.ArrayList(Edge) = .empty;
@@ -353,11 +368,18 @@ fn extract(gpa: std.mem.Allocator, arena: std.mem.Allocator, idx: *const index_m
             if (!isScoredDefKind(target.kind)) continue;
             const from = keys[sym.id].?;
             const to = keys[ref.target].?;
-            const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ from, to });
+            const key = try std.fmt.allocPrint(arena, "{d}\x00{d}", .{ sym.id, ref.target });
             const slot = try edge_at.getOrPut(key);
             if (!slot.found_existing) {
                 slot.value_ptr.* = edges.items.len;
-                try edges.append(gpa, .{ .from = from, .to = to, .exact = ref.exact, .lines = &.{} });
+                try edges.append(gpa, .{
+                    .from = from,
+                    .to = to,
+                    .exact = ref.exact,
+                    .lines = &.{},
+                    .from_line = sym.line,
+                    .to_line = target.line,
+                });
                 try lines_of.append(gpa, .empty);
             }
             const at = slot.value_ptr.*;
@@ -400,7 +422,13 @@ fn defLess(_: void, a: Def, b: Def) bool {
 fn edgeLess(_: void, a: Edge, b: Edge) bool {
     const by_from = std.mem.order(u8, a.from, b.from);
     if (by_from != .eq) return by_from == .lt;
-    return std.mem.order(u8, a.to, b.to) == .lt;
+    const by_to = std.mem.order(u8, a.to, b.to);
+    if (by_to != .eq) return by_to == .lt;
+    // Same (from, to) string pair: an overload set or a field/accessor
+    // pair. Break the tie by the endpoints' own declaration lines so the
+    // ordering (report, JSON, --propose output) is deterministic.
+    if (a.from_line != b.from_line) return a.from_line < b.from_line;
+    return a.to_line < b.to_line;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,19 +582,32 @@ fn scoreEdges(
     exact_agree: *usize,
     sites: *Score,
 ) !Score {
-    var produced = std.StringHashMap(usize).init(gpa);
-    defer produced.deinit();
-    for (actual, 0..) |a, i| {
-        try produced.put(try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ a.from, a.to }), i);
+    // Grouped by the (from, to) string pair: usually one produced edge, but
+    // more than one when the pair names an overload set or a field/accessor
+    // pair - each a distinct definition sharing that `file:qualified` key.
+    var produced = std.StringHashMap(std.ArrayList(usize)).init(gpa);
+    defer {
+        var it = produced.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        produced.deinit();
     }
-    var expected = std.StringHashMap(void).init(gpa);
-    defer expected.deinit();
+    for (actual, 0..) |a, i| {
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ a.from, a.to });
+        const slot = try produced.getOrPut(key);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(gpa, i);
+    }
+    // Tracked per produced edge (not per string pair) so a phantom overload
+    // sibling of a correctly-matched edge is still reported as a phantom.
+    const matched_actual = try gpa.alloc(bool, actual.len);
+    defer gpa.free(matched_actual);
+    @memset(matched_actual, false);
 
     var score = Score{ .actual = actual.len, .expected = golden.len };
     for (golden) |g| {
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ g.from, g.to });
-        try expected.put(key, {});
-        const hit = produced.get(key) orelse {
+        const candidates: []const usize = if (produced.get(key)) |l| l.items else &.{};
+        const hit = pickCandidate(actual, candidates, g) orelse {
             try findings.append(gpa, .{
                 .kind = .edge_missing,
                 .site = try edgeSite(arena, g.from, g.lines),
@@ -574,6 +615,7 @@ fn scoreEdges(
             });
             continue;
         };
+        matched_actual[hit] = true;
         score.matched += 1;
         const a = actual[hit];
         if (a.exact == g.exact) {
@@ -614,9 +656,8 @@ fn scoreEdges(
             });
         }
     }
-    for (actual) |a| {
-        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ a.from, a.to });
-        if (expected.contains(key)) continue;
+    for (actual, 0..) |a, i| {
+        if (matched_actual[i]) continue;
         try findings.append(gpa, .{
             .kind = .edge_phantom,
             .site = try edgeSite(arena, a.from, a.lines),
@@ -624,6 +665,23 @@ fn scoreEdges(
         });
     }
     return score;
+}
+
+/// Which produced edge a golden edge names, among candidates sharing its
+/// (from, to) string pair. A single candidate is unambiguous; more than one
+/// (an overload set or a field/accessor pair) requires `from_line`/`to_line`
+/// to pick the right definition - absent both, the first candidate is taken,
+/// which only happens when the golden's own definitions did not in fact
+/// share the name (validateGolden requires the line whenever they do).
+fn pickCandidate(actual: []const Edge, candidates: []const usize, g: GoldenEdge) ?usize {
+    if (candidates.len == 0) return null;
+    for (candidates) |i| {
+        const a = actual[i];
+        if (g.from_line) |fl| if (a.from_line != fl) continue;
+        if (g.to_line) |tl| if (a.to_line != tl) continue;
+        return i;
+    }
+    return null;
 }
 
 /// `file:line` for an edge: the owning file of `from` plus its first call site.
@@ -671,8 +729,21 @@ fn scoreAll(
 fn validateGolden(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, g: Golden) !void {
     var declared = std.StringHashMap(void).init(gpa);
     defer declared.deinit();
+    // How many definitions share a `file:qualified` key - an overload set,
+    // or a field and the accessor it generates - and at which lines, so an
+    // edge naming one of them can be required to say (and checked to say
+    // correctly) which.
+    var name_count = std.StringHashMap(usize).init(gpa);
+    defer name_count.deinit();
+    var def_at_line = std.StringHashMap(void).init(gpa);
+    defer def_at_line.deinit();
     for (g.definitions) |d| {
-        try declared.put(try std.fmt.allocPrint(arena, "{s}:{s}", .{ d.file, d.qualified }), {});
+        const name_key = try std.fmt.allocPrint(arena, "{s}:{s}", .{ d.file, d.qualified });
+        try declared.put(name_key, {});
+        const slot = try name_count.getOrPut(name_key);
+        if (!slot.found_existing) slot.value_ptr.* = 0;
+        slot.value_ptr.* += 1;
+        try def_at_line.put(try std.fmt.allocPrint(arena, "{s}#{d}", .{ name_key, d.line }), {});
     }
     for (g.definitions) |d| {
         const expected_qualified = if (d.parent) |p|
@@ -712,7 +783,47 @@ fn validateGolden(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []cons
             );
             return BenchError.GoldenInvalid;
         }
+        try requireLineWhenAmbiguous(path, name_count, e, e.from, e.from_line, "from");
+        try requireLineWhenAmbiguous(path, name_count, e, e.to, e.to_line, "to");
+        if (e.from_line) |l| try requireLineIsADefinition(arena, path, def_at_line, e.from, l);
+        if (e.to_line) |l| try requireLineIsADefinition(arena, path, def_at_line, e.to, l);
     }
+}
+
+/// `endpoint`'s `file:qualified` key names more than one definition (an
+/// overload set, or a field and its generated accessor) only when `line` is
+/// set to say which.
+fn requireLineWhenAmbiguous(
+    path: []const u8,
+    name_count: std.StringHashMap(usize),
+    e: GoldenEdge,
+    endpoint: []const u8,
+    line: ?u32,
+    which: []const u8,
+) !void {
+    const n = name_count.get(endpoint) orelse 0;
+    if (n <= 1 or line != null) return;
+    std.debug.print(
+        "accuracy-bench: {s}: edge {s} -> {s}: {s} endpoint is ambiguous ({d} definitions share `{s}`); set {s}_line\n",
+        .{ path, e.from, e.to, which, n, endpoint, which },
+    );
+    return BenchError.GoldenInvalid;
+}
+
+fn requireLineIsADefinition(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    def_at_line: std.StringHashMap(void),
+    endpoint: []const u8,
+    line: u32,
+) !void {
+    const key = try std.fmt.allocPrint(arena, "{s}#{d}", .{ endpoint, line });
+    if (def_at_line.contains(key)) return;
+    std.debug.print(
+        "accuracy-bench: {s}: edge endpoint {s} has no definition at line {d}\n",
+        .{ path, endpoint, line },
+    );
+    return BenchError.GoldenInvalid;
 }
 
 fn scoreOne(

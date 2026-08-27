@@ -37,7 +37,22 @@ golden that breaks this. An edge is `exact` when the language's own resolver
 binds the site to exactly one definition, and heuristic when the binding is
 genuinely ambiguous; `exact` agreement is scored separately from the edge
 itself, because getting the endpoints right and the confidence wrong is a
-different bug from missing the edge.
+different bug from missing the edge. `lines` is hand-verified call-site
+ground truth, scored as call-site recall within matched edges: not itself
+floored the way the five headline metrics are, but every call site it names
+must appear among the produced edge's own lines or it is reported as a
+finding (`MISS site`).
+
+An edge is keyed `file:qualified` on each end - the same key defs are
+bucketed by, since overloads legitimately share it. Most edges are
+unambiguous under that key, but 34 across five languages are not: an
+overload set (`Ledger.Post(string,int)` vs `Ledger.Post(Entry)`), or a field
+and the accessor it generates (`Product.sku` the field vs `Product.sku()`
+the method), share a `file:qualified` pair while naming different
+definitions. Those edges carry an explicit `from_line` and/or `to_line`
+saying which definition's own declaration line the endpoint names; the bench
+refuses a golden where an endpoint's key is ambiguous and the line is
+missing, so this can't rot back into a silent guess.
 
 ## Baseline at this commit
 
@@ -208,10 +223,11 @@ measures the invention:
   an edge has to pick one, and there is no principled choice, so
   `Counter::bump`'s CRTP call `static_cast<Derived*>(this)->step()` is left out
   entirely (no resolver binds it without instantiation either).
-- **An edge between two overloads of one name.** `Ledger.Post(string, int)`
-  calling `Ledger.Post(Entry)` has the same from and to key. The edge model has
-  no overload discriminator, so overload-to-overload calls are unrepresentable
-  and excluded in C#, C++ and Java.
+- **An edge between two overloads of one name** (`Ledger.Post(string, int)`
+  calling `Ledger.Post(Entry)`) is now representable - `from_line`/`to_line`
+  disambiguate each end independently - and not itself a construct with no
+  answer; it is simply not yet recorded in any golden, since no corpus
+  exercises it through a call the reviewed indexer output actually produces.
 - **Which function a function-pointer member reaches.** `ops->step(n, by)` in C
   binds to the member `TrickyOps.step`; picking `node_step` out of it needs
   whole-program analysis of every assignment. The golden records the member and
