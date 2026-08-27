@@ -842,7 +842,7 @@ fn neighborsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Va
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
     const roots = try queries.resolveTarget(arena, c, target);
-    try queries.writeNeighbors(w, c, roots[0], scopeOf(self, p));
+    try queries.writeNeighbors(w, c, roots[0], try scopeOf(self, p));
 }
 
 fn pathMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -861,7 +861,7 @@ fn outlineMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Valu
     try queries.writeOutline(w, c, p.str("path") orelse "", .{
         .kinds = try kindsOf(arena, p),
         .limit = p.positive("limit", 300),
-        .scope = scopeOf(self, p),
+        .scope = try scopeOf(self, p),
     });
 }
 
@@ -871,7 +871,7 @@ fn hotMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w
     const p = Params.from(params);
     try queries.writeHot(w, c, p.str("path") orelse "", .{
         .limit = p.positive("limit", 25),
-        .scope = scopeOf(self, p),
+        .scope = try scopeOf(self, p),
     });
 }
 
@@ -883,7 +883,7 @@ fn unusedMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
         .noPublic = p.boolean("noPublic", false),
         .followImports = p.boolean("followImports", false),
         .limit = p.positive("limit", 300),
-        .scope = scopeOf(self, p),
+        .scope = try scopeOf(self, p),
     });
 }
 
@@ -895,8 +895,43 @@ fn diffMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, 
         .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
         .limit = p.positive("limit", 500),
-        .scope = scopeOf(self, p),
+        .scope = try scopeOf(self, p),
     });
+}
+
+fn routesMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeRoutes(w, c, p.str("filter") orelse "", p.positive("limit", 300));
+}
+
+fn eventsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeEvents(w, c, p.str("filter") orelse "", p.positive("limit", 50));
+}
+
+fn importsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    try queries.writeImports(w, c, Params.from(params).str("path") orelse "");
+}
+
+fn importersMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const path = Params.from(params).str("path") orelse return error.InvalidParams;
+    if (path.len == 0) return error.InvalidParams;
+    try queries.writeImporters(w, c, path);
+}
+
+fn graphMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    try queries.writeGraphFile(w, arena, c, p.str("path") orelse "", try scopeOf(self, p));
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +960,11 @@ const requests = [_]Entry{
     .{ .name = "navgraph/hot", .run = hotMethod },
     .{ .name = "navgraph/unused", .run = unusedMethod },
     .{ .name = "navgraph/diff", .run = diffMethod },
+    .{ .name = "navgraph/routes", .run = routesMethod },
+    .{ .name = "navgraph/events", .run = eventsMethod },
+    .{ .name = "navgraph/imports", .run = importsMethod },
+    .{ .name = "navgraph/importers", .run = importersMethod },
+    .{ .name = "navgraph/graph", .run = graphMethod },
 };
 
 const notifications = [_]NotifEntry{
@@ -1938,15 +1978,15 @@ test "navgraph/neighbors reports Vm.push's caller and its lack of callees" {
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
     defer ts.deinit();
     try ts.start();
+    // Pinned: the fixture also has the generic `Stack.push`, so a bare `push`
+    // is ambiguous — the same disambiguation the CLI asks for.
     var res = try ts.request(49,
-        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/neighbors","params":{"symbol":"push"}}
+        \\{"jsonrpc":"2.0","id":49,"method":"navgraph/neighbors","params":{"symbol":"Vm.push"}}
     );
     defer res.deinit();
     const r = (try resultOf(res)).object;
     try testing.expectEqualStrings("push", r.get("symbol").?.object.get("name").?.string);
     try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
-    // Vm.run calls it directly (exact); a same-named `push` elsewhere in the
-    // fixture (bytecode_vm.zig) also picks up heuristic name-collision edges.
     var found_run = false;
     for (r.get("callers").?.array.items) |c| {
         if (std.mem.eql(u8, c.object.get("symbol").?.object.get("name").?.string, "run")) found_run = true;
@@ -1959,20 +1999,40 @@ test "navgraph/path finds the call chain from eval to push" {
     defer ts.deinit();
     try ts.start();
     var res = try ts.request(50,
-        \\{"jsonrpc":"2.0","id":50,"method":"navgraph/path","params":{"from":"eval","to":"push"}}
+        \\{"jsonrpc":"2.0","id":50,"method":"navgraph/path","params":{"from":"eval","to":"Vm.push"}}
     );
     defer res.deinit();
-    const chain = (try resultOf(res)).object.get("path").?.array.items;
+    const ok = (try resultOf(res)).object;
+    const chain = ok.get("path").?.array.items;
     try testing.expectEqual(@as(usize, 3), chain.len);
     try testing.expectEqualStrings("eval", chain[0].object.get("name").?.string);
     try testing.expectEqualStrings("run", chain[1].object.get("name").?.string);
     try testing.expectEqualStrings("push", chain[2].object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 0), ok.get("ambiguousTo").?.array.items.len);
 
     var none = try ts.request(51,
-        \\{"jsonrpc":"2.0","id":51,"method":"navgraph/path","params":{"from":"no_such_symbol_xyz","to":"push"}}
+        \\{"jsonrpc":"2.0","id":51,"method":"navgraph/path","params":{"from":"no_such_symbol_xyz","to":"Vm.push"}}
     );
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), (try resultOf(none)).object.get("path").?.array.items.len);
+}
+
+test "navgraph/path names an ambiguous endpoint instead of reporting no path" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    // Both `Stack.push` and `Vm.push` match; a bare `push` has no unique
+    // endpoint, and answering `path: []` would be a wrong answer.
+    var res = try ts.request(52,
+        \\{"jsonrpc":"2.0","id":52,"method":"navgraph/path","params":{"from":"eval","to":"push"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqual(@as(usize, 0), r.get("path").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("ambiguousFrom").?.array.items.len);
+    const cands = r.get("ambiguousTo").?.array.items;
+    try testing.expectEqual(@as(usize, 2), cands.len);
+    for (cands) |c| try testing.expectEqualStrings("push", c.object.get("name").?.string);
 }
 
 test "navgraph/outline lists vm.zig's symbols" {
@@ -2062,4 +2122,109 @@ test "navgraph/diff reports the roots of an unsaved overlay edit, wrapping blast
         if (std.mem.eql(u8, root.object.get("name").?.string, "added")) found = true;
     }
     try testing.expect(found);
+}
+
+test "navgraph/routes maps an HTTP route to its handler and its client caller" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(55,
+        \\{"jsonrpc":"2.0","id":55,"method":"navgraph/routes","params":{}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    var route: ?std.json.ObjectMap = null;
+    for (items) |it| {
+        if (std.mem.eql(u8, it.object.get("symbol").?.object.get("name").?.string, "GET /api/orders")) {
+            route = it.object;
+        }
+    }
+    try testing.expect(route != null);
+    const handler = route.?.get("handler").?.object;
+    try testing.expectEqualStrings("list_orders", handler.get("name").?.string);
+    var found = false;
+    for (route.?.get("callers").?.array.items) |c| {
+        if (std.mem.eql(u8, c.object.get("name").?.string, "listOrders")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "navgraph/events pairs the backend handler with the frontend emitter" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(56,
+        \\{"jsonrpc":"2.0","id":56,"method":"navgraph/events","params":{"filter":"order_placed"}}
+    );
+    defer res.deinit();
+    const groups = (try resultOf(res)).object.get("groups").?.array.items;
+    try testing.expectEqual(@as(usize, 1), groups.len);
+    try testing.expectEqualStrings("order_placed", groups[0].object.get("key").?.string);
+    const sites = groups[0].object.get("sites").?.array.items;
+    try testing.expectEqual(@as(usize, 2), sites.len);
+    var saw_handler = false;
+    var saw_emitter = false;
+    for (sites) |s| {
+        const role = s.object.get("role").?.string;
+        if (std.mem.eql(u8, role, "handler")) saw_handler = true;
+        if (std.mem.eql(u8, role, "emitter")) saw_emitter = true;
+    }
+    try testing.expect(saw_handler and saw_emitter);
+}
+
+test "navgraph/imports lists app.py's local module imports" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(57,
+        \\{"jsonrpc":"2.0","id":57,"method":"navgraph/imports","params":{"path":"app.py"}}
+    );
+    defer res.deinit();
+    const files = (try resultOf(res)).object.get("files").?.array.items;
+    try testing.expectEqual(@as(usize, 1), files.len);
+    try testing.expectEqualStrings("backend/app.py", files[0].object.get("file").?.string);
+    const imps = files[0].object.get("imports").?.array.items;
+    var found = false;
+    for (imps) |i| {
+        if (std.mem.eql(u8, i.object.get("target").?.string, "backend/store.py")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "navgraph/importers lists store.py's reverse dependencies" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(58,
+        \\{"jsonrpc":"2.0","id":58,"method":"navgraph/importers","params":{"path":"store.py"}}
+    );
+    defer res.deinit();
+    const files = (try resultOf(res)).object.get("files").?.array.items;
+    try testing.expectEqual(@as(usize, 1), files.len);
+    try testing.expectEqualStrings("backend/store.py", files[0].object.get("file").?.string);
+    var found = false;
+    for (files[0].object.get("importers").?.array.items) |imp| {
+        if (std.mem.eql(u8, imp.object.get("file").?.string, "backend/app.py")) found = true;
+    }
+    try testing.expect(found);
+
+    var missing = try ts.request(59,
+        \\{"jsonrpc":"2.0","id":59,"method":"navgraph/importers","params":{}}
+    );
+    defer missing.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(missing));
+}
+
+test "navgraph/graph writes an HTML file under .navgraph and returns its path" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(60,
+        \\{"jsonrpc":"2.0","id":60,"method":"navgraph/graph","params":{}}
+    );
+    defer res.deinit();
+    const path = (try resultOf(res)).object.get("path").?.string;
+    try testing.expect(std.mem.startsWith(u8, path, ".navgraph/graph-"));
+    try testing.expect(std.mem.endsWith(u8, path, ".html"));
+    const st = try ts.server.session.?.root_dir.statFile(ts.server.io, path, .{});
+    try testing.expect(st.size > 0);
 }

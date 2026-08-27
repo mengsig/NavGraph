@@ -10,6 +10,7 @@ const model = @import("../model.zig");
 const query = @import("../query.zig");
 const render = @import("../render.zig");
 const gitdiff = @import("../gitdiff.zig");
+const viz = @import("../viz.zig");
 const overlay = @import("overlay.zig");
 const payload = @import("payload.zig");
 const position = @import("position.zig");
@@ -816,11 +817,24 @@ pub fn writePath(w: *Writer, ctx: Ctx, from_name: []const u8, to_name: []const u
     const idx = ctx.index();
     var fbuf: [64]SymbolId = undefined;
     var tbuf: [64]SymbolId = undefined;
+    const from_ids = query.resolveIds(idx, from_name, &fbuf);
+    const to_ids = query.resolveIds(idx, to_name, &tbuf);
+    // A path is authoritative only between unique endpoints, so an ambiguous
+    // name yields no path. Say which name, and offer the candidates: reporting
+    // it as "no path" would be a wrong answer, not a missing one.
+    if (from_ids.len > 1 or to_ids.len > 1) {
+        try w.writeAll("{\"path\":[],\"ambiguousFrom\":");
+        try payload.writeSymbolArray(w, ctx, if (from_ids.len > 1) from_ids else &.{});
+        try w.writeAll(",\"ambiguousTo\":");
+        try payload.writeSymbolArray(w, ctx, if (to_ids.len > 1) to_ids else &.{});
+        try w.writeByte('}');
+        return;
+    }
     const chain = try query.shortestPathIds(idx, from_name, to_name, &fbuf, &tbuf);
     defer idx.gpa.free(chain);
     try w.writeAll("{\"path\":");
     try payload.writeSymbolArray(w, ctx, chain);
-    try w.writeByte('}');
+    try w.writeAll(",\"ambiguousFrom\":[],\"ambiguousTo\":[]}");
 }
 
 // ---------------------------------------------------------------------------
@@ -983,4 +997,203 @@ pub fn writeDiff(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, ref: []const u8, 
         .scope = opts.scope,
     });
     try w.writeByte('}');
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+/// Write `{items:[{symbol,handler,callers:Symbol[]}]}` for every `route`
+/// symbol whose name contains `filter`.
+pub fn writeRoutes(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void {
+    const idx = ctx.index();
+    try w.writeAll("{\"items\":[");
+    var shown: u32 = 0;
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind != .route) continue;
+        if (filter.len != 0 and std.mem.indexOf(u8, sym.name, filter) == null) continue;
+        if (shown >= limit) break;
+        if (shown != 0) try w.writeByte(',');
+        try writeRouteItem(w, ctx, sym);
+        shown += 1;
+    }
+    try w.writeAll("]}");
+}
+
+fn writeRouteItem(w: *Writer, ctx: Ctx, route: Symbol) !void {
+    const idx = ctx.index();
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, route.id);
+    try w.writeAll(",\"handler\":");
+    var handler: SymbolId = invalid;
+    for (route.refs) |ref| {
+        if (ref.kind == .call and ref.target != invalid) handler = ref.target;
+    }
+    if (handler == invalid) {
+        try w.writeAll("null");
+    } else {
+        try payload.writeSymbolId(w, ctx, handler);
+    }
+    try w.writeAll(",\"callers\":[");
+    for (idx.callersOf(route.id), 0..) |cid, k| {
+        if (k != 0) try w.writeByte(',');
+        try payload.writeSymbolId(w, ctx, cid);
+    }
+    try w.writeAll("]}");
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/// Write `{groups:[{key,sites:[{role,verb,file,uri,line,in?}]}]}`, linking
+/// message-bus handlers (register/on) to emitters (send/emit) by string key.
+pub fn writeEvents(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void {
+    const idx = ctx.index();
+    const sites = try query.collectEvents(idx, filter);
+    defer idx.gpa.free(sites);
+
+    try w.writeAll("{\"groups\":[");
+    var shown_keys: u32 = 0;
+    var i: usize = 0;
+    while (i < sites.len) {
+        const key = sites[i].ref.key;
+        if (shown_keys != 0) try w.writeByte(',');
+        try w.writeAll("{\"key\":");
+        try payload.writeString(w, key);
+        try w.writeAll(",\"sites\":[");
+        var first = true;
+        while (i < sites.len and std.mem.eql(u8, sites[i].ref.key, key)) : (i += 1) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try writeEventSite(w, ctx, sites[i]);
+        }
+        try w.writeAll("]}");
+        shown_keys += 1;
+        if (shown_keys >= limit) break;
+    }
+    try w.writeAll("]}");
+}
+
+fn writeEventSite(w: *Writer, ctx: Ctx, site: query.EventSite) !void {
+    const idx = ctx.index();
+    const file = idx.graph.files[site.file];
+    try w.writeAll("{\"role\":\"");
+    try w.writeAll(if (site.ref.role == .handler) "handler" else "emitter");
+    try w.writeAll("\",\"verb\":");
+    try payload.writeString(w, site.ref.verb);
+    try w.writeAll(",\"file\":");
+    try payload.writeString(w, file.path);
+    try w.writeAll(",\"uri\":\"");
+    try overlay.writeUriIn(w, ctx.session.root_abs, file.path);
+    try w.print("\",\"line\":{d}", .{site.ref.line});
+    const owner = query.enclosingSymbolName(idx, file, site.ref.offset);
+    if (owner.len != 0) {
+        try w.writeAll(",\"in\":");
+        try payload.writeString(w, owner);
+    }
+    try w.writeByte('}');
+}
+
+// ---------------------------------------------------------------------------
+// Imports / importers
+// ---------------------------------------------------------------------------
+
+/// Write `{files:[{file,uri,imports:[{target,targetUri,binding}]}]}`: the
+/// local modules each in-scope file imports (resolved edges only).
+pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8) !void {
+    const idx = ctx.index();
+    try w.writeAll("{\"files\":[");
+    var first = true;
+    for (idx.graph.files) |file| {
+        const imps = idx.importsOf(file.id);
+        if (imps.len == 0 or !query.matchesFilter(file.path, filter)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"file\":");
+        try payload.writeString(w, file.path);
+        try w.writeAll(",\"uri\":\"");
+        try overlay.writeUriIn(w, ctx.session.root_abs, file.path);
+        try w.writeAll("\",\"imports\":[");
+        for (imps, 0..) |imp, k| {
+            if (k != 0) try w.writeByte(',');
+            const target = idx.graph.files[imp.target];
+            try w.writeAll("{\"target\":");
+            try payload.writeString(w, target.path);
+            try w.writeAll(",\"targetUri\":\"");
+            try overlay.writeUriIn(w, ctx.session.root_abs, target.path);
+            try w.writeAll("\",\"binding\":");
+            try payload.writeString(w, imp.binding);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]}");
+}
+
+/// Write `{files:[{file,uri,importers:[{file,uri}]}]}`: files that import
+/// the file(s) matching `path` — reverse dependencies.
+pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8) !void {
+    const idx = ctx.index();
+    try w.writeAll("{\"files\":[");
+    var first = true;
+    for (idx.graph.files) |target| {
+        if (!query.matchesFilter(target.path, path)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"file\":");
+        try payload.writeString(w, target.path);
+        try w.writeAll(",\"uri\":\"");
+        try overlay.writeUriIn(w, ctx.session.root_abs, target.path);
+        try w.writeAll("\",\"importers\":[");
+        var wrote: u32 = 0;
+        for (idx.graph.files) |src| {
+            if (!fileImportsFile(idx, src.id, target.id)) continue;
+            if (wrote != 0) try w.writeByte(',');
+            try w.writeAll("{\"file\":");
+            try payload.writeString(w, src.path);
+            try w.writeAll(",\"uri\":\"");
+            try overlay.writeUriIn(w, ctx.session.root_abs, src.path);
+            try w.writeAll("\"}");
+            wrote += 1;
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]}");
+}
+
+fn fileImportsFile(idx: *const Index, src: model.FileId, target: model.FileId) bool {
+    for (idx.importsOf(src)) |imp| if (imp.target == target) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Graph
+// ---------------------------------------------------------------------------
+
+/// Render the interactive HTML graph (over `viz.graph`) and write it to
+/// `.navgraph/graph-<hash>.html` under the served root — `<hash>` is a content
+/// hash, so an identical view (same filter, same test scope) reuses one file
+/// instead of littering a new one per request. Writes `{path, nodes, nodesTotal,
+/// truncated}`, `path` root-relative.
+pub fn writeGraphFile(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, path_filter: []const u8, scope: Scope) !void {
+    const s = ctx.session;
+    var html: Writer.Allocating = .init(gpa);
+    defer html.deinit();
+    // The page itself has nowhere to say it was capped, so the node counts ride
+    // back on the response instead of a capped subgraph passing for the graph.
+    const cut = try viz.graph(&html.writer, ctx.index(), path_filter, .{ .tests = scope.tests });
+    const bytes = html.written();
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(bytes);
+    const rel = try std.fmt.allocPrint(gpa, ".navgraph/graph-{x:0>16}.html", .{hasher.final()});
+    defer gpa.free(rel);
+
+    try s.root_dir.createDirPath(s.io, ".navgraph");
+    try s.root_dir.writeFile(s.io, .{ .sub_path = rel, .data = bytes });
+
+    try w.writeAll("{\"path\":");
+    try payload.writeString(w, rel);
+    try w.print(",\"nodes\":{d},\"nodesTotal\":{d},\"truncated\":{}}}", .{ cut.shown, cut.total, cut.any() });
 }

@@ -283,11 +283,19 @@ other navgraph/* walk uses, for a consistent contract.
 
 ### `navgraph/path`
 
-Params: `{ from:string, to:string }` → `{ path:Symbol[] }`.
+Params: `{ from:string, to:string }` →
+`{ path:Symbol[], ambiguousFrom:Symbol[], ambiguousTo:Symbol[] }`.
 
 The shortest call path from `from` to `to` (BFS over resolved call/use edges),
-source-first; empty when either name is unknown or no path exists. Names accept
-the same `Parent.name` / `name@path` forms as every CLI name argument.
+source-first; `path` is empty when either name is unknown or no path exists.
+Names accept the same `Parent.name` / `name@path` forms as every CLI name
+argument.
+
+A path is authoritative only between unique endpoints. When a name matches
+several definitions the walk is not run and its candidates come back in
+`ambiguousFrom` / `ambiguousTo`, so an ambiguous question is never answered as
+"no path" — re-ask with `Parent.name` or `name@path`. Both arrays are empty on
+an ordinary answer.
 
 ### `navgraph/outline`
 
@@ -332,6 +340,57 @@ unsaved buffer differs from disk, wrapped as a `navgraph/blast` walk from those
 roots — the blast radius of a pending change. Unlike `navgraph/blast`'s own
 `{ ref }` target form, an empty change set is not a `-32001` error here:
 "nothing changed" is a routine answer, not a failed lookup.
+
+### `navgraph/routes`
+
+Params: `{ filter?:string, limit?:int (300) }` →
+`{ items:[{symbol,handler:Symbol|null,callers:Symbol[]}] }`.
+
+Every HTTP route (`symbol.name` is `"METHOD /path"`, e.g. `"GET /api/orders"`),
+its resolved handler definition, and the client call sites that hit it.
+`filter` is a substring match over the route name.
+
+### `navgraph/events`
+
+Params: `{ filter?:string, limit?:int (50) }` →
+`{ groups:[{key,sites:[{role:"handler"|"emitter", verb, file, uri, line, in?}]}] }`.
+
+
+Message-bus handlers (`register`/`on`) linked to emitters (`send`/`emit`) by
+their shared string key, key-sorted, paired keys first. `in` names the
+enclosing definition when the site sits inside one. `limit` caps the number of
+key groups returned.
+
+### `navgraph/imports`
+
+Params: `{ path?:string }` →
+`{ files:[{file,uri,imports:[{target,targetUri,binding}]}] }`.
+
+The local modules each in-scope file imports (resolved edges only). `path` is
+a substring filter over the importing file's path.
+
+### `navgraph/importers`
+
+Params: `{ path:string }` → `{ files:[{file,uri,importers:[{file,uri}]}] }`.
+
+Files that import the file(s) matching `path` — reverse dependencies. `path`
+is required (a substring filter over the imported file's path).
+
+### `navgraph/graph`
+
+Params: `{ path?:string } & Scope` →
+`{ path:string, nodes:int, nodesTotal:int, truncated:bool }`.
+
+Renders the same interactive HTML visualization as `navgraph graph` and writes
+it to `.navgraph/graph-<hash>.html` under the served root (`<hash>` is a
+content hash, so re-requesting the same view reuses one file). `path` is
+returned root-relative; open it in a browser. `scope.tests` selects whether
+test symbols appear in the graph (`scope.strict` has no effect here).
+
+The page holds at most `nodes` of `nodesTotal` symbols — the renderer's own
+node cap, which the HTML has nowhere to report. `truncated` says the view is
+partial, so a client can say so rather than present a capped subgraph as the
+graph.
 
 ## Notifications (server → client)
 
@@ -437,12 +496,6 @@ and requires the process to exit 0. CI runs it against the ReleaseFast build.
 
 ## Limitations
 
-- **Not yet implemented** (a stacked follow-up): `navgraph/routes`, `events`,
-  `imports`, `importers`, `graph`. Per the contract they are **not** advertised in
-  `experimental.navgraph.methods` until they land — a client should read that
-  list rather than assume. `methods` holds only names that can be *called*;
-  server→client notifications are listed separately under `notifications`. Adding one is a single adapter function plus a table
-  entry in `src/lsp/handlers.zig`.
 - Symbol ids are per-generation (see above).
 - `textDocument/definition` returns the resolved definition first, then the
   other same-name candidates, so an ambiguous name still offers every choice.
