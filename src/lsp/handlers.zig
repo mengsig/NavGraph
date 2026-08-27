@@ -305,12 +305,12 @@ fn positionOf(p: Params) Error!position.Position {
     };
 }
 
-fn scopeOf(self: *Server, p: Params) queries.Scope {
+fn scopeOf(self: *Server, p: Params) Error!queries.Scope {
     var scope = queries.Scope.fromConfig(self.cfg);
     scope.strict = p.boolean("strict", scope.strict);
-    if (p.str("tests")) |t| {
-        if (query.TestScope.parse(t)) |ts| scope.tests = ts;
-    }
+    // An unknown scope is rejected, not dropped: answering the default question
+    // instead of the one asked is worse than erroring.
+    if (p.str("tests")) |t| scope.tests = query.TestScope.parse(t) orelse return error.InvalidParams;
     return scope;
 }
 
@@ -355,13 +355,17 @@ fn initialize(self: *Server, gpa: std.mem.Allocator, params: ?std.json.Value, w:
             "\"experimental\":{{\"navgraph\":{{\"protocolVersion\":{d},\"methods\":[",
         .{ self.encoding.name(), protocol_version },
     );
-    var first = true;
-    for (navgraph_methods) |name| {
-        if (!first) try w.writeByte(',');
-        first = false;
+    try writeNameList(w, &navgraph_methods);
+    try w.writeAll("],\"notifications\":[");
+    try writeNameList(w, &navgraph_notifications);
+    try w.print("]}}}}}},\"serverInfo\":{{\"name\":\"navgraph\",\"version\":\"{s}\"}}}}", .{version});
+}
+
+fn writeNameList(w: *Writer, names: []const []const u8) !void {
+    for (names, 0..) |name, i| {
+        if (i != 0) try w.writeByte(',');
         try payload.writeString(w, name);
     }
-    try w.print("]}}}}}},\"serverInfo\":{{\"name\":\"navgraph\",\"version\":\"{s}\"}}}}", .{version});
 }
 
 fn negotiateEncoding(caps: Params) position.Encoding {
@@ -723,7 +727,7 @@ fn blast(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *W
         .depth = @min(p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
         .limit = p.positive("limit", 500),
-        .scope = scopeOf(self, p),
+        .scope = try scopeOf(self, p),
     });
 }
 
@@ -739,7 +743,7 @@ fn searchMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
     const c = try self.ctx();
     const p = Params.from(params);
     const q = p.str("query") orelse return error.InvalidParams;
-    const scope = scopeOf(self, p);
+    const scope = try scopeOf(self, p);
     const filter = search.Filter{ .kinds = try kindsOf(arena, p), .tests = scope.tests };
 
     var hits: std.ArrayList(search.Hit) = .empty;
@@ -820,7 +824,7 @@ fn tree(
         .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
         .direction = direction,
         .refs = p.boolean("refs", false),
-        .scope = scopeOf(self, p),
+        .scope = try scopeOf(self, p),
     });
     try w.writeByte('}');
 }
@@ -868,9 +872,11 @@ const notifications = [_]NotifEntry{
     .{ .name = "$/setTrace", .run = ignore },
 };
 
-/// Every implemented `navgraph/*` method, advertised in `initialize`.
+/// Every callable `navgraph/*` request, advertised in `initialize`. A client is
+/// told to build its method list from this, so it must hold only names that can
+/// actually be called — `navgraph/indexed` is a notification and lives below.
 pub const navgraph_methods = blk: {
-    var names: [requests.len + 1][]const u8 = undefined;
+    var names: [requests.len][]const u8 = undefined;
     var n: usize = 0;
     for (requests) |e| {
         if (std.mem.startsWith(u8, e.name, "navgraph/")) {
@@ -878,11 +884,12 @@ pub const navgraph_methods = blk: {
             n += 1;
         }
     }
-    names[n] = "navgraph/indexed";
-    n += 1;
     const out = names[0..n].*;
     break :blk out;
 };
+
+/// Every `navgraph/*` notification the server sends, advertised separately.
+pub const navgraph_notifications = [_][]const u8{"navgraph/indexed"};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1084,6 +1091,68 @@ test "initialize advertises the contract's capabilities and methods" {
     const methods = ng.get("methods").?.array.items;
     try testing.expectEqual(navgraph_methods.len, methods.len);
     for (methods) |m| try testing.expect(std.mem.startsWith(u8, m.string, "navgraph/"));
+
+    // A notification is not a callable method; clients build their method list
+    // from this array, so anything in it must survive being called.
+    const notifs = ng.get("notifications").?.array.items;
+    try testing.expectEqual(navgraph_notifications.len, notifs.len);
+    try testing.expectEqualStrings("navgraph/indexed", notifs[0].string);
+    for (methods) |m| try testing.expect(!std.mem.eql(u8, m.string, "navgraph/indexed"));
+}
+
+test "every advertised navgraph method is dispatchable" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.responseFor(1);
+    defer res.deinit();
+    const ng = (try resultOf(res)).object.get("capabilities").?.object
+        .get("experimental").?.object.get("navgraph").?.object;
+
+    var id: i64 = 200;
+    for (ng.get("methods").?.array.items) |m| {
+        id += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const body = try std.fmt.allocPrint(
+            arena.allocator(),
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{{}}}}",
+            .{ id, m.string },
+        );
+        var got = try ts.request(id, body);
+        defer got.deinit();
+        // Params may well be wrong for the method; "unknown method" may not be.
+        if (got.value.object.get("error")) |e| {
+            try testing.expect(e.object.get("code").?.integer != -32601);
+        }
+    }
+}
+
+test "an invalid tests scope is rejected, not silently ignored" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    const methods = [_][]const u8{ "navgraph/blast", "navgraph/search", "navgraph/callers", "navgraph/calls" };
+    var id: i64 = 300;
+    for (methods) |method| {
+        id += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const body = try std.fmt.allocPrint(
+            arena.allocator(),
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\"," ++
+                "\"params\":{{\"symbol\":\"run\",\"query\":\"run\",\"tests\":\"bogus\"}}}}",
+            .{ id, method },
+        );
+        var got = try ts.request(id, body);
+        defer got.deinit();
+        try testing.expectEqual(@as(i64, -32602), try errorCodeOf(got));
+    }
+
+    // A valid scope still answers.
+    var ok = try ts.request(320,
+        \\{"jsonrpc":"2.0","id":320,"method":"navgraph/blast","params":{"symbol":"run","tests":"without"}}
+    );
+    defer ok.deinit();
+    try testing.expect((try resultOf(ok)).object.get("summary") != null);
 }
 
 test "initialize defaults to utf-16 when the client offers no encoding" {

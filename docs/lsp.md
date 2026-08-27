@@ -58,7 +58,9 @@ CLI prints them.
   "textDocumentSync": {"openClose": true, "change": 1, "save": {"includeText": false}},
   "definitionProvider": true, "referencesProvider": true, "hoverProvider": true,
   "documentSymbolProvider": true, "workspaceSymbolProvider": true,
-  "experimental": {"navgraph": {"protocolVersion": 1, "methods": [ /* every implemented navgraph/* method */ ]}}
+  "experimental": {"navgraph": {"protocolVersion": 1,
+    "methods": [ /* every callable navgraph/* request */ ],
+    "notifications": [ /* every navgraph/* notification the server sends */ ]}}
 }, "serverInfo": {"name": "navgraph", "version": "…"}}
 ```
 
@@ -91,7 +93,7 @@ disappears again when the buffer is closed.
 | `-32700` | A frame body that is not JSON, or a frame the server could not parse. The server resyncs and keeps serving. |
 | `-32600` | Not a JSON-RPC request, or a request before `initialized`. |
 | `-32601` | Unknown method. |
-| `-32602` | Bad params: a missing/ill-typed field, an unknown `direction`, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. |
+| `-32602` | Bad params: a missing/ill-typed field, an unknown `direction` or `tests` scope, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. |
 | `-32603` | Internal failure (allocation, IO). |
 | `-32001` | A `Target` that resolves to nothing — `{"message": "…: symbol not found", …}`. |
 | `-32002` | The request could not be completed: currently only a grep regex that exhausts one of the bounds below. |
@@ -348,7 +350,8 @@ Reproduce with a client that drives the binary over a pipe: `initialize` →
   `outline`, `hot`, `unused`, `diff`, `routes`, `events`, `imports`,
   `importers`, `graph`. Per the contract they are **not** advertised in
   `experimental.navgraph.methods` until they land — a client should read that
-  list rather than assume. Adding one is a single adapter function plus a table
+  list rather than assume. `methods` holds only names that can be *called*;
+  server→client notifications are listed separately under `notifications`. Adding one is a single adapter function plus a table
   entry in `src/lsp/handlers.zig`.
 - Symbol ids are per-generation (see above).
 - `textDocument/definition` returns the resolved definition first, then the
