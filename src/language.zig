@@ -68,6 +68,95 @@ pub const Language = enum {
         };
     }
 
+    /// Whether `name` is a builtin/standard-library container or scalar type in
+    /// this language. A member call through a receiver of such a type
+    /// (`items.add`, `entries.len`, `items_.size`) belongs to that library, so
+    /// the resolver must abstain instead of matching a same-named project
+    /// method. Deliberately a small, curated list of the types projects
+    /// actually declare fields and locals with — a name absent from it just
+    /// keeps today's heuristic behaviour.
+    pub fn isBuiltinContainer(self: Language, name: []const u8) bool {
+        const table: []const []const u8 = switch (self.family()) {
+            .c => &.{
+                "vector",        "map",        "unordered_map", "set",     "unordered_set",
+                "string",        "array",      "list",          "deque",   "pair",
+                "optional",      "queue",      "stack",         "span",    "string_view",
+                "shared_ptr",    "unique_ptr", "weak_ptr",      "ostream", "istream",
+                "ostringstream", "size_t",     "int",           "char",    "double",
+                "float",         "bool",       "FILE",
+            },
+            .java => &.{
+                "List",     "ArrayList", "LinkedList",  "Map",     "HashMap",
+                "TreeMap",  "Set",       "HashSet",     "TreeSet", "Collection",
+                "Iterator", "Stream",    "Optional",    "String",  "StringBuilder",
+                "Integer",  "Long",      "Double",      "Boolean", "Object",
+                "Arrays",   "Objects",   "Collections",
+            },
+            .csharp => &.{
+                "List",        "Dictionary",    "IEnumerable", "IList",    "IDictionary",
+                "ICollection", "HashSet",       "Queue",       "Stack",    "Array",
+                "String",      "StringBuilder", "Task",        "Nullable", "Tuple",
+            },
+            .rust => &.{
+                "Vec",      "VecDeque", "HashMap", "HashSet", "BTreeMap",
+                "BTreeSet", "String",   "Option",  "Result",  "Iterator",
+                "str",      "Box",      "Rc",      "Arc",     "RefCell",
+                "Cell",     "Cow",      "Mutex",   "RwLock",
+            },
+            .python => &.{
+                "dict",  "list",        "set",     "tuple",       "str",
+                "int",   "float",       "bytes",   "bool",        "frozenset",
+                "deque", "defaultdict", "Counter", "OrderedDict", "Path",
+            },
+            .js => &.{
+                "Array",  "Map",    "Set",    "WeakMap", "WeakSet",
+                "Object", "String", "Number", "Promise", "Date",
+                "RegExp", "JSON",   "Error",
+            },
+            .zig => &.{
+                "ArrayList",     "ArrayListUnmanaged", "HashMap",            "AutoHashMap",
+                "StringHashMap", "ArrayHashMap",       "StringArrayHashMap", "Allocator",
+                "Writer",        "Reader",
+            },
+            .go, .lua, .ruby, .other => &.{},
+        };
+        for (table) |t| if (std.mem.eql(u8, t, name)) return true;
+        return false;
+    }
+
+    /// Whether `name` is a wrapper whose members are reached through the type
+    /// it wraps. A call on a value declared `Box<Expr>` dispatches to `Expr`'s
+    /// method, so a *receiver* of this type must not abstain the way an opaque
+    /// container does — but `Box::new` is still the wrapper's own. C++
+    /// `unique_ptr`/`shared_ptr`/`weak_ptr` and `optional` reach their pointee
+    /// through `operator->` the same way.
+    ///
+    /// Known gap: these names stay in `isBuiltinContainer` for the qualifier
+    /// side, but the receiver-side abstain there is `isBuiltinContainer and
+    /// !derefsToInner`, so it never fires for them. A call to the WRAPPER's own
+    /// member (`u_.reset()`, `w_.lock()`) therefore still reaches a same-named
+    /// project method by the global-name guess, exactly as before this table
+    /// existed.
+    pub fn derefsToInner(self: Language, name: []const u8) bool {
+        const table: []const []const u8 = switch (self.family()) {
+            .rust => &.{ "Box", "Rc", "Arc", "RefCell", "Cell", "Cow", "Mutex", "RwLock" },
+            .c => &.{ "unique_ptr", "shared_ptr", "weak_ptr", "optional" },
+            else => return false,
+        };
+        for (table) |t| if (std.mem.eql(u8, t, name)) return true;
+        return false;
+    }
+
+    /// Whether a declaration writes the type before the name (`Product p`)
+    /// rather than after it (`p: Product`). C, C++, Java and C# do; the
+    /// annotation languages and the `:=`/`let` forms do not.
+    pub fn declaresTypeBeforeName(self: Language) bool {
+        return switch (self) {
+            .c, .cpp, .java, .csharp => true,
+            .zig, .python, .javascript, .typescript, .tsx, .lua, .go, .rust, .ruby, .unknown => false,
+        };
+    }
+
     /// Family groups languages that resolve references against each other.
     pub fn family(self: Language) Family {
         return switch (self) {

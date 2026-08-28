@@ -7965,9 +7965,12 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     try testing.expectEqual(@as(usize, 1), root_obj.get("freshness").?.object.get("changes").?.array.items.len);
     try testing.expectEqual(@as(i64, 1), root_obj.get("parse_health").?.object.get("count").?.integer);
     const resolution = root_obj.get("unresolved_references").?.object;
-    try testing.expectEqual(@as(i64, 3), resolution.get("count").?.integer);
+    // `"x".slice()` is a member of a string literal, not a reference the
+    // project could ever resolve: the parser no longer records a member whose
+    // receiver it cannot name, so it is not reported as unresolved.
+    try testing.expectEqual(@as(i64, 2), resolution.get("count").?.integer);
     try testing.expectEqual(@as(i64, 1), resolution.get("categories").?.object.get("likely_local").?.integer);
-    try testing.expectEqual(@as(i64, 2), resolution.get("categories").?.object.get("external_or_unmodeled").?.integer);
+    try testing.expectEqual(@as(i64, 1), resolution.get("categories").?.object.get("external_or_unmodeled").?.integer);
     try testing.expectEqualStrings("likely_local", resolution.get("items").?.array.items[0].object.get("resolution").?.string);
 
     var local_buf: std.ArrayList(u8) = .empty;

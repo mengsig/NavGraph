@@ -217,9 +217,59 @@ pub fn build(b: *std.Build) void {
     efficiency_cmd.setCwd(b.path("."));
     const efficiency_step = b.step("efficiency", "Check deterministic agent-context compression budgets");
     efficiency_step.dependOn(&efficiency_cmd.step);
+
+    // Accuracy benchmark: scores the indexer against the hand-verified golden
+    // corpora in tests/golden/. It links the graph engine directly (the JSON
+    // command surfaces drop kinds, so scoring through them would exempt the
+    // constructs the corpora exist to stress).
+    const accuracy_bench_exe = b.addExecutable(.{
+        .name = "accuracy-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/accuracy-bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "NavGraph", .module = mod }},
+        }),
+    });
+    const accuracy_cmd = b.addSystemCommand(&.{"sh"});
+    accuracy_cmd.addFileArg(b.path("tests/accuracy.sh"));
+    accuracy_cmd.addArtifactArg(accuracy_bench_exe);
+    accuracy_cmd.addDirectoryArg(b.path("."));
+    accuracy_cmd.setCwd(b.path("."));
+    if (b.args) |args| accuracy_cmd.addArgs(args);
+    const accuracy_step = b.step("bench", "Score the indexer against the golden accuracy corpora");
+    accuracy_step.dependOn(&accuracy_cmd.step);
+
+    // Formatting is a gate, not a habit: nothing else in CI runs `zig fmt`, so
+    // unformatted files accumulated silently until a rename collided with an
+    // unrelated branch's realignment of the same table.
+    const fmt_check = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--check", "src", "tests", "build.zig" });
+    fmt_check.setCwd(b.path("."));
+
+    // docs/accuracy.md's "After the wave" table is generated from a bench run.
+    // It was retyped by hand once and went stale by two commits, so the suite
+    // now fails while the document disagrees with the measurement.
+    const doc_table_cmd = b.addSystemCommand(&.{"sh"});
+    doc_table_cmd.addFileArg(b.path("tests/accuracy.sh"));
+    doc_table_cmd.addArtifactArg(accuracy_bench_exe);
+    doc_table_cmd.addDirectoryArg(b.path("."));
+    doc_table_cmd.addArg("--check-doc-table");
+    doc_table_cmd.setCwd(b.path("."));
+
+    // White-box tests inside accuracy-bench.zig itself (the floor ratchet,
+    // ratioBp) - not covered by mod_tests/exe_tests, which only root at
+    // src/root.zig and src/main.zig.
+    const accuracy_bench_tests = b.addTest(.{ .root_module = accuracy_bench_exe.root_module });
+    const run_accuracy_bench_tests = b.addRunArtifact(accuracy_bench_tests);
+    run_accuracy_bench_tests.setCwd(b.path("."));
+
     test_step.dependOn(&contract_cmd.step);
     test_step.dependOn(&manifest_contract_cmd.step);
     test_step.dependOn(&efficiency_cmd.step);
+    test_step.dependOn(&accuracy_cmd.step);
+    test_step.dependOn(&run_accuracy_bench_tests.step);
+    test_step.dependOn(&doc_table_cmd.step);
+    test_step.dependOn(&fmt_check.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

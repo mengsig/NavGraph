@@ -1744,9 +1744,9 @@ test "definition and references resolve real testenv sources" {
     , .{vm_uri}));
     defer def.deinit();
     const locs = (try resultOf(def)).array.items;
-    // The graph's own choice comes first; the generic `Stack.push` is the
-    // same-name candidate the editor is also offered.
-    try testing.expectEqual(@as(usize, 2), locs.len);
+    // The graph's own choice comes first; the generic `Stack.push` and
+    // `Registry.push` are the same-name candidates the editor is also offered.
+    try testing.expectEqual(@as(usize, 3), locs.len);
     try testing.expectEqualStrings(vm_uri, locs[0].object.get("uri").?.string);
     try testing.expectEqual(@as(i64, 31), locs[0].object.get("range").?.object.get("start").?.object.get("line").?.integer);
     try testing.expectEqual(@as(i64, 11), locs[0].object.get("range").?.object.get("start").?.object.get("character").?.integer);
@@ -2087,13 +2087,16 @@ test "navgraph/neighbors returns an item per resolution, not just the first" {
     );
     defer res.deinit();
     const items = (try resultOf(res)).object.get("items").?.array.items;
-    // `run` is defined in both vm.zig and bytecode_vm.zig; both must appear,
-    // not just whichever the graph happens to index first.
-    try testing.expectEqual(@as(usize, 2), items.len);
-    var files: [2][]const u8 = undefined;
-    for (items, 0..) |item, i| files[i] = item.object.get("symbol").?.object.get("file").?.string;
-    try testing.expect(std.mem.eql(u8, files[0], "vm.zig") or std.mem.eql(u8, files[1], "vm.zig"));
-    try testing.expect(std.mem.eql(u8, files[0], "bytecode_vm.zig") or std.mem.eql(u8, files[1], "bytecode_vm.zig"));
+    // `run` is defined in vm.zig, bytecode_vm.zig and tricky_zig.zig; every one
+    // must appear, not just whichever the graph happens to index first.
+    try testing.expectEqual(@as(usize, 3), items.len);
+    for ([_][]const u8{ "vm.zig", "bytecode_vm.zig", "tricky_zig.zig" }) |want| {
+        var seen = false;
+        for (items) |item| {
+            if (std.mem.eql(u8, item.object.get("symbol").?.object.get("file").?.string, want)) seen = true;
+        }
+        try testing.expect(seen);
+    }
 }
 
 test "navgraph/neighbors includes a data-read callee, unlike the tree walks (F14)" {
@@ -2150,8 +2153,8 @@ test "navgraph/path names an ambiguous endpoint instead of reporting no path" {
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
     defer ts.deinit();
     try ts.start();
-    // Both `Stack.push` and `Vm.push` match; a bare `push` has no unique
-    // endpoint, and answering `path: []` would be a wrong answer.
+    // `Stack.push`, `Vm.push` and `Registry.push` all match; a bare `push` has
+    // no unique endpoint, and answering `path: []` would be a wrong answer.
     var res = try ts.request(52,
         \\{"jsonrpc":"2.0","id":52,"method":"navgraph/path","params":{"from":"eval","to":"push"}}
     );
@@ -2160,7 +2163,7 @@ test "navgraph/path names an ambiguous endpoint instead of reporting no path" {
     try testing.expectEqual(@as(usize, 0), r.get("path").?.array.items.len);
     try testing.expectEqual(@as(usize, 0), r.get("ambiguousFrom").?.array.items.len);
     const cands = r.get("ambiguousTo").?.array.items;
-    try testing.expectEqual(@as(usize, 2), cands.len);
+    try testing.expectEqual(@as(usize, 3), cands.len);
     for (cands) |c| try testing.expectEqualStrings("push", c.object.get("name").?.string);
 }
 
@@ -2221,8 +2224,8 @@ test "navgraph/hot ranks tokenize above the leaf push/pop methods" {
     const items = (try resultOf(res)).object.get("items").?.array.items;
     try testing.expect(items.len > 0);
     try testing.expectEqualStrings("tokenize", items[0].object.get("symbol").?.object.get("name").?.string);
-    try testing.expectEqual(@as(i64, 3), items[0].object.get("fanIn").?.integer);
-    try testing.expectEqual(@as(i64, 3), items[0].object.get("fanInExact").?.integer);
+    try testing.expectEqual(@as(i64, 4), items[0].object.get("fanIn").?.integer);
+    try testing.expectEqual(@as(i64, 4), items[0].object.get("fanInExact").?.integer);
 }
 
 test "navgraph/hot honors an explicit limit at 300, unlike the CLI's sentinel default (F9)" {
