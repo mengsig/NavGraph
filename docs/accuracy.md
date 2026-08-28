@@ -243,29 +243,60 @@ number and is left as it was recorded.
 | zig | 100.00 | 72.91 | 105/105/144 | 98.36 | 63.82 | 60/61/94 | 61.66 | 100.00 | 50.00 | 64/64/128 |
 | **all** | **93.26** | **72.54** | 1038/1113/1431 | **84.46** | **55.58** | 538/637/968 | **70.45** | **96.97** | **52.45** | 577/595/1100 |
 
-After the wave:
+Fix round 2 corrected several golden entries that had been graded to what the
+indexer emits rather than to the fixture's source, so five denominators moved
+(see **Golden corrections** below). Re-measuring the wave's base binary
+against the corrected goldens makes every delta below like-for-like: def P
+93.33, def R 72.68 (1051/1126/1446), edge P 84.55, edge R 55.47 (542/641/977),
+exact agreement 69.92, site P 97.00, site R 52.38 (582/600/1111).
 
+After the wave. This table is GENERATED — regenerate it with `zig build bench
+-- --render-doc-table`, and `zig build test` fails while it disagrees with the
+run:
+
+<!-- accuracy-table:after-wave-1 -->
 | language | def P | def R | defs | edge P | edge R | edges | exact agree | site P | site R | sites |
 |---|---|---|---|---|---|---|---|---|---|---|
 | c | 98.68 | 65.78 | 75/76/114 | 100.00 | 56.81 | 50/50/88 | 100.00 | 100.00 | 52.94 | 54/54/102 |
-| cpp | 69.40 | 56.02 | 93/134/166 | 39.02 | 18.60 | 16/41/86 | 68.75 | 100.00 | 16.83 | 17/17/101 |
+| cpp | 70.71 | 56.89 | 99/140/174 | 44.44 | 21.73 | 20/45/92 | 55.00 | 100.00 | 19.62 | 21/21/107 |
 | csharp | 100.00 | 71.07 | 86/86/121 | 94.59 | 49.29 | 35/37/71 | 82.85 | 87.50 | 53.16 | 42/48/79 |
 | go | 100.00 | 79.20 | 80/80/101 | 89.74 | 58.33 | 35/39/60 | 85.71 | 100.00 | 58.33 | 35/35/60 |
 | java | 100.00 | 76.25 | 106/106/139 | 97.05 | 59.45 | 66/68/111 | 87.87 | 93.58 | 59.83 | 73/78/122 |
 | javascript | 85.05 | 77.08 | 74/87/96 | 95.91 | 72.30 | 47/49/65 | 82.97 | 100.00 | 73.13 | 49/49/67 |
 | lua | 90.90 | 66.66 | 50/55/75 | 84.90 | 84.90 | 45/53/53 | 93.33 | 100.00 | 86.20 | 50/50/58 |
 | python | 96.68 | 91.14 | 175/181/192 | 90.76 | 85.50 | 118/130/138 | 75.42 | 100.00 | 85.81 | 121/121/141 |
-| ruby | 97.36 | 92.50 | 74/76/80 | 100.00 | 70.96 | 44/44/62 | 81.81 | 100.00 | 71.42 | 45/45/63 |
+| ruby | 97.46 | 92.77 | 77/79/83 | 100.00 | 73.84 | 48/48/65 | 81.25 | 100.00 | 73.52 | 50/50/68 |
 | rust | 98.64 | 85.88 | 73/74/85 | 84.31 | 51.19 | 43/51/84 | 83.72 | 97.95 | 40.00 | 48/49/120 |
-| typescript | 91.78 | 56.77 | 67/73/118 | 100.00 | 46.42 | 26/26/56 | 84.61 | 100.00 | 44.06 | 26/26/59 |
+| typescript | 92.20 | 58.19 | 71/77/122 | 100.00 | 46.42 | 26/26/56 | 84.61 | 100.00 | 44.06 | 26/26/59 |
 | zig | 100.00 | 72.91 | 105/105/144 | 100.00 | 64.89 | 61/61/94 | 67.21 | 100.00 | 50.78 | 65/65/128 |
-| **all** | **93.38** | **73.93** | 1058/1133/1431 | **90.29** | **60.54** | 586/649/968 | **82.42** | **98.12** | **56.82** | 625/637/1100 |
+| **all** | **93.45** | **74.06** | 1071/1146/1446 | **90.41** | **60.79** | 594/657/977 | **81.81** | **98.14** | **57.06** | 634/646/1111 |
+<!-- /accuracy-table:after-wave-1 -->
 
-No measurement dropped in any language. Overall edge precision rose 84.46 →
-90.29, edge recall 55.58 → 60.54, exact agreement 70.45 → 82.42, site
-precision 96.97 → 98.12, site recall 52.45 → 56.82. Zig and TypeScript now
-produce no phantom edge at all; Ruby still produces none while nearly
-quadrupling what it finds.
+No measurement dropped in any language against that like-for-like base.
+Overall edge precision rose 84.55 → 90.41, edge recall 55.47 → 60.79, exact
+agreement 69.92 → 81.81, definition precision 93.33 → 93.45, definition recall
+72.68 → 74.06, site precision 97.00 → 98.14, site recall 52.38 → 57.06. Zig and
+TypeScript now produce no phantom edge at all; Ruby still produces none while
+nearly quadrupling what it finds.
+
+**Golden corrections (fix round 2).** The wave's own golden additions had been
+written to the indexer's answer, and two raised cpp floors rested on that. The
+entries now say what the source says, and the three floors that could not hold
+were lowered with the reason recorded in `floors.json`'s history:
+
+- cpp `exact_agreement` 75.00 → 55.00 — the four `Car` edges (`tricky_run ->
+  Car.goUnique`/`goShared`, `Car.goUnique`/`goShared -> Engine.start`) were the
+  only inexact entries among 92, and C++ binds each to exactly one definition.
+- cpp `def_recall` 57.55 → 56.89 — `Car.engine_` and `Car.shared_` are listed
+  like the 22 comparable fields in the same golden.
+- ruby `site_recall` 74.62 → 73.52 — `LoudLedger.new` [204] dispatches to
+  `Ledger#initialize`, which `LoudLedger` does not define.
+- ruby `exact_agreement` 82.60 → 81.25 — the new `LoudLedger.size ->
+  Ledger.size` [134] edge is exact in Ruby (MRO `LoudLedger -> Loud ->
+  Ledger`, and `Loud` has no `size`); the resolver reports it inferred.
+
+Nothing about the indexer changed for any of these: seven gaps that were
+hidden in the grading are now findings the next wave can see.
 
 **What each change bought.** Ordered by what moved:
 
@@ -307,24 +338,24 @@ called, not calling), and `RefPattern.matches` never targets it at the base -
 retargeted one. The fourth "loss" was a bookkeeping error, not a real
 regression; the true count is three lost, seven gained, all justified above.
 
-**Floors** were re-recorded once at the end of the wave with a plain
-`--update-floors`; every metric that moved rose, and nothing was lowered
-(`--lower-floors` was not used and is not needed — the three floors the base
-merge put underwater were recovered by the wave's own fixes, not by lowering
-them).
+**Floors** were re-recorded with a plain `--update-floors`; the three floors
+the base merge put underwater were recovered by the wave's own fixes, not by
+lowering them. The only `--lower-floors` in the wave is the golden-correction
+round above, where the expectations got stricter and the indexer did not
+change — each one named, with its reason, under **Golden corrections**.
 
 **What this wave did not fix.** The acceptance targets it misses, and why:
 
-- **cpp edge precision is 39.0%, not ≥90%.** 25 of its 41 produced edges are
+- **cpp edge precision is 44.4%, not ≥90%.** 25 of its 45 produced edges are
   phantoms, and essentially all of them are failure class 3: an out-of-line
   `double Shape::area() const` is indexed as a free `area` with no parent, so
   the edge's `from` or `to` names a definition the golden does not have. That
   is wave 4's change, not this one's. The two phantoms this wave could reach —
   `items_.size()` on a `std::vector` field, and a CRTP call through
   `static_cast<Derived*>(this)` — are gone.
-- **Overall edge precision is 90.3%, not ≥95%,** and exact agreement 82.4%,
+- **Overall edge precision is 90.4%, not ≥95%,** and exact agreement 81.8%,
   not ≥85%. cpp alone accounts for 25 of the 63 remaining phantom edges.
-- **Ruby edge recall is 71.0%, not ≥80%.** What is left needs machinery
+- **Ruby edge recall is 73.8%, not ≥80%.** What is left needs machinery
   outside this wave: string interpolation (`"#{prefix}-#{id}"` is one string
   token, so two golden edges are invisible), operator *call sites* (`ledger +
   tagged`, `merged[0]` — wave 8 owns those, and this wave records only the
@@ -348,12 +379,17 @@ see "Fix round 1" and "Fix round 2" above; neither touched exactness.) As
 merge did not touch definition extraction) and 430 missing edges, 99 phantom
 edges, 159 exactness disagreements.
 
-After wave 1 the census reads: 354 missing definitions, 56 phantom
-definitions, 19 mis-kinded, 382 missing edges, 63 phantom edges, 103 exactness
-disagreements. Measured against the wave's actual (post-merge) base, not the
-pre-merge one, the wave-only deltas are 430→382 missing edges, 99→63 phantom
-edges, 159→103 exactness disagreements - the merge itself accounts for the
-rest of the gap from the pre-merge 456/91/157. Classes 4, 5, 6 and 9 are the
+The two censuses below are both measured against the goldens AS THEY STAND at
+this commit - the base binary and the wave's binary over the same
+expectations - so the delta is the indexer's and nothing else. (Fix round 2's
+golden corrections moved the merged-base census from the 430/99/159 recorded
+above to 376/56/19 and 435/99/163: stricter expectations, same base binary.)
+At the merged base: 376 missing definitions, 56 phantom definitions, 19
+mis-kinded, 435 missing edges, 99 phantom edges, 163 exactness disagreements.
+After wave 1: 356 missing definitions, 56 phantom definitions, 19 mis-kinded,
+383 missing edges, 63 phantom edges, 108 exactness disagreements, and one
+missed call site on a matched edge. The wave-only deltas are 435→383 missing
+edges, 99→63 phantom edges, 163→108 exactness disagreements. Classes 4, 5, 6 and 9 are the
 ones the wave moved; the counts below
 describe the baseline, and each class says where it now stands.
 

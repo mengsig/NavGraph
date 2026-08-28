@@ -19,6 +19,8 @@
 //!   accuracy-bench <repo-root> --update-floors \
 //!     --lower-floors --reason "<why>"                   accept a measured drop, with a reason
 //!   accuracy-bench <repo-root> --propose <root>         emit a golden skeleton
+//!   accuracy-bench <repo-root> --render-doc-table       docs/accuracy.md's measured table
+//!   accuracy-bench <repo-root> --check-doc-table        fail when that table is stale
 //!
 //! `--propose` reports what the indexer currently sees. That is an authoring
 //! aid, never ground truth: every entry is hand-checked against the source (and
@@ -29,7 +31,7 @@ const navgraph = @import("NavGraph");
 const model = navgraph.model;
 const index_mod = navgraph.index;
 
-const BenchError = error{ UsageError, GoldenInvalid, BelowFloor };
+const BenchError = error{ UsageError, GoldenInvalid, BelowFloor, DocTableStale };
 
 const golden_dir_path = "tests/golden";
 const floors_file = "floors.json";
@@ -199,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
     const opts = parseArgs(args) catch {
         std.debug.print(
             "usage: accuracy-bench <repo-root> [--update-floors [--lower-floors --reason \"<why>\"]] " ++
-                "[--propose <fixture-root>] [-j]\n",
+                "[--propose <fixture-root>] [--render-doc-table | --check-doc-table] [-j]\n",
             .{},
         );
         return BenchError.UsageError;
@@ -215,6 +217,16 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const results = try scoreAll(gpa, arena, io, repo, opts.repo_root);
+
+    if (opts.render_doc_table) {
+        try renderDocTable(out, results);
+        try out.flush();
+        return;
+    }
+    if (opts.check_doc_table) {
+        defer out.flush() catch {};
+        return checkDocTable(arena, io, repo, out, results);
+    }
 
     if (opts.update_floors) {
         try writeFloors(gpa, arena, io, repo, results, opts.lower_floors, opts.reason);
@@ -238,6 +250,8 @@ const Options = struct {
     reason: ?[]const u8 = null,
     propose: ?[]const u8 = null,
     json: bool = false,
+    render_doc_table: bool = false,
+    check_doc_table: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -260,6 +274,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return BenchError.UsageError;
             opts.propose = args[i];
+        } else if (std.mem.eql(u8, a, "--render-doc-table")) {
+            opts.render_doc_table = true;
+        } else if (std.mem.eql(u8, a, "--check-doc-table")) {
+            opts.check_doc_table = true;
         } else return BenchError.UsageError;
     }
     // --lower-floors always needs its reason printed, and only makes sense
@@ -267,6 +285,7 @@ fn parseArgs(args: []const []const u8) !Options {
     // reason would print nothing useful, so it doesn't count as one.
     if (opts.lower_floors and (opts.reason == null or opts.reason.?.len == 0 or !opts.update_floors)) return BenchError.UsageError;
     if (opts.reason != null and !opts.lower_floors) return BenchError.UsageError;
+    if (opts.render_doc_table and opts.check_doc_table) return BenchError.UsageError;
     return opts;
 }
 
@@ -1210,6 +1229,113 @@ fn reportRow(out: *std.Io.Writer, r: LanguageResult) !void {
     );
 }
 
+// ---------------------------------------------------------------------------
+// docs/accuracy.md's measured table
+// ---------------------------------------------------------------------------
+
+const doc_path = "docs/accuracy.md";
+const doc_table_open = "<!-- accuracy-table:after-wave-1 -->";
+const doc_table_close = "<!-- /accuracy-table:after-wave-1 -->";
+
+/// The "After the wave" table in `docs/accuracy.md`, rendered from THIS run.
+/// The doc used to be retyped by hand and went stale by two commits; it is now
+/// generated, and `--check-doc-table` fails the suite when the file drifts.
+fn renderDocTable(out: *std.Io.Writer, results: []const LanguageResult) !void {
+    try out.writeAll("| language | def P | def R | defs | edge P | edge R | edges | exact agree | site P | site R | sites |\n");
+    try out.writeAll("|---|---|---|---|---|---|---|---|---|---|---|\n");
+    var total = LanguageResult{
+        .language = "all",
+        .root = "",
+        .defs = .{},
+        .edges = .{},
+        .exact_agree = 0,
+        .sites = .{},
+        .findings = &.{},
+    };
+    for (results) |r| {
+        try renderDocRow(out, r, false);
+        total.defs.matched += r.defs.matched;
+        total.defs.actual += r.defs.actual;
+        total.defs.expected += r.defs.expected;
+        total.edges.matched += r.edges.matched;
+        total.edges.actual += r.edges.actual;
+        total.edges.expected += r.edges.expected;
+        total.exact_agree += r.exact_agree;
+        total.sites.matched += r.sites.matched;
+        total.sites.actual += r.sites.actual;
+        total.sites.expected += r.sites.expected;
+    }
+    try renderDocRow(out, total, true);
+}
+
+/// One markdown row. The aggregate row bolds its seven percentages, matching
+/// the surrounding tables in the document.
+fn renderDocRow(out: *std.Io.Writer, r: LanguageResult, aggregate: bool) !void {
+    try out.print("| {s} |", .{if (aggregate) "**all**" else r.language});
+    try renderDocPct(out, r.defs.precisionBp(), aggregate);
+    try renderDocPct(out, r.defs.recallBp(), aggregate);
+    try renderDocCounts(out, r.defs);
+    try renderDocPct(out, r.edges.precisionBp(), aggregate);
+    try renderDocPct(out, r.edges.recallBp(), aggregate);
+    try renderDocCounts(out, r.edges);
+    try renderDocPct(out, r.exactAgreementBp(), aggregate);
+    try renderDocPct(out, r.sites.precisionBp(), aggregate);
+    try renderDocPct(out, r.sites.recallBp(), aggregate);
+    try renderDocCounts(out, r.sites);
+    try out.writeAll("\n");
+}
+
+fn renderDocPct(out: *std.Io.Writer, bp: u32, bold: bool) !void {
+    const v = fmtBp(bp);
+    const b = if (bold) "**" else "";
+    try out.print(" {s}{d}.{d:0>2}{s} |", .{ b, v.whole, v.frac, b });
+}
+
+fn renderDocCounts(out: *std.Io.Writer, s: Score) !void {
+    try out.print(" {d}/{d}/{d} |", .{ s.matched, s.actual, s.expected });
+}
+
+/// Body between the generated-table markers, or null when a marker is absent.
+fn docTableBody(text: []const u8) ?[]const u8 {
+    const open = std.mem.indexOf(u8, text, doc_table_open) orelse return null;
+    const body_start = open + doc_table_open.len;
+    const close = std.mem.indexOfPos(u8, text, body_start, doc_table_close) orelse return null;
+    return std.mem.trim(u8, text[body_start..close], "\n");
+}
+
+/// Fail when `docs/accuracy.md`'s generated table no longer matches the run.
+fn checkDocTable(arena: std.mem.Allocator, io: std.Io, repo: std.Io.Dir, out: *std.Io.Writer, results: []const LanguageResult) !void {
+    const text = repo.readFileAlloc(io, doc_path, arena, .unlimited) catch |err| {
+        std.debug.print("accuracy-bench: cannot read {s} ({s})\n", .{ doc_path, @errorName(err) });
+        return BenchError.DocTableStale;
+    };
+    const found = docTableBody(text) orelse {
+        std.debug.print(
+            "accuracy-bench: {s} has no `{s}` ... `{s}` block to check\n",
+            .{ doc_path, doc_table_open, doc_table_close },
+        );
+        return BenchError.DocTableStale;
+    };
+
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(arena);
+    var buf: std.Io.Writer.Allocating = .fromArrayList(arena, &rendered);
+    try renderDocTable(&buf.writer, results);
+    rendered = buf.toArrayList();
+    const want = std.mem.trim(u8, rendered.items, "\n");
+
+    if (std.mem.eql(u8, found, want)) {
+        try out.print("accuracy-bench: {s}'s measured table matches this run\n", .{doc_path});
+        return;
+    }
+    std.debug.print(
+        "accuracy-bench: {s}'s measured table is stale. Regenerate it:\n" ++
+            "  zig build bench -- --render-doc-table\n\nrecorded:\n{s}\n\nmeasured:\n{s}\n",
+        .{ doc_path, found, want },
+    );
+    return BenchError.DocTableStale;
+}
+
 fn reportFloors(out: *std.Io.Writer, results: []const LanguageResult, floors: Floors) !void {
     const n = violations(results, floors);
     if (n == 0) {
@@ -1661,4 +1787,50 @@ test "writeFloors round-trips through the file and the ratchet governs re-record
     try writeFloors(gpa, arena, io, tmp.dir, &.{regressed}, true, "test drop");
     floors = try loadFloors(arena, io, tmp.dir);
     try testing.expectEqual(@as(u32, 5000), floors.floors[0].def_precision_bp);
+}
+
+test "docTableBody finds the generated block, and reports its absence rather than passing" {
+    const testing = std.testing;
+    const doc =
+        "intro\n\n" ++ doc_table_open ++ "\n| a | b |\n|---|---|\n" ++ doc_table_close ++ "\n\ntail\n";
+    try testing.expectEqualStrings("| a | b |\n|---|---|", docTableBody(doc).?);
+
+    // A document with no block (or a truncated one) must not read as a match.
+    try testing.expect(docTableBody("no markers here") == null);
+    try testing.expect(docTableBody("intro\n" ++ doc_table_open ++ "\n| a |\n") == null);
+}
+
+test "renderDocTable bolds only the aggregate row and totals every column" {
+    const testing = std.testing;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var w: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer buf = w.toArrayList();
+
+    try renderDocTable(&w.writer, &.{
+        .{
+            .language = "lang_a",
+            .root = "",
+            .defs = .{ .matched = 1, .actual = 2, .expected = 4 },
+            .edges = .{ .matched = 1, .actual = 1, .expected = 2 },
+            .exact_agree = 1,
+            .sites = .{ .matched = 3, .actual = 4, .expected = 6 },
+            .findings = &.{},
+        },
+        .{
+            .language = "lang_b",
+            .root = "",
+            .defs = .{ .matched = 3, .actual = 6, .expected = 4 },
+            .edges = .{ .matched = 1, .actual = 3, .expected = 2 },
+            .exact_agree = 0,
+            .sites = .{ .matched = 1, .actual = 4, .expected = 2 },
+            .findings = &.{},
+        },
+    });
+
+    const out = w.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "| lang_a | 50.00 | 25.00 | 1/2/4 |") != null);
+    // Aggregate: defs 4/8/8 -> 50.00 P, 50.00 R; exact 1 of 2 matched edges.
+    try testing.expect(std.mem.indexOf(u8, out, "| **all** | **50.00** | **50.00** | 4/8/8 |") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "| **50.00** | **50.00** | 4/8/8 | **50.00** | **50.00** | 2/4/4 | **50.00** |") != null);
 }
