@@ -380,6 +380,10 @@ const Def = struct {
     /// A `self.x = …` capture: its owner is the enclosing class, not the
     /// constructor it is written in.
     self_field: bool,
+    /// A method whose direct parent is an object *literal* (`{ save() {} }`),
+    /// as opposed to a class/interface body. Its owner is the nearest binding
+    /// wrapping the literal, not a container kind — see `resolveParents`.
+    object_member: bool,
     /// Nearest enclosing captured definition of any kind. Filled after all defs
     /// are known; distinct from `parent_local`, which follows the heuristic
     /// backend's narrower rule (see `resolveParents`).
@@ -471,6 +475,11 @@ fn nodeKey(node: TSNode) usize {
     return @intFromPtr(node.id);
 }
 
+fn nodeTypeIs(node: TSNode, t: []const u8) bool {
+    if (ts_node_is_null(node)) return false;
+    return std.mem.eql(u8, std.mem.span(ts_node_type(node)), t);
+}
+
 /// Outer-before-inner, source order. Deterministic ordering matters: the on-disk
 /// cache round-trips this list and a warm build must reproduce it exactly.
 fn sortDefs(defs: []Def) void {
@@ -488,15 +497,23 @@ fn sortDefs(defs: []Def) void {
 ///
 /// `parent_local` matches the heuristic backend: a definition is owned by an
 /// enclosing *container* (class/struct/interface/enum), so a nested helper
-/// function stays parentless and keeps resolving by its bare name. Two
-/// exceptions, both the heuristic's too: a `self.x` field belongs to the class
-/// it is written on rather than the constructor that assigns it, and a
-/// container declared inside a function belongs to that function.
+/// function stays parentless and keeps resolving by its bare name. Three
+/// exceptions: a `self.x` field belongs to the class it is written on rather
+/// than the constructor that assigns it (heuristic too); a container declared
+/// inside a function belongs to that function (heuristic too); and an object
+/// literal's method belongs to the nearest binding regardless of its kind — an
+/// object literal is not itself a named container, so without this a
+/// `const h = { save() {} }` method is parentless and `collisions` sees it as
+/// a false duplicate of an unrelated top-level `save`.
 fn resolveParents(by_node: *const std.AutoHashMapUnmanaged(usize, u32), defs: []Def) void {
     for (defs) |*d| d.nearest = nearestDef(by_node, d.node);
     for (defs) |*d| {
         if (d.self_field) {
             d.parent_local = nearestContainer(by_node, d.node, defs);
+            continue;
+        }
+        if (d.object_member) {
+            d.parent_local = d.nearest;
             continue;
         }
         const near = d.nearest orelse continue;
@@ -635,6 +652,7 @@ fn collectDefs(
             .declared_type = declared,
             .import_path = path,
             .self_field = kind == .field and recv_node != null,
+            .object_member = kind == .method and nodeTypeIs(ts_node_parent(def), "object"),
         });
     }
     // `export` marks a declaration node, which is the definition's *parent*, so
@@ -670,10 +688,13 @@ fn hasExportedAncestor(marked: *const std.AutoHashMapUnmanaged(usize, void), nod
 }
 
 /// A node whose children are members of the enclosing declaration rather than
-/// declarations in their own right.
+/// declarations in their own right. `interface_body` and `object` (an object
+/// *literal*, as opposed to the `object_type` above it) round out the set so
+/// `export` stops at every member-list shape the same way — an interface's
+/// members and an object literal's methods do not inherit it either.
 fn isMemberList(node: TSNode) bool {
     const t = std.mem.span(ts_node_type(node));
-    inline for (.{ "class_body", "statement_block", "object_type", "enum_body", "block" }) |name| {
+    inline for (.{ "class_body", "statement_block", "object_type", "interface_body", "enum_body", "object", "block" }) |name| {
         if (std.mem.eql(u8, t, name)) return true;
     }
     return false;

@@ -945,6 +945,103 @@ test "one symbol per member, and no definition lost on shapes the fixtures lack"
     try testing.expectEqual(model.SymbolKind.variable, kindOf(&ts, "genHelper").?);
 }
 
+/// The symbol named `name` whose parent is named `parent` (`""` for
+/// parentless), distinct from `symbolNamed`, which cannot disambiguate a name
+/// repeated under different parents (`save` below appears three times).
+fn symbolIn(idx: *const index.Index, parent: []const u8, name: []const u8) ?model.Symbol {
+    for (idx.graph.symbols) |sym| {
+        if (!std.mem.eql(u8, sym.name, name)) continue;
+        if (std.mem.eql(u8, parentName(idx, sym), parent)) return sym;
+    }
+    return null;
+}
+
+test "export does not reach through an interface or object-literal body either" {
+    // F2/F3/F6 (round 2). `isMemberList` stopped the `export`-inheritance walk
+    // at class/type-alias/enum bodies but not at an interface body, so
+    // `export interface IFace { a; m() {} }` reported `a`/`m` as exported while
+    // the equivalent `export type TAlias = { c }` reported `c` as not — one
+    // rule, two answers for the same shape. `object` (an object literal) had
+    // the same gap, and additionally left its methods parentless, so
+    // `export const handlers = { save() {} }` yielded a module-scope, exported
+    // `save` that collided with an unrelated top-level `function save() {}`.
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "e.ts", .data =
+        \\export const handlers = { save(x: number) { return x; }, load() { return 0; } };
+        \\export class Real { save(x: number) { return x; } }
+        \\function save(n: number) { return n; }
+        \\
+        \\export interface IFace { a: number; m(): void; }
+        \\interface Priv { b: number; n(): void; }
+        \\export type TAlias = { c: number };
+        \\export enum E { X }
+        \\export class C { d = 1; p(): void {} }
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var ts = try index.build(gpa, io, root, false, .tree_sitter);
+    defer ts.deinit();
+
+    // The object literal's methods are parented to the binding, not left
+    // dangling at module scope — the fix that closes the false collision.
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "handlers", "save"));
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "handlers", "load"));
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "Real", "save"));
+    // The module-private function is the only parentless `save` left, so
+    // `collections`'s default (parentless-only) collision scan sees one `save`
+    // per scope rather than a name shared across scopes.
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "", "save"));
+
+    // Every member-list shape agrees: `export` on the container does not mark
+    // the member. Interface members previously disagreed (reported `true`).
+    const members = [_]struct { parent: []const u8, name: []const u8 }{
+        .{ .parent = "handlers", .name = "save" },
+        .{ .parent = "handlers", .name = "load" },
+        .{ .parent = "IFace", .name = "a" },
+        .{ .parent = "IFace", .name = "m" },
+        .{ .parent = "TAlias", .name = "c" },
+        .{ .parent = "E", .name = "X" },
+        .{ .parent = "C", .name = "d" },
+        .{ .parent = "C", .name = "p" },
+    };
+    for (members) |m| {
+        const sym = symbolIn(&ts, m.parent, m.name) orelse {
+            std.debug.print("missing {s}.{s}\n", .{ m.parent, m.name });
+            return error.TestUnexpectedResult;
+        };
+        try testing.expect(!sym.exported);
+    }
+    // A non-exported interface's members stay non-exported too (no export
+    // anywhere on the ancestor chain).
+    try testing.expect(!(symbolIn(&ts, "Priv", "b") orelse return error.TestUnexpectedResult).exported);
+    try testing.expect(!(symbolIn(&ts, "Priv", "n") orelse return error.TestUnexpectedResult).exported);
+    // The containers themselves still export normally.
+    try testing.expect((symbolIn(&ts, "", "IFace") orelse return error.TestUnexpectedResult).exported);
+    try testing.expect((symbolIn(&ts, "", "TAlias") orelse return error.TestUnexpectedResult).exported);
+    try testing.expect((symbolIn(&ts, "", "E") orelse return error.TestUnexpectedResult).exported);
+    try testing.expect((symbolIn(&ts, "", "C") orelse return error.TestUnexpectedResult).exported);
+
+    // `collisions`'s default (parentless-only) scan sees no group at all: the
+    // one remaining `save` name-collision candidate is a single symbol.
+    const opts = navgraph.query.Options{};
+    const ids = try navgraph.query.collectCollisionSymbols(&ts, "", opts);
+    defer gpa.free(ids);
+    var groups: u32 = 0;
+    var i: usize = 0;
+    while (i < ids.len) {
+        var end = i + 1;
+        const name = ts.graph.symbols[ids[i]].name;
+        while (end < ids.len and std.mem.eql(u8, ts.graph.symbols[ids[end]].name, name)) end += 1;
+        if (end - i > 1) groups += 1;
+        i = end;
+    }
+    try testing.expectEqual(@as(u32, 0), groups);
+}
+
 // ---------------------------------------------------------------------------
 // Attribution cost
 // ---------------------------------------------------------------------------

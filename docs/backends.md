@@ -89,14 +89,18 @@ and `-Dtree-sitter=all` have distinct `buildId`s and cannot share a cache.
 
 The two backends agree on what is public API, which the differ asserts symbol
 for symbol. Python uses the leading-underscore rule; TypeScript uses the
-`export` keyword, and an `export` does not reach through a class, interface or
-enum body — `export class C { m() {} }` exports `C`, not `C.m`.
+`export` keyword, and an `export` does not reach through a class, interface,
+enum, type-alias or object-literal body — `export class C { m() {} }` exports
+`C`, not `C.m`, and `export const h = { save() {} }` exports `h`, not
+`h.save`. The rule is one token per node shape (`isMemberList` in
+`ts_backend.zig`); every member-list shape stops the walk the same way.
 
 A member named twice is one symbol: a field declared and then assigned on
 `this`/`self`, or an overload signature standing next to its implementation. A
 `get`/`set` pair is two real members and stays two. A container declared inside
 a function belongs to that function; a nested helper function stays parentless
-and keeps resolving by its bare name.
+and keeps resolving by its bare name. An object literal's methods are parented
+to the binding that owns the literal (`h.save` above), the same rule.
 
 ### Reference chain heads
 
