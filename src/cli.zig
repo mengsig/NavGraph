@@ -165,7 +165,7 @@ const usage_text =
     \\                                         (finds `Order` without every `createOrder`)
     \\  --no-recurse                           outline/files/status: only files directly in the
     \\                                         given dir, not its subtrees
-    \\  --full                                  status: item-level freshness/parse/resolution
+    \\  --full                                 status: item-level freshness/parse/resolution
     \\                                         dump (default is a bounded summary)
     \\  -t, --tests <with|without|only>        Unified test-scope for outline/search/
     \\                                         callers/hot/unused: with (default) |
