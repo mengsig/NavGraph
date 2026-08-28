@@ -291,19 +291,57 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
     .{".codeflow"},
 });
 
-fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
-    try loadGitignore(b, path_buf.items);
+/// A directory entry captured so the walk can order it. `name` is owned (the
+/// iterator's buffer is reused by the next `next`).
+const DirEntry = struct { name: []const u8, kind: std.Io.File.Kind };
+
+fn dirEntryLess(_: void, a: DirEntry, b: DirEntry) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+/// Read `dir`'s entries and sort them byte-wise by name.
+///
+/// `dir.iterate()` yields entries in filesystem order — ext4 hashes names with
+/// a per-filesystem seed, tmpfs keeps creation order — so the raw order differs
+/// between machines. File order decides symbol ids, and every resolver tie-break
+/// that falls back to id order rides on it, which made the same commit produce a
+/// different graph on a different filesystem. Sorting here is the single place
+/// that pins it.
+fn sortedEntries(b: *Builder, dir: std.Io.Dir) ![]DirEntry {
+    var entries: std.ArrayList(DirEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| b.gpa.free(e.name);
+        entries.deinit(b.gpa);
+    }
     var it = dir.iterate();
-    const base_len = path_buf.items.len;
     while (try it.next(b.io)) |entry| {
         if (entry.name.len == 0) continue;
+        if (entry.kind != .directory and entry.kind != .file) continue;
+        const name = try b.gpa.dupe(u8, entry.name);
+        errdefer b.gpa.free(name);
+        try entries.append(b.gpa, .{ .name = name, .kind = entry.kind });
+    }
+    const out = try entries.toOwnedSlice(b.gpa);
+    std.mem.sort(DirEntry, out, {}, dirEntryLess);
+    return out;
+}
+
+fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
+    try loadGitignore(b, path_buf.items);
+    const entries = try sortedEntries(b, dir);
+    defer {
+        for (entries) |e| b.gpa.free(e.name);
+        b.gpa.free(entries);
+    }
+    const base_len = path_buf.items.len;
+    for (entries) |entry| {
         path_buf.shrinkRetainingCapacity(base_len);
         if (base_len != 0) try path_buf.append(b.gpa, '/');
         try path_buf.appendSlice(b.gpa, entry.name);
         switch (entry.kind) {
             .directory => try enterDir(b, dir, entry.name, path_buf),
             .file => try maybeAddFile(b, path_buf.items),
-            else => {},
+            else => unreachable,
         }
     }
     path_buf.shrinkRetainingCapacity(base_len);
@@ -2641,8 +2679,13 @@ test "go: a call never binds to a type that shares the package-qualified name" {
     var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
     defer idx.deinit();
 
-    const stats_struct = idx.lookup("Stats")[0];
-    try testing.expectEqual(model.SymbolKind.@"struct", idx.graph.symbols[stats_struct].kind);
+    // Pick the struct by kind: `Stats` also names two methods, and which one
+    // `lookup` lists first is file order, not something this test is about.
+    var stats_struct: SymbolId = invalid;
+    for (idx.lookup("Stats")) |cid| {
+        if (idx.graph.symbols[cid].kind == .@"struct") stats_struct = cid;
+    }
+    try testing.expect(stats_struct != invalid);
     const store_stats = qualifiedId(&idx, "Store", "Stats").?;
 
     const api_stats = idx.graph.symbols[qualifiedId(&idx, "API", "Stats").?];
@@ -5900,4 +5943,37 @@ test "edit-requery cache stays identical to no-cache across rename add delete an
     try testing.expectEqual(@as(usize, 0), final.lookup("leaf").len);
     try testing.expectEqual(@as(usize, 0), final.lookup("save").len);
     try testing.expectEqual(final.lookup("caller")[0], final.callersOf(final.lookup("twig")[0])[0]);
+}
+
+test "file discovery order is sorted, not the filesystem's" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "alpha");
+    try tmp.dir.createDirPath(io, "beta");
+
+    // Written in an order that is neither sorted nor its reverse, so a walk that
+    // trusted the filesystem would have to be lucky to pass: ext4 hashes entry
+    // names with a per-filesystem seed, tmpfs returns creation order.
+    const created = [_][]const u8{
+        "m.zig", "beta/q.zig", "a.zig", "alpha/n.zig",
+        "z.zig", "beta/b.zig", "c.zig", "alpha/e.zig",
+    };
+    for (created) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "pub fn f() void {}\n" });
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Depth-first over byte-sorted entries: `a.zig` < `alpha` < `beta` < `c.zig`.
+    const expected = [_][]const u8{
+        "a.zig",      "alpha/e.zig", "alpha/n.zig", "beta/b.zig",
+        "beta/q.zig", "c.zig",       "m.zig",       "z.zig",
+    };
+    try testing.expectEqual(expected.len, idx.graph.files.len);
+    for (expected, idx.graph.files) |want, file| try testing.expectEqualStrings(want, file.path);
 }

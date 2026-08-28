@@ -262,22 +262,25 @@ run:
 | csharp | 100.00 | 71.07 | 86/86/121 | 94.59 | 49.29 | 35/37/71 | 82.85 | 87.50 | 53.16 | 42/48/79 |
 | go | 100.00 | 79.20 | 80/80/101 | 89.74 | 58.33 | 35/39/60 | 85.71 | 100.00 | 58.33 | 35/35/60 |
 | java | 100.00 | 76.25 | 106/106/139 | 97.05 | 59.45 | 66/68/111 | 87.87 | 93.58 | 59.83 | 73/78/122 |
-| javascript | 85.05 | 77.08 | 74/87/96 | 95.91 | 72.30 | 47/49/65 | 82.97 | 100.00 | 73.13 | 49/49/67 |
+| javascript | 85.05 | 77.08 | 74/87/96 | 97.95 | 73.84 | 48/49/65 | 81.25 | 100.00 | 74.62 | 50/50/67 |
 | lua | 90.90 | 66.66 | 50/55/75 | 84.90 | 84.90 | 45/53/53 | 93.33 | 100.00 | 86.20 | 50/50/58 |
-| python | 96.68 | 91.14 | 175/181/192 | 90.76 | 85.50 | 118/130/138 | 75.42 | 100.00 | 85.81 | 121/121/141 |
+| python | 96.68 | 91.14 | 175/181/192 | 93.07 | 87.68 | 121/130/138 | 73.55 | 100.00 | 87.94 | 124/124/141 |
 | ruby | 97.46 | 92.77 | 77/79/83 | 100.00 | 73.84 | 48/48/65 | 81.25 | 100.00 | 73.52 | 50/50/68 |
 | rust | 98.64 | 85.88 | 73/74/85 | 84.31 | 51.19 | 43/51/84 | 83.72 | 97.95 | 40.00 | 48/49/120 |
 | typescript | 92.20 | 58.19 | 71/77/122 | 100.00 | 46.42 | 26/26/56 | 84.61 | 100.00 | 44.06 | 26/26/59 |
-| zig | 100.00 | 72.91 | 105/105/144 | 100.00 | 64.89 | 61/61/94 | 67.21 | 100.00 | 50.78 | 65/65/128 |
-| **all** | **93.45** | **74.06** | 1071/1146/1446 | **90.41** | **60.79** | 594/657/977 | **81.81** | **98.14** | **57.06** | 634/646/1111 |
+| zig | 100.00 | 72.91 | 105/105/144 | 98.36 | 63.82 | 60/61/94 | 68.33 | 100.00 | 50.00 | 64/64/128 |
+| **all** | **93.45** | **74.06** | 1071/1146/1446 | **90.86** | **61.10** | 597/657/977 | **81.40** | **98.15** | **57.33** | 637/649/1111 |
 <!-- /accuracy-table:after-wave-1 -->
 
-No measurement dropped in any language against that like-for-like base.
-Overall edge precision rose 84.55 → 90.41, edge recall 55.47 → 60.79, exact
-agreement 69.92 → 81.81, definition precision 93.33 → 93.45, definition recall
-72.68 → 74.06, site precision 97.00 → 98.14, site recall 52.38 → 57.06. Zig and
-TypeScript now produce no phantom edge at all; Ruby still produces none while
-nearly quadrupling what it finds.
+No measurement dropped in any language against that like-for-like base. The
+table is measured with the sorted file walk of **Fix round 3** below, which
+moved four of these cells after the wave was otherwise finished. Overall edge
+precision rose 84.55 → 90.86, edge recall 55.47 → 61.10, exact agreement
+69.92 → 81.40, definition precision 93.33 → 93.45, definition recall
+72.68 → 74.06, site precision 97.00 → 98.15, site recall 52.38 → 57.33.
+TypeScript produces no phantom edge at all, and Ruby still produces none while
+nearly quadrupling what it finds; Zig produces exactly one, for the reason
+**Fix round 3** gives.
 
 **Golden corrections (fix round 2).** The wave's own golden additions had been
 written to the indexer's answer, and two raised cpp floors rested on that. The
@@ -393,8 +396,8 @@ change — each one named, with its reason, under **Golden corrections**.
   is wave 4's change, not this one's. The two phantoms this wave could reach —
   `items_.size()` on a `std::vector` field, and a CRTP call through
   `static_cast<Derived*>(this)` — are gone.
-- **Overall edge precision is 90.4%, not ≥95%,** and exact agreement 81.8%,
-  not ≥85%. cpp alone accounts for 25 of the 63 remaining phantom edges.
+- **Overall edge precision is 90.9%, not ≥95%,** and exact agreement 81.4%,
+  not ≥85%. cpp alone accounts for 25 of the 60 remaining phantom edges.
 - **Ruby edge recall is 73.8%, not ≥80%.** What is left needs machinery
   outside this wave: string interpolation (`"#{prefix}-#{id}"` is one string
   token, so two golden edges are invisible), operator *call sites* (`ledger +
@@ -403,6 +406,53 @@ change — each one named, with its reason, under **Golden corrections**.
 - Zig's remaining exactness gap is type aliases: `operands: OperandStack` where
   `const OperandStack = Stack(i64)` needs the alias followed to `Stack`, which
   needs a return/alias type the model does not record.
+
+### Fix round 3: file discovery ran in filesystem order
+
+`zig build bench` was green locally and red on GitHub CI for the same commit.
+The walk read each directory in `std.Io.Dir.iterate` order, which is the
+filesystem's: ext4 hashes entry names with a per-filesystem seed, tmpfs returns
+creation order. File order assigns symbol ids, and every resolution that ends
+in a tie-break on id rides on it, so one commit produced a different call graph
+per filesystem. Reproduced by copying the tree onto tmpfs and running the same
+binary: zig edge precision 90.16 and csharp exact agreement 85.29 there against
+100.00 and 82.85 on the local ext4.
+
+`collectDir` (`src/index.zig`) now reads a directory's entries, sorts them
+byte-wise by name, and only then recurses. ext4 and tmpfs produce a
+byte-identical table. `heuristicMethodTarget` still breaks a scoring tie by
+lowest symbol id; that is now a path-order tie-break instead of a
+filesystem-order one.
+
+Five floors had been recorded from the local ext4 order and are not reachable
+from sorted order. They were re-recorded with `--lower-floors --reason "file
+discovery ran in filesystem order; these five floors recorded an ext4
+hash-order fluke, not a reachable result"`:
+
+- zig `edge_precision` 100.00 → 98.36 — `BytecodeVm.run` calls
+  `self.stack.peek()` at `bytecode_vm.zig:60`. Zig receiver typing does not
+  reach a field of the enclosing container here, so it falls to the name guess,
+  where `Stack.peek` and `Lexer.peek` score equally. ext4 listed `stack.zig`
+  first and the guess was right by luck; sorted order lists `lexer.zig` first
+  and the same guess is wrong. The 100.00 was the coin, not the resolver.
+- zig `edge_recall` 64.89 → 63.82 and `site_recall` 50.78 → 50.00 — that one
+  edge, counted as a miss.
+- python `exact_agreement` 75.42 → 73.55 and javascript `exact_agreement`
+  82.97 → 81.25 — both denominators grew (python matched edges 118 → 121,
+  javascript 47 → 48) while the agreeing count held (89 and 39), so the ratio
+  fell while the languages got strictly better.
+
+Six floors rose in the same run: python edge P 90.76 → 93.07, edge R
+85.50 → 87.68, site R 85.81 → 87.94; javascript edge P 95.91 → 97.95, edge R
+72.30 → 73.84, site R 73.13 → 74.62; zig exact agreement 67.21 → 68.33.
+
+One test was order-fragile too: "go: a call never binds to a type that shares
+the package-qualified name" took `lookup("Stats")[0]` as the struct, and three
+symbols are named `Stats`. It selects by kind now.
+
+The open gap this exposes is Zig's, not the walk's: a field of the enclosing
+container (`self.stack`) does not type its receiver, so the call is a 1-in-2
+name guess rather than an exact bind.
 
 ## Failure classes, by what they cost
 
