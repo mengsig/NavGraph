@@ -17,5 +17,7 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.16.0
+      - name: Run the test suite (fmt check, doc-table check, unit tests)
+        run: zig build test --summary all
       - name: Score the golden corpora
         run: zig build bench
