@@ -313,7 +313,9 @@ fn decodeDiagnostics(obj: std.json.ObjectMap) DecodeError!Request {
         .parsed = .{
             .command = if (std.mem.eql(u8, analysis, "coverage")) .coverage else .status,
             .arg = path,
-            .options = .{ .format = .json, .limit = cursorFetchLimit(after, limit), .limit_set = true },
+            // Compact status omits `items`; the envelope needs the full item
+            // list to source `status`/`likely_local` (strips it back out itself).
+            .options = .{ .format = .json, .limit = cursorFetchLimit(after, limit), .limit_set = true, .status_full = true },
         },
         .max_bytes = max_bytes,
         .cursor_page = .{ .after = after orelse 0, .limit = limit },

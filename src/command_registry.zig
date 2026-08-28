@@ -118,6 +118,7 @@ pub const Option = enum {
     include,
     direction,
     offset,
+    full,
 };
 
 pub const ValueKind = enum { boolean, string, integer, enumeration, cursor };
@@ -217,6 +218,9 @@ pub const option_descriptors = [_]OptionDescriptor{
     // B1's continuation for the CLI mirrors (`--after` is the unrelated
     // JSONL row-stream cursor; this pages *within* one JSON response's list).
     .{ .option = .offset, .name = "offset", .spellings = &.{valueFlag("--offset")}, .value_kind = .integer },
+    // `status`: opt into the full item-level freshness/parse/resolution dump;
+    // the default is a bounded summary (eval finding 3, agent-eval routing).
+    .{ .option = .full, .name = "full", .spellings = &.{trueFlag("--full")}, .value_kind = .boolean },
 };
 
 pub const CommandDescriptor = struct {
@@ -340,7 +344,7 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .churn, .name = "churn", .summary = "Rank symbols by how much their history has changed.", .example = "navgraph churn src --last 50 --sort lines", .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .sort, .since, .last }, .option_value_overrides = &churn_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .collisions, .name = "collisions", .summary = "Find definitions that share the same name.", .example = "navgraph collisions -k struct,fn", .aliases = &.{"duplicates"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .kind, .tests, .visibility, .members }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .files, .name = "files", .summary = "List indexed files and their symbol counts.", .example = "navgraph files --sort symbols", .aliases = &.{"manifest"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format, .sort, .no_recurse }, .option_value_overrides = &files_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .status, .name = "status", .summary = "Show index freshness, cache state, and any warnings.", .example = "navgraph status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format, .after, .no_recurse }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .status, .name = "status", .summary = "Show a compact project summary; --full for freshness/parse/resolution diagnostics.", .example = "navgraph status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format, .after, .no_recurse, .full }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .read, .name = "read", .summary = "Print a bounded, numbered range of source lines.", .example = "navgraph read src/parser.zig:1-40", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .no_cache, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = false, .cache_effect = .none },
     .{ .command = .strings, .name = "strings", .summary = "Search inside string literals (URLs, log text, and the like).", .example = "navgraph strings TODO", .aliases = &.{ "str", "literals" }, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .todos, .name = "todos", .summary = "List TODO/FIXME/HACK comments.", .example = "navgraph todos src", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },

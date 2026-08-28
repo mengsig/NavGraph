@@ -284,6 +284,15 @@ pub const Backend = enum(u8) {
     heuristic,
     /// A real grammar via `ts_backend.zig`.
     tree_sitter,
+
+    /// Spelling accepted by `--backend` (hyphenated), for output an agent may
+    /// feed back in — the raw field name (`tree_sitter`) is not.
+    pub fn tag(self: Backend) []const u8 {
+        return switch (self) {
+            .heuristic => "heuristic",
+            .tree_sitter => "tree-sitter",
+        };
+    }
 };
 
 /// File-level parser reliability. A desync means an unterminated literal may

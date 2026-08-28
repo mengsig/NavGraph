@@ -569,7 +569,7 @@ test "a tree-sitter fallback is visible on the structured surfaces, not just std
     defer buf.deinit(gpa);
     var w: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
     defer w.deinit();
-    try testing.expect(try navgraph.query.status(&w.writer, io, &idx, "", .{ .format = .json }));
+    try testing.expect(try navgraph.query.status(&w.writer, io, &idx, "", .{ .format = .json, .status_full = true }));
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, w.written(), .{});
     defer parsed.deinit();
     const health_obj = parsed.value.object.get("parse_health").?.object;

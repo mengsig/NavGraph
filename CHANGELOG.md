@@ -15,8 +15,17 @@ All notable changes to NavGraph are documented here. Format loosely follows
 - `zig build differ` diffs both backends over the fixture trees: no definition
   or edge the scanner finds may disappear, and every newly exact edge is a
   reviewed entry with a written reason.
+- `--full` for `status`: the item-level freshness/parse/resolution dump that
+  used to be the only output. `--full -j`/`--full --jsonl` are a superset of
+  the pre-change payload (two additive keys, `languages` and `backend`; no
+  key removed, no value changed), not byte-identical to it.
 
 ### Changed
+
+- `status`'s default output (text and `-j`/`--jsonl`) is now a bounded
+  summary — project/language/backend counts, cache state, and headline
+  freshness/parse/resolution counts, with no per-file or per-reference item
+  arrays. Use `--full` for the previous file-level dump.
 
 - Python and TypeScript accuracy against the golden corpora, measured by
   `zig build bench`: definition recall 91.14 → 96.87 (python) and
