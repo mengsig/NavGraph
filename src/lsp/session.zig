@@ -468,7 +468,8 @@ pub const Session = struct {
             };
         if (text.len > std.math.maxInt(u32)) return error.FileTooBig;
 
-        const parsed = try index_mod.parseOne(self.gpa, arena, text, lang, self.parsing());
+        const hint = try self.reparseHint(arena, key, text);
+        const parsed = try index_mod.parseOne(self.gpa, arena, text, lang, self.parsing(), hint);
         try self.installSlot(.{
             .arena = arena_box,
             .file = .{
@@ -481,6 +482,20 @@ pub const Session = struct {
             },
             .overlaid = from_overlay != null,
         });
+    }
+
+    /// The incremental-reparse seam for this file (`index.ReparseHint`): the
+    /// edit since the slot's previous text, computed by diffing (LSP's Full
+    /// sync mode never sends the delta itself — see `index.computeEdit`).
+    /// Empty on a first parse (no previous slot). `old_tree` is always null:
+    /// this session has no tree-sitter backend to own one.
+    fn reparseHint(self: *Session, arena: std.mem.Allocator, path: []const u8, new_text: []const u8) !index_mod.ReparseHint {
+        const i = self.by_path.get(path) orelse return .{};
+        const old_text = self.slots.items[i].file.text;
+        const edit = index_mod.computeEdit(old_text, new_text) orelse return .{};
+        const edits = try arena.alloc(index_mod.TreeEdit, 1);
+        edits[0] = edit;
+        return .{ .edits = edits };
     }
 
     /// Put `slot` in place of its path's entry (appending when the file is new),

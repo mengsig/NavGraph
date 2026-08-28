@@ -743,18 +743,51 @@ pub const ParseOutput = struct {
     health: model.ParseHealth,
 };
 
+/// A byte offset's row/column, in tree-sitter's `TSPoint` shape (byte column,
+/// not an encoded one — distinct from `lsp/position.zig`'s LSP columns).
+pub const Point = struct { row: u32, column: u32 };
+
+/// One edit, shaped like tree-sitter's `TSInputEdit` so a tree-sitter backend
+/// can hand it to `ts_tree_edit` unchanged.
+pub const TreeEdit = struct {
+    start_byte: u32,
+    old_end_byte: u32,
+    new_end_byte: u32,
+    start_point: Point,
+    old_end_point: Point,
+    new_end_point: Point,
+};
+
+/// The seam a tree-sitter-owned parse backend (`ts_backend.zig`) would read to
+/// reparse incrementally instead of cold-parsing: the previous parse's tree
+/// plus the edit(s) since it, ready for `ts_tree_edit`. `old_tree` is
+/// backend-owned (`?*anyopaque`, opaque here); neither the heuristic scanner
+/// nor `ts_backend.parse` reads either field yet, so `parseOne` always
+/// cold-parses regardless of `backends.Parsing.choice`. A resident session
+/// (`lsp/session.zig`) builds `edits` from `computeEdit` on every reparse
+/// regardless of backend, so the hook is real and testable even though
+/// nothing here consumes it yet.
+pub const ReparseHint = struct {
+    old_tree: ?*anyopaque = null,
+    edits: []const TreeEdit = &.{},
+};
+
 /// Parse one file's source into the records `assemble` consumes. `arena` owns
 /// the result and every string it points at except `text`, which the caller
-/// must keep alive for as long as the records are used.
+/// must keep alive for as long as the records are used. `hint` is the
+/// incremental-reparse seam (see `ReparseHint`); this heuristic backend
+/// ignores it and always parses `text` from scratch.
 pub fn parseOne(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     text: []const u8,
     lang: language.Language,
     parsing: backends.Parsing,
+    hint: ReparseHint,
 ) !ParseOutput {
     std.debug.assert(text.len <= std.math.maxInt(u32));
     std.debug.assert(lang != .unknown);
+    _ = hint;
     var parsed: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer parsed.deinit(gpa);
     const health = try parsing.parse(gpa, arena, text, lang, &parsed);
@@ -762,7 +795,79 @@ pub fn parseOne(
 }
 
 fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParseOutput {
-    return parseOne(b.gpa, b.arena, text, lang, b.parsing);
+    return parseOne(b.gpa, b.arena, text, lang, b.parsing, .{});
+}
+
+/// The byte/point delta between two full-document snapshots of the same file —
+/// the common-prefix/common-suffix trim, shaped as a `TreeEdit`. LSP's Full
+/// sync mode (this server's only mode) never sends the edit itself, only the
+/// whole new text, so this is where a delta gets reconstructed for
+/// `ReparseHint.edits`. Null when the texts are identical.
+pub fn computeEdit(old: []const u8, new: []const u8) ?TreeEdit {
+    std.debug.assert(old.len <= std.math.maxInt(u32));
+    std.debug.assert(new.len <= std.math.maxInt(u32));
+    const min_len = @min(old.len, new.len);
+    var prefix: usize = 0;
+    while (prefix < min_len and old[prefix] == new[prefix]) prefix += 1;
+    var suffix: usize = 0;
+    const max_suffix = min_len - prefix;
+    while (suffix < max_suffix and old[old.len - 1 - suffix] == new[new.len - 1 - suffix]) suffix += 1;
+    if (prefix == old.len and prefix == new.len) return null; // identical
+
+    const old_end = old.len - suffix;
+    const new_end = new.len - suffix;
+    return .{
+        .start_byte = @intCast(prefix),
+        .old_end_byte = @intCast(old_end),
+        .new_end_byte = @intCast(new_end),
+        .start_point = pointAt(old, prefix),
+        .old_end_point = pointAt(old, old_end),
+        .new_end_point = pointAt(new, new_end),
+    };
+}
+
+/// The row/column of byte offset `at` in `text` (byte columns, tree-sitter
+/// style — never an LSP-encoded one).
+fn pointAt(text: []const u8, at: usize) Point {
+    std.debug.assert(at <= text.len);
+    var row: u32 = 0;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '\n')) |nl| {
+        if (nl >= at) break;
+        row += 1;
+        line_start = nl + 1;
+        i = nl + 1;
+    }
+    return .{ .row = row, .column = @intCast(at - line_start) };
+}
+
+test "computeEdit finds the changed span and null on identical text" {
+    const testing = std.testing;
+    try testing.expect(computeEdit("same", "same") == null);
+
+    // "pub fn run() void {}" -> "pub fn run() u32 {}": mid-text replace.
+    const old = "pub fn run() void {}";
+    const new = "pub fn run() u32 {}";
+    const edit = computeEdit(old, new).?;
+    try testing.expectEqual(@as(u32, 13), edit.start_byte);
+    try testing.expectEqualStrings("void", old[edit.start_byte..edit.old_end_byte]);
+    try testing.expectEqualStrings("u32", new[edit.start_byte..edit.new_end_byte]);
+    try testing.expectEqual(@as(u32, 0), edit.start_point.row);
+    try testing.expectEqual(@as(u32, 13), edit.start_point.column);
+
+    // A pure append after a newline: the whole new line is the edit.
+    const appended = computeEdit("a\nb", "a\nb\nc").?;
+    try testing.expectEqual(@as(u32, 3), appended.start_byte);
+    try testing.expectEqual(@as(u32, 3), appended.old_end_byte);
+    try testing.expectEqual(@as(u32, 5), appended.new_end_byte);
+    try testing.expectEqual(@as(u32, 1), appended.start_point.row);
+    try testing.expectEqual(@as(u32, 1), appended.start_point.column);
+    try testing.expectEqual(@as(u32, 2), appended.new_end_point.row);
+
+    // A pure deletion: new_end_byte == start_byte.
+    const deleted = computeEdit("a\nb\nc", "a\nc").?;
+    try testing.expectEqual(deleted.start_byte, deleted.new_end_byte);
 }
 
 /// Write the parse-health warning for `rel_path` into `w`, or nothing when the
@@ -6273,8 +6378,8 @@ test "assemble frees each allocation exactly once when one fails" {
     var registry = backends.Registry.init(testing.allocator);
     defer registry.deinit();
     const parsing = backends.Parsing{ .choice = .auto, .registry = &registry };
-    const app = try parseOne(testing.allocator, a, app_src, .zig, parsing);
-    const util = try parseOne(testing.allocator, a, util_src, .zig, parsing);
+    const app = try parseOne(testing.allocator, a, app_src, .zig, parsing, .{});
+    const util = try parseOne(testing.allocator, a, util_src, .zig, parsing, .{});
     const files = [_]ParsedFile{
         .{
             .path = "app.zig",
@@ -6323,8 +6428,8 @@ test "an index generation is freed exactly once whether or not its replacement f
     var registry = backends.Registry.init(testing.allocator);
     defer registry.deinit();
     const parsing = backends.Parsing{ .choice = .auto, .registry = &registry };
-    const app = try parseOne(testing.allocator, a, app_src, .zig, parsing);
-    const util = try parseOne(testing.allocator, a, util_src, .zig, parsing);
+    const app = try parseOne(testing.allocator, a, app_src, .zig, parsing, .{});
+    const util = try parseOne(testing.allocator, a, util_src, .zig, parsing, .{});
     const files = [_]ParsedFile{
         .{
             .path = "app.zig",
