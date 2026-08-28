@@ -76,7 +76,7 @@ test schema fingerprint is the exact canonical emitted contract  src/capabilitie
 ```
 
 That's the loop: index once (automatic), then `search` / `def` / `calls` /
-`callers` / `affected` and the rest of the 40 commands in [Usage](#usage)
+`callers` / `affected` and the rest of the 43 commands in [Usage](#usage)
 below — `navgraph help <command>` prints full usage for any of them.
 
 ## Use it from Neovim

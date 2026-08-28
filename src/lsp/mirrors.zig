@@ -216,7 +216,7 @@ test "hunks reports the working change against HEAD, grouped by hunk" {
     // exactly one hunk.
     try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = "pub fn helper() void {\n    _ = 1;\n}\n" });
 
-    var session = try session_mod.Session.init(testing.allocator, io, root, .{ .watch = false }, true);
+    var session = try session_mod.Session.init(testing.allocator, io, root, .{ .watch = false }, .auto, true);
     defer session.deinit();
     const ctx = ctxOf(&session);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);

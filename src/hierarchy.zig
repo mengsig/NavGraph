@@ -1167,7 +1167,7 @@ test "build accepts an arena allocator distinct from idx.gpa without leaking" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data = "class Base:\n    pass\nclass Sub(Base):\n    pass\n" });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

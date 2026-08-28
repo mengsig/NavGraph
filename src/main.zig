@@ -1017,7 +1017,7 @@ fn rpcToolCall(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value
 /// failure, but as a JSON-RPC error here since there is no stdout to print
 /// a diagnostic to).
 fn openMirrorSession(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value) !?lsp.session.Session {
-    return lsp.session.Session.init(session.gpa, session.io, session.root, .{ .watch = false }, session.use_cache) catch |err| {
+    return lsp.session.Session.init(session.gpa, session.io, session.root, .{ .watch = false }, session.parsing.choice, session.use_cache) catch |err| {
         var buf: [192]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "failed to index '{s}': {s}", .{ session.root, @errorName(err) }) catch "failed to index";
         try rpcError(out, id, -32603, message);
@@ -2373,7 +2373,7 @@ test "MCP navgraph.where/context/hunks round-trip and reject hostile input" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
