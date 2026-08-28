@@ -1105,6 +1105,7 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
     try std.testing.expectEqual(Command.serve, parseCommand("serve").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
+    try std.testing.expectEqual(Command.capabilities, parseCommand("capabilities").?);
 }
 
 test "parseCommand: every alias maps to its command" {
@@ -1146,6 +1147,9 @@ test "parseCommand: every alias maps to its command" {
     // help aliases
     try std.testing.expectEqual(Command.help, parseCommand("--help").?);
     try std.testing.expectEqual(Command.help, parseCommand("-h").?);
+    // capabilities doubles as the version verb
+    try std.testing.expectEqual(Command.capabilities, parseCommand("version").?);
+    try std.testing.expectEqual(Command.capabilities, parseCommand("--version").?);
 }
 
 test "phase 1 commands and scoped flags parse" {

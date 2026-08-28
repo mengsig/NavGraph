@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          cache-key: release-${{ matrix.target }}
+
+      # Zig cross-compiles every target from one host — no macOS runner needed
+      # (the binary is pure Zig/std, no Objective-C framework dependency).
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="navgraph-${{ matrix.target }}"
+          mkdir "$staging"
+          cp zig-out/bin/navgraph "$staging/"
+          cp README.md CHANGELOG.md "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: navgraph-${{ matrix.target }}
+          path: navgraph-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum navgraph-*.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/navgraph-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
