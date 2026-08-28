@@ -3361,6 +3361,11 @@ test "checked-in Java corpus resolves lexical, static-import, and inherited memb
     try testing.expectEqual(model.ResolutionReason.inheritance, cents_ref.resolution_reason);
 }
 
+/// Timed repetitions per size. Runner jitter is one-sided — it only ever makes
+/// a build slower — so the fastest of a few runs is the size's real cost, and
+/// the ratio between the two sizes stops swinging with it.
+const perf_reps = 3;
+
 /// Write a Java corpus of `groups` files, each declaring `per_group` subclasses
 /// of a shared `Base`, and return how long indexing it took in milliseconds.
 /// Deliberately file-light so the timing measures resolution, not file I/O.
@@ -3393,16 +3398,21 @@ fn javaInheritanceBuildMs(tmp: *std.testing.TmpDir, groups: usize, per_group: us
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
-    var idx = try build(testing.allocator, io, root, false);
-    defer idx.deinit();
-    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
+    var best_ms: i64 = std.math.maxInt(i64);
+    var rep: usize = 0;
+    while (rep < perf_reps) : (rep += 1) {
+        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        var idx = try build(testing.allocator, io, root, false);
+        defer idx.deinit();
+        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
+        best_ms = @min(best_ms, @as(i64, @intCast(elapsed_ms)));
 
-    // Every subclass still reaches the inherited member — the table is a
-    // speedup, not a drop in recall.
-    const shared = idx.lookup("shared")[0];
-    try testing.expectEqual(groups * per_group, idx.callersOf(shared).len);
-    return @intCast(elapsed_ms);
+        // Every subclass still reaches the inherited member — the table is a
+        // speedup, not a drop in recall.
+        const shared = idx.lookup("shared")[0];
+        try testing.expectEqual(groups * per_group, idx.callersOf(shared).len);
+    }
+    return best_ms;
 }
 
 test "Java inherited-member resolution stays linear in symbol count" {
@@ -3412,14 +3422,21 @@ test "Java inherited-member resolution stays linear in symbol count" {
     //
     // Bound is a ratio measured in this same run, not wall-clock: a saturated
     // runner slows both builds together, so the assertion does not drift with
-    // machine load (F6). Ten times the symbols is ten times the work when
-    // linear and a hundred times when quadratic; 3x slack over linear separates
-    // them with room to spare, and the floor keeps a sub-millisecond baseline
-    // from making the bound meaningless.
+    // machine load (F6). The two constants below are measured, not guessed
+    // (F2) — 10 idle samples of each build at 20x scale on a 16-core box:
+    //
+    //   linear (this tree)  elapsed/small 12.9 .. 44.6  (expectation 20)
+    //   quadratic (pre-fix) elapsed/small  257 .. 295
+    //
+    // 8x the linear expectation lands between them: >= 3.6x headroom over the
+    // worst linear sample, and it still fails the quadratic build with ~1.6x to
+    // spare. The 20x scale is what opens that gap — at 10x the quadratic
+    // penalty was only ~6x linear, too close to the noise to bound safely. The
+    // floor keeps a sub-millisecond baseline from making the bound meaningless.
     const testing = std.testing;
     const per_group = 40;
     const small_groups = 6;
-    const groups = 60;
+    const groups = 120;
 
     var small_tmp = testing.tmpDir(.{ .iterate = true });
     defer small_tmp.cleanup();
@@ -3430,7 +3447,7 @@ test "Java inherited-member resolution stays linear in symbol count" {
     const elapsed_ms = try javaInheritanceBuildMs(&tmp, groups, per_group);
 
     const scale: i64 = groups / small_groups;
-    const linear_bound = 3 * scale * small_ms + 50;
+    const linear_bound = 8 * scale * small_ms + 50;
     try testing.expect(elapsed_ms <= linear_bound);
 }
 
