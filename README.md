@@ -24,12 +24,15 @@ Download the latest release (swap `x86_64-linux` for `aarch64-linux`,
 
 ```sh
 curl -LO https://github.com/mengsig/NavGraph/releases/latest/download/navgraph-x86_64-linux.tar.gz
+curl -LO https://github.com/mengsig/NavGraph/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS   # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
 tar xzf navgraph-x86_64-linux.tar.gz
-install -D navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
+mkdir -p ~/.local/bin && install navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
 ```
 
-The release also attaches a `SHA256SUMS` file (one entry per archive) if you
-want to verify the download.
+`SHA256SUMS` has one entry per archive; `--ignore-missing` skips the three you
+didn't download. It covers corruption, not authenticity — the file is unsigned
+and served from the same origin as the tarball.
 
 Now point it at a repo. There's no separate "build the index" step — the
 first command does it and caches the result:
@@ -447,36 +450,41 @@ navgraph search Graph --duplicates
 Outline a file at signature detail:
 
 ```
-$ navgraph outline src/parser.zig
+$ navgraph outline src/parser.zig -k fn,struct,method -l 5
 # src/parser.zig (zig)
-  fn parse ( gpa: std.mem.Allocator, ... ) !void  L69
-  fn collectRefs (ctx: *Ctx, lo: u32, hi: u32, ...) ![]Reference  L172
-  struct Ctx  L37
-    method Ctx.isPunct (self: *const Ctx, i: u32, c: u8) bool  L53
-  ...
+  struct ParsedSymbol  L24-53
+  struct BodyInfo  L56-61
+  struct Ctx  L65-96
+    method Ctx.ch (self: *const Ctx, i: u32) u8  L79-82
+    method Ctx.isPunct (self: *const Ctx, i: u32, c: u8) bool  L84-86
+… (stopped at -l 5; raise it to see more)
 ```
 
 Follow the call graph two levels deep (callees). Resolved edges recurse;
 unresolved/external calls are summarised on a `~ ext:` line:
 
 ```
-$ navgraph calls collectRefs -d 2
-fn collectRefs (...) ![]Reference  src/parser.zig:172
-  method Token.text (...) []const u8  src/lexer.zig:30
+$ navgraph calls collectRefs -d 2 -l 3
+fn collectRefs (ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const u8, kw: KeywordSet) !BodyInfo  src/parser.zig:593-693
+  method Token.text (self: Token, source: []const u8) []const u8  src/lexer.zig:30-34  ↳:622 ?
     ~ ext: assert
-  fn recordRef (...) !void  src/parser.zig:193
-    ~ ext: get, put, @intCast, append
-  ~ ext: assert, StringHashMap, init, ArrayList, has, eql, dupe
+  method Class.has (self: Class, c: u8) bool  src/lsp/regex.zig:73-75  ↳:626 ?
+    ~ ext: @intCast
+  ~ ext: assert, StringHashMap, keyIterator, next, free, deinit, ArrayList, deinit, deinit, deinit, deinit, deinit, dupe
+(2 heuristic `?` edges shown — re-run with -s to drop them)
+… 15 branches elided (--budget/--max-nodes; 3 nodes shown)
 ```
 
 Who calls a symbol:
 
+`emit` is ambiguous across files here; pin one with `name@path`:
+
 ```
-$ navgraph callers emit
-fn emit (ctx: *Ctx, sym: ParsedSymbol) !u32  src/parser.zig:216
-  fn parseZigFn (...) !u32  src/parser.zig:291
-  fn parseZigConst (...) !u32  src/parser.zig:333
-  ...
+$ navgraph callers 'emit@src/parser.zig' -l 3
+fn emit (ctx: *Ctx, sym: ParsedSymbol) !u32  src/parser.zig:1583-1589
+  fn emitRoute (ctx: *Ctx, rd: api.RouteDef, n: u32, prefixes: *const std.StringHashMap([]const u8)) !void  src/parser.zig:307-330  ↳:318
+  fn emitMount (ctx: *Ctx, m: api.RouterMount, recv_i: u32) !void  src/parser.zig:336-359  ↳:346
+… 49 branches elided (--budget/--max-nodes; 3 nodes shown)
 ```
 
 Who implements a port, and which dispatch sites reach it:
@@ -525,7 +533,7 @@ Show a full definition:
 
 ```
 $ navgraph def bracketMatches -v full
-fn bracketMatches  src/parser.zig:128
+fn bracketMatches  src/parser.zig:528-532
 fn bracketMatches(open: u8, cl: u8) bool {
     return (open == '(' and cl == ')') or
         (open == '{' and cl == '}') or
