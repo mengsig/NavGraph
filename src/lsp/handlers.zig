@@ -3533,6 +3533,34 @@ test "navgraph/context enforces its budget: budgets 1 and 2000 return different,
     try testing.expect(first_id != second_id);
 }
 
+test "navgraph/context ranks a production caller before test callers even when file order lists the tests first (A1)" {
+    const gpa = testing.allocator;
+    const files = [_][2][]const u8{.{
+        "app.zig",
+        \\pub fn target() void {}
+        \\test "case a exercises target" { target(); }
+        \\test "case b exercises target" { target(); }
+        \\test "case c exercises target" { target(); }
+        \\pub fn prodCaller() void { target(); }
+        \\
+    }};
+    const ts = try TestServer.init(gpa, testing.io, &files);
+    defer ts.deinit();
+    try ts.start();
+
+    var res = try ts.request(341,
+        \\{"jsonrpc":"2.0","id":341,"method":"navgraph/context","params":{"symbol":"target"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    const callers = r.get("callers").?.array.items;
+    try testing.expectEqual(@as(usize, 4), callers.len);
+    // Pre-fix: exactness alone ties every caller here (all four edges are
+    // exact), so the sort was a no-op and `idx.callersOf`'s file order — all
+    // three test blocks ahead of the fn declared after them — survived.
+    try testing.expectEqualStrings("prodCaller", callers[0].object.get("name").?.string);
+}
+
 test "navgraph/where resolves the enclosing symbol and its breadcrumb chain" {
     const ts = try startedPy(testing.allocator);
     defer ts.deinit();

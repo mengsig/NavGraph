@@ -836,20 +836,46 @@ fn symbolBytes(ctx: Ctx, id: SymbolId) !u64 {
     return discarding.fullCount();
 }
 
-/// Caller priority for capping under budget: an exact call edge outranks a
-/// heuristic one ("closer" — the same exact-over-heuristic tie-break
-/// `locate`/`blast`'s neighbour walk already use). `std.mem.sort` is stable,
-/// so equal-priority callers keep `idx.callersOf`'s original relative order.
+/// Caller priority for capping under budget and for `offset`'s page order
+/// (A1): production code before any test block — a test-only ranking left a
+/// hot symbol's real call sites buried behind hundreds of test callers, all
+/// tied at the same priority once every edge was exact — then an exact call
+/// edge over a heuristic one, then proximity to the target (same file, then
+/// same directory). `std.mem.sort` is stable, so callers tied on every key
+/// keep `idx.callersOf`'s original relative order.
 const CallerPriority = struct {
     idx: *const Index,
     target: SymbolId,
 
+    fn value(self: CallerPriority, id: SymbolId) u4 {
+        const idx = self.idx;
+        const sym = idx.graph.symbols[id];
+        const target_file = idx.graph.symbols[self.target].file;
+        var v: u4 = 0;
+        if (!query.isTestSymbol(idx, sym)) v |= 0b1000;
+        if (query.hasExactEdge(idx, id, self.target)) v |= 0b0100;
+        if (sym.file == target_file) {
+            v |= 0b0011;
+        } else if (sameDir(idx, sym.file, target_file)) {
+            v |= 0b0001;
+        }
+        return v;
+    }
+
     fn lessThan(self: CallerPriority, a: SymbolId, b: SymbolId) bool {
-        const a_exact = query.hasExactEdge(self.idx, a, self.target);
-        const b_exact = query.hasExactEdge(self.idx, b, self.target);
-        return a_exact and !b_exact;
+        return self.value(a) > self.value(b);
     }
 };
+
+/// Whether two files share a parent directory — the "same module" proxy for
+/// `CallerPriority`'s proximity tier (no coarser module concept exists here).
+fn sameDir(idx: *const Index, a: model.FileId, b: model.FileId) bool {
+    const path_a = idx.graph.files[a].path;
+    const path_b = idx.graph.files[b].path;
+    const dir_a = std.fs.path.dirname(path_a) orelse "";
+    const dir_b = std.fs.path.dirname(path_b) orelse "";
+    return std.mem.eql(u8, dir_a, dir_b);
+}
 
 /// How many of `ordered[offset..]` fit within `remaining_bytes`, greedily in
 /// priority order. Never returns 0 when the page has at least one caller to
