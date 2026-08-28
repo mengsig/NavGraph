@@ -218,9 +218,11 @@ wave starts by merging `main`. That merge alone — no work of this wave's —
 moved four languages: go edge P 81.8→87.2 and edge R 45.0→56.7, lua edge R
 54.7→79.2, rust edge R 42.9→50.0, and cpp edge P 38.5→33.3 (six more
 typed-receiver calls landing on a header declaration where the golden names
-the out-of-line definition). Three floors went red on the merge — cpp edge
-precision, lua exact agreement, rust site precision — and every one of them
-is back above its floor by the end of this wave, without `--lower-floors`.
+the out-of-line definition). Four floors went red on the merge — cpp edge
+precision (33.33% vs floor 38.46%), lua exact agreement (66.66% vs floor
+79.31%), lua site precision (95.91% vs floor 96.96%), rust site precision
+(94.00% vs floor 97.61%) — and every one of them is back above its floor
+by the end of this wave, without `--lower-floors`.
 The table below is measured on the merged base, so it separates the merge
 from the wave; the "Baseline at this commit" table above is the pre-merge
 number and is left as it was recorded.
@@ -277,15 +279,33 @@ quadrupling what it finds.
 | A member reached through an expression we cannot name is no longer recorded as a *bare* reference and handed to the global name match; a qualifier naming a standard-library type abstains; `Weights w({1.0})` types its local | cpp, rust | cpp edge P 36.6→39.0, rust site P 94.1→98.0 and edge P 78.2→84.3 |
 | One-letter names are references (the collector dropped every identifier shorter than two bytes, so `pub fn a() void { b(); }` produced no callee in any language) | all | no corpus defines a one-letter symbol, so nothing moved; covered by a new index test |
 
-**NavGraph's own `src/` as a second corpus.** Paired whole-project edge dumps
-across the wave: 5621 → 5624 edges over an unchanged 2666 definitions. Four
-edges lost, each justified — three were replaced by the correct target
-(`outlineFile -> SymbolKind.tag` became `Language.tag`, `pathJson ->
-SymbolKind.tag` became `Confidence.tag`, `RefPattern.matches ->
-RefPattern.partMatches` became `exactOrGlob`, the alias it holds) and the
-fourth, `serve -> gitdiff.flush`, was a phantom: `out` is a `*std.Io.Writer`,
-so `out.flush()` is the standard library's. Seven edges gained, all through a
-now-typed receiver.
+**NavGraph's own `src/` as a second corpus.** Paired dumps from binaries built
+at the wave's base (`3451d51`) and its HEAD, run over one frozen copy of
+`src/` (the `3451d51` snapshot) so the diff isolates resolver behavior from
+the wave's own source changes: 5529 → 5533 edges over the same 2438
+definitions. Three edges lost, each justified: two were replaced by the
+correct target (`json_out.zig:outlineFile -> model.zig:tag` became
+`json_out.zig:outlineFile -> language.zig:tag`; `taint.zig:pathJson ->
+model.zig:tag` became `taint.zig:pathJson -> taint_graph.zig:tag`), and the
+third, `main.zig:serve -> gitdiff.zig:flush`, is a phantom at the base itself:
+`out` is a `*std.Io.Writer`, so `out.flush()` is the standard library's, not
+`gitdiff.flush`. Seven edges gained: the two retargets above, plus
+`index.zig:buildOpenDir -> gitignore.zig:deinit`, `main.zig:ServerSession.deinit
+-> main.zig:RootAuthority.deinit`, `main.zig:SampleFixture.deinit ->
+index.zig:Index.deinit`, `taint.zig:pathText -> taint_graph.zig:tag`, and
+`query.zig:RefPattern.matches -> query.zig:exactOrGlob` — all through a
+now-typed receiver except the last, which is the alias-follow feature
+reaching through `const partMatches = exactOrGlob;` (present in `query.zig`
+at both commits; only HEAD's resolver follows it).
+
+A prior pass of this measurement (over each commit's own, differently-sized
+`src/` tree) reported four lost edges, the fourth being `RefPattern.matches ->
+RefPattern.partMatches` becoming `exactOrGlob`. That does not reproduce on a
+fixed corpus: `partMatches` never has an outgoing edge at either commit (it is
+called, not calling), and `RefPattern.matches` never targets it at the base -
+`matches -> exactOrGlob` is a new edge via the `partMatches` alias, not a
+retargeted one. The fourth "loss" was a bookkeeping error, not a real
+regression; the true count is three lost, seven gained, all justified above.
 
 **Floors** were re-recorded once at the end of the wave with a plain
 `--update-floors`; every metric that moved rose, and nothing was lowered
@@ -315,17 +335,26 @@ them).
 
 ## Failure classes, by what they cost
 
-Counted across all twelve languages at the pre-wave-1 baseline: 374 missing
-definitions, 56 phantom definitions, 19 mis-kinded or mis-placed definitions,
-456 missing edges, 91 phantom edges, 157 exactness disagreements. (Fix round 1
-grew the missing/phantom counts by correcting goldens that were previously too
-small or mismatched, and fix round 2's F3/F4/F7/F8/F16 grew the missing-edge
-count further the same way - see "Fix round 1" and "Fix round 2" above; neither
-touched exactness.)
+Counted across all twelve languages at the pre-wave-1 baseline (before wave
+1's own `main` merge): 374 missing definitions, 56 phantom definitions, 19
+mis-kinded or mis-placed definitions, 456 missing edges, 91 phantom edges, 157
+exactness disagreements. (Fix round 1 grew the missing/phantom counts by
+correcting goldens that were previously too small or mismatched, and fix
+round 2's F3/F4/F7/F8/F16 grew the missing-edge count further the same way -
+see "Fix round 1" and "Fix round 2" above; neither touched exactness.) As
+"Wave 1" above explains, wave 1's own base moved first with a merge of
+`main` that was none of this wave's work; the census at that merged base
+(the wave's actual starting point) is 374/56/19 definitions (unchanged - the
+merge did not touch definition extraction) and 430 missing edges, 99 phantom
+edges, 159 exactness disagreements.
 
-After wave 1 the same census reads: 354 missing definitions, 56 phantom
+After wave 1 the census reads: 354 missing definitions, 56 phantom
 definitions, 19 mis-kinded, 382 missing edges, 63 phantom edges, 103 exactness
-disagreements. Classes 4, 5, 6 and 9 are the ones it moved; the counts below
+disagreements. Measured against the wave's actual (post-merge) base, not the
+pre-merge one, the wave-only deltas are 430→382 missing edges, 99→63 phantom
+edges, 159→103 exactness disagreements - the merge itself accounts for the
+rest of the gap from the pre-merge 456/91/157. Classes 4, 5, 6 and 9 are the
+ones the wave moved; the counts below
 describe the baseline, and each class says where it now stands.
 
 **1. Container members are indexed for two languages out of twelve** - 242 of

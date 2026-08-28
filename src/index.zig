@@ -1623,7 +1623,7 @@ fn heuristicMethodTarget(idx: *const Index, from: model.Symbol, name: []const u8
     return best;
 }
 
-/// Above this many same-named callable candidates, a receiver-unknown call is/// Above this many same-named callable candidates, a receiver-unknown call is
+/// Above this many same-named callable candidates, a receiver-unknown call is
 /// left unresolved instead of heuristically bound (see heuristicMethodTarget).
 const max_heuristic_candidates = 4;
 
