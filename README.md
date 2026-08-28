@@ -76,7 +76,7 @@ test schema fingerprint is the exact canonical emitted contract  src/capabilitie
 ```
 
 That's the loop: index once (automatic), then `search` / `def` / `calls` /
-`callers` / `affected` and the rest of the 40 commands in [Usage](#usage)
+`callers` / `affected` and the rest of the 43 commands in [Usage](#usage)
 below — `navgraph help <command>` prints full usage for any of them.
 
 ## Use it from Neovim
@@ -225,7 +225,10 @@ navgraph <command> [arg] [flags]
 | `rename <sym> <new>` | Apply a collision-checked exact rename; `--preview` emits a unified patch without writing. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges, nodes_total, truncated}` JSON. `-l` caps the node set; the JSON reports the total and text says so on stderr. Respects `--tests`. |
-| `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. |
+| `hunks [ref]`      | Working change's hunks, blast radius and roots — `navgraph/impact` mirror. Default ref is `HEAD`, like `affected`/`diff`. `--limit`/`--offset` page the blast radius; `--depth`/`--direction` control the walk. |
+| `context <symbol>` | One symbol's definition, callers/callees/types/tests in a single call, trimmed to `--budget` tokens — `navgraph/context` mirror. `--include` restricts sections (`callers,callees,types,tests,body`); `--offset` pages a budget-capped `callers` list. |
+| `where <file:line>`| Symbol enclosing a 1-based `file:line`, plus its breadcrumb chain — `navgraph/where` mirror (stack traces, diff hunks). |
+| `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. `navgraph.hunks`/`.context`/`.where` mirror the three commands above as MCP tools. |
 | `lsp`              | Run as a resident **editor server** (LSP over stdio) that keeps the graph in memory — see [Editor integration](#editor-integration). |
 | `help [command]`   | Show the full catalogue or concise registry-derived help for one command. |
 
@@ -246,7 +249,8 @@ list of flags that actually *do* something is `navgraph capabilities -j`
 | `-d, --depth <N>`             | Graph depth for call walks, `neighbors`, and `raises` propagation (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
 | `-l, --limit <N>`             | Max results (default `300`; `hot`'s own default is `25`). The flag is explicit, not a sentinel: on `imports`/`importers`/`graph`/`hot` a value you give is a real cap — `300` included — and leaving it off keeps the first three unbounded and `hot` at 25. |
-| `--budget <bytes>`            | On commands declaring this option, a hard serialized stdout ceiling (minimum 64 bytes); results are importance-ranked, compacted, and marked/cursored when truncated. |
+| `--budget <bytes>`            | On commands declaring this option, a hard serialized stdout ceiling (minimum 64 bytes); results are importance-ranked, compacted, and marked/cursored when truncated. On `context` specifically this is a *token* budget instead (default 2000; `0` means the default, not "no cap") — `navgraph/context`'s wire `budget`, not a byte ceiling. |
+| `--include <a,b,…>`           | `context`: sections to compute (`callers,callees,types,tests,body`); default is every section, an explicit empty list computes none. |
 | `--max-nodes <N>`             | Exact retained-node cap; `--summary` renders retained nodes at name detail and reports elision. |
 | `--since <ref>`               | Git comparison ref for `affected` or the lower history bound for `churn`. |
 | `--last <N>`                  | Commit bound for `history`/`churn` (default `10`). |
@@ -369,6 +373,16 @@ The full manifest remains available through `navgraph/capabilities` and
 rejected. `navgraph.reload` accepts `{"noCache":true}` and atomically swaps in a
 fresh index only after the rebuild succeeds. A no-id `workspace/reload`
 notification refreshes the snapshot without emitting a response.
+
+`navgraph.hunks` (`{ref?, depth?, direction?, limit?, offset?}`),
+`navgraph.context` (`{symbol, budget?, include?, offset?}`)
+and `navgraph.where` (`{file, line}`) mirror the `hunks`/`context`/`where` CLI
+verbs and `navgraph/impact`/`context`/`where`'s LSP wire shapes exactly — one
+symbol's full context, the working change's hunks, or the symbol enclosing a
+line, each in a single typed call. Each opens its own one-shot index per call
+rather than reusing the server's resident one (see `docs/lsp.md`'s "1.1" CLI
+and MCP mirrors section for why), so unlike `navgraph.query` above, a call
+here costs a fresh walk.
 
 Find who writes and reads a field, or trace the handoff to a sink:
 
@@ -565,15 +579,20 @@ navgraph lsp [-C|--root <dir>] [--log <file>] [--log-level error|info|debug]
 ```
 
 - **Standard LSP** — `definition`, `references`, `hover`, `documentSymbol`,
-  `workspace/symbol`, full document sync. An open buffer's unsaved text drives
-  the graph, so answers reflect what you are typing, not what is on disk.
+  `workspace/symbol`, call/type hierarchy, `implementation`, `typeDefinition`,
+  `documentHighlight`, `codeLens`, full document sync. An open buffer's unsaved
+  text drives the graph, so answers reflect what you are typing, not what is
+  on disk.
 - **`navgraph/*`** — the full CLI verb set over the resident graph: `status`,
-  `symbolAt`, `blast`, `search`, `grep`, `callers`, `calls`, `rescan`,
-  `neighbors`, `path`, `outline`, `hot`, `unused`, `diff`, `routes`, `events`,
-  `imports`, `importers`, `graph`, plus a `navgraph/indexed` notification after
-  every re-index. `blast` is the one to reach for: the transitive callers (or
+  `symbolAt`, `blast`, `impact`, `tests`, `types`, `context`, `where`,
+  `search`, `grep`, `callers`, `calls`, `rescan`, `neighbors`, `path`,
+  `outline`, `hot`, `unused`, `diff`, `routes`, `events`, `imports`,
+  `importers`, `graph`, plus a `navgraph/indexed` notification after every
+  re-index. `blast` is the one to reach for: the transitive callers (or
   callees) of a symbol, a file, or everything changed since a git ref — with a
-  per-depth and per-file summary.
+  per-depth and per-file summary. `context` is the one to reach for from an
+  editing agent: everything about one symbol in a single call, trimmed to a
+  token budget.
 - A background mtime poll picks up changes made outside the editor (a git
   checkout, a formatter) and re-indexes them.
 

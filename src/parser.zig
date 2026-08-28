@@ -1237,7 +1237,7 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
                 // Go writes `name T` with no separator (`o *Other`, `w http.ResponseWriter`).
                 if (typeFromChain(ctx, i + 1, close)) |t| ty = t;
             }
-            try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
+            try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty, .is_param = true });
             // A Go group shares one type written after the last name
             // (`store, other *Local`): back-fill the names that parsed untyped.
             if (ctx.cfg.language == .go and ty.len != 0) {
@@ -1394,14 +1394,20 @@ fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Bindin
             continue;
         }
         if (ctx.isPunct(i, ',')) {
-            if (cDeclarator(ctx, start, i + 1)) |b| try list.append(ctx.gpa, b);
+            if (cDeclarator(ctx, start, i + 1)) |b| try list.append(ctx.gpa, asParam(b));
             start = i + 1;
         }
         i += 1;
     }
     if (start < close) {
-        if (cDeclarator(ctx, start, close + 1)) |b| try list.append(ctx.gpa, b);
+        if (cDeclarator(ctx, start, close + 1)) |b| try list.append(ctx.gpa, asParam(b));
     }
+}
+
+/// `cDeclarator` is shared between param and body-local binding collection
+/// (it cannot itself know which); the caller tags the outcome.
+fn asParam(b: Binding) Binding {
+    return .{ .name = b.name, .type_name = b.type_name, .is_param = true };
 }
 
 /// Statement keywords a Go short declaration may follow directly, so the
@@ -3911,7 +3917,7 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
 fn withGoReceiverBinding(ctx: *Ctx, bindings: []Binding, name: []const u8, type_name: []const u8) ![]Binding {
     if (name.len == 0 or type_name.len == 0) return bindings;
     const grown = try ctx.arena.realloc(bindings, bindings.len + 1);
-    grown[grown.len - 1] = .{ .name = name, .type_name = type_name };
+    grown[grown.len - 1] = .{ .name = name, .type_name = type_name, .is_param = true };
     return grown;
 }
 

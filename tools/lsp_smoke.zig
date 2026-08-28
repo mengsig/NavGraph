@@ -13,7 +13,12 @@ const std = @import("std");
 
 /// Ids whose replies must carry a `result`. Each is a request sent *behind* a
 /// hostile one, so answering it proves the server survived and stayed in sync.
-const must_succeed = [_]i64{ 1, 11, 13, 77, 14, 15 };
+const must_succeed = [_]i64{ 1, 11, 13, 77, 14, 15, 16, 17, 18 };
+
+/// Ids of the coldstart-F1 hostile numeric-param reproductions: each must
+/// come back `-32602`, never crash the process (Debug) and never silently
+/// answer out of undefined behavior (ReleaseFast) — coldstart F1/F14.
+const must_reject_params = [_]i64{ 30, 31, 32, 33, 34, 35, 36, 37, 38 };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -171,6 +176,66 @@ fn buildSession(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     try frame(gpa, &out,
         \\{"jsonrpc":"2.0","id":14,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
     );
+
+    // 1.1: a callHierarchy round-trip (prepare -> incomingCalls) survives too.
+    const util_uri = try std.fmt.allocPrint(arena, "file://{s}/util.zig", .{root});
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"textDocument/prepareCallHierarchy\"," ++
+            "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":0,\"character\":7}}}}}}",
+        .{util_uri},
+    ));
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":17,"method":"callHierarchy/incomingCalls","params":{"item":{"data":{"qualified":"helper","file":"util.zig"}}}}
+    );
+
+    // 1.1: navgraph/impact over the open (unsaved, disk-absent) min.js overlay.
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":18,"method":"navgraph/impact","params":{}}
+    );
+
+    // coldstart F1/F14: the review's 9 hostile-numeric-param reproductions —
+    // a non-finite float or an out-of-u32 integer on every numeric param —
+    // must answer -32602, never crash (Debug) or silently misbehave (ReleaseFast).
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"navgraph/where\",\"params\":{{\"uri\":\"{s}\",\"line\":1e300}}}}",
+        .{util_uri},
+    ));
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":31,"method":"navgraph/impact","params":{"range":{"start":{"line":9223372036854775807}}}}
+    );
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":32,"method":"navgraph/impact","params":{"range":{"start":{"line":5000000000}}}}
+    );
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":33,"method":"navgraph/impact","params":{"limit":1e300}}
+    );
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":34,"method":"navgraph/context","params":{"symbol":"helper","budget":1e300}}
+    );
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":35,"method":"navgraph/tests","params":{"symbol":"helper","limit":1e300}}
+    );
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"id\":36,\"method\":\"textDocument/prepareCallHierarchy\"," ++
+            "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":5000000000}}}}}}",
+        .{util_uri},
+    ));
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"id\":37,\"method\":\"textDocument/prepareCallHierarchy\"," ++
+            "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":1e300}}}}}}",
+        .{util_uri},
+    ));
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"textDocument/documentHighlight\"," ++
+            "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":5000000000}}}}}}",
+        .{util_uri},
+    ));
+
     try frame(gpa, &out,
         \\{"jsonrpc":"2.0","id":15,"method":"shutdown"}
     );
@@ -256,6 +321,33 @@ fn checkReplies(gpa: std.mem.Allocator, out: []const u8) !void {
     }
     if (blast.get("edges").?.array.items.len == 0) fail("blast found no edge", .{});
     if (replies.get(15).?.object.get("result").? != .null) fail("shutdown must return null", .{});
+
+    // callHierarchy round-trip: prepare finds `helper`, incomingCalls finds `run`.
+    const prepared = replies.get(16).?.object.get("result").?.array.items;
+    if (prepared.len != 1) fail("prepareCallHierarchy returned {d} items, want 1", .{prepared.len});
+    if (!std.mem.eql(u8, prepared[0].object.get("name").?.string, "helper")) {
+        fail("prepareCallHierarchy resolved '{s}', want 'helper'", .{prepared[0].object.get("name").?.string});
+    }
+    const incoming = replies.get(17).?.object.get("result").?.array.items;
+    if (incoming.len != 1) fail("incomingCalls returned {d} items, want 1", .{incoming.len});
+    const caller_name = incoming[0].object.get("from").?.object.get("name").?.string;
+    if (!std.mem.eql(u8, caller_name, "run")) fail("incomingCalls' caller is '{s}', want 'run'", .{caller_name});
+
+    // impact round-trip: the open min.js overlay (absent from disk) is one hunk.
+    const impact = replies.get(18).?.object.get("result").?.object;
+    const hunks = impact.get("hunks").?.array.items;
+    if (hunks.len == 0) fail("navgraph/impact found no hunks for the open overlay", .{});
+    if (impact.get("changeId").? != .string) fail("navgraph/impact's changeId is not a string", .{});
+
+    // coldstart F1/F14: every hostile numeric param rejected with -32602, not
+    // a crash (proven simply by the process having exited 0 above) and not a
+    // silently-wrong result.
+    for (must_reject_params) |id| {
+        const reply = replies.get(id) orelse fail("hostile-param id {d} was never answered", .{id});
+        const rp_err = reply.object.get("error") orelse fail("hostile-param id {d} should have failed, got a result", .{id});
+        const rp_code = rp_err.object.get("code").?.integer;
+        if (rp_code != -32602) fail("hostile-param id {d} gave {d}, want -32602", .{ id, rp_code });
+    }
 }
 
 fn clip(s: []const u8) []const u8 {

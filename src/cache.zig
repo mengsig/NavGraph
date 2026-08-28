@@ -174,6 +174,7 @@ fn skipSymbol(cur: *Cursor) !void {
     while (b < bind_count) : (b += 1) {
         _ = try cur.getStr(); // name
         _ = try cur.getStr(); // type_name
+        _ = try cur.getU8(); // is_param
     }
 }
 
@@ -287,6 +288,7 @@ fn readBindings(arena: std.mem.Allocator, cur: *Cursor) ![]const Binding {
     for (binds) |*b| b.* = .{
         .name = try arena.dupe(u8, try cur.getStr()),
         .type_name = try arena.dupe(u8, try cur.getStr()),
+        .is_param = (try cur.getU8()) != 0,
     };
     return binds;
 }
@@ -393,6 +395,7 @@ fn writeSymbol(
     for (sym.bindings) |b| {
         try putStr(gpa, buf, b.name);
         try putStr(gpa, buf, b.type_name);
+        try buf.append(gpa, @intFromBool(b.is_param));
     }
 }
 
@@ -654,6 +657,7 @@ fn encSym(
     for (binds) |b| {
         try putStr(a, buf, b.name);
         try putStr(a, buf, b.type_name);
+        try putU8(a, buf, @intFromBool(b.is_param));
     }
 }
 
@@ -728,6 +732,7 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
     for (expected.bindings, got.bindings) |eb, gb| {
         try t.expectEqualStrings(eb.name, gb.name);
         try t.expectEqualStrings(eb.type_name, gb.type_name);
+        try t.expectEqual(eb.is_param, gb.is_param);
     }
 }
 

@@ -143,6 +143,9 @@ pub const Hit = struct {
     positions: [max_query_len]u32,
     /// Use sites, for a `refs` search. Empty for a definition search.
     lines: []const u32 = &.{},
+    /// Whether this hit's qualified name is in the caller's `Filter.recent`
+    /// (`navgraph/search`'s `recent` ranking tier — see `sortHits`).
+    in_recent: bool = false,
 
     pub fn matches(self: *const Hit) []const u32 {
         return self.positions[0..self.count];
@@ -152,7 +155,15 @@ pub const Hit = struct {
 pub const Filter = struct {
     kinds: []const u8 = "",
     tests: query.TestScope = .with,
+    /// Client-supplied recently-used qualified names; a match ranks above
+    /// every other tier (`navgraph/search`'s `recent` param).
+    recent: []const []const u8 = &.{},
 };
+
+fn inRecent(recent: []const []const u8, qualified: []const u8) bool {
+    for (recent) |r| if (std.mem.eql(u8, r, qualified)) return true;
+    return false;
+}
 
 /// Rank every definition whose qualified name fuzzy-matches `needle`. Returns
 /// the total number of matches; `out` holds them sorted best-first (all of them
@@ -171,7 +182,13 @@ pub fn searchSymbols(
         if (!inScope(filter.tests, query.isTestSymbol(idx, sym))) continue;
         const qualified = qualifiedInto(idx, sym, &buf);
         const s = score(qualified, needle) orelse continue;
-        try out.append(gpa, .{ .id = sym.id, .score = s.value, .count = s.count, .positions = s.positions });
+        try out.append(gpa, .{
+            .id = sym.id,
+            .score = s.value,
+            .count = s.count,
+            .positions = s.positions,
+            .in_recent = inRecent(filter.recent, qualified),
+        });
     }
     sortHits(idx, out.items);
 }
@@ -189,6 +206,7 @@ pub fn searchRefs(
     const pat = query.RefPattern.parse(pattern);
     var lines: std.ArrayList(u32) = .empty;
     defer lines.deinit(gpa);
+    var buf: [512]u8 = undefined;
     for (idx.graph.symbols) |sym| {
         if (!query.kindAllowed(sym.kind, filter.kinds)) continue;
         if (!inScope(filter.tests, query.isTestSymbol(idx, sym))) continue;
@@ -212,6 +230,7 @@ pub fn searchRefs(
             .count = s.count,
             .positions = s.positions,
             .lines = try gpa.dupe(u32, lines.items),
+            .in_recent = inRecent(filter.recent, qualifiedInto(idx, sym, &buf)),
         });
     }
     sortHits(idx, out.items);
@@ -229,9 +248,11 @@ fn sortHits(idx: *const Index, hits: []Hit) void {
     std.mem.sort(Hit, hits, idx, hitLessThan);
 }
 
-/// Best first: score, then fan-in, then the shorter file path, then the id so
-/// the order is total (a client paging through results sees a stable list).
+/// Best first: `recent` membership, then score, then fan-in, then the shorter
+/// file path, then the id so the order is total (a client paging through
+/// results sees a stable list).
 fn hitLessThan(idx: *const Index, a: Hit, b: Hit) bool {
+    if (a.in_recent != b.in_recent) return a.in_recent;
     if (a.score != b.score) return a.score > b.score;
     const ca = idx.callersOf(a.id).len;
     const cb = idx.callersOf(b.id).len;

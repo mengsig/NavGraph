@@ -4,6 +4,7 @@
 //! Layering, outermost first — each layer depends only on the ones below it:
 //!   loop      the stdio run loop, timers and logging
 //!   handlers  method dispatch (standard LSP + navgraph/*)
+//!   mirrors   one-shot CLI/MCP callers of queries (no resident session)
 //!   queries   query adapters over a live Index
 //!   payload   the contract's JSON shapes
 //!   session   the resident index: overlays, re-index, watcher
@@ -19,6 +20,7 @@ pub const payload = @import("lsp/payload.zig");
 pub const regex = @import("lsp/regex.zig");
 pub const search = @import("lsp/search.zig");
 pub const queries = @import("lsp/queries.zig");
+pub const mirrors = @import("lsp/mirrors.zig");
 pub const handlers = @import("lsp/handlers.zig");
 pub const loop = @import("lsp/loop.zig");
 

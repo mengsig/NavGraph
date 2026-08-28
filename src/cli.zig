@@ -115,6 +115,16 @@ const usage_text =
     \\  coverage [path]    % of fn/method reachable from a test (call-graph, no instrumentation)
     \\  graph [path]       Interactive HTML visualization of the code graph
     \\                     (redirect stdout to a .html file; -j emits the raw JSON model)
+    \\  hunks [ref]        Working change's hunks, blast radius and roots (navgraph/impact
+    \\                     mirror); default ref is HEAD, like affected/diff; --limit raises
+    \\                     the 500-node cap, --offset pages past it, --direction/--depth
+    \\                     control the walk
+    \\  context <symbol>   One symbol's definition, callers/callees/types/tests in a single
+    \\                     call, trimmed to --budget tokens (navgraph/context mirror);
+    \\                     --include restricts sections (callers,callees,types,tests,body);
+    \\                     --offset pages a budget-capped callers list
+    \\  where <file:line>  Symbol enclosing a 1-based file:line, plus its breadcrumb chain
+    \\                     (navgraph/where mirror; stack traces and diff hunks)
     \\  capabilities       Machine-readable protocol, build, language, command,
     \\                     option, output, safety, and trust metadata (alias: version)
     \\  serve             Long-lived JSON-RPC/MCP server over stdin/stdout
@@ -130,6 +140,9 @@ const usage_text =
     \\                                         file to scope to it (default: .)
     \\  -l, --limit <N>                        Max results (default: 300)
     \\  --budget <bytes> / --max-nodes <N>     Hard stdout-byte / graph-node bounds
+    \\                                         (context: a token budget instead, default 2000)
+    \\  --include <a,b,…>                     context: sections to compute (callers,callees,
+    \\                                         types,tests,body); default is every section
     \\  --since <ref> / --from-tests           Affected/churn history and reaches selectors
     \\  --last <N>                             history/churn commit bound (default: 10)
     \\  --preview                              rename: emit patch without writing files
@@ -296,6 +309,14 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
                 try w.writeAll("-p, --vis <all|public|private>; --public; --private; --no-private\n");
                 continue;
             }
+            // `context`'s `--budget` is a token count (0 means "use the
+            // 2000-token default"), not the shared descriptor's hard *byte*
+            // floor of 64 — the generic "(min 64)" annotation below would be
+            // actively wrong here.
+            if (option == .budget and desc.command == .context) {
+                try w.writeAll("--budget <N>  (tokens; default 2000, 0 also means default)\n");
+                continue;
+            }
             for (option_desc.spellings, 0..) |spelling, i| {
                 if (i != 0) try w.writeAll(", ");
                 try w.writeAll(spelling.flag);
@@ -453,13 +474,45 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "--budget", "--max-nodes" })) {
-        out.used_options.insert(if (std.mem.eql(u8, f.name, "--budget")) .budget else .max_nodes);
+        const is_budget = std.mem.eql(u8, f.name, "--budget");
+        out.used_options.insert(if (is_budget) .budget else .max_nodes);
         const value = try parseUint(try f.value(args, i, f.name), f.name);
-        if (std.mem.eql(u8, f.name, "--budget") and value < 64)
+        // `context`'s `--budget` is `navgraph/context`'s wire `budget`: a
+        // *token* count, not the hard stdout-byte ceiling every other
+        // command's `--budget` means. 0 is a real, documented value there
+        // (silently reinterpreted as the 2000-token default), so the byte
+        // floor below must not apply to it.
+        if (is_budget and out.command == .context) {
+            out.options.context_budget = value;
+            return f.next(i);
+        }
+        if (is_budget and value < 64)
             return fail(error.BadValue, "--budget must be at least 64 bytes (enough for valid truncation metadata)", .{});
         if (std.mem.eql(u8, f.name, "--max-nodes") and value == 0)
             return fail(error.BadValue, "--max-nodes must be at least 1", .{});
-        if (std.mem.eql(u8, f.name, "--budget")) out.options.budget = value else out.options.max_nodes = value;
+        if (is_budget) out.options.budget = value else out.options.max_nodes = value;
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--include")) {
+        out.used_options.insert(.include);
+        out.options.include = try f.value(args, i, f.name);
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--direction")) {
+        out.used_options.insert(.direction);
+        const val = try f.value(args, i, f.name);
+        if (std.mem.eql(u8, val, "callers")) {
+            out.options.hunks_direction = .callers;
+        } else if (std.mem.eql(u8, val, "callees")) {
+            out.options.hunks_direction = .callees;
+        } else {
+            return fail(error.BadValue, "invalid value '{s}' for --direction (expected callers|callees)", .{val});
+        }
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--offset")) {
+        out.used_options.insert(.offset);
+        out.options.mirror_offset = try parseUint(try f.value(args, i, f.name), "--offset");
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--after")) {

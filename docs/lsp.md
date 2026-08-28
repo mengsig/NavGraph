@@ -166,24 +166,32 @@ Resolution order — the graph's own, not a fresh guess:
 ### `navgraph/blast`
 
 Params: `Target | { file:string } | { ref:string }`, plus
-`{ depth?:int, direction?:"callers"|"callees", limit?:int (500) } & Scope`.
+`{ depth?:int, direction?:"callers"|"callees", limit?:int (500), offset?:int
+(0) } & Scope`.
 
 ```
 { roots:Symbol[],
   nodes:[{ symbol:Symbol, depth:int, via:int[], exact:bool }],
   edges:Edge[],
-  summary:{ symbols:int, files:int, tests:int, maxDepth:int, truncated:bool,
-            byDepth:int[], byFile:[{file:string,count:int}] } }
+  summary:{ symbols:int, total:int, files:int, tests:int, maxDepth:int,
+            truncated:bool, byDepth:int[], byFile:[{file:string,count:int}] },
+  next:int|null }
 ```
 
 - `{ file }` unions every definition in that file. `{ ref }` is every definition
   changed since that git ref (`navgraph diff`'s rule) **plus** every definition
   in a file whose unsaved buffer differs from the copy on disk.
 - Breadth-first to `depth`; each symbol appears once, at its **minimum** depth.
+  The walk always covers the full depth-bounded reachable set — `nodes`/`edges`
+  are the `[offset, offset+limit)` page of it, in that same stable BFS order;
+  `edges` is restricted to edges whose caller/callee-walk source is on the page.
 - `via` names the depth-1 neighbours the node was reached through.
 - `edges` are always written caller→callee, whichever direction the walk ran.
-- `byFile` is ranked by count descending, then path.
-- `truncated` is set when `limit` stopped the walk.
+- `byFile`/`byDepth`/`maxDepth`/`tests` describe the page in `nodes`, matching
+  `symbols` (`nodes.length`) — `summary.total` is the true reachable count,
+  independent of paging.
+- `truncated` is set when the page doesn't reach `total`; `next` is the
+  `offset` for the following page, or `null` once nothing remains.
 
 ### `navgraph/search`
 
@@ -337,8 +345,8 @@ same-name twin, at the cost of depending on import resolution.
 ### `navgraph/diff`
 
 Params: `{ ref?:string ("HEAD"), depth?:int (1), direction?:"callers"|
-"callees" ("callers"), limit?:int (500) } & Scope` → `{ ref:string,
-blast: <the navgraph/blast result> }`.
+"callees" ("callers"), limit?:int (500), offset?:int (0) } & Scope` →
+`{ ref:string, blast: <the navgraph/blast result> }`.
 
 Definitions changed since `ref` **plus** every definition in a file whose
 unsaved buffer differs from disk, wrapped as a `navgraph/blast` walk from those
@@ -527,6 +535,368 @@ and requires the process to exit 0. CI runs it against the ReleaseFast build.
   CLI's `diff`, which has the same gap. Save the file under a tracked path (or
   `git add` it) to bring it into `diff`'s view.
 
+## 1.1
+
+Additive to v1: `protocolVersion` stays `1`; `navgraph/status` gains
+`protocolMinor: 1`. Every method below is listed in
+`experimental.navgraph.methods` only once implemented — a client builds its
+method list from that array, never from this document's version number alone.
+
+`Symbol` gains `contentHash:string` — a stable hash of the definition's source
+text (signature + body), whitespace-normalized so reformatting alone does not
+change it. Key per-site client state (e.g. an approved-impact marker) on
+`qualified@file` + `contentHash`, so it invalidates when the code actually
+changes.
+
+### Standard LSP additions
+
+| Method | Result |
+| --- | --- |
+| `textDocument/prepareCallHierarchy` | `CallHierarchyItem[]` |
+| `callHierarchy/incomingCalls` | `CallHierarchyIncomingCall[]` |
+| `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCall[]` |
+| `textDocument/prepareTypeHierarchy` | `TypeHierarchyItem[]` |
+| `typeHierarchy/supertypes` / `subtypes` | `TypeHierarchyItem[]` |
+| `textDocument/implementation` | `Location[]` |
+| `textDocument/typeDefinition` | `Location[]` |
+| `textDocument/documentHighlight` | `DocumentHighlight[]` |
+| `textDocument/codeLens` | `CodeLens[]`; `codeLens/resolve` is a no-op (the lens is already fully populated) |
+
+```
+CallHierarchyItem { name, kind:int, uri, range, selectionRange,
+                     data:{ id:int, qualified:string, file:string, exact?:bool } }
+```
+
+`data` is what `incomingCalls`/`outgoingCalls`/`supertypes`/`subtypes` re-resolve
+from — by `qualified`+`file`, not the possibly-stale `id` (ids are only stable
+within one index generation). Heuristic (non-exact) edges are still returned;
+`data.exact` carries the flag on a call-hierarchy item (a type-hierarchy edge
+has no separate confidence bit, so `exact` is omitted there).
+
+```jsonc
+// -> textDocument/prepareCallHierarchy {textDocument:{uri}, position}
+[{"name":"mid","kind":12,"uri":"file:///…/app.zig",
+  "range":{"start":{"line":7,"character":0},"end":{"line":9,"character":1}},
+  "selectionRange":{"start":{"line":7,"character":3},"end":{"line":7,"character":6}},
+  "data":{"id":3,"qualified":"mid","file":"app.zig"}}]
+
+// -> callHierarchy/incomingCalls {item}
+[{"from":{"name":"run", …}, "fromRanges":[{"start":{"line":4,"character":4},"end":{"line":4,"character":7}}]}]
+```
+
+`textDocument/implementation` covers both member- and type-level conformance:
+implementors of an interface/trait/protocol **method**, or of a **type**
+(structural port relations plus keyword-declared subtypes, so duck-typed
+Python and keyword-typed Java/TS/C#/Go/Ruby both surface here).
+`textDocument/typeDefinition` answers from the enclosing body's own typed
+bindings (`name: TypeName` locals/params) — empty, never an error, when the
+identifier under the cursor has no recorded binding.
+
+`textDocument/documentHighlight` reports every reference site of the symbol
+under the cursor **in the current document only**: the definition itself
+(`kind: 1`, Text) and each use (`kind: 2` Read or `kind: 3` Write, when known).
+
+```jsonc
+// -> textDocument/codeLens {textDocument:{uri}}
+[{"range":{"start":{"line":7,"character":0},"end":{"line":9,"character":1}},
+  "command":{"title":"1 callers · 1 callees","command":"navgraph.blast",
+             "arguments":[{"symbol":"mid@app.zig"}]}}]
+```
+
+One lens per definition with a call-graph presence; `command.arguments[0].symbol`
+is a `name@file` string, the same form `Target.symbol` accepts, so a client can
+wire the lens straight into a `navgraph/blast` (or `navgraph/impact`) request.
+
+### `navgraph/impact`
+
+Params: `({ uri?:string, range?:{start:{line,character},end:{line,character}} } |
+{ ref?:string }) & { depth?:int, direction?:"callers"|"callees", limit?:int(500),
+offset?:int(0) } & Scope`.
+
+```
+{ roots:Symbol[], nodes:[…], edges:Edge[], summary:{…}, next:int|null,
+  hunks:[{ uri:string, range:Range, roots:Symbol[] }],
+  changeId:string }
+```
+
+The blast radius of the current **working change**, grouped by changed hunk —
+`navgraph/blast`'s result shape (including its `offset`/`summary.total`/`next`
+paging — B1: a response with more blast radius than `limit` shows must report
+the true size and a working continuation, not a `truncated:true` dead end)
+plus `hunks`. Two sources:
+
+- No `ref`: the working change is every open document whose buffer differs
+  from disk (overlay vs disk); `uri` narrows to one document. A hunk is the
+  common-prefix/common-suffix span between the disk copy and the buffer (the
+  same trim the incremental-reparse seam computes) — multiple disjoint edits
+  in one buffer collapse into the single span between the first and the last,
+  same as the reparse hook's own granularity.
+- `ref` given: disk vs that git ref (`navgraph diff`'s rule), one hunk per
+  changed range `git diff` reports; overlays are not consulted in this mode.
+- `uri` + `range` together (no `ref`): the client hands navgraph an exact hunk
+  it already knows about, bypassing overlay comparison entirely — useful
+  before a `didChange` for that edit has round-tripped.
+
+An empty change (nothing open differs from disk, or an empty diff against
+`ref`) is `{ roots:[], nodes:[], edges:[], summary:{ symbols:0, total:0,
+files:0, tests:0, maxDepth:0, truncated:false, byDepth:[], byFile:[] },
+next:null, hunks:[], changeId:"0000000000000000" }` — a routine answer, not
+`-32001` (matches `navgraph/diff`'s own "nothing changed" rule). A bad `ref`
+**is** an error (`-32002`, git's own message), same as `navgraph/diff`.
+
+`changeId` is a hash of the hunk set's shape (each hunk's file + line range,
+in file order) — stable for "this is still the same working change", distinct
+for a new one. It is deliberately not a deep content hash: per-symbol staleness
+is `contentHash`'s job, not this one's.
+
+### `navgraph/tests`
+
+Params: `Target & { limit?:int(200) } & Scope` (`Scope` is accepted for the
+contract's `Target & Scope` shape; `tests`/`strict` have no effect here — the
+walk already answers "which tests", and always follows the same exact
+call/route_call edges `navgraph coverage` does).
+
+```
+{ symbol:Symbol, tests:[{ symbol:Symbol, depth:int, via:int[] }],
+  summary:{ count:int, maxDepth:int, truncated:bool } }
+```
+
+`query.coverage`'s forward walk from every test, inverted and rooted at one
+target: every test symbol from which `target` is reachable through an exact
+call/route_call edge (`target` never lists itself). `via` names the depth-1
+neighbour each test was reached through, same convention as `navgraph/blast`.
+An unresolved `Target` is `-32001`.
+
+### `navgraph/types`
+
+Params: `Target & { limit?:int(200) } & Scope`.
+
+```
+{ symbol:Symbol, supertypes:Symbol[], subtypes:Symbol[], implementors:Symbol[],
+  users:[{ symbol:Symbol, kind:"extends"|"implements"|"param"|"local" }],
+  truncated:bool }
+```
+
+"Who uses type T": `supertypes`/`subtypes` are one hop of the same base table
+`typeHierarchy` walks; `implementors` is the same type-level table
+`textDocument/implementation` uses. `users` unifies the subtype (`extends`) and
+implementor (`implements`) edges with typed param/local bindings whose
+declared type names this symbol (`param` when the binding is one of the
+owner's own parameters, else `local`) — a best-effort, name-based match (the
+same one `navgraph flow --on-type` already uses), so a shadowed same-named
+type in another scope can produce a false match. `field`/`return`/
+`annotation`/`generic` uses are not yet extracted by any language backend, so
+they are simply absent from `users` — never an error, per the contract's
+best-effort clause for languages/kinds not yet modeled.
+
+### `navgraph/context`
+
+Params: `Target & { budget?:int(2000, tokens), offset?:int(0) }`.
+
+```
+{ symbol:Symbol, definition:{ text:string, range:Range }, signature:string,
+  doc?:string, callers:Symbol[], callees:Symbol[], types:Symbol[],
+  tests:Symbol[], callersTotal:int, next:int|null, truncated:bool,
+  tokensEstimate:int }
+```
+
+Everything an editing agent typically needs about one symbol, in a single
+call. `types` is `navgraph/types`'s best-effort scan applied to this one
+symbol: a container's declared supertypes, or a function/method's own typed
+binding types. `tests` is `navgraph/tests`'s reachability list for this
+symbol. `tokensEstimate` is the real serialized byte count of everything below
+(the whole response, not just signatures) divided by ~4 — good enough to
+shrink monotonically, not an exact tokenizer count.
+
+Trimmed to `budget` (B2: this is an enforced bound, not a suggestion), **in
+order**: the body (`definition.text` falls back to the bare `signature`),
+then `tests`, then `types`, then `callees`. `callers` is never dropped as a
+whole section, but — unlike the others — it is count-capped to whatever
+budget remains once every other section has settled: production code before
+any test block, then an exact call edge over a heuristic one, then proximity
+to the target (same file, then same directory), with a floor of one shown
+whenever the symbol has any caller at all, so an extreme budget still answers
+"who calls this" rather than going empty. `callersTotal` is the true caller
+count regardless of the *cap* — it is `0` when `include` excludes `callers`
+outright, same as the section itself. `offset` pages through that priority
+order and `next` is the offset for the following page, or `null` once
+nothing remains (B1). `truncated` is set when a section `include` asked for
+was actually dropped by the ladder, or `callers` is capped/paged past what
+this response shows — never merely because `include` never asked for a
+section. An unresolved `Target` is `-32001`.
+
+### `navgraph/where`
+
+Params: `{ uri:string, line:int (1-based) }`.
+
+```
+{ enclosing:Symbol|null, breadcrumbs:Symbol[], file:string }
+```
+
+The symbol enclosing `line` — built for stack traces and diff hunks, which are
+1-based, unlike an LSP `position.line`. `enclosing` is `null` (never an error)
+for a line with no enclosing definition (file scope, a blank line, or a file
+outside the index). `breadcrumbs` is the enclosing chain outermost → innermost
+(`[Class, method]` for a line inside `Class.method`), empty when `enclosing` is
+null.
+
+### `navgraph/symbolAt` gains `range` and `breadcrumbs`
+
+```
+{ word, symbol, enclosing, candidates,
+  range: Range|null, breadcrumbs: Symbol[] }
+```
+
+`range` is the identifier's own LSP range (`null` off any identifier, matching
+`word`/`symbol`/`candidates`' existing empty-answer convention).
+`breadcrumbs` is the enclosing chain outermost → innermost, rooted at
+`enclosing` — for winbar-style breadcrumbs. `navgraph/where` reuses the exact
+same chain walk.
+
+### `navgraph/search` gains `recent`
+
+Params add `recent?:string[]` — client-supplied qualified names (an editor's
+own recently-visited-symbols list). A hit whose `qualified` is in `recent`
+ranks above every other tier, before score; ties among `recent` hits still
+break on score, fan-in, path length, then id, same as always.
+
+### `navgraph/status` gains `protocolMinor` and `backend`
+
+```
+{ …, protocolMinor:1,
+  backend:{ default:"auto", languages:{ <lang>:"heuristic"|"tree-sitter" } } }
+```
+
+`backend.languages` reports, per language actually present in the index,
+which parse backend served it. This repo ships only the heuristic
+lexer/parser (`src/parser.zig`), so every language reports `"heuristic"` —
+`backend` exists so a client can tell backends apart once a tree-sitter
+backend (`feat/x/tree-sitter-backend`) lands, without a protocol version bump.
+
+### `limit` / `truncated` everywhere
+
+Every `navgraph/*` list method now accepts `limit` and reports `truncated`:
+`navgraph/outline`, `navgraph/hot`, `navgraph/unused`, `navgraph/routes`,
+`navgraph/events` and `navgraph/imports` gained `truncated` in 1.1
+(`navgraph/blast`, `navgraph/search`, `navgraph/grep`, `navgraph/importers`,
+`navgraph/tests` and `navgraph/types` already reported it).
+
+`navgraph/blast`, `navgraph/diff`, `navgraph/impact` and `navgraph/context`
+additionally gain a working continuation past `truncated:true` (B1: a
+truncated response with no route to the rest, and no way to size what's
+missing, is a contract violation — the independent evaluation's finding #4,
+also flagged for the 1.0 `map`/`source`/`read` helpers' own `next`).
+`offset` pages a stable priority order (BFS order for the blast-radius
+methods; for `context`'s `callers`, production code before any test block,
+then exactness, then proximity — see `navgraph/context` below); the response's
+`next` is the `offset` for the following page, or `null` once nothing
+remains; `summary.total` / `callersTotal` report the true count independent
+of paging.
+
+### Incremental re-parse (server-side only — not visible on the wire)
+
+`index.parseOne` takes a `ReparseHint{ old_tree:?*anyopaque, edits:[]TreeEdit }`
+seam, shaped for a tree-sitter backend's `ts_tree_edit`. This repo's heuristic
+lexer/parser ignores the hint and always cold-parses; the seam exists so
+`feat/x/tree-sitter-backend` (PR #9, not merged here) can satisfy it without
+touching `index`/`session`/LSP code again. `session.reparse` computes `edits`
+itself via `index.computeEdit` (a common-prefix/common-suffix diff of the
+previous parsed text against the new one) on every reparse, regardless of
+backend — LSP Full sync (this server's only mode) never sends a delta, so this
+is where one gets reconstructed. `navgraph/impact`'s overlay-hunk detection
+(above) reuses this same function.
+
+Measured: no regression in single-file re-index with the seam threaded through
+(noise-dominated, ~16–48 ms either way on this repo's own largest files —
+whole-graph re-resolution, not parsing, is the actual cost driver; see
+"Measured performance" above).
+
+### Known limitations (1.1)
+
+- `navgraph/types`'s `users` and `navgraph/context`'s `types` match typed
+  bindings by **type name**, not by resolved id — the same limitation
+  `navgraph flow --on-type` already has. A same-named type in an unrelated
+  scope can produce a false match.
+- `navgraph/impact`'s overlay-hunk detection collapses every disjoint edit in
+  one buffer into a single span (the reparse seam's own granularity) — two
+  edits far apart in one file report as one hunk covering the whole span
+  between them, not two.
+- `limit:0`/`budget:0` on any method is not honored as "no cap" — it is
+  silently reinterpreted as "use the default" (500/200/2000/…), matching the
+  1.0 helper's existing behavior. An explicit `0` and an absent `limit` are
+  indistinguishable on the wire; send a real cap instead of `0`. The CLI's own
+  `-l/--limit` diverges from this on purpose: `--limit 0` is a usage error
+  (`-l/--limit must be at least 1`), not a silent default, on every CLI
+  command that takes it — including `hunks`/`context`'s mirrored flags.
+- `navgraph/types.supertypes` and `typeHierarchy/supertypes` drop a base the
+  resolver could not place in the index (an external/ambiguous base) rather
+  than reporting it — the CLI's `navgraph hierarchy` shows it as `~ external/
+  ambiguous base: Name ?`, but the LSP surface currently cannot distinguish
+  "no supertype" from "supertype outside the index".
+
+### CLI and MCP mirrors
+
+`navgraph/impact`, `navgraph/context` and `navgraph/where` are also available
+outside the LSP: `navgraph hunks`/`context`/`where` on the command line, and
+`navgraph.hunks`/`navgraph.context`/`navgraph.where` as tools on `navgraph
+serve`/`mcp`'s MCP surface (alongside `navgraph.query`). All three share their
+implementation with the LSP server verbatim (`src/lsp/mirrors.zig` calls
+`queries.writeImpact`/`writeContext`/`writeWhere` directly) — the query logic
+lives in exactly one place; only how a caller reaches it differs.
+
+- `navgraph hunks [ref] [--depth N] [--direction callers|callees] [--limit N]
+  [--offset N] [-j]` — the working change's hunks, blast radius and roots
+  (`navgraph/impact`'s wire shape exactly, `roots`/`nodes`/`edges`/`summary`/
+  `next`/`hunks`/`changeId` included, `summary.total` and `next` among them —
+  B1/m6: these flags were previously unreachable from the CLI/MCP mirrors, the
+  mechanism that made a `limit`-truncated `hunks` response unrecoverable on
+  those two surfaces; `--limit` is the one that actually raises the 500-node
+  page). Named `hunks`, not `impact`, because `navgraph impact` was already
+  taken (an alias of the pre-1.1 `navgraph affected` command, an unrelated
+  git-diff query). The CLI and MCP tool never have an open-document overlay,
+  so — unlike the wire method, which treats an absent `ref` as "compare open
+  buffers to disk" — a missing `ref` here always means "compare disk to HEAD",
+  the same default `navgraph diff`/`navgraph affected` already use. Unset
+  `--depth` keeps the session's configured depth, not the CLI's generic
+  depth-1 default meant for `calls`/`callers`.
+- `navgraph context <symbol> [--budget N] [--include a,b,…] [--offset N]
+  [-j]` — `navgraph/context`'s wire shape exactly: definition, signature, doc,
+  callers/callees/types/tests, trimmed to `--budget` tokens (default 2000; `0`
+  is silently reinterpreted as the default, per the wire contract — never a
+  usage error). `--include` is the same allow-list the wire `include` array
+  validates (`callers`, `callees`, `types`, `tests`, `body`); absent means
+  every section, present-but-empty means none. `--budget` here is *not* the
+  CLI's shared hard-byte-output `--budget` (a different unit and a different
+  default entirely) — `context` is the one command where that flag means
+  tokens, matching the wire param it mirrors. `--offset` pages a budget-capped
+  `callers` list (B1/B2), distinct from `--after`'s unrelated JSONL row-stream
+  cursor.
+- `navgraph where <file>:<line> [-j]` — the symbol enclosing a 1-based
+  `file:line` and its breadcrumb chain, `navgraph/where`'s wire shape exactly.
+  A file outside the index answers `{"enclosing":null,...}` (never an error,
+  per the wire contract); a malformed `file:line` (no colon, a non-numeric or
+  zero line) is reported as a usage message and exit 1, not a crash.
+
+All three default to human-readable text; `-j` emits the identical JSON the
+wire methods return (the same `Symbol` shape — `qualified`, `uri`,
+`contentHash`, 0-based `range`s — not the CLI's own differently-shaped `-j`
+output; text mode is a plain reformatting of that same JSON, computed once).
+
+Design note: the CLI's other commands dispatch over a plain, already-loaded
+`Index`; the MCP surface's `navgraph.query`/legacy `navgraph` tools dispatch
+the same way over a resident one. Neither fits `queries.writeImpact`/
+`writeContext`/`writeWhere`, which need a `Session` (for git/overlay access,
+URI construction, and the position-encoding convention `Ctx` carries). Rather
+than thread a `Session` through the CLI's `Index`-based dispatch, or grow
+`agent_api`'s typed operation envelope with three more Session-shaped
+operations, `src/lsp/mirrors.zig` builds a throwaway one-shot `Session` per
+call — the same walk `Session.init` already does, and the same one-shot cost
+model every other `navgraph` CLI invocation already pays. The MCP tools pay
+that cost on every call (unlike `navgraph.query`, which reuses the server's
+resident index) since `Session` always builds its own index rather than
+adopting an existing one; not worth carrying two synchronized indices unless
+these mirrors turn out to be called often enough for it to matter.
+
 ## Neovim
 
 ```lua
@@ -559,6 +929,7 @@ vim.api.nvim_create_autocmd("FileType", {
 | --- | --- |
 | `loop.zig` | The stdio run loop, the read deadline, logging. |
 | `handlers.zig` | The method table, `initialize` negotiation, error mapping. |
+| `mirrors.zig` | One-shot CLI/MCP callers of `queries.write*` (`navgraph hunks`/`context`/`where` and their MCP tools) — no resident session. |
 | `queries.zig` | Target resolution, blast, call trees, hover, document symbols, grep, and every other `navgraph/*` adapter. |
 | `search.zig` | Fuzzy ranking, include globs, grep patterns. |
 | `payload.zig` | The JSON shapes above — one writer each. |

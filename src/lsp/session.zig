@@ -115,13 +115,16 @@ pub const Session = struct {
     indexed_at_unix_ms: i64,
     used_cache: bool,
 
-    /// Open the root, walk it, and assemble the first index.
+    /// Open the root, walk it, and assemble the first index. `use_cache`
+    /// mirrors the CLI's `--no-cache`; the resident LSP server always passes
+    /// `true` (a long-lived session's whole point is to amortize the parse).
     pub fn init(
         gpa: std.mem.Allocator,
         io: std.Io,
         root_path: []const u8,
         cfg: Config,
         backend: backends.Choice,
+        use_cache: bool,
     ) !Session {
         const start_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
         // Everything the session will own is acquired inside this block, so its
@@ -143,7 +146,7 @@ pub const Session = struct {
                 gpa.destroy(registry);
             }
 
-            var sources = try index_mod.collect(gpa, io, root_dir, null, null, true, .{
+            var sources = try index_mod.collect(gpa, io, root_dir, null, null, use_cache, .{
                 .choice = backend,
                 .registry = registry,
             });
@@ -468,7 +471,8 @@ pub const Session = struct {
             };
         if (text.len > std.math.maxInt(u32)) return error.FileTooBig;
 
-        const parsed = try index_mod.parseOne(self.gpa, arena, text, lang, self.parsing());
+        const hint = try self.reparseHint(arena, key, text);
+        const parsed = try index_mod.parseOne(self.gpa, arena, text, lang, self.parsing(), hint);
         try self.installSlot(.{
             .arena = arena_box,
             .file = .{
@@ -481,6 +485,20 @@ pub const Session = struct {
             },
             .overlaid = from_overlay != null,
         });
+    }
+
+    /// The incremental-reparse seam for this file (`index.ReparseHint`): the
+    /// edit since the slot's previous text, computed by diffing (LSP's Full
+    /// sync mode never sends the delta itself — see `index.computeEdit`).
+    /// Empty on a first parse (no previous slot). `old_tree` is always null:
+    /// this session has no tree-sitter backend to own one.
+    fn reparseHint(self: *Session, arena: std.mem.Allocator, path: []const u8, new_text: []const u8) !index_mod.ReparseHint {
+        const i = self.by_path.get(path) orelse return .{};
+        const old_text = self.slots.items[i].file.text;
+        const edit = index_mod.computeEdit(old_text, new_text) orelse return .{};
+        const edits = try arena.alloc(index_mod.TreeEdit, 1);
+        edits[0] = edit;
+        return .{ .edits = edits };
     }
 
     /// Put `slot` in place of its path's entry (appending when the file is new),
@@ -611,7 +629,7 @@ pub const Fixture = struct {
         for (files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
         const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         errdefer gpa.free(root);
-        const session = try Session.init(gpa, io, root, .{ .watch = false }, .auto);
+        const session = try Session.init(gpa, io, root, .{ .watch = false }, .auto, true);
         return .{ .tmp = tmp, .root = root, .session = session };
     }
 

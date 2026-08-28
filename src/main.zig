@@ -17,6 +17,7 @@ const capabilities = @import("capabilities.zig");
 const agent_api = @import("agent_api.zig");
 const workspace_path = @import("workspace_path.zig");
 const lsp = @import("lsp.zig");
+const gitutil = @import("gitutil.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -130,6 +131,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The three 1.1 mirrors need a `Session`, not the `*Index` the generic
+    // one-shot dispatch below builds — see `lsp.mirrors`'s doc comment.
+    if (parsed.command == .hunks or parsed.command == .context or parsed.command == .where) {
+        const found = runMirrorCommand(gpa, io, arena, out, parsed) catch |err| switch (err) {
+            error.WriteFailed => std.process.exit(141),
+            else => return err,
+        };
+        out.flush() catch std.process.exit(141);
+        if (!found) std.process.exit(1);
+        return;
+    }
     var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache, parsed.backend) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
@@ -171,6 +183,200 @@ fn runLspServer(gpa: std.mem.Allocator, io: std.Io, err_out: *std.Io.Writer, par
         .backend = parsed.backend,
     });
     if (code != 0) std.process.exit(code);
+}
+
+/// `navgraph hunks/context/where`: build a one-shot `Session` (see
+/// `lsp.mirrors`'s doc comment for why), run the requested mirror into an
+/// in-memory buffer, then render it — the buffer's bytes verbatim for `-j`,
+/// or `writeMirrorText`'s reformatting of the same JSON for text (the CLI's
+/// default). A malformed/unresolved input is reported the way `diff`/`read`
+/// already report theirs: a format-aware message on stdout
+/// (`query.emitError`) and `found = false` (the caller maps that to exit 1,
+/// same as every other one-shot command); only a real internal failure
+/// propagates as an error. An index-build failure is reported the same way
+/// `index_mod.build`'s own failure is on every other command (message + exit
+/// 1 right here) — that is a distinct, earlier failure class than "the query
+/// ran but found nothing".
+fn runMirrorCommand(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, out: *std.Io.Writer, parsed: cli.Parsed) !bool {
+    var session = lsp.session.Session.init(gpa, io, parsed.root, .{ .watch = false }, parsed.backend, parsed.use_cache) catch |err| {
+        try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
+        out.flush() catch std.process.exit(141);
+        std.process.exit(1);
+    };
+    defer session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&session);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var detail: ?[]const u8 = null;
+    const mirror_err: ?anyerror = switch (parsed.command) {
+        .hunks => blk: {
+            const params = lsp.mirrors.HunksParams{
+                // Unset `-d/--depth` keeps hunks' own established default
+                // (the session's configured depth), not the CLI's generic
+                // depth-1 default meant for `calls`/`callers`.
+                .depth = if (parsed.used_options.contains(.depth)) parsed.options.depth else session.cfg.depth,
+                .direction = switch (parsed.options.hunks_direction) {
+                    .callers => .callers,
+                    .callees => .callees,
+                },
+                .limit = if (parsed.options.limit_set) parsed.options.limit else 500,
+                .offset = parsed.options.mirror_offset,
+            };
+            lsp.mirrors.hunks(&aw.writer, arena, ctx, parsed.arg, params, &detail) catch |err| break :blk err;
+            break :blk null;
+        },
+        .context => blk: {
+            const budget = if (parsed.options.context_budget != 0) parsed.options.context_budget else 2000;
+            const include = if (parsed.used_options.contains(.include))
+                lsp.mirrors.parseIncludeCsv(parsed.options.include) catch |err| {
+                    detail = "unknown --include value (expected callers, callees, types, tests, body)";
+                    break :blk err;
+                }
+            else
+                lsp.queries.ContextInclude{};
+            lsp.mirrors.context(&aw.writer, arena, ctx, parsed.arg, budget, include, parsed.options.mirror_offset) catch |err| {
+                if (err == error.SymbolNotFound)
+                    detail = std.fmt.allocPrint(arena, "no definition named '{s}'", .{parsed.arg}) catch null;
+                break :blk err;
+            };
+            break :blk null;
+        },
+        .where => blk: {
+            const loc = lsp.mirrors.parseFileLine(parsed.arg) orelse {
+                detail = std.fmt.allocPrint(arena, "malformed location '{s}' (expected file:line, 1-based)", .{parsed.arg}) catch null;
+                break :blk error.InvalidParams;
+            };
+            lsp.mirrors.where(&aw.writer, arena, ctx, loc.path, loc.line) catch |err| break :blk err;
+            break :blk null;
+        },
+        else => unreachable,
+    };
+
+    if (mirror_err) |err| {
+        // Downstream closed the pipe mid-query (in-memory buffer, so this can
+        // only be an arena OOM) — a real failure, not "nothing found".
+        if (err == error.WriteFailed) return err;
+        const message = detail orelse lsp.mirrors.errorMessage(err);
+        try query.emitError(out, parsed.options.format, message);
+        return false;
+    }
+
+    switch (parsed.options.format) {
+        .json, .jsonl => {
+            try out.writeAll(aw.written());
+            try out.writeByte('\n');
+        },
+        .text => try writeMirrorText(out, arena, parsed.command, aw.written()),
+    }
+    return true;
+}
+
+/// Re-render one mirror's JSON (`runMirrorCommand`'s buffer — always the
+/// exact `lsp.queries.write*` output) as text. This is presentation only: the
+/// query itself already ran once, above: text mode never re-derives the
+/// answer, only reformats it, so the two output formats can never disagree.
+fn writeMirrorText(out: *std.Io.Writer, arena: std.mem.Allocator, command: cli.Command, json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    switch (command) {
+        .where => try writeWhereText(out, root),
+        .context => try writeContextText(out, root),
+        .hunks => try writeHunksText(out, root),
+        else => unreachable,
+    }
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = obj.get(key) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+fn jsonInt(obj: std.json.ObjectMap, key: []const u8) i64 {
+    const v = obj.get(key) orelse return 0;
+    return if (v == .integer) v.integer else 0;
+}
+
+/// One line for a `Symbol` object: `kind qualified — file:line`.
+fn writeSymbolLine(out: *std.Io.Writer, indent: []const u8, sym: std.json.Value) !void {
+    const o = sym.object;
+    try out.print("{s}{s} {s} — {s}:{d}\n", .{ indent, jsonStr(o, "kind"), jsonStr(o, "qualified"), jsonStr(o, "file"), jsonInt(o, "line") });
+}
+
+fn writeSymbolArray(out: *std.Io.Writer, label: []const u8, arr: std.json.Value) !void {
+    const items = arr.array.items;
+    try out.print("{s} ({d}):\n", .{ label, items.len });
+    if (items.len == 0) {
+        try out.writeAll("  (none)\n");
+        return;
+    }
+    for (items) |sym| try writeSymbolLine(out, "  ", sym);
+}
+
+fn writeWhereText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
+    const enclosing = root.get("enclosing") orelse .null;
+    if (enclosing == .null) {
+        try out.print("(no enclosing symbol in {s})\n", .{jsonStr(root, "file")});
+        return;
+    }
+    try out.writeAll("enclosing: ");
+    try writeSymbolLine(out, "", enclosing);
+    const chain = root.get("breadcrumbs").?.array.items;
+    try out.writeAll("breadcrumbs: ");
+    for (chain, 0..) |sym, i| {
+        if (i != 0) try out.writeAll(" > ");
+        try out.writeAll(jsonStr(sym.object, "qualified"));
+    }
+    try out.writeByte('\n');
+}
+
+fn writeContextText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
+    const sym = root.get("symbol").?.object;
+    try out.print("{s} {s} — {s}:{d}\n{s}\n", .{
+        jsonStr(sym, "kind"), jsonStr(sym, "qualified"), jsonStr(sym, "file"), jsonInt(sym, "line"), jsonStr(sym, "sig"),
+    });
+    const doc = jsonStr(sym, "doc");
+    if (doc.len != 0) try out.print("\n{s}\n", .{doc});
+    const def = root.get("definition").?.object;
+    const text = jsonStr(def, "text");
+    if (text.len != 0) try out.print("\ndefinition:\n{s}\n", .{text});
+    try out.writeByte('\n');
+    try writeSymbolArray(out, "callers", root.get("callers").?);
+    try writeSymbolArray(out, "callees", root.get("callees").?);
+    try writeSymbolArray(out, "types", root.get("types").?);
+    try writeSymbolArray(out, "tests", root.get("tests").?);
+    const truncated = root.get("truncated").?.bool;
+    try out.print("truncated: {}  tokensEstimate: {d}  callersTotal: {d}\n", .{ truncated, jsonInt(root, "tokensEstimate"), jsonInt(root, "callersTotal") });
+    if (root.get("next")) |next| if (next != .null) {
+        try out.print("next: --offset {d} (more callers)\n", .{next.integer});
+    };
+}
+
+fn writeHunksText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
+    const hunks_arr = root.get("hunks").?.array.items;
+    try out.print("changeId: {s}\nhunks ({d}):\n", .{ jsonStr(root, "changeId"), hunks_arr.len });
+    for (hunks_arr) |h| {
+        const ho = h.object;
+        const range = ho.get("range").?.object;
+        const start_line = range.get("start").?.object.get("line").?.integer + 1;
+        const end_line = range.get("end").?.object.get("line").?.integer + 1;
+        const roots = ho.get("roots").?.array.items;
+        // A hunk's own JSON carries a `file://` `uri` (no separate relative
+        // path); a root's `file` field is the repo-relative one the rest of
+        // this renderer already uses, so prefer it when the hunk has a root.
+        const path = if (roots.len != 0) jsonStr(roots[0].object, "file") else jsonStr(ho, "uri");
+        try out.print("  {s} lines {d}-{d}:\n", .{ path, start_line, end_line });
+        for (roots) |sym| try writeSymbolLine(out, "    ", sym);
+    }
+    try writeSymbolArray(out, "roots", root.get("roots").?);
+    const summary = root.get("summary").?.object;
+    try out.print(
+        "blast: {d}/{d} symbols shown, {d} files, {d} tests, maxDepth {d}, truncated {}\n",
+        .{ jsonInt(summary, "symbols"), jsonInt(summary, "total"), jsonInt(summary, "files"), jsonInt(summary, "tests"), jsonInt(summary, "maxDepth"), summary.get("truncated").?.bool },
+    );
+    if (root.get("next")) |next| if (next != .null) {
+        try out.print("next: --offset {d} (more nodes; raise --limit or page with --offset)\n", .{next.integer});
+    };
 }
 
 /// Say on stderr how many graph nodes `-l` withheld.
@@ -283,7 +489,10 @@ fn dispatchWithAuthority(
                 try noteGraphTruncation(io, truncation, parsed.options.limit);
             break :blk true; // graph always emits a page/model
         },
-        .capabilities, .serve, .lsp, .help => unreachable,
+        // `.hunks`/`.context`/`.where` are intercepted in `main()`, before
+        // `dispatchWithAuthority` is ever reached (`runMirrorCommand`): they
+        // need a `Session`, not the `*Index` this function dispatches over.
+        .capabilities, .serve, .lsp, .help, .hunks, .context, .where => unreachable,
     };
 }
 
@@ -680,7 +889,15 @@ fn rpcTools(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     try out.writeAll(",\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
     try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Legacy read-only argv compatibility tool. Prefer navgraph.query. Mutating commands, including rename and rename --preview, are rejected.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false}},");
     try out.writeAll("{\"name\":\"navgraph.capabilities\",\"description\":\"Return NavGraph's machine-readable protocol, build identity, language, command, option, output, access, and trust contract without rebuilding the index.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},");
-    try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}}]}}\n");
+    try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}},");
+    // 1.1 mirrors of navgraph/impact, navgraph/context and navgraph/where
+    // (docs/lsp.md "1.1"): each builds its own one-shot index per call rather
+    // than sharing this server's resident one (src/lsp/mirrors.zig's doc
+    // comment explains why), so a call here costs a fresh walk, unlike
+    // navgraph.query above.
+    try out.writeAll("{\"name\":\"navgraph.hunks\",\"description\":\"navgraph/impact mirror: the working change's hunks, blast radius and roots. Default ref is HEAD, like affected/diff. limit raises the 500-node page cap, offset pages past it, direction/depth control the walk.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"ref\":{\"type\":\"string\"},\"depth\":{\"type\":\"integer\",\"minimum\":0},\"direction\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\"]},\"limit\":{\"type\":\"integer\",\"minimum\":0},\"offset\":{\"type\":\"integer\",\"minimum\":0}},\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph.context\",\"description\":\"navgraph/context mirror: one symbol's definition, callers/callees/types/tests in a single call, trimmed to a token budget (default 2000; 0 also means default). offset pages a budget-capped callers list.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"symbol\":{\"type\":\"string\"},\"budget\":{\"type\":\"integer\",\"minimum\":0},\"include\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\",\"types\",\"tests\",\"body\"]}},\"offset\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"symbol\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph.where\",\"description\":\"navgraph/where mirror: the symbol enclosing a 1-based file:line, plus its breadcrumb chain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\"},\"line\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"file\",\"line\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}}]}}\n");
     return true;
 }
 
@@ -777,7 +994,247 @@ fn rpcToolCall(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value
         return rpcCapabilitiesTool(out, session.gpa, id, arguments);
     if (std.mem.eql(u8, name.string, "navgraph.reload"))
         return rpcReloadTool(out, session, id, arguments);
+    if (std.mem.eql(u8, name.string, "navgraph.hunks"))
+        return rpcHunksTool(out, session, id, arguments);
+    if (std.mem.eql(u8, name.string, "navgraph.context"))
+        return rpcContextTool(out, session, id, arguments);
+    if (std.mem.eql(u8, name.string, "navgraph.where"))
+        return rpcWhereTool(out, session, id, arguments);
     try rpcError(out, id, -32602, "unknown tool");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// navgraph.hunks / navgraph.context / navgraph.where: the 1.1 mirror tools.
+// Each opens its own one-shot Session over `session.root` (lsp.mirrors' doc
+// comment explains why this doesn't reuse `session.idx`) and runs the exact
+// same lsp.mirrors call the CLI verb runs, so the query logic is one
+// implementation shared by the LSP server, the CLI and this MCP surface.
+// ---------------------------------------------------------------------------
+
+/// Open a one-shot mirror session over `session.root`, or report an
+/// index-build failure as a tool error (matching the CLI's equivalent
+/// failure, but as a JSON-RPC error here since there is no stdout to print
+/// a diagnostic to).
+fn openMirrorSession(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value) !?lsp.session.Session {
+    return lsp.session.Session.init(session.gpa, session.io, session.root, .{ .watch = false }, session.parsing.choice, session.use_cache) catch |err| {
+        var buf: [192]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "failed to index '{s}': {s}", .{ session.root, @errorName(err) }) catch "failed to index";
+        try rpcError(out, id, -32603, message);
+        return null;
+    };
+}
+
+/// Write one mirror's structured result: `writeAgentResult`'s envelope shape
+/// (a `structuredContent` object an MCP client reads directly, plus a
+/// placeholder `content` message), reusing that convention rather than
+/// inventing a second one for these three tools.
+fn writeMirrorResult(out: *std.Io.Writer, id: ?std.json.Value, json: []const u8) !void {
+    try rpcResultPrefix(out, id);
+    try out.writeAll("{\"content\":[{\"type\":\"text\",\"text\":\"NavGraph structured result\"}],\"structuredContent\":");
+    try out.writeAll(json);
+    try out.writeAll(",\"isError\":false}}\n");
+}
+
+fn rpcHunksTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
+    std.debug.assert(id != null);
+    var ref: []const u8 = "";
+    var depth: ?u32 = null;
+    var direction: lsp.queries.Direction = .callers;
+    var limit: u32 = 500;
+    var offset: u32 = 0;
+    for (arguments.object.keys(), arguments.object.values()) |key, value| {
+        if (std.mem.eql(u8, key, "ref")) {
+            if (value != .string) {
+                try rpcError(out, id, -32602, "ref must be a string");
+                return true;
+            }
+            ref = value.string;
+        } else if (std.mem.eql(u8, key, "depth")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "depth must be a non-negative integer");
+                return true;
+            }
+            depth = @intCast(value.integer);
+        } else if (std.mem.eql(u8, key, "direction")) {
+            if (value == .string and std.mem.eql(u8, value.string, "callers")) {
+                direction = .callers;
+            } else if (value == .string and std.mem.eql(u8, value.string, "callees")) {
+                direction = .callees;
+            } else {
+                try rpcError(out, id, -32602, "direction must be 'callers' or 'callees'");
+                return true;
+            }
+        } else if (std.mem.eql(u8, key, "limit")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "limit must be a non-negative integer");
+                return true;
+            }
+            // 0 is the wire contract's own "use the default" value.
+            if (value.integer != 0) limit = @intCast(value.integer);
+        } else if (std.mem.eql(u8, key, "offset")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "offset must be a non-negative integer");
+                return true;
+            }
+            offset = @intCast(value.integer);
+        } else {
+            try rpcError(out, id, -32602, "unknown field for navgraph.hunks (expected: ref, depth, direction, limit, offset)");
+            return true;
+        }
+    }
+
+    var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
+    defer mirror_session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&mirror_session);
+
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var detail: ?[]const u8 = null;
+    const params = lsp.mirrors.HunksParams{
+        .depth = depth orelse mirror_session.cfg.depth,
+        .direction = direction,
+        .limit = limit,
+        .offset = offset,
+    };
+    lsp.mirrors.hunks(&aw.writer, arena, ctx, ref, params, &detail) catch |err| {
+        try rpcError(out, id, lsp.mirrors.errorCode(err), detail orelse lsp.mirrors.errorMessage(err));
+        return true;
+    };
+    try writeMirrorResult(out, id, aw.written());
+    return true;
+}
+
+fn rpcContextTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
+    std.debug.assert(id != null);
+    var symbol: ?[]const u8 = null;
+    var budget: u32 = 2000;
+    var include: lsp.queries.ContextInclude = .{};
+    var offset: u32 = 0;
+    for (arguments.object.keys(), arguments.object.values()) |key, value| {
+        if (std.mem.eql(u8, key, "symbol")) {
+            if (value != .string or value.string.len == 0) {
+                try rpcError(out, id, -32602, "symbol must be a non-empty string");
+                return true;
+            }
+            symbol = value.string;
+        } else if (std.mem.eql(u8, key, "budget")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "budget must be a non-negative integer");
+                return true;
+            }
+            // 0 is the wire contract's own "use the default" value, same as
+            // an absent budget — not a special case to reject or zero out.
+            if (value.integer != 0) budget = @intCast(value.integer);
+        } else if (std.mem.eql(u8, key, "include")) {
+            if (value != .array) {
+                try rpcError(out, id, -32602, "include must be an array of strings");
+                return true;
+            }
+            include = lsp.queries.ContextInclude.none;
+            for (value.array.items) |item| {
+                if (item != .string) {
+                    try rpcError(out, id, -32602, "include items must be strings");
+                    return true;
+                }
+                const s = item.string;
+                if (std.mem.eql(u8, s, "callers")) {
+                    include.callers = true;
+                } else if (std.mem.eql(u8, s, "callees")) {
+                    include.callees = true;
+                } else if (std.mem.eql(u8, s, "types")) {
+                    include.types = true;
+                } else if (std.mem.eql(u8, s, "tests")) {
+                    include.tests = true;
+                } else if (std.mem.eql(u8, s, "body")) {
+                    include.body = true;
+                } else {
+                    try rpcError(out, id, -32602, "include values must be one of: callers, callees, types, tests, body");
+                    return true;
+                }
+            }
+        } else if (std.mem.eql(u8, key, "offset")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "offset must be a non-negative integer");
+                return true;
+            }
+            offset = @intCast(value.integer);
+        } else {
+            try rpcError(out, id, -32602, "unknown field for navgraph.context (expected: symbol, budget, include, offset)");
+            return true;
+        }
+    }
+    const sym = symbol orelse {
+        try rpcError(out, id, -32602, "symbol is required");
+        return true;
+    };
+
+    var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
+    defer mirror_session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&mirror_session);
+
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    lsp.mirrors.context(&aw.writer, arena, ctx, sym, budget, include, offset) catch |err| {
+        const message = if (err == error.SymbolNotFound)
+            std.fmt.allocPrint(arena, "no definition named '{s}'", .{sym}) catch lsp.mirrors.errorMessage(err)
+        else
+            lsp.mirrors.errorMessage(err);
+        try rpcError(out, id, lsp.mirrors.errorCode(err), message);
+        return true;
+    };
+    try writeMirrorResult(out, id, aw.written());
+    return true;
+}
+
+fn rpcWhereTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
+    std.debug.assert(id != null);
+    var file: ?[]const u8 = null;
+    var line: ?u32 = null;
+    for (arguments.object.keys(), arguments.object.values()) |key, value| {
+        if (std.mem.eql(u8, key, "file")) {
+            if (value != .string or value.string.len == 0) {
+                try rpcError(out, id, -32602, "file must be a non-empty string");
+                return true;
+            }
+            file = value.string;
+        } else if (std.mem.eql(u8, key, "line")) {
+            if (value != .integer or value.integer < 1 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "line must be a positive integer (1-based)");
+                return true;
+            }
+            line = @intCast(value.integer);
+        } else {
+            try rpcError(out, id, -32602, "unknown field for navgraph.where (expected: file, line)");
+            return true;
+        }
+    }
+    const f = file orelse {
+        try rpcError(out, id, -32602, "file is required");
+        return true;
+    };
+    const l = line orelse {
+        try rpcError(out, id, -32602, "line is required");
+        return true;
+    };
+
+    var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
+    defer mirror_session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&mirror_session);
+
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    lsp.mirrors.where(&aw.writer, arena, ctx, f, l) catch |err| {
+        try rpcError(out, id, lsp.mirrors.errorCode(err), lsp.mirrors.errorMessage(err));
+        return true;
+    };
+    try writeMirrorResult(out, id, aw.written());
     return true;
 }
 
@@ -1462,6 +1919,284 @@ test "cli.parse rejects malformed invocations" {
     try std.testing.expectError(error.UnknownFlag, cli.parse(&.{ "outline", "--bogus" }));
 }
 
+// ---------------------------------------------------------------------------
+// hunks/context/where: the 1.1 CLI mirrors (runMirrorCommand + cli.parse).
+// Session-based, so they need their own fixture (a root path, not an
+// already-built *Index — see lsp.mirrors's doc comment for why).
+// ---------------------------------------------------------------------------
+
+const MirrorFixture = struct {
+    tmp: std.testing.TmpDir,
+    root: []u8,
+
+    fn init(io: std.Io) !MirrorFixture {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        try writeSampleProject(io, tmp.dir);
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn deinit(self: *MirrorFixture) void {
+        std.testing.allocator.free(self.root);
+        self.tmp.cleanup();
+    }
+};
+
+/// Run `runMirrorCommand` for `parsed` (`parsed.root` is overwritten with
+/// `fx.root`) and return its rendered output plus `found`. Uses a real arena
+/// for the `arena` parameter, same as `main()` does: `runMirrorCommand`
+/// relies on bulk-free semantics there (an error `detail` is arena-allocated
+/// and never individually freed), so a plain leak-tracked allocator would
+/// flag it as a leak even though production never frees it either.
+fn runMirrorOwned(io: std.Io, fx: MirrorFixture, parsed_in: cli.Parsed) !struct { text: []u8, found: bool } {
+    const alloc = std.testing.allocator;
+    var parsed = parsed_in;
+    parsed.root = fx.root;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(alloc, &buf);
+    defer aw.deinit();
+    const found = try runMirrorCommand(alloc, io, arena_state.allocator(), &aw.writer, parsed);
+    return .{ .text = try alloc.dupe(u8, aw.written()), .found = found };
+}
+
+test "cli.parse maps hunks/context/where and their flags" {
+    const h = try cli.parse(&.{ "hunks", "HEAD~1", "-j" });
+    try std.testing.expectEqual(cli.Command.hunks, h.command);
+    try std.testing.expectEqualStrings("HEAD~1", h.arg);
+    try std.testing.expectEqual(query.OutputFormat.json, h.options.format);
+
+    const c = try cli.parse(&.{ "context", "run", "--budget", "0", "--include", "callers,types" });
+    try std.testing.expectEqual(cli.Command.context, c.command);
+    try std.testing.expectEqualStrings("run", c.arg);
+    try std.testing.expectEqual(@as(u32, 0), c.options.context_budget);
+    try std.testing.expectEqualStrings("callers,types", c.options.include);
+    try std.testing.expect(c.used_options.contains(.include));
+
+    const w = try cli.parse(&.{ "where", "app.zig:7" });
+    try std.testing.expectEqual(cli.Command.where, w.command);
+    try std.testing.expectEqualStrings("app.zig:7", w.arg);
+
+    // context's --budget is not the shared byte floor: 0 must not usage-error.
+    _ = try cli.parse(&.{ "context", "run", "--budget", "0" });
+    // ...but every other command's --budget still enforces the byte floor.
+    try std.testing.expectError(error.BadValue, cli.parse(&.{ "calls", "run", "--budget", "0" }));
+}
+
+test "dispatch where names the enclosing symbol and breadcrumbs" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .where, .arg = "app.zig:7", .options = .{ .format = .json } });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+    try std.testing.expect(has(r.text, "run"));
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.text, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("run", parsed.value.object.get("enclosing").?.object.get("name").?.string);
+}
+
+test "dispatch where off a malformed location reports the error and found=false, not a crash" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .where, .arg = "app.zig" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(!r.found);
+    try std.testing.expect(has(r.text, "malformed location"));
+}
+
+test "dispatch context includes the callee chain and honors --include" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    var opts = query.Options{};
+    opts.context_budget = 2000;
+    opts.format = .json;
+    const full = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "run", .options = opts });
+    defer std.testing.allocator.free(full.text);
+    try std.testing.expect(full.found);
+    try std.testing.expect(has(full.text, "mid"));
+
+    var include_opts = query.Options{};
+    include_opts.context_budget = 2000;
+    include_opts.format = .json;
+    var used = std.EnumSet(cli.registry.Option).initEmpty();
+    used.insert(.include);
+    const callers_only = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "run", .options = include_opts, .used_options = used });
+    defer std.testing.allocator.free(callers_only.text);
+    try std.testing.expect(callers_only.found);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, callers_only.text, .{});
+    defer parsed.deinit();
+    // `include` given but empty (`""`) is a strict "nothing" allow-list.
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("callees").?.array.items.len);
+}
+
+test "dispatch context on an unknown symbol reports not found, not a crash" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "nope_xyz" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(!r.found);
+    try std.testing.expect(has(r.text, "no definition named"));
+}
+
+test "dispatch context budget 0 does not error, per navgraph/context's own contract" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    // context_budget defaults to 0, which runMirrorCommand maps to the wire
+    // default (2000) rather than passing 0 straight through.
+    const r = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "run" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+}
+
+test "dispatch hunks off a bad ref reports the error, not a crash" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+    // A bare ref like "" would still resolve against *this worktree's own*
+    // enclosing git repo (`.zig-cache/tmp/...` sits inside it) — an
+    // unmistakably bad ref is what actually forces GitFailed deterministically,
+    // reported the same way `diff`'s own "unrunnable git root" case is
+    // (query.emitError, found=false), never a crash.
+    const r = try runMirrorOwned(io, fx, .{ .command = .hunks, .arg = "not-a-real-ref-xyz" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(!r.found);
+    try std.testing.expect(has(r.text, "git diff"));
+}
+
+test "dispatch hunks reports the working change against HEAD, grouped by hunk" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+    const Git = struct {
+        fn ok(allocator: std.mem.Allocator, test_io: std.Io, cwd: []const u8, argv: []const []const u8) !void {
+            const result = try gitutil.run(allocator, test_io, cwd, argv);
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try std.testing.expect(result.term == .exited and result.term.exited == 0);
+        }
+    };
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "init", "--quiet" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "add", "--", "app.zig", "util.zig" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{
+        "git",     "-c",                   "user.name=NavGraph Test", "-c",                       "user.email=navgraph@example.invalid",
+        "-c",      "commit.gpgsign=false", "-c",                      "core.hooksPath=/dev/null", "commit",
+        "--quiet", "--no-verify",          "-m",                      "base",
+    });
+    // A single inserted line inside helper's own body: nothing else in the
+    // file moves (in particular, no trailing-newline change on the file's
+    // last line), so `git diff --unified=0` reports exactly one hunk.
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = "pub fn helper() void {\n    inner();\n    _ = 1;\n}\n\nfn inner() void {}" });
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .hunks, .options = .{ .format = .json } });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.text, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(obj.get("hunks").?.array.items.len == 1);
+    try std.testing.expectEqualStrings("helper", obj.get("roots").?.array.items[0].object.get("name").?.string);
+}
+
+// A callee chain 13 deep (f0 -> f1 -> ... -> f12): long enough that an
+// unclamped `--depth` and the session's max_depth (10) disagree — this
+// suite's usual project saturates well under depth 10, so the m4 clamp is
+// unobservable there (the independent review flagged exactly this: "could
+// not demonstrate").
+fn deepChainFixture(io: std.Io) !MirrorFixture {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    errdefer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data =
+        \\pub fn f0() void { f1(); }
+        \\pub fn f1() void { f2(); }
+        \\pub fn f2() void { f3(); }
+        \\pub fn f3() void { f4(); }
+        \\pub fn f4() void { f5(); }
+        \\pub fn f5() void { f6(); }
+        \\pub fn f6() void { f7(); }
+        \\pub fn f7() void { f8(); }
+        \\pub fn f8() void { f9(); }
+        \\pub fn f9() void { f10(); }
+        \\pub fn f10() void { f11(); }
+        \\pub fn f11() void { f12(); }
+        \\pub fn f12() void {}
+    });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    return .{ .tmp = tmp, .root = root };
+}
+
+// m4 regression: every wire handler clamps `depth` to `Config.max_depth`
+// (10) before it reaches the walk; the CLI/MCP `hunks` mirror passed
+// `depth` straight through, so a caller could force an unbounded-depth walk
+// the LSP surface refuses.
+test "dispatch hunks clamps --depth to the session's max depth (m4)" {
+    const io = std.testing.io;
+    var fx = try deepChainFixture(io);
+    defer fx.deinit();
+
+    const Git = struct {
+        fn ok(allocator: std.mem.Allocator, test_io: std.Io, cwd: []const u8, argv: []const []const u8) !void {
+            const result = try gitutil.run(allocator, test_io, cwd, argv);
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try std.testing.expect(result.term == .exited and result.term.exited == 0);
+        }
+    };
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "init", "--quiet" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "add", "--", "app.zig" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{
+        "git",     "-c",                   "user.name=NavGraph Test", "-c",                       "user.email=navgraph@example.invalid",
+        "-c",      "commit.gpgsign=false", "-c",                      "core.hooksPath=/dev/null", "commit",
+        "--quiet", "--no-verify",          "-m",                      "base",
+    });
+    // One changed line inside f0's own body creates a hunk rooted at f0.
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data =
+        \\pub fn f0() void { _ = 1; f1(); }
+        \\pub fn f1() void { f2(); }
+        \\pub fn f2() void { f3(); }
+        \\pub fn f3() void { f4(); }
+        \\pub fn f4() void { f5(); }
+        \\pub fn f5() void { f6(); }
+        \\pub fn f6() void { f7(); }
+        \\pub fn f7() void { f8(); }
+        \\pub fn f8() void { f9(); }
+        \\pub fn f9() void { f10(); }
+        \\pub fn f10() void { f11(); }
+        \\pub fn f11() void { f12(); }
+        \\pub fn f12() void {}
+    });
+
+    var used = std.EnumSet(cli.registry.Option).initEmpty();
+    used.insert(.depth);
+    var opts = query.Options{};
+    opts.format = .json;
+    opts.hunks_direction = .callees;
+    opts.depth = 999999;
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .hunks, .options = opts, .used_options = used });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.text, .{});
+    defer parsed.deinit();
+    // Pre-fix: an unclamped depth walked the whole 13-node chain (f0..f12).
+    // Clamped to max_depth (10), the reachable set stops at f10 — 11 nodes
+    // (f0 through f10, depth 0..10).
+    try std.testing.expectEqual(@as(i64, 11), parsed.value.object.get("summary").?.object.get("total").?.integer);
+}
+
 test "phase 4 hierarchy exceptions and taint dispatch" {
     const testing = std.testing;
     const io = testing.io;
@@ -1633,6 +2368,58 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32600"));
 }
 
+test "MCP navgraph.where/context/hunks round-trip and reject hostile input" {
+    const testing = std.testing;
+    const io = testing.io;
+    var fx = try sampleFixture(io);
+    defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
+    defer session.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    // app.zig line 7 is `mid();` inside `run`.
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"navgraph.where","arguments":{"file":"app.zig","line":7}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navgraph.context","arguments":{"symbol":"run","budget":0}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"navgraph.context","arguments":{"symbol":"nope_xyz"}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"navgraph.where","arguments":{"file":"app.zig"}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"navgraph.context","arguments":{"include":["bogus"],"symbol":"run"}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"navgraph.hunks","arguments":{"ref":"not-a-real-ref-xyz"}}}
+    ));
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, aw.written(), "\n"), '\n');
+    var responses: [6]std.json.Parsed(std.json.Value) = undefined;
+    var count: usize = 0;
+    while (lines.next()) |line| : (count += 1) responses[count] = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+    defer for (responses[0..count]) |*r| r.deinit();
+    try testing.expectEqual(@as(usize, 6), count);
+
+    const where_result = responses[0].value.object.get("result").?.object;
+    try testing.expectEqualStrings("run", where_result.get("structuredContent").?.object.get("enclosing").?.object.get("name").?.string);
+
+    // budget:0 does not error (silently reinterpreted as the 2000 default).
+    const context_result = responses[1].value.object.get("result").?.object;
+    try testing.expectEqualStrings("run", context_result.get("structuredContent").?.object.get("symbol").?.object.get("name").?.string);
+
+    try testing.expectEqual(@as(i64, -32001), responses[2].value.object.get("error").?.object.get("code").?.integer);
+    try testing.expectEqual(@as(i64, -32602), responses[3].value.object.get("error").?.object.get("code").?.integer); // missing `line`
+    try testing.expectEqual(@as(i64, -32602), responses[4].value.object.get("error").?.object.get("code").?.integer); // unknown include value
+    try testing.expectEqual(@as(i64, -32002), responses[5].value.object.get("error").?.object.get("code").?.integer); // bad git ref
+}
+
 test "typed MCP facade covers six read-only surfaces with a stable bounded envelope" {
     const testing = std.testing;
     const io = testing.io;
@@ -1782,9 +2569,14 @@ test "MCP identity and capability surfaces share the live manifest contract" {
     try testing.expectEqualStrings(capabilities.capability_schema, init_navgraph.get("capabilitySchema").?.string);
 
     const tools = responses[1].value.object.get("result").?.object;
-    try testing.expectEqual(@as(usize, 4), tools.get("tools").?.array.items.len);
+    // navgraph.query, navgraph (legacy), navgraph.capabilities, navgraph.reload,
+    // navgraph.hunks, navgraph.context, navgraph.where.
+    try testing.expectEqual(@as(usize, 7), tools.get("tools").?.array.items.len);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.capabilities") != null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.query") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.hunks") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.context") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.where") != null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "phase3") == null);
     try testing.expectEqualStrings(agent_api.tool_name, init_navgraph.get("queryTool").?.string);
     try testing.expectEqualStrings(agent_api.query_schema, init_navgraph.get("querySchema").?.string);

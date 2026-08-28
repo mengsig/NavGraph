@@ -38,6 +38,32 @@ All notable changes to NavGraph are documented here. Format loosely follows
 - References one character long (`b()`) were skipped by the tree-sitter
   backend, on a rule the heuristic scanner no longer applies.
 
+## [1.1.0] - 2026-08-28
+
+### Added
+
+- **`navgraph lsp` 1.1**: standard call/type hierarchy
+  (`prepareCallHierarchy`/`incomingCalls`/`outgoingCalls`,
+  `prepareTypeHierarchy`/`supertypes`/`subtypes`), `implementation`,
+  `typeDefinition`, `documentHighlight`, and `codeLens`/`codeLens/resolve`.
+- Custom `navgraph/impact` (the working change's blast radius, grouped by
+  changed hunk), `navgraph/tests` (every test reaching a symbol — the
+  `coverage` walk inverted), `navgraph/types` ("who uses type T"),
+  `navgraph/context` (one symbol's callers/callees/types/tests/definition in
+  a single call, trimmed to a token budget), and `navgraph/where` (the symbol
+  enclosing a `file:line`).
+- `navgraph/symbolAt` gains `range`/`breadcrumbs`; `navgraph/search` gains a
+  `recent`-names ranking tier; `navgraph/status` gains `protocolMinor` and
+  `backend`; every `Symbol` gains a stable `contentHash`. Every list method
+  now reports `truncated`.
+- An incremental-reparse seam (`index.ReparseHint`) for a future
+  tree-sitter-backed parser, behind the heuristic backend unchanged.
+- CLI and MCP mirrors of `navgraph/impact`/`context`/`where`: `navgraph
+  hunks`/`context`/`where` on the command line, and `navgraph.hunks`/
+  `.context`/`.where` as MCP tools on `navgraph serve`. All three share their
+  implementation with the LSP server verbatim (`src/lsp/mirrors.zig`).
+- See [`docs/lsp.md`](docs/lsp.md)'s "1.1" section for the full contract.
+
 ## [1.0.0] - 2026-08-28
 
 First tagged release.
