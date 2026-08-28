@@ -854,12 +854,21 @@ fn followFunctionAlias(idx: *const Index, ref: *model.Reference) void {
         if (found == invalid) found = cid;
     }
     if (matches != 1) return;
+    // Re-derive confidence for the alias's own target rather than inheriting
+    // whatever reason resolved `ref` to the alias constant — a unique
+    // same-file function name is exact evidence in its own right.
     ref.target = found;
+    ref.exact = true;
+    ref.resolution_status = .exact;
+    ref.resolution_reason = .same_file_fallback;
 }
 
 /// The sole identifier a declaration is initialized to, or null when the
 /// initializer is anything else. `= double_value;` answers `double_value`;
-/// `= ->(n) { n * 2 }`, `= makeScaler(2)` and `= 3` answer nothing.
+/// `= ->(n) { n * 2 }`, `= makeScaler(2)` and `= 3` answer nothing. Takes the
+/// FIRST top-level `=`: a multi-declarator statement's parser now scopes each
+/// symbol to its own clause, but a shared signature (an unanticipated form)
+/// must still bind the name in front of it, not a sibling's initializer.
 fn aliasInitializerName(decl: []const u8) ?[]const u8 {
     var eq: ?usize = null;
     var i: usize = 0;
@@ -873,8 +882,12 @@ fn aliasInitializerName(decl: []const u8) ?[]const u8 {
         if (i + 1 < decl.len and decl[i + 1] == '>') continue;
         if (i > 0 and (decl[i - 1] == '!' or decl[i - 1] == '<' or decl[i - 1] == '>' or decl[i - 1] == '=')) continue;
         eq = i;
+        break;
     }
     const start = (eq orelse return null) + 1;
+    // A comma before the initializer marks more than one declarator sharing
+    // this text (`a = f, b = g`) — refuse rather than guess whose name it is.
+    if (std.mem.indexOfScalar(u8, decl[0..start], ',') != null) return null;
     var rhs = std.mem.trim(u8, decl[start..], " \t\r\n");
     if (std.mem.endsWith(u8, rhs, ";")) rhs = std.mem.trim(u8, rhs[0 .. rhs.len - 1], " \t\r\n");
     if (rhs.len == 0) return null;
@@ -2775,6 +2788,43 @@ test "a call through a function-valued const keeps its edge" {
     // holds: `alias` names no body of its own, so `exactOrGlob` is what the
     // call reaches (see `followFunctionAlias`).
     try testing.expectEqual(idx.lookup("exactOrGlob")[0], ref.target);
+}
+
+test "js: a multi-declarator alias binds each name to its own initializer" {
+    // Regression (F5): `aliasInitializerName` took the LAST `=` on the line, so
+    // `const a = first, b = second;` aliased `a` to `second` and marked the
+    // wrong edge `exact=true` — surviving `--strict`. Each declarator must now
+    // get its own scoped symbol and its own initializer.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.mjs", .data =
+        \\function first() { return 1; }
+        \\function second() { return 2; }
+        \\const a = first, b = second;
+        \\export function useA() { return a(1); }
+        \\export function useB() { return b(1); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Both declarators are their own symbol, aliasing their own initializer.
+    const first_fn = idx.lookup("first")[0];
+    const second_fn = idx.lookup("second")[0];
+    const use_a = idx.graph.symbols[idx.lookup("useA")[0]];
+    const use_b = idx.graph.symbols[idx.lookup("useB")[0]];
+    const call_a = refByName(use_a, "a").?;
+    const call_b = refByName(use_b, "b").?;
+
+    try testing.expectEqual(first_fn, call_a.target);
+    try testing.expect(call_a.exact);
+    try testing.expectEqual(second_fn, call_b.target);
+    try testing.expect(call_b.exact);
 }
 
 test "an express sub-router mount keeps its router handler" {

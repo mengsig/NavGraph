@@ -2839,19 +2839,46 @@ fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exp
     if (arrow_body.is_fn and arrow_body.arrow_i != sentinel) {
         return emitJsArrowExpr(ctx, start_i, name_i, arrow_body.arrow_i, parent, exported, arrow_mods, hi);
     }
+    return parseJsPlainDeclarators(ctx, start_i, name_i, semi_i, hi, parent, exported);
+}
+
+/// Emit one `.variable` symbol per comma-separated declarator in a plain
+/// `const`/`let`/`var` statement (`const a = f, b = g;`), each scoped to just
+/// its own `NAME [= INIT]` clause. A shared span across declarators let
+/// `aliasInitializerName` see every sibling's `=` and pick the wrong one.
+fn parseJsPlainDeclarators(ctx: *Ctx, start_i: u32, first_name_i: u32, semi_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
+    const stmt_end = if (semi_i != sentinel) semi_i else hi;
+    var name_i = first_name_i;
+    var first = true;
+    while (true) {
+        const comma_i = findNext(ctx, name_i + 1, stmt_end, ',');
+        // A middle declarator's span stops just before its comma; the last one
+        // spans through the statement's `;`, matching a single-declarator span.
+        const span_end = if (comma_i != sentinel)
+            ctx.toks[comma_i - 1].end
+        else if (semi_i != sentinel)
+            ctx.toks[semi_i].end
+        else
+            ctx.toks[name_i].end;
+        _ = try emit(ctx, .{
+            .name = ctx.textOf(name_i),
+            .kind = .variable,
+            .line = ctx.toks[name_i].line,
+            .span_start = if (first) lineStartOffset(ctx, start_i) else ctx.toks[name_i].start,
+            .span_end = span_end,
+            .sig_end = span_end,
+            .doc = if (first) collectDoc(ctx, start_i) else "",
+            .exported = exported,
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        if (comma_i == sentinel) break;
+        const next_name = comma_i + 1;
+        if (next_name >= stmt_end or ctx.toks[next_name].kind != .identifier) break;
+        name_i = next_name;
+        first = false;
+    }
     const end_i = if (semi_i != sentinel) semi_i else name_i;
-    _ = try emit(ctx, .{
-        .name = ctx.textOf(name_i),
-        .kind = .variable,
-        .line = ctx.toks[name_i].line,
-        .span_start = lineStartOffset(ctx, start_i),
-        .span_end = ctx.toks[end_i].end,
-        .sig_end = ctx.toks[end_i].end,
-        .doc = collectDoc(ctx, start_i),
-        .exported = exported,
-        .parent_local = parent,
-        .refs = &.{},
-    });
     return tokenAfterOffset(ctx, ctx.toks[end_i].end, hi);
 }
 
