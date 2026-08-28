@@ -949,10 +949,6 @@ test "one symbol per member, and no definition lost on shapes the fixtures lack"
 // Attribution cost
 // ---------------------------------------------------------------------------
 
-/// Definition count of the large corpus; the small one is a quarter of it, so
-/// the linear expectation is a 4x build time.
-const perf_defs: u32 = 8000;
-
 fn writeDefs(dir: std.Io.Dir, io: std.Io, name: []const u8, count: u32) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -963,56 +959,62 @@ fn writeDefs(dir: std.Io.Dir, io: std.Io, name: []const u8, count: u32) !void {
     try dir.writeFile(io, .{ .sub_path = name, .data = body.items });
 }
 
-/// Fastest of three builds of `root`, in milliseconds. Jitter is one-sided, so
-/// the minimum is the signal.
-fn fastestBuildMs(gpa: std.mem.Allocator, root: []const u8, choice: backends.Choice) !i64 {
-    const io = testing.io;
-    var best: i64 = std.math.maxInt(i64);
-    var run: u32 = 0;
-    while (run < 3) : (run += 1) {
-        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        var idx = try index.build(gpa, io, root, false, choice);
-        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
-        idx.deinit();
-        best = @min(best, @as(i64, @intCast(elapsed_ms)));
-    }
-    return best;
-}
-
-fn perfCorpusMs(gpa: std.mem.Allocator, defs: u32) !i64 {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    try writeDefs(tmp.dir, testing.io, "all.py", defs);
-    var path_buf: [256]u8 = undefined;
-    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    return fastestBuildMs(gpa, root, .tree_sitter);
+/// Builds `root` and returns the attribution probe counts recorded during that
+/// one build (`ts_backend.probe_count`/`probe_sites`), reset first so the
+/// result reflects only this build.
+fn probeCounts(gpa: std.mem.Allocator, root: []const u8) !struct { probes: u64, sites: u64 } {
+    ts_backend.probe_count = 0;
+    ts_backend.probe_sites = 0;
+    var idx = try index.build(gpa, testing.io, root, false, .tree_sitter);
+    idx.deinit();
+    return .{ .probes = ts_backend.probe_count, .sites = ts_backend.probe_sites };
 }
 
 test "reference attribution stays linear in one file's definition count" {
-    // F10. Owner attribution scanned every definition in the file for every
-    // reference site and every local binding, so ONE large module cost
+    // F1 (round 2). Owner attribution scanned every definition in the file for
+    // every reference site and every local binding, so ONE large module cost
     // O(defs x sites) while the same definitions spread over many files did
-    // not: 4x the definitions in a single file cost 13.7x the time.
+    // not.
     //
-    // The bound is a same-run ratio between two sizes of the same corpus, never
-    // a wall clock: a saturated runner slows both builds, so the assertion does
-    // not drift with machine load. Take the fastest of a few runs per size —
-    // jitter is one-sided.
+    // This used to be a same-run wall-clock ratio (`big_ms <= 5 * small_ms +
+    // 50`). It does not reproduce: instrumented sampling of this exact code,
+    // Debug, 16 cores, load 1.7-2.8, found the *linear* range is 1.72x .. 7.66x
+    // (not the documented 2.60x .. 2.71x) because the small corpus alone swings
+    // bimodally between 160ms and 365ms, and the two sizes are measured seconds
+    // apart. That range overlaps the *pre-fix quadratic* range of 7.86x ..
+    // 12.30x, so no wall-clock threshold separates the two populations at this
+    // corpus size — the built test binary failed 2 runs in 8 (25%) at load ~2.5.
     //
-    // Both populations are measured, not guessed. Three samples of each, Debug,
-    // 16 cores, 2 000 vs 8 000 definitions (a 4x linear expectation):
-    //
-    //   linear (this tree)  big/small  2.60 .. 2.71
-    //   quadratic (pre-fix) big/small  7.86 .. 12.30
-    //
-    // 5x lands between them: 1.8x headroom over the worst linear sample, and it
-    // still fails the pre-fix build by 1.5x. Under 4x the linear samples sit
-    // below the expectation because per-file fixed costs do not scale.
+    // Count probes instead: `enclosingCallable`'s binary search plus its
+    // `nearest`-chain walk costs O(log n + depth) per site, deterministically,
+    // with zero dependency on machine load. Measured `per_site` (probes /
+    // sites) rose by exactly 1.00 per doubling of the corpus — textbook
+    // log2(n) — and was byte-identical across repeated runs at every size. The
+    // pre-fix per-site linear scan would have cost ~1.9e8 probes at 8 000 defs
+    // against the ~6.7e5 measured here: a 286x separation, vs. the ~1.0x a wall
+    // clock resolves.
     if (!ts_backend.any_grammar) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const small_ms = try perfCorpusMs(gpa, perf_defs / 4);
-    const big_ms = try perfCorpusMs(gpa, perf_defs);
-    try testing.expect(big_ms <= 5 * small_ms + 50);
+    const sizes = [_]u32{ 1000, 2000, 4000, 8000, 16000 };
+    for (sizes) |defs| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try writeDefs(tmp.dir, testing.io, "all.py", defs);
+        var path_buf: [256]u8 = undefined;
+        const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+        // Run twice: a probe count is a pure function of the corpus, not a
+        // sample — the property a wall clock could never have.
+        const first = try probeCounts(gpa, root);
+        const second = try probeCounts(gpa, root);
+        try testing.expectEqual(first.probes, second.probes);
+        try testing.expectEqual(first.sites, second.sites);
+        try testing.expect(first.sites > 0);
+
+        // log2(n) + 8: generous headroom over the measured ~log2(n)+1, but
+        // orders of magnitude below the pre-fix O(n)-per-site scan.
+        try testing.expect(first.probes <= first.sites * (std.math.log2_int(u32, defs) + 8));
+    }
 }
 
 // ---------------------------------------------------------------------------

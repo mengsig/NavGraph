@@ -13,6 +13,7 @@
 //!     never retained, so a later `ts_query_delete` cannot corrupt kinds.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const language = @import("language.zig");
 const model = @import("model.zig");
@@ -53,6 +54,14 @@ pub fn supports(lang: Language) bool {
 
 /// Whether this build linked any grammar at all.
 pub const any_grammar = build_options.ts_python or build_options.ts_typescript or build_options.ts_tsx;
+
+/// Attribution-cost regression counters (`backend-differ.zig`'s "stays linear"
+/// test): `probe_count` is one binary-search step or `nearest` hop,
+/// `probe_sites` is one `enclosingCallable` call. A count is deterministic and
+/// load-independent where a wall clock is neither; compiled out of release
+/// builds by the `builtin.is_test` guard at every increment site.
+pub var probe_count: u64 = 0;
+pub var probe_sites: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // C API bindings
@@ -974,6 +983,7 @@ const SiteScope = enum { body_only, with_signature };
 /// nest, so every definition containing `offset` is an ancestor of the last
 /// definition opened at or before it, i.e. on that one's `nearest` chain.
 fn enclosingCallable(defs: []const Def, offset: u32, scope: SiteScope) ?u32 {
+    if (builtin.is_test) probe_sites += 1;
     var cur = lastOpenedAt(defs, offset);
     while (cur) |i| {
         const d = defs[i];
@@ -988,6 +998,7 @@ fn enclosingCallable(defs: []const Def, offset: u32, scope: SiteScope) ?u32 {
         // Enclosing definitions sort earlier, so the walk strictly ascends and
         // cannot loop.
         std.debug.assert(next < i);
+        if (builtin.is_test) probe_count += 1;
         cur = next;
     }
     return null;
@@ -998,6 +1009,7 @@ fn lastOpenedAt(defs: []const Def, offset: u32) ?u32 {
     var lo: usize = 0;
     var hi: usize = defs.len;
     while (lo < hi) {
+        if (builtin.is_test) probe_count += 1;
         const mid = lo + (hi - lo) / 2;
         if (defs[mid].span_start <= offset) lo = mid + 1 else hi = mid;
     }
