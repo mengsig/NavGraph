@@ -818,7 +818,7 @@ fn renderStatusSummary(w: *Writer, idx: *const Index, filter: []const u8, opts: 
     try w.writeAll("backend:");
     const backend_counts = statusBackendCounts(idx, filter, opts);
     inline for (@typeInfo(model.Backend).@"enum".fields) |f| {
-        if (backend_counts[f.value] != 0) try w.print(" {s} {d}", .{ f.name, backend_counts[f.value] });
+        if (backend_counts[f.value] != 0) try w.print(" {s} {d}", .{ (@as(model.Backend, @enumFromInt(f.value))).tag(), backend_counts[f.value] });
     }
     try w.writeByte('\n');
     const state = idx.cache_snapshot;

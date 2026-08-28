@@ -1417,7 +1417,7 @@ fn writeBackendBreakdown(w: *Writer, idx: *const Index, filter: []const u8, opts
         if (counts[f.value] != 0) {
             if (!first) try w.writeByte(',');
             first = false;
-            try w.print("\"{s}\":{d}", .{ f.name, counts[f.value] });
+            try w.print("\"{s}\":{d}", .{ (@as(model.Backend, @enumFromInt(f.value))).tag(), counts[f.value] });
         }
     }
     try w.writeByte('}');
