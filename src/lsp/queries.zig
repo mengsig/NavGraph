@@ -364,35 +364,49 @@ const BlastEdge = struct {
     lines: []const u32,
 };
 
-/// Walk the graph from `roots` and write the contract's blast result.
-///
+const BlastResult = struct {
+    nodes: std.ArrayList(BlastNode),
+    edges: std.ArrayList(BlastEdge),
+    truncated: bool,
+
+    fn deinit(self: *BlastResult, gpa: std.mem.Allocator) void {
+        for (self.nodes.items) |*n| n.via.deinit(gpa);
+        self.nodes.deinit(gpa);
+        for (self.edges.items) |e| gpa.free(e.lines);
+        self.edges.deinit(gpa);
+    }
+};
+
+/// Walk the graph from `roots` — the shared BFS behind `writeBlast` and
+/// `writeImpact`, which each format the result into a different envelope.
 /// Each symbol appears once, at the shallowest depth it was reached; `via`
 /// records the depth-1 neighbours it was reached through. Edges are always
-/// written caller→callee whichever direction the walk ran.
-pub fn writeBlast(
-    w: *Writer,
+/// caller→callee whichever direction the walk ran.
+fn computeBlast(
     gpa: std.mem.Allocator,
     ctx: Ctx,
     roots: []const SymbolId,
     opts: BlastOptions,
-) !void {
+) !BlastResult {
     const idx = ctx.index();
     var nodes: std.ArrayList(BlastNode) = .empty;
+    errdefer {
+        for (nodes.items) |*n| n.via.deinit(gpa);
+        nodes.deinit(gpa);
+    }
     var seen: std.AutoHashMapUnmanaged(SymbolId, usize) = .empty;
+    defer seen.deinit(gpa);
     var edges: std.ArrayList(BlastEdge) = .empty;
+    errdefer {
+        for (edges.items) |e| gpa.free(e.lines);
+        edges.deinit(gpa);
+    }
     var edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer edge_seen.deinit(gpa);
     // `query.callSiteLines` grows its output with the index's own allocator, so
     // this scratch list must be freed with that one, not the request arena.
     var lines: std.ArrayList(u32) = .empty;
-    defer {
-        for (nodes.items) |*n| n.via.deinit(gpa);
-        nodes.deinit(gpa);
-        seen.deinit(gpa);
-        for (edges.items) |e| gpa.free(e.lines);
-        edges.deinit(gpa);
-        edge_seen.deinit(gpa);
-        lines.deinit(idx.gpa);
-    }
+    defer lines.deinit(idx.gpa);
 
     var truncated = false;
     for (roots) |id| {
@@ -448,10 +462,12 @@ pub fn writeBlast(
         }
     }
 
-    try w.writeAll("{\"roots\":");
-    try payload.writeSymbolArray(w, ctx, roots);
-    try w.writeAll(",\"nodes\":[");
-    for (nodes.items, 0..) |n, i| {
+    return .{ .nodes = nodes, .edges = edges, .truncated = truncated };
+}
+
+fn writeBlastNodesAndEdges(w: *Writer, ctx: Ctx, result: BlastResult) !void {
+    try w.writeAll("\"nodes\":[");
+    for (result.nodes.items, 0..) |n, i| {
         if (i != 0) try w.writeByte(',');
         try w.writeAll("{\"symbol\":");
         try payload.writeSymbolId(w, ctx, n.id);
@@ -460,12 +476,30 @@ pub fn writeBlast(
         try w.print(",\"exact\":{}}}", .{n.exact});
     }
     try w.writeAll("],\"edges\":[");
-    for (edges.items, 0..) |e, i| {
+    for (result.edges.items, 0..) |e, i| {
         if (i != 0) try w.writeByte(',');
         try payload.writeEdge(w, e.from, e.to, e.exact, e.lines);
     }
-    try w.writeAll("],\"summary\":");
-    try writeBlastSummary(w, gpa, ctx, nodes.items, truncated);
+    try w.writeByte(']');
+}
+
+/// Write the contract's blast result: `computeBlast`'s walk from `roots`.
+pub fn writeBlast(
+    w: *Writer,
+    gpa: std.mem.Allocator,
+    ctx: Ctx,
+    roots: []const SymbolId,
+    opts: BlastOptions,
+) !void {
+    var result = try computeBlast(gpa, ctx, roots, opts);
+    defer result.deinit(gpa);
+
+    try w.writeAll("{\"roots\":");
+    try payload.writeSymbolArray(w, ctx, roots);
+    try w.writeByte(',');
+    try writeBlastNodesAndEdges(w, ctx, result);
+    try w.writeAll(",\"summary\":");
+    try writeBlastSummary(w, gpa, ctx, result.nodes.items, result.truncated);
     try w.writeByte('}');
 }
 
@@ -522,6 +556,106 @@ fn writeBlastSummary(
         try w.print(",\"count\":{d}}}", .{r.count});
     }
     try w.writeAll("]}");
+}
+
+// ---------------------------------------------------------------------------
+// Tests (inverted coverage)
+// ---------------------------------------------------------------------------
+
+pub const TestsForOptions = struct {
+    limit: u32 = 200,
+};
+
+const ReachNode = struct { id: SymbolId, depth: u32, via: std.ArrayList(SymbolId) };
+
+/// Whether `from` references `to` through an exact call/route_call edge — the
+/// same executable-edge criterion `query.testReachable` walks forward from
+/// tests; `navgraph/tests` walks it backward from one target.
+fn executableEdge(idx: *const Index, from: SymbolId, to: SymbolId) bool {
+    for (idx.graph.symbols[from].refs) |ref| {
+        if (ref.target == to and ref.exact and (ref.kind == .call or ref.kind == .route_call)) return true;
+    }
+    return false;
+}
+
+/// `navgraph/tests`: every test symbol from which `target` is reachable
+/// through an exact call/route_call edge — `query.coverage`'s forward walk
+/// from every test, inverted and rooted at one target. `target` itself is
+/// never listed even when it is a test (a test does not cover itself).
+/// The shared reverse walk behind `writeTestsFor` and `navgraph/context`'s
+/// `tests` field: every symbol (test or not) reachable backward from `target`
+/// through an exact call/route_call edge, each at its shallowest depth.
+/// `nodes[0]` is always `target` itself, at depth 0. Caller frees with
+/// `freeReachNodes`.
+fn reachingWalk(gpa: std.mem.Allocator, idx: *const Index, target: SymbolId) !std.ArrayList(ReachNode) {
+    var nodes: std.ArrayList(ReachNode) = .empty;
+    errdefer {
+        for (nodes.items) |*n| n.via.deinit(gpa);
+        nodes.deinit(gpa);
+    }
+    var seen: std.AutoHashMapUnmanaged(SymbolId, usize) = .empty;
+    defer seen.deinit(gpa);
+    try seen.put(gpa, target, 0);
+    try nodes.append(gpa, .{ .id = target, .depth = 0, .via = .empty });
+
+    var cursor: usize = 0;
+    while (cursor < nodes.items.len) : (cursor += 1) {
+        const from_id = nodes.items[cursor].id;
+        const depth = nodes.items[cursor].depth;
+        for (idx.callersOf(from_id)) |cid| {
+            if (!executableEdge(idx, cid, from_id)) continue;
+            const gop = try seen.getOrPut(gpa, cid);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = nodes.items.len;
+                try nodes.append(gpa, .{ .id = cid, .depth = depth + 1, .via = .empty });
+            }
+            const slot = &nodes.items[gop.value_ptr.*];
+            if (slot.depth == depth + 1 and !contains(slot.via.items, from_id)) {
+                try slot.via.append(gpa, from_id);
+            }
+        }
+    }
+    return nodes;
+}
+
+fn freeReachNodes(gpa: std.mem.Allocator, nodes: *std.ArrayList(ReachNode)) void {
+    for (nodes.items) |*n| n.via.deinit(gpa);
+    nodes.deinit(gpa);
+}
+
+pub fn writeTestsFor(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, target: SymbolId, opts: TestsForOptions) !void {
+    const idx = ctx.index();
+    var nodes = try reachingWalk(gpa, idx, target);
+    defer freeReachNodes(gpa, &nodes);
+
+    var count: u32 = 0;
+    var max_depth: u32 = 0;
+    for (nodes.items[1..]) |n| {
+        if (!query.isTestSymbol(idx, idx.graph.symbols[n.id])) continue;
+        count += 1;
+        max_depth = @max(max_depth, n.depth);
+    }
+
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, target);
+    try w.writeAll(",\"tests\":[");
+    var shown: u32 = 0;
+    var truncated = false;
+    for (nodes.items[1..]) |n| {
+        if (!query.isTestSymbol(idx, idx.graph.symbols[n.id])) continue;
+        if (shown >= opts.limit) {
+            truncated = true;
+            continue;
+        }
+        if (shown != 0) try w.writeByte(',');
+        shown += 1;
+        try w.writeAll("{\"symbol\":");
+        try payload.writeSymbolId(w, ctx, n.id);
+        try w.print(",\"depth\":{d},\"via\":", .{n.depth});
+        try payload.writeLines(w, n.via.items);
+        try w.writeByte('}');
+    }
+    try w.print("],\"summary\":{{\"count\":{d},\"maxDepth\":{d},\"truncated\":{}}}}}", .{ count, max_depth, truncated });
 }
 
 /// Iterate a symbol's graph neighbours in one direction, applying the same
@@ -855,6 +989,130 @@ pub fn writeImplementation(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: Sym
         }
     }
     try w.writeByte(']');
+}
+
+pub const TypesOptions = struct {
+    limit: u32 = 200,
+    scope: Scope,
+};
+
+fn writeTypeUser(w: *Writer, ctx: Ctx, id: SymbolId, kind: []const u8) !void {
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, id);
+    try w.print(",\"kind\":\"{s}\"}}", .{kind});
+}
+
+/// `navgraph/types`: "who uses type T" — the base/impl table (supertypes,
+/// subtypes, implementors, same data `typeHierarchy`/`implementation` walk)
+/// plus a unified `users` list combining the subtype ("extends") and
+/// implementor ("implements") edges with typed param/local bindings whose
+/// `Binding.type_name` names this type (matched by name, like
+/// `query.typeConsumerBinding` — the same name-not-id limitation that walk
+/// already carries). Field/return/annotation/generic uses are not yet
+/// extracted by any language backend, so they are simply absent, never an
+/// error (the contract's documented best-effort clause).
+pub fn writeTypes(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, opts: TypesOptions) !void {
+    const idx = ctx.index();
+    const sym = idx.graph.symbols[id];
+
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, id);
+    var hgraph = try hierarchy.build(gpa, idx);
+    defer hgraph.deinit();
+    try w.writeAll(",\"supertypes\":[");
+    {
+        var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+        defer seen.deinit(gpa);
+        var wrote = false;
+        for (hgraph.edges) |e| {
+            if (e.subtype != id or e.supertype == invalid) continue;
+            if ((try seen.getOrPut(gpa, e.supertype)).found_existing) continue;
+            const super = idx.graph.symbols[e.supertype];
+            if (!opts.scope.admits(idx, super)) continue;
+            if (wrote) try w.writeByte(',');
+            wrote = true;
+            try payload.writeSymbolId(w, ctx, e.supertype);
+        }
+    }
+    try w.writeAll("],\"subtypes\":[");
+    {
+        var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+        defer seen.deinit(gpa);
+        var wrote = false;
+        for (hgraph.edges) |e| {
+            if (e.supertype != id or e.subtype == invalid) continue;
+            if ((try seen.getOrPut(gpa, e.subtype)).found_existing) continue;
+            const sub = idx.graph.symbols[e.subtype];
+            if (!opts.scope.admits(idx, sub)) continue;
+            if (wrote) try w.writeByte(',');
+            wrote = true;
+            try payload.writeSymbolId(w, ctx, e.subtype);
+        }
+    }
+    try w.writeAll("],\"implementors\":[");
+    var pgraph = try impls.build(gpa, idx);
+    defer pgraph.deinit();
+    {
+        var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+        defer seen.deinit(gpa);
+        var wrote = false;
+        for (pgraph.relations) |r| {
+            if (r.port != id) continue;
+            if ((try seen.getOrPut(gpa, r.implementation)).found_existing) continue;
+            const impl_sym = idx.graph.symbols[r.implementation];
+            if (!opts.scope.admits(idx, impl_sym)) continue;
+            if (wrote) try w.writeByte(',');
+            wrote = true;
+            try payload.writeSymbolId(w, ctx, r.implementation);
+        }
+    }
+    try w.writeAll("],\"users\":[");
+    var shown: u32 = 0;
+    var truncated = false;
+    var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+    defer seen.deinit(gpa);
+    for (hgraph.edges) |e| {
+        if (e.supertype != id or e.subtype == invalid) continue;
+        if ((try seen.getOrPut(gpa, e.subtype)).found_existing) continue;
+        if (!opts.scope.admits(idx, idx.graph.symbols[e.subtype])) continue;
+        if (shown >= opts.limit) {
+            truncated = true;
+            continue;
+        }
+        if (shown != 0) try w.writeByte(',');
+        shown += 1;
+        try writeTypeUser(w, ctx, e.subtype, "extends");
+    }
+    for (pgraph.relations) |r| {
+        if (r.port != id) continue;
+        if ((try seen.getOrPut(gpa, r.implementation)).found_existing) continue;
+        if (!opts.scope.admits(idx, idx.graph.symbols[r.implementation])) continue;
+        if (shown >= opts.limit) {
+            truncated = true;
+            continue;
+        }
+        if (shown != 0) try w.writeByte(',');
+        shown += 1;
+        try writeTypeUser(w, ctx, r.implementation, "implements");
+    }
+    for (idx.graph.symbols) |owner| {
+        for (owner.bindings) |b| {
+            if (!std.mem.eql(u8, b.type_name, sym.name)) continue;
+            if ((try seen.getOrPut(gpa, owner.id)).found_existing) continue;
+            if (!opts.scope.admits(idx, owner)) continue;
+            if (shown >= opts.limit) {
+                truncated = true;
+                continue;
+            }
+            if (shown != 0) try w.writeByte(',');
+            shown += 1;
+            const owner_sig = owner.signature(idx.graph.files[owner.file].text);
+            const kind: []const u8 = if (std.mem.indexOf(u8, owner_sig, b.name) != null) "param" else "local";
+            try writeTypeUser(w, ctx, owner.id, kind);
+            break;
+        }
+    }
+    try w.print("],\"truncated\":{}}}", .{truncated});
 }
 
 /// `textDocument/typeDefinition`: the declared type of the identifier at
@@ -1363,6 +1621,178 @@ pub fn writeDiff(
         .scope = opts.scope,
     });
     try w.writeByte('}');
+}
+
+// ---------------------------------------------------------------------------
+// Impact (working-change blast, grouped by hunk)
+// ---------------------------------------------------------------------------
+
+pub const ImpactOptions = struct {
+    depth: u32,
+    direction: Direction,
+    limit: u32,
+    scope: Scope,
+};
+
+const ImpactHunk = struct { file: model.FileId, lo: u32, hi: u32 };
+
+/// An explicit hunk a client already knows about, bypassing overlay
+/// comparison entirely.
+pub const ImpactRange = struct { lo: u32, hi: u32 };
+
+/// One hunk from an overlay that differs from disk: the common-prefix/suffix
+/// trim `index.computeEdit` already computes for the reparse seam, reused
+/// here as a single approximate hunk per changed file (multiple disjoint
+/// edits in one buffer collapse into the span between the first and last).
+/// On disk read failure (a new, untracked, overlay-only file) `disk` is
+/// empty, so the whole overlay becomes one hunk — not a special case.
+fn appendOverlayHunk(
+    gpa: std.mem.Allocator,
+    s: *session_mod.Session,
+    path: []const u8,
+    overlay_text: []const u8,
+    fid: model.FileId,
+    hunks: *std.ArrayList(ImpactHunk),
+) !void {
+    var disk: []const u8 = &.{};
+    var owned = false;
+    if (s.root_dir.readFileAlloc(s.io, path, gpa, .limited(8 * 1024 * 1024))) |bytes| {
+        disk = bytes;
+        owned = true;
+    } else |_| {}
+    defer if (owned) gpa.free(disk);
+    const edit = index_mod.computeEdit(disk, overlay_text) orelse return;
+    try hunks.append(gpa, .{ .file = fid, .lo = edit.start_point.row + 1, .hi = edit.new_end_point.row + 1 });
+}
+
+/// A stable id for the whole set of hunks (file + line range each), so a
+/// client can tell "this is still the same working change" apart from a new
+/// one. Deliberately keyed on shape (file, range), not deep content bytes —
+/// per-symbol staleness is `Symbol.contentHash`'s job, not this one's.
+fn changeId(idx: *const Index, hunks: []const ImpactHunk) u64 {
+    var hasher = std.hash.Wyhash.init(0x4e_47_43_48_41_4e_47_45); // "NGCHANGE"
+    for (hunks) |h| {
+        hasher.update(idx.graph.files[h.file].path);
+        hasher.update(std.mem.asBytes(&h.lo));
+        hasher.update(std.mem.asBytes(&h.hi));
+    }
+    return hasher.final();
+}
+
+/// `navgraph/impact`: the blast radius of the current WORKING CHANGE (overlay
+/// vs disk) or, when `ref` is given, of disk vs that git ref — grouped by
+/// changed hunk. `uri_path` narrows either mode to one document; `range`
+/// (meaningful only with `uri_path`, and only outside `ref` mode) lets a
+/// client hand navgraph a hunk it already knows about instead of requiring an
+/// overlay to already differ from disk. No hunks -> the documented zero
+/// result (`roots`/`nodes`/`edges` empty, a zeroed `summary`), not an error.
+pub fn writeImpact(
+    w: *Writer,
+    gpa: std.mem.Allocator,
+    ctx: Ctx,
+    ref: ?[]const u8,
+    uri_path: ?[]const u8,
+    range: ?ImpactRange,
+    opts: ImpactOptions,
+    detail: *?[]const u8,
+) !void {
+    const idx = ctx.index();
+    const s = ctx.session;
+
+    var hunks: std.ArrayList(ImpactHunk) = .empty;
+    defer hunks.deinit(gpa);
+
+    if (ref) |ref_spec| {
+        const spec = if (ref_spec.len != 0) ref_spec else "HEAD";
+        const result = query.runGitDiff(gpa, s.io, s.root_path, spec) catch |err| {
+            detail.* = try std.fmt.allocPrint(gpa, "git diff {s} failed: {s}", .{ spec, @errorName(err) });
+            return error.GitFailed;
+        };
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+        if (result.term != .exited or result.term.exited != 0) {
+            detail.* = try std.fmt.allocPrint(gpa, "git diff {s} failed: {s}", .{ spec, firstLineCapped(result.stderr, 300) });
+            return error.GitFailed;
+        }
+        const changes = gitdiff.parse(gpa, result.stdout) catch |err| {
+            detail.* = try std.fmt.allocPrint(gpa, "git diff {s} produced an unusable patch: {s}", .{ spec, @errorName(err) });
+            return error.GitFailed;
+        };
+        defer gitdiff.freeChanges(gpa, changes);
+        for (changes) |change| {
+            if (uri_path) |only| if (!std.mem.eql(u8, change.path, only)) continue;
+            const file = query.findDiffFile(idx, change.path) orelse continue;
+            const fid = fileIdOf(idx, file.path) orelse continue;
+            for (change.ranges) |r| {
+                const lo = if (r.empty and r.lo == 0) @as(u32, 1) else r.lo;
+                const hi = if (r.empty and r.hi == 0) @as(u32, 1) else r.hi;
+                try hunks.append(gpa, .{ .file = fid, .lo = lo, .hi = hi });
+            }
+        }
+    } else if (range) |rg| {
+        if (uri_path) |path| if (fileIdOf(idx, path)) |fid| {
+            try hunks.append(gpa, .{ .file = fid, .lo = rg.lo, .hi = rg.hi });
+        };
+    } else if (uri_path) |path| {
+        if (s.overlays.docs.get(path)) |overlay_text| if (fileIdOf(idx, path)) |fid| {
+            try appendOverlayHunk(gpa, s, path, overlay_text, fid, &hunks);
+        };
+    } else {
+        for (s.overlays.docs.keys(), s.overlays.docs.values()) |path, overlay_text| {
+            const fid = fileIdOf(idx, path) orelse continue;
+            try appendOverlayHunk(gpa, s, path, overlay_text, fid, &hunks);
+        }
+    }
+
+    var roots: std.ArrayList(SymbolId) = .empty;
+    defer roots.deinit(gpa);
+    var hunk_roots: std.ArrayList([]const SymbolId) = .empty;
+    defer {
+        for (hunk_roots.items) |hr| gpa.free(hr);
+        hunk_roots.deinit(gpa);
+    }
+    for (hunks.items) |h| {
+        const file = idx.graph.files[h.file];
+        var one: std.ArrayList(SymbolId) = .empty;
+        defer one.deinit(gpa);
+        var i = file.sym_start;
+        while (i < file.sym_end) : (i += 1) {
+            const sym = idx.graph.symbols[i];
+            if (!reportable(sym.kind)) continue;
+            if (!query.symbolTouched(sym, file.text, &.{.{ .lo = h.lo, .hi = h.hi }})) continue;
+            try one.append(gpa, sym.id);
+            if (!contains(roots.items, sym.id)) try roots.append(gpa, sym.id);
+        }
+        try hunk_roots.append(gpa, try one.toOwnedSlice(gpa));
+    }
+
+    var result = try computeBlast(gpa, ctx, roots.items, .{
+        .depth = opts.depth,
+        .direction = opts.direction,
+        .limit = opts.limit,
+        .scope = opts.scope,
+    });
+    defer result.deinit(gpa);
+
+    try w.writeAll("{\"roots\":");
+    try payload.writeSymbolArray(w, ctx, roots.items);
+    try w.writeByte(',');
+    try writeBlastNodesAndEdges(w, ctx, result);
+    try w.writeAll(",\"summary\":");
+    try writeBlastSummary(w, gpa, ctx, result.nodes.items, result.truncated);
+    try w.writeAll(",\"hunks\":[");
+    for (hunks.items, hunk_roots.items, 0..) |h, hr, i| {
+        if (i != 0) try w.writeByte(',');
+        const file = idx.graph.files[h.file];
+        try w.writeAll("{\"uri\":\"");
+        try overlay.writeUriIn(w, ctx.session.root_abs, file.path);
+        try w.writeAll("\",\"range\":");
+        try payload.writeLineRange(w, file.text, h.lo, h.hi, ctx.encoding);
+        try w.writeAll(",\"roots\":");
+        try payload.writeSymbolArray(w, ctx, hr);
+        try w.writeByte('}');
+    }
+    try w.print("],\"changeId\":\"{x:0>16}\"}}", .{changeId(idx, hunks.items)});
 }
 
 // ---------------------------------------------------------------------------

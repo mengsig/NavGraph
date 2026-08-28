@@ -202,6 +202,19 @@ pub fn writeDefRange(w: *Writer, ctx: Ctx, sym: Symbol) !void {
     );
 }
 
+/// A 0-based LSP range spanning whole 1-based lines `[lo, hi]` of `text`
+/// (`navgraph/impact`'s `hunks[].range`) — the full width of `hi`, unlike
+/// `writeByteRange`'s exact-offset span.
+pub fn writeLineRange(w: *Writer, text: []const u8, lo: u32, hi: u32, enc: position.Encoding) !void {
+    const lo0 = if (lo == 0) 0 else lo - 1;
+    const hi0 = if (hi == 0) 0 else hi - 1;
+    const end_col = position.byteToColumn(position.lineSlice(text, hi0) orelse "", enc);
+    try w.print(
+        "{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
+        .{ lo0, hi0, end_col },
+    );
+}
+
 /// A 0-based LSP range covering `name` on 1-based `line`. When the name is not
 /// found on that line the range collapses at column 0.
 pub fn writeNameRange(w: *Writer, text: []const u8, line_1based: u32, name: []const u8, enc: position.Encoding) !void {

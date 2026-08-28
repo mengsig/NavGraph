@@ -903,6 +903,34 @@ fn directionOf(p: Params, fallback: queries.Direction) Error!queries.Direction {
     return error.InvalidParams;
 }
 
+/// `navgraph/tests`: `query.coverage`'s forward walk from every test,
+/// inverted and rooted at one target. `Scope` is accepted for the contract's
+/// `Target & Scope` shape but unused: the result already IS a test list, so
+/// `scope.tests` has no meaningful filter, and the walk mirrors
+/// `query.testReachable`'s own always-exact edge criterion (no strict knob).
+fn testsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    _ = try scopeOf(self, p);
+    const target = try targetOf(self, arena, p);
+    const roots = try resolveTargetOrErr(self, arena, c, target);
+    try queries.writeTestsFor(w, arena, c, roots[0], .{ .limit = p.positive("limit", 200) });
+}
+
+/// `navgraph/types`: "who uses type T" — supertypes/subtypes/implementors
+/// plus a best-effort `users` list (see `queries.writeTypes`'s doc for what
+/// is and is not extracted per language).
+fn typesMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const scope = try scopeOf(self, p);
+    const target = try targetOf(self, arena, p);
+    const roots = try resolveTargetOrErr(self, arena, c, target);
+    try queries.writeTypes(w, arena, c, roots[0], .{ .limit = p.positive("limit", 200), .scope = scope });
+}
+
 fn searchMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
     try self.flushPending(arena, .change);
     const c = try self.ctx();
@@ -1138,6 +1166,8 @@ const requests = [_]Entry{
     .{ .name = "navgraph/status", .run = status },
     .{ .name = "navgraph/symbolAt", .run = symbolAt },
     .{ .name = "navgraph/blast", .run = blast },
+    .{ .name = "navgraph/tests", .run = testsMethod },
+    .{ .name = "navgraph/types", .run = typesMethod },
     .{ .name = "navgraph/search", .run = searchMethod },
     .{ .name = "navgraph/grep", .run = grep },
     .{ .name = "navgraph/callers", .run = callersMethod },
@@ -1988,6 +2018,128 @@ test "textDocument/codeLens reports callers/callees per definition, and resolve 
     );
     defer bad.deinit();
     try testing.expectEqual(@as(i64, -32602), try errorCodeOf(bad));
+}
+
+const tests_project = [_][2][]const u8{
+    .{
+        "app.zig",
+        \\pub fn leaf() void {}
+        \\
+        \\fn mid() void {
+        \\    leaf();
+        \\}
+        \\
+        \\pub fn run() void {
+        \\    mid();
+        \\}
+        \\
+        \\pub fn orphan() void {}
+        \\
+        \\test "covers run" {
+        \\    run();
+        \\}
+        \\
+    },
+};
+
+test "navgraph/tests inverts coverage: every test reaching the target, with depth and via" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &tests_project);
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(74,
+        \\{"jsonrpc":"2.0","id":74,"method":"navgraph/tests","params":{"symbol":"leaf"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("leaf", r.get("symbol").?.object.get("name").?.string);
+
+    const found = r.get("tests").?.array.items;
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings("covers run", found[0].object.get("symbol").?.object.get("name").?.string);
+    // leaf(0) <- mid(1) <- run(2) <- "covers run"(3).
+    try testing.expectEqual(@as(i64, 3), found[0].object.get("depth").?.integer);
+    const via = found[0].object.get("via").?.array.items;
+    try testing.expectEqual(@as(usize, 1), via.len);
+    try testing.expectEqualStrings("run", ts.server.session.?.idx.graph.symbols[@intCast(via[0].integer)].name);
+
+    const summary = r.get("summary").?.object;
+    try testing.expectEqual(@as(i64, 1), summary.get("count").?.integer);
+    try testing.expectEqual(@as(i64, 3), summary.get("maxDepth").?.integer);
+    try testing.expect(!summary.get("truncated").?.bool);
+}
+
+test "navgraph/tests reports an empty list for an uncalled symbol, and -32001 off a bad target" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &tests_project);
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(75,
+        \\{"jsonrpc":"2.0","id":75,"method":"navgraph/tests","params":{"symbol":"orphan"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqual(@as(usize, 0), r.get("tests").?.array.items.len);
+    try testing.expectEqual(@as(i64, 0), r.get("summary").?.object.get("count").?.integer);
+
+    var missing = try ts.request(76,
+        \\{"jsonrpc":"2.0","id":76,"method":"navgraph/tests","params":{"symbol":"nope"}}
+    );
+    defer missing.deinit();
+    try testing.expectEqual(@as(i64, -32001), try errorCodeOf(missing));
+}
+
+test "navgraph/types reports the base/impl table and dedupes a user across extends and implements" {
+    const ts = try startedPy(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(77,
+        \\{"jsonrpc":"2.0","id":77,"method":"navgraph/types","params":{"symbol":"Store"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("Store", r.get("symbol").?.object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 0), r.get("supertypes").?.array.items.len);
+
+    const subtypes = r.get("subtypes").?.array.items;
+    try testing.expectEqual(@as(usize, 1), subtypes.len);
+    try testing.expectEqualStrings("Partial", subtypes[0].object.get("name").?.string);
+
+    // Both `Partial` (nominal) and `MemoryStore` (structural-only) implement Store.
+    const implementors = r.get("implementors").?.array.items;
+    try testing.expectEqual(@as(usize, 2), implementors.len);
+
+    // `Partial` qualifies as both a subtype (extends) and an implementor
+    // (implements); it must appear exactly once in `users`, as "extends".
+    const users = r.get("users").?.array.items;
+    try testing.expectEqual(@as(usize, 2), users.len);
+    var saw_partial_extends = false;
+    var saw_memorystore_implements = false;
+    for (users) |u| {
+        const name = u.object.get("symbol").?.object.get("name").?.string;
+        const kind = u.object.get("kind").?.string;
+        if (std.mem.eql(u8, name, "Partial")) {
+            try testing.expectEqualStrings("extends", kind);
+            saw_partial_extends = true;
+        } else if (std.mem.eql(u8, name, "MemoryStore")) {
+            try testing.expectEqualStrings("implements", kind);
+            saw_memorystore_implements = true;
+        }
+    }
+    try testing.expect(saw_partial_extends and saw_memorystore_implements);
+    try testing.expect(!r.get("truncated").?.bool);
+}
+
+test "navgraph/types classifies a typed param binding as a user" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &widget_project);
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(78,
+        \\{"jsonrpc":"2.0","id":78,"method":"navgraph/types","params":{"symbol":"Widget"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    const users = r.get("users").?.array.items;
+    try testing.expectEqual(@as(usize, 1), users.len);
+    try testing.expectEqualStrings("run", users[0].object.get("symbol").?.object.get("name").?.string);
+    try testing.expectEqualStrings("param", users[0].object.get("kind").?.string);
 }
 
 test "navgraph/blast reports depth, via, byFile and the file target form" {
