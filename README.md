@@ -144,7 +144,7 @@ navgraph <command> [arg] [flags]
 | `history <symbol>` | Symbol-range Git history and patches, bounded by `--last` (default 10). Alias: `hist`. |
 | `blame <symbol>`   | Per-line author, commit, and summary provenance for a current symbol range. |
 | `churn [path]`     | Rank current symbols by historical commits or added plus removed/replaced hunk lines (`--sort commits|lines`, `--last`, `--since`). |
-| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. |
+| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. Returns the top 25 unless `-l N` asks for more. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
 | `status [filter]`  | Index/cache snapshot, changed-since-build files, skipped paths, parse health, and unresolved/external graph-reference diagnostics. |
 | `read <file[:A-B]>`| Paged numbered source; ranges are validated/merged, `-l` and hard `--budget` bound pages, and `--after <next>` resumes. |
@@ -173,7 +173,7 @@ list of flags that actually *do* something is `navgraph capabilities -j`
 | `-v, --verbosity <level>`     | `names` \| `sig` \| `doc` \| `full` (default `sig`). |
 | `-d, --depth <N>`             | Graph depth for call walks, `neighbors`, and `raises` propagation (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
-| `-l, --limit <N>`             | Max results (default `300`). On `imports`/`importers`/`graph`, which are otherwise unbounded, it caps only when given explicitly. |
+| `-l, --limit <N>`             | Max results (default `300`; `hot`'s own default is `25`). The flag is explicit, not a sentinel: on `imports`/`importers`/`graph`/`hot` a value you give is a real cap — `300` included — and leaving it off keeps the first three unbounded and `hot` at 25. |
 | `--budget <bytes>`            | On commands declaring this option, a hard serialized stdout ceiling (minimum 64 bytes); results are importance-ranked, compacted, and marked/cursored when truncated. |
 | `--max-nodes <N>`             | Exact retained-node cap; `--summary` renders retained nodes at name detail and reports elision. |
 | `--since <ref>`               | Git comparison ref for `affected` or the lower history bound for `churn`. |
@@ -506,11 +506,18 @@ Everything for one run lives in a single arena that is freed on exit.
   bindings, and fields of the enclosing type declared with one, such as Go
   `store store.Store` behind `a.store.Get()`) and import-aware, but a call on an
   untracked receiver falls back to a name match, marked heuristic (`?`);
-  `--strict` drops those. A call never binds to a non-callable: a type sharing
-  the method's name is not a call target where the language has no constructor
-  call. Import evidence only suppresses a name match for languages whose import
-  forms are actually resolved — Rust `use` is unmodelled, so it does not.
-  Treat the graph as high-recall guidance.
+  `--strict` drops those. A call never binds to a non-callable: a type is a call
+  target only where the language spells construction as a call (Python/Ruby
+  classes, C++/Java/C#/Rust constructors, JS factories), while a `var`/`const`
+  stays legal because nothing here types values and a function-valued binding is
+  genuinely callable. A Go conversion (`models.WidgetID(n)`) is recorded as a
+  type use rather than a call. A local shadows a same-named package —
+  `for _, store := range xs` binds `store.Get()` to the local, not to package
+  `store` — and a bare qualifier that names a package/namespace resolves to that
+  clause as an inferred edge, never an exact one. Import evidence only
+  suppresses a name match for languages whose import forms are actually
+  resolved — Rust `use` is unmodelled, so it does not. Treat the graph as
+  high-recall guidance.
 - `affected` and `reaches --from-tests` are structural call-graph impact, not
   runtime coverage. Dynamic dispatch still needs `--impls` or may remain unknown;
   pure deletions cannot be seeded from symbols absent from the current index.
