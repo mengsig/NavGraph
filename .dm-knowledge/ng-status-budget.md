@@ -1,0 +1,1 @@
+- **[convention]** status default is a compact summary (project/language/backend counts, cache, headline freshness/parse/resolution counts); the file-level dump (changed files, skipped paths, per-warning/per-reference detail) is behind --full (query.Options.status_full), mirrored in -j and --jsonl (default jsonl page is just the summary row).  _(2026-08-28T17:00:33Z)_
