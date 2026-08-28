@@ -115,13 +115,16 @@ pub const Session = struct {
     indexed_at_unix_ms: i64,
     used_cache: bool,
 
-    /// Open the root, walk it, and assemble the first index.
+    /// Open the root, walk it, and assemble the first index. `use_cache`
+    /// mirrors the CLI's `--no-cache`; the resident LSP server always passes
+    /// `true` (a long-lived session's whole point is to amortize the parse).
     pub fn init(
         gpa: std.mem.Allocator,
         io: std.Io,
         root_path: []const u8,
         cfg: Config,
         backend: backends.Choice,
+        use_cache: bool,
     ) !Session {
         const start_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
         // Everything the session will own is acquired inside this block, so its
@@ -143,7 +146,7 @@ pub const Session = struct {
                 gpa.destroy(registry);
             }
 
-            var sources = try index_mod.collect(gpa, io, root_dir, null, null, true, .{
+            var sources = try index_mod.collect(gpa, io, root_dir, null, null, use_cache, .{
                 .choice = backend,
                 .registry = registry,
             });
@@ -626,7 +629,7 @@ pub const Fixture = struct {
         for (files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
         const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         errdefer gpa.free(root);
-        const session = try Session.init(gpa, io, root, .{ .watch = false }, .auto);
+        const session = try Session.init(gpa, io, root, .{ .watch = false }, .auto, true);
         return .{ .tmp = tmp, .root = root, .session = session };
     }
 

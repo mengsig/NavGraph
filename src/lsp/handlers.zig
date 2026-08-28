@@ -488,7 +488,7 @@ fn initialized(self: *Server, arena: std.mem.Allocator, _: ?std.json.Value) Erro
         try self.send(try progressCreate(arena, token));
         try self.notify(arena, "$/progress", try progressBegin(arena, token));
     }
-    self.session = session_mod.Session.init(self.gpa, self.io, self.root, self.cfg, self.backend) catch |err| {
+    self.session = session_mod.Session.init(self.gpa, self.io, self.root, self.cfg, self.backend, true) catch |err| {
         self.log.print(.err, "indexing {s} failed: {s}", .{ self.root, @errorName(err) });
         if (self.client_progress) try self.notify(arena, "$/progress", try progressEnd(arena, token, "index failed"));
         try self.notify(arena, "window/logMessage", try logMessageParams(arena, 1, "navgraph: indexing failed"));
