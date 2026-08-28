@@ -789,3 +789,33 @@ test "a cache entry may only answer for the backend that produced it" {
     try testing.expect(backends.cacheEntryUsable(.go, .tree_sitter, heur));
     try testing.expect(!backends.cacheEntryUsable(.go, .tree_sitter, ts));
 }
+
+// ---------------------------------------------------------------------------
+// Visibility
+// ---------------------------------------------------------------------------
+
+test "exportedness agrees with the heuristic backend for every shared symbol" {
+    // F2. `Key` deliberately excludes `exported`, so nothing else in this file
+    // notices when the two backends disagree about what is public API — and
+    // `--visibility`, `unused --no-public` and every JSON payload read it.
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var compared: u32 = 0;
+    var mismatched: u32 = 0;
+    for (fixture_trees) |tree| {
+        var pair = try Pair.open(gpa, tree);
+        defer pair.close();
+        for (pair.heuristic.graph.symbols) |sym| {
+            if (!grammarBacked(pair.heuristic.graph.files[sym.file].language)) continue;
+            const twin = memberOrTopLevel(&pair.tree_sitter, &pair.heuristic, sym) orelse continue;
+            compared += 1;
+            if (twin.exported == sym.exported) continue;
+            mismatched += 1;
+            std.debug.print("navgraph differ: {s} {s}:{d} {s} exported {} -> {}\n", .{
+                tree, pair.heuristic.graph.files[sym.file].path, sym.line, sym.name, sym.exported, twin.exported,
+            });
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), mismatched);
+    try testing.expect(compared > 0);
+}

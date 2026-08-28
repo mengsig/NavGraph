@@ -415,7 +415,7 @@ pub fn parse(
 
     var defs: std.ArrayList(Def) = .empty;
     defer defs.deinit(gpa);
-    try collectDefs(c, cursor, gpa, source, root, &defs);
+    try collectDefs(c, cursor, gpa, source, lang, root, &defs);
     sortDefs(defs.items);
 
     var by_node: std.AutoHashMapUnmanaged(usize, u32) = .empty;
@@ -512,6 +512,7 @@ fn collectDefs(
     cursor: *TSQueryCursor,
     gpa: std.mem.Allocator,
     source: []const u8,
+    lang: Language,
     root: TSNode,
     out: *std.ArrayList(Def),
 ) Error!void {
@@ -610,7 +611,7 @@ fn collectDefs(
             .span_end = span_end,
             .sig_end = sig_end,
             .doc = docOf(source, doc_node),
-            .exported = kind != .import and name.len != 0 and name[0] != '_',
+            .exported = defaultExported(lang, kind, name),
             .modifiers = mods,
             .declared_type = declared,
             .import_path = path,
@@ -625,11 +626,36 @@ fn collectDefs(
     }
 }
 
-/// True when any ancestor of `node` was captured as an `export`ed declaration.
+/// Visibility before any `export` marker is applied. Python spells visibility
+/// with a leading underscore; TypeScript spells it with the `export` keyword, so
+/// guessing from the name shape reports every module-private const, let, var and
+/// function — and every class member — as public API.
+fn defaultExported(lang: Language, kind: SymbolKind, name: []const u8) bool {
+    if (kind == .import or name.len == 0) return false;
+    return switch (lang) {
+        .python => name[0] != '_',
+        else => false,
+    };
+}
+
+/// True when an ancestor of `node` was captured as an `export`ed declaration,
+/// without crossing into a member list on the way. `export class C { m() {} }`
+/// exports `C`, not `C.m` — which is what the heuristic scanner reports too.
 fn hasExportedAncestor(marked: *const std.AutoHashMapUnmanaged(usize, void), node: TSNode) bool {
     var cur = ts_node_parent(node);
     while (!ts_node_is_null(cur)) : (cur = ts_node_parent(cur)) {
         if (marked.contains(nodeKey(cur))) return true;
+        if (isMemberList(cur)) return false;
+    }
+    return false;
+}
+
+/// A node whose children are members of the enclosing declaration rather than
+/// declarations in their own right.
+fn isMemberList(node: TSNode) bool {
+    const t = std.mem.span(ts_node_type(node));
+    inline for (.{ "class_body", "statement_block", "object_type", "enum_body", "block" }) |name| {
+        if (std.mem.eql(u8, t, name)) return true;
     }
     return false;
 }
