@@ -962,39 +962,9 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
         }
     }
 
-    // Level 0 keeps every section `include` allows, at full size (`callers`
-    // uncapped); each higher level drops one more, in the contract's stated
-    // order. A section `include` excludes stays dropped at every level (F5).
-    // Stop at the first level that fits, or the last if none does — measured
-    // in real emitted bytes (M3), not a signature-only approximation.
-    var level: u32 = 0;
-    var chars: u64 = 0;
-    while (true) : (level += 1) {
-        const with_body = level < 1 and opts.include.body;
-        const with_tests = level < 2 and opts.include.tests;
-        const with_types = level < 3 and opts.include.types;
-        const with_callees = level < 4 and opts.include.callees;
-        chars = try contextFieldBytes(ctx, .{
-            .id = id,
-            .sym = sym,
-            .definition_text = if (with_body) body_text else sig,
-            .sig = sig,
-            .doc = doc,
-            .callers = callers,
-            .callees = if (with_callees) callees.items else &.{},
-            .types = if (with_types) types.items else &.{},
-            .tests_list = if (with_tests) tests_list.items else &.{},
-        });
-        if (estimateTokens(chars) <= opts.budget or level >= 4) break;
-    }
-    const with_body = level < 1 and opts.include.body;
-    const with_tests = level < 2 and opts.include.tests;
-    const with_types = level < 3 and opts.include.types;
-    const with_callees = level < 4 and opts.include.callees;
-
-    // `callers` is never dropped as a whole section, but at this point it may
-    // still be the sole reason the response overshoots `budget` (B2) — cap it
-    // to whatever room is left once every other section has settled.
+    // `callers` is never dropped as a whole section; every level below caps
+    // it to whatever room that level leaves once its other sections are
+    // sized, highest-priority callers first (`CallerPriority`, A1).
     const ordered_callers: []SymbolId = if (opts.include.callers) blk: {
         const buf = try gpa.dupe(SymbolId, callers);
         std.mem.sort(SymbolId, buf, CallerPriority{ .idx = idx, .target = id }, CallerPriority.lessThan);
@@ -1002,24 +972,57 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
     } else &.{};
     defer if (opts.include.callers) gpa.free(ordered_callers);
 
-    const base_bytes = try contextFieldBytes(ctx, .{
-        .id = id,
-        .sym = sym,
-        .definition_text = if (with_body) body_text else sig,
-        .sig = sig,
-        .doc = doc,
-        .callers = &.{},
-        .callees = if (with_callees) callees.items else &.{},
-        .types = if (with_types) types.items else &.{},
-        .tests_list = if (with_tests) tests_list.items else &.{},
-    });
+    // Level 0 keeps every section `include` allows, at full size; each
+    // higher level drops one more, in the contract's stated order. A section
+    // `include` excludes stays dropped at every level (F5). Stop at the
+    // first level that fits, or the last if none does — measured in real
+    // emitted bytes (M3), against the *capped* caller page this level would
+    // actually ship (A2: measuring the full uncapped caller list here made
+    // every level look oversized and forced every section to drop to pay
+    // for callers that got capped away regardless).
     const byte_budget = @as(u64, opts.budget) * 4;
-    const remaining: u64 = if (byte_budget > base_bytes) byte_budget - base_bytes else 0;
-    const shown_count = if (opts.include.callers) try fitCallers(ctx, ordered_callers, opts.offset, remaining) else 0;
-    const callers_start = @min(@as(usize, opts.offset), ordered_callers.len);
-    const callers_page = ordered_callers[callers_start .. callers_start + shown_count];
+    var level: u32 = 0;
+    var with_body = false;
+    var with_tests = false;
+    var with_types = false;
+    var with_callees = false;
+    var callers_page: []const SymbolId = &.{};
+    while (true) : (level += 1) {
+        with_body = level < 1 and opts.include.body;
+        with_tests = level < 2 and opts.include.tests;
+        with_types = level < 3 and opts.include.types;
+        with_callees = level < 4 and opts.include.callees;
+        const base_bytes = try contextFieldBytes(ctx, .{
+            .id = id,
+            .sym = sym,
+            .definition_text = if (with_body) body_text else sig,
+            .sig = sig,
+            .doc = doc,
+            .callers = &.{},
+            .callees = if (with_callees) callees.items else &.{},
+            .types = if (with_types) types.items else &.{},
+            .tests_list = if (with_tests) tests_list.items else &.{},
+        });
+        const remaining: u64 = if (byte_budget > base_bytes) byte_budget - base_bytes else 0;
+        const shown = if (opts.include.callers) try fitCallers(ctx, ordered_callers, opts.offset, remaining) else 0;
+        const start = @min(@as(usize, opts.offset), ordered_callers.len);
+        callers_page = ordered_callers[start .. start + shown];
+        const chars = try contextFieldBytes(ctx, .{
+            .id = id,
+            .sym = sym,
+            .definition_text = if (with_body) body_text else sig,
+            .sig = sig,
+            .doc = doc,
+            .callers = callers_page,
+            .callees = if (with_callees) callees.items else &.{},
+            .types = if (with_types) types.items else &.{},
+            .tests_list = if (with_tests) tests_list.items else &.{},
+        });
+        if (estimateTokens(chars) <= opts.budget or level >= 4) break;
+    }
+
     const callers_total = callers.len;
-    const shown_end = @as(usize, opts.offset) + shown_count;
+    const shown_end = @as(usize, opts.offset) + callers_page.len;
     const next: ?usize = if (opts.include.callers and shown_end < callers_total) shown_end else null;
 
     const fields: ContextFields = .{

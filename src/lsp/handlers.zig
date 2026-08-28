@@ -3533,6 +3533,52 @@ test "navgraph/context enforces its budget: budgets 1 and 2000 return different,
     try testing.expect(first_id != second_id);
 }
 
+/// A2 regression: the drop ladder must judge each level against the caller
+/// page that level would actually ship, not the full uncapped caller list
+/// (queries.zig:951 pre-fix) — else hundreds of callers make every level
+/// look oversized and the body never survives any reasonable budget, even
+/// though callers themselves get capped to a handful regardless.
+fn manyCallersWithBodyFixture(gpa: std.mem.Allocator, comptime count: u32) !Writer.Allocating {
+    var src: Writer.Allocating = .init(gpa);
+    errdefer src.deinit();
+    try src.writer.writeAll(
+        \\pub fn target() void {
+        \\    var sum: i32 = 0;
+        \\    var i: i32 = 0;
+        \\    while (i < 10) : (i += 1) sum += i;
+        \\}
+        \\
+    );
+    var i: u32 = 0;
+    while (i < count) : (i += 1) try src.writer.print("pub fn caller{d}() void {{ target(); }}\n", .{i});
+    return src;
+}
+
+test "navgraph/context keeps the definition body under a moderate budget despite hundreds of callers" {
+    const gpa = testing.allocator;
+    const caller_count = 200;
+    var src = try manyCallersWithBodyFixture(gpa, caller_count);
+    defer src.deinit();
+    const files = [_][2][]const u8{.{ "app.zig", src.written() }};
+
+    const ts = try TestServer.init(gpa, testing.io, &files);
+    defer ts.deinit();
+    try ts.start();
+
+    var res = try ts.request(340,
+        \\{"jsonrpc":"2.0","id":340,"method":"navgraph/context","params":{"symbol":"target","budget":500}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    // Pre-fix: the ladder measured all 200 callers, uncapped, at every
+    // level, so no level ever fit and the body fell back to the bare
+    // signature regardless of budget.
+    const text = r.get("definition").?.object.get("text").?.string;
+    try testing.expect(std.mem.indexOf(u8, text, "sum += i") != null);
+    try testing.expectEqual(@as(i64, caller_count), r.get("callersTotal").?.integer);
+    try testing.expect(r.get("callers").?.array.items.len >= 1);
+}
+
 test "navgraph/context ranks a production caller before test callers even when file order lists the tests first (A1)" {
     const gpa = testing.allocator;
     const files = [_][2][]const u8{.{
