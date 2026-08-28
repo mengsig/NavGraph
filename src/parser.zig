@@ -593,7 +593,13 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // strict agent queries. Preserve real receivers such as `value.field`
         // and `make().field`.
         if (isZigReceiverlessMember(ctx, i, lo, receiver.name)) continue;
-        if (isRubyScopeQualifier(ctx, i, lo, hi)) continue;
+        if (isScopeQualifierOnly(ctx, i, lo, hi)) continue;
+        // A member reached through an expression we cannot name
+        // (`static_cast<Derived*>(this)->step()`, `make().field`) has an unknown
+        // receiver, not an absent one. Recording it as a bare reference would
+        // hand it to the global name match, which is how a CRTP call ended up
+        // on an unrelated same-named function.
+        if (isUnnamedReceiverMember(ctx, i, lo, receiver.name)) continue;
         const assignment = assignmentAccess(ctx, i, hi);
         const qualifier = if (assignment.write and receiver.name.len == 0)
             enclosingCallQualifier(ctx, i, lo)
@@ -635,15 +641,44 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     };
 }
 
-/// A `::`-scoped Ruby constant that only scopes the call after it
-/// (`Tricky::Ledger.created`) names no dependency of its own — the edge is to
-/// the method. `Tricky::Ledger.new` is different: it constructs, so the type is
-/// genuinely used there.
-fn isRubyScopeQualifier(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
-    if (ctx.cfg.language != .ruby) return false;
-    if (!(i >= lo + 2 and ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':'))) return false;
-    if (!ctx.isPunct(i + 1, '.')) return false;
-    return i + 2 < hi and ctx.toks[i + 2].kind == .identifier and !ctx.identEql(i + 2, "new");
+/// Whether the identifier at `i` is a member access (`.name` / `->name`) whose
+/// receiver `memberQualifier` could not name. Zig's receiverless `.tag` labels
+/// have their own rule; Java and Ruby keep an explicit method guess for a
+/// receiverless call (a chained `line.item().sku()`, a `&:sym` block), so for
+/// them the reference is still worth resolving.
+fn isUnnamedReceiverMember(ctx: *const Ctx, i: u32, lo: u32, qualifier: []const u8) bool {
+    if (qualifier.len != 0 or i <= lo) return false;
+    switch (ctx.cfg.language) {
+        .zig, .java, .ruby => return false,
+        else => {},
+    }
+    if (ctx.isPunct(i - 1, '.')) return true;
+    return i >= lo + 2 and ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-');
+}
+
+/// A type name that only scopes the *function* after it — Ruby's
+/// `Tricky::Ledger.created`, Rust's `Cents::from_value` — names no dependency
+/// of its own: the edge is to that function. A constructor (`::new` / `.new`)
+/// is different, since it genuinely uses the type, and so is an uppercase
+/// member (`Val::Number`), which names an enum variant of the type.
+fn isScopeQualifierOnly(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    const member: u32 = switch (ctx.cfg.language) {
+        // Ruby scopes the type with `::` and then calls with `.`.
+        .ruby => blk: {
+            if (!(i >= lo + 2 and ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':'))) return false;
+            if (!ctx.isPunct(i + 1, '.')) return false;
+            break :blk i + 2;
+        },
+        .rust => blk: {
+            if (!(ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, ':'))) return false;
+            break :blk i + 3;
+        },
+        else => return false,
+    };
+    if (member >= hi or ctx.toks[member].kind != .identifier) return false;
+    const name = ctx.textOf(member);
+    if (name.len == 0 or std.ascii.isUpper(name[0])) return false;
+    return !std.mem.eql(u8, name, "new");
 }
 
 /// Ruby's `&:name` block shorthand — `map(&:to_row)` calls `to_row` on each
@@ -1240,7 +1275,7 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
     if (i < limit and ctx.toks[i].kind == .identifier and
         !c_decl_modifiers.has(ctx.textOf(i)) and !c_statement_keywords.has(ctx.textOf(i)))
     {
-        if (!endsCDeclarator(ctx, i + 1, limit)) return null;
+        if (!endsCDeclarator(ctx, i + 1, limit) and !isDirectInit(ctx, i + 1, limit)) return null;
         const name = ctx.textOf(i);
         if (type_name) |t| return .{ .name = name, .type_name = t };
         // `long *p;` — the modifier is the type.
@@ -1275,6 +1310,19 @@ fn skipGenericArgs(ctx: *const Ctx, i: u32, limit: u32) ?u32 {
         }
     }
     return null;
+}
+
+/// Whether `Type name(` at `i` opens a direct-initialization (`Weights w({1.0})`)
+/// rather than a function declaration (`double area(int)`). Only a literal or a
+/// braced initializer as the first argument decides it: everything else is the
+/// most vexing parse, where a declaration is the safer reading.
+fn isDirectInit(ctx: *const Ctx, i: u32, limit: u32) bool {
+    if (!ctx.isPunct(i, '(') or i + 1 >= limit) return false;
+    if (ctx.isPunct(i + 1, '{')) return true;
+    return switch (ctx.toks[i + 1].kind) {
+        .number, .string => true,
+        else => false,
+    };
 }
 
 /// Record `name -> Type` for each C/C++ parameter in `(...)`.

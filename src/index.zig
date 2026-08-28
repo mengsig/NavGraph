@@ -828,9 +828,59 @@ fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
             resolveOne(idx, sym.*, ref);
+            followFunctionAlias(idx, ref);
             dropMisboundCall(idx, sym.*, ref);
         }
     }
+}
+
+/// A call through a constant/variable that holds nothing but a named function
+/// (`const doubler = doubleValue;`, `var Doubler Adjust = double`) reaches that
+/// function: the binding is an alias, not a definition of its own. Only an
+/// initializer that is exactly one identifier naming a unique project callable
+/// is followed, so a lambda literal or a factory call keeps its own edge.
+fn followFunctionAlias(idx: *const Index, ref: *model.Reference) void {
+    if (ref.kind != .call or ref.target == invalid) return;
+    const alias = idx.graph.symbols[ref.target];
+    if (alias.kind != .constant and alias.kind != .variable) return;
+    const name = aliasInitializerName(alias.signature(idx.graph.files[alias.file].text)) orelse return;
+    const candidates = idx.by_name.get(name) orelse return;
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
+    for (candidates) |cid| {
+        const cand = idx.graph.symbols[cid];
+        if (!isCallable(cand) or cand.file != alias.file) continue;
+        matches += 1;
+        if (found == invalid) found = cid;
+    }
+    if (matches != 1) return;
+    ref.target = found;
+}
+
+/// The sole identifier a declaration is initialized to, or null when the
+/// initializer is anything else. `= double_value;` answers `double_value`;
+/// `= ->(n) { n * 2 }`, `= makeScaler(2)` and `= 3` answer nothing.
+fn aliasInitializerName(decl: []const u8) ?[]const u8 {
+    var eq: ?usize = null;
+    var i: usize = 0;
+    while (i < decl.len) : (i += 1) {
+        if (decl[i] != '=') continue;
+        // Skip a comparison/arrow operator: `==`, `!=`, `<=`, `>=`, `=>`.
+        if (i + 1 < decl.len and decl[i + 1] == '=') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < decl.len and decl[i + 1] == '>') continue;
+        if (i > 0 and (decl[i - 1] == '!' or decl[i - 1] == '<' or decl[i - 1] == '>' or decl[i - 1] == '=')) continue;
+        eq = i;
+    }
+    const start = (eq orelse return null) + 1;
+    var rhs = std.mem.trim(u8, decl[start..], " \t\r\n");
+    if (std.mem.endsWith(u8, rhs, ";")) rhs = std.mem.trim(u8, rhs[0 .. rhs.len - 1], " \t\r\n");
+    if (rhs.len == 0) return null;
+    for (rhs) |c| if (!isIdentByte(c)) return null;
+    if (std.ascii.isDigit(rhs[0])) return null;
+    return rhs;
 }
 
 /// Invariant: a call site never binds to a *type*, unless the language spells
@@ -1415,6 +1465,12 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         }
         if (idx.graph.files[from.file].language.isBuiltinContainer(type_name)) return;
     }
+
+    // A qualifier that names a standard-library type (`Vec::new`, `Array.from`,
+    // `std::vector<T>::size`) reaches that library's member, never a project
+    // one. Every same-file/imported/package branch above already declined, so
+    // no project type of that name is in scope here.
+    if (idx.graph.files[from.file].language.isBuiltinContainer(ref.qualifier)) return;
 
     // Heuristic fallback: a *call* whose receiver type we can't infer
     // (`svc.create_run()`, `self.planning_service.create_run()`, `Foo.bar()` on
@@ -2710,7 +2766,10 @@ test "a call through a function-valued const keeps its edge" {
     const use = idx.graph.symbols[qualifiedId(&idx, "Holder", "use").?];
     const ref = refByName(use, "alias").?;
     try testing.expectEqual(model.RefKind.call, ref.kind);
-    try testing.expectEqual(alias, ref.target);
+    // The edge survives, and now points past the alias at the function it
+    // holds: `alias` names no body of its own, so `exactOrGlob` is what the
+    // call reaches (see `followFunctionAlias`).
+    try testing.expectEqual(idx.lookup("exactOrGlob")[0], ref.target);
 }
 
 test "an express sub-router mount keeps its router handler" {
@@ -4479,6 +4538,56 @@ test "a field of the enclosing type gives a bare receiver its declared type (jav
     try testing.expect(ref.exact);
     try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
     try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+}
+
+test "cpp: a direct-initialized local types its receiver; an unnameable one abstains" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "w.hpp", .data =
+        \\class Weights {
+        \\public:
+        \\    explicit Weights(std::vector<double> w) : w_(w) {}
+        \\    std::size_t size() const { return w_.size(); }
+        \\private:
+        \\    std::vector<double> w_;
+        \\};
+        \\class Bag {
+        \\public:
+        \\    std::size_t size() const { return 0; }
+        \\};
+        \\template <typename Derived>
+        \\class Counter {
+        \\public:
+        \\    int bump() { return static_cast<Derived*>(this)->step(); }
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "w.cpp", .data =
+        \\#include "w.hpp"
+        \\int step() { return 1; }
+        \\double run() {
+        \\    Weights weights({1.0, 2.0});
+        \\    return weights.size();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `Weights weights({...})` is a definition, not the most vexing parse, so
+    // `weights.size()` reaches Weights and never the same-named Bag.size.
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    try testing.expectEqual(qualifiedId(&idx, "Weights", "size").?, refByQual(run, "weights", "size").?.target);
+
+    // The CRTP receiver `static_cast<Derived*>(this)` names no type, so the
+    // call abstains instead of landing on the free `step` by name alone.
+    const bump = idx.graph.symbols[qualifiedId(&idx, "Counter", "bump").?];
+    try testing.expect(refByName(bump, "step") == null);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(idx.lookup("step")[0]).len);
 }
 
 test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {
