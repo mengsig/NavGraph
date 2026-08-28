@@ -1166,7 +1166,10 @@ fn rpcWhereTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Valu
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var aw: std.Io.Writer.Allocating = .init(arena);
-    try lsp.mirrors.where(&aw.writer, arena, ctx, f, l);
+    lsp.mirrors.where(&aw.writer, arena, ctx, f, l) catch |err| {
+        try rpcError(out, id, lsp.mirrors.errorCode(err), lsp.mirrors.errorMessage(err));
+        return true;
+    };
     try writeMirrorResult(out, id, aw.written());
     return true;
 }
