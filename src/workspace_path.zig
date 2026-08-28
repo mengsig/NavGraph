@@ -101,10 +101,12 @@ pub fn openFileKnownRoot(
 ) !std.Io.File {
     try validateRelative(path);
 
-    var file = try root.openFile(io, path, .{
+    // The kernel's resolve-beneath refusal IS the escape signal, but macOS
+    // reports it as an errno std cannot classify -- score it, never leak it.
+    var file = root.openFile(io, path, .{
         .follow_symlinks = true,
         .resolve_beneath = true,
-    });
+    }) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     errdefer file.close(io);
 
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -127,10 +129,12 @@ pub fn openFileKnownTarget(
     try validateRelative(path);
     try validateRelative(expected_target);
 
-    var file = try root.openFile(io, path, .{
+    // The kernel's resolve-beneath refusal IS the escape signal, but macOS
+    // reports it as an errno std cannot classify -- score it, never leak it.
+    var file = root.openFile(io, path, .{
         .follow_symlinks = true,
         .resolve_beneath = true,
-    });
+    }) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     errdefer file.close(io);
 
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
