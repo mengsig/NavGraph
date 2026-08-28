@@ -135,7 +135,7 @@
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.[]", "exact": true, "lines": [196], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.created", "exact": true, "lines": [214], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.each_title", "exact": true, "lines": [199], "verified": "manual"},
-    {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.initialize", "exact": true, "lines": [189], "verified": "manual"},
+    {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.initialize", "exact": true, "lines": [189, 204], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.Ledger.post", "exact": true, "lines": [190, 193, 205], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.LoudLedger", "exact": true, "lines": [204], "verified": "manual"},
     {"from": "lib/tricky_ruby.rb:tricky_run", "to": "lib/tricky_ruby.rb:Tricky.LoudLedger.size", "exact": true, "lines": [206], "verified": "manual"},

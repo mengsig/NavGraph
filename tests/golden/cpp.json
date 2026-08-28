@@ -158,6 +158,8 @@
     {"file": "tricky_cpp.hpp", "name": "Car", "qualified": "Car.Car", "kind": "method", "line": 105, "parent": "Car"},
     {"file": "tricky_cpp.hpp", "name": "goUnique", "qualified": "Car.goUnique", "kind": "method", "line": 108, "parent": "Car"},
     {"file": "tricky_cpp.hpp", "name": "goShared", "qualified": "Car.goShared", "kind": "method", "line": 109, "parent": "Car"},
+    {"file": "tricky_cpp.hpp", "name": "engine_", "qualified": "Car.engine_", "kind": "field", "line": 112, "parent": "Car"},
+    {"file": "tricky_cpp.hpp", "name": "shared_", "qualified": "Car.shared_", "kind": "field", "line": 113, "parent": "Car"},
     {"file": "tricky_cpp.hpp", "name": "Describe", "qualified": "Describe", "kind": "struct", "line": 118, "parent": null},
     {"file": "tricky_cpp.hpp", "name": "text", "qualified": "Describe.text", "kind": "method", "line": 119, "parent": "Describe"},
     {"file": "tricky_cpp.hpp", "name": "Describe", "qualified": "Describe", "kind": "struct", "line": 123, "parent": null},
@@ -255,19 +257,19 @@
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Analyzer.Report.set_count", "exact": true, "lines": [96], "verified": "lsp"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Counter.bump", "exact": true, "lines": [104], "verified": "lsp"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Car", "exact": true, "lines": [110], "verified": "manual"},
-    {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Car.goShared", "exact": false, "lines": [111], "verified": "manual"},
-    {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Car.goUnique", "exact": false, "lines": [111], "verified": "manual"},
+    {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Car.goShared", "exact": true, "lines": [111], "verified": "manual"},
+    {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Car.goUnique", "exact": true, "lines": [111], "verified": "manual"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Describe", "exact": true, "lines": [122], "to_line": 123, "verified": "lsp"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Engine", "exact": true, "lines": [110], "verified": "manual"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Severity", "exact": true, "lines": [94, 122], "verified": "lsp"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:StepCounter", "exact": true, "lines": [103], "verified": "lsp"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Weights", "exact": true, "lines": [106], "verified": "lsp"},
     {"from": "tricky_cpp.cpp:tricky_run", "to": "tricky_cpp.hpp:Weights.size", "exact": true, "lines": [123], "verified": "lsp"},
+    {"from": "tricky_cpp.hpp:Car.goShared", "to": "tricky_cpp.hpp:Engine.start", "exact": true, "lines": [109], "verified": "manual"},
+    {"from": "tricky_cpp.hpp:Car.goUnique", "to": "tricky_cpp.hpp:Engine.start", "exact": true, "lines": [108], "verified": "manual"},
     {"from": "vec2.hpp:Vec2.magnitude", "to": "vec2.hpp:dot", "exact": true, "lines": [53], "from_line": 52, "verified": "lsp"},
     {"from": "vec2.hpp:Vec2.operator*", "to": "vec2.hpp:Vec2", "exact": true, "lines": [33], "verified": "lsp"},
     {"from": "vec2.hpp:Vec2.operator+", "to": "vec2.hpp:Vec2", "exact": true, "lines": [25], "verified": "lsp"},
-    {"from": "vec2.hpp:Vec2.operator-", "to": "vec2.hpp:Vec2", "exact": true, "lines": [29], "verified": "lsp"},
-    {"from": "tricky_cpp.hpp:Car.goShared", "to": "tricky_cpp.hpp:Engine.start", "exact": false, "lines": [109], "verified": "manual"},
-    {"from": "tricky_cpp.hpp:Car.goUnique", "to": "tricky_cpp.hpp:Engine.start", "exact": false, "lines": [108], "verified": "manual"}
+    {"from": "vec2.hpp:Vec2.operator-", "to": "vec2.hpp:Vec2", "exact": true, "lines": [29], "verified": "lsp"}
   ]
 }
