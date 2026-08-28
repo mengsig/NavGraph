@@ -565,15 +565,20 @@ navgraph lsp [-C|--root <dir>] [--log <file>] [--log-level error|info|debug]
 ```
 
 - **Standard LSP** — `definition`, `references`, `hover`, `documentSymbol`,
-  `workspace/symbol`, full document sync. An open buffer's unsaved text drives
-  the graph, so answers reflect what you are typing, not what is on disk.
+  `workspace/symbol`, call/type hierarchy, `implementation`, `typeDefinition`,
+  `documentHighlight`, `codeLens`, full document sync. An open buffer's unsaved
+  text drives the graph, so answers reflect what you are typing, not what is
+  on disk.
 - **`navgraph/*`** — the full CLI verb set over the resident graph: `status`,
-  `symbolAt`, `blast`, `search`, `grep`, `callers`, `calls`, `rescan`,
-  `neighbors`, `path`, `outline`, `hot`, `unused`, `diff`, `routes`, `events`,
-  `imports`, `importers`, `graph`, plus a `navgraph/indexed` notification after
-  every re-index. `blast` is the one to reach for: the transitive callers (or
+  `symbolAt`, `blast`, `impact`, `tests`, `types`, `context`, `where`,
+  `search`, `grep`, `callers`, `calls`, `rescan`, `neighbors`, `path`,
+  `outline`, `hot`, `unused`, `diff`, `routes`, `events`, `imports`,
+  `importers`, `graph`, plus a `navgraph/indexed` notification after every
+  re-index. `blast` is the one to reach for: the transitive callers (or
   callees) of a symbol, a file, or everything changed since a git ref — with a
-  per-depth and per-file summary.
+  per-depth and per-file summary. `context` is the one to reach for from an
+  editing agent: everything about one symbol in a single call, trimmed to a
+  token budget.
 - A background mtime poll picks up changes made outside the editor (a git
   checkout, a formatter) and re-indexes them.
 
