@@ -3763,4 +3763,3 @@ test "golden parity: routes/events/imports/importers agree with the CLI's -j out
         try expectSameOrder(cli_flat.items, lsp_flat.items);
     }
 }
-
