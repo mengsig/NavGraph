@@ -4868,6 +4868,49 @@ test "rust: a smart-pointer receiver derefs to its inner type, but not as a qual
     try testing.expectEqual(invalid, refByQual(store_new, "Vec", "new").?.target);
 }
 
+test "cpp: unique_ptr/shared_ptr receivers deref to their inner type, but a raw container still abstains" {
+    // Regression (F2): derefsToInner was scoped to Rust only, so a C++
+    // unique_ptr/shared_ptr field's own isBuiltinContainer entry made the
+    // resolver abstain instead of falling through to the correct target —
+    // silently dropping edges the base commit produced.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.hpp", .data =
+        \\class Engine {
+        \\public:
+        \\    int start() { return 1; }
+        \\};
+        \\class Car {
+        \\    std::unique_ptr<Engine> engine_;
+        \\    std::shared_ptr<Engine> shared_;
+        \\    std::vector<Engine> pool_;
+        \\public:
+        \\    int goUnique() { return engine_->start(); }
+        \\    int goShared() { return shared_->start(); }
+        \\    int goPool() { return pool_.start(); }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const engine_start = qualifiedId(&idx, "Engine", "start").?;
+    const go_unique = idx.graph.symbols[qualifiedId(&idx, "Car", "goUnique").?];
+    const go_shared = idx.graph.symbols[qualifiedId(&idx, "Car", "goShared").?];
+    try testing.expectEqual(engine_start, refByQual(go_unique, "engine_", "start").?.target);
+    try testing.expectEqual(engine_start, refByQual(go_shared, "shared_", "start").?.target);
+
+    // `std::vector<Engine>` is not a smart pointer: still abstains rather than
+    // guessing a same-named project method.
+    const go_pool = idx.graph.symbols[qualifiedId(&idx, "Car", "goPool").?];
+    try testing.expectEqual(invalid, refByQual(go_pool, "pool_", "start").?.target);
+}
+
 test "one-letter names resolve as call sites in every language family" {
     const testing = std.testing;
     const io = testing.io;

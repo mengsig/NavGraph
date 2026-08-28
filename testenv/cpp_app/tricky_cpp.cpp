@@ -107,6 +107,9 @@ double tricky_run() {
     weights[0] = 0.5;
     double picked = weights(2);
 
+    Car car(std::make_unique<Engine>(), std::make_shared<Engine>());
+    int engineSteps = car.goUnique() + car.goShared();
+
     // Structured binding over a pair.
     std::pair<double, double> pair{picked, scaled};
     auto [lo, hi] = pair;
@@ -117,7 +120,7 @@ double tricky_run() {
 
     return moved + rim + std::strlen(kBanner) +
            std::strlen(label(Severity::Low)) + Describe<double>::text().size() +
-           weights.size() + static_cast<double>(Analyzer::instances);
+           weights.size() + static_cast<double>(Analyzer::instances) + engineSteps;
 }
 
 }  // namespace geo::tricky

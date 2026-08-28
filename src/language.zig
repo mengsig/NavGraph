@@ -81,7 +81,7 @@ pub const Language = enum {
                 "vector",   "map",    "unordered_map", "set",    "unordered_set",
                 "string",   "array",  "list",          "deque",  "pair",
                 "optional", "queue",  "stack",         "span",   "string_view",
-                "shared_ptr", "unique_ptr", "ostream",  "istream", "ostringstream",
+                "shared_ptr", "unique_ptr", "weak_ptr", "ostream",  "istream", "ostringstream",
                 "size_t",   "int",    "char",          "double", "float",
                 "bool",     "FILE",
             },
@@ -127,12 +127,18 @@ pub const Language = enum {
     /// Whether `name` is a smart pointer whose members are reached through the
     /// type it wraps. A call on a value declared `Box<Expr>` dispatches to
     /// `Expr`'s method, so a *receiver* of this type must not abstain the way an
-    /// opaque container does — but `Box::new` is still the wrapper's own.
+    /// opaque container does — but `Box::new` is still the wrapper's own. C++
+    /// `unique_ptr`/`shared_ptr`/`weak_ptr` dispatch through their pointee the
+    /// same way; both stay in `isBuiltinContainer` too, so the wrapper's own
+    /// members (`reset`, `get`, `lock`, ...) still never bind to a same-named
+    /// project method unless a project method of that exact name exists.
     pub fn derefsToInner(self: Language, name: []const u8) bool {
-        if (self.family() != .rust) return false;
-        for ([_][]const u8{ "Box", "Rc", "Arc", "RefCell", "Cell", "Cow", "Mutex", "RwLock" }) |t| {
-            if (std.mem.eql(u8, t, name)) return true;
-        }
+        const table: []const []const u8 = switch (self.family()) {
+            .rust => &.{ "Box", "Rc", "Arc", "RefCell", "Cell", "Cow", "Mutex", "RwLock" },
+            .c => &.{ "unique_ptr", "shared_ptr", "weak_ptr" },
+            else => return false,
+        };
+        for (table) |t| if (std.mem.eql(u8, t, name)) return true;
         return false;
     }
 

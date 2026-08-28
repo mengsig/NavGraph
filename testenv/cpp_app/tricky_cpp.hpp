@@ -2,6 +2,7 @@
 #define GEO_TRICKY_CPP_HPP
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,6 +90,27 @@ public:
 
 private:
     std::vector<double> w_;
+};
+
+/// Regression: a unique_ptr/shared_ptr field dispatches through its pointee,
+/// exactly like Rust's Box/Rc — the wrapper itself must not shadow that
+/// dispatch the way an opaque container (std::vector, ...) does.
+class Engine {
+public:
+    int start() const { return 1; }
+};
+
+class Car {
+public:
+    Car(std::unique_ptr<Engine> engine, std::shared_ptr<Engine> shared)
+        : engine_(std::move(engine)), shared_(std::move(shared)) {}
+
+    int goUnique() const { return engine_->start(); }
+    int goShared() const { return shared_->start(); }
+
+private:
+    std::unique_ptr<Engine> engine_;
+    std::shared_ptr<Engine> shared_;
 };
 
 /// Primary template plus an explicit specialization.
