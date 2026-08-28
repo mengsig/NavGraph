@@ -1069,9 +1069,31 @@ pub const TestServer = struct {
         return build(gpa, io, tmp, root);
     }
 
-    /// Serve an existing directory in the repository (the `testenv/` fixtures).
+    /// Serve a private temp copy of an existing repository directory (the
+    /// `testenv/` fixtures). A resident session's first walk always writes a
+    /// parse cache back (`Session.init`, no open document yet), so serving
+    /// `testenv/` in place would leave a `.navgraph/` cache dir in the
+    /// checked-in fixture tree on every test run (merge-gate review F4).
     pub fn initAt(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8) !*TestServer {
-        return build(gpa, io, null, try gpa.dupe(u8, root_path));
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        var src = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+        defer src.close(io);
+        try copyTree(gpa, io, src, tmp.dir);
+        const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        errdefer gpa.free(root);
+        return build(gpa, io, tmp, root);
+    }
+
+    /// Copy every regular file from `src` into `dest`, preserving relative
+    /// paths; directories are created as needed.
+    fn copyTree(gpa: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dest: std.Io.Dir) !void {
+        var walker = try src.walk(gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            try src.copyFile(entry.path, dest, entry.path, io, .{ .make_path = true });
+        }
     }
 
     fn build(gpa: std.mem.Allocator, io: std.Io, tmp: ?std.testing.TmpDir, root: []u8) !*TestServer {
