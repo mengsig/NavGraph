@@ -29,16 +29,16 @@ pub const Store = struct {
     pub fn put(self: *Store, path: []const u8, text: []const u8) !void {
         const copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(copy);
-        const gop = try self.docs.getOrPut(self.gpa, path);
-        if (gop.found_existing) {
-            self.gpa.free(gop.value_ptr.*);
-        } else {
-            gop.key_ptr.* = self.gpa.dupe(u8, path) catch |err| {
-                self.docs.swapRemoveAt(gop.index);
-                return err;
-            };
+        if (self.docs.getPtr(path)) |held| {
+            self.gpa.free(held.*);
+            held.* = copy;
+            return;
         }
-        gop.value_ptr.* = copy;
+        // A new entry is inserted whole: nothing may fail between reserving the
+        // slot and writing its key, or removal would read an unwritten key.
+        const key = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(key);
+        try self.docs.put(self.gpa, key, copy);
     }
 
     /// Drop the overlay for `path`. Returns whether one was held.
@@ -163,6 +163,20 @@ test "Store copies its arguments so callers may reuse their buffers" {
     @memset(&path_buf, 'x');
     @memset(&text_buf, 'y');
     try testing.expectEqualStrings("hello", s.get("a.zig").?);
+}
+
+fn putSequence(gpa: std.mem.Allocator) !void {
+    var s = Store.init(gpa);
+    defer s.deinit();
+    try s.put("a.zig", "one");
+    try s.put("a.zig", "two");
+    try s.put("b.zig", "three");
+}
+
+test "Store put leaves no half-written entry when an allocation fails" {
+    // The old insert wrote the key after reserving the slot, so an OOM there
+    // removed an entry whose key had never been written.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, putSequence, .{});
 }
 
 test "Store remove drops the overlay and reports whether one was held" {
