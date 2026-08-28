@@ -926,6 +926,7 @@ fn blast(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *W
         .depth = @min(try p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
         .limit = try p.positive("limit", 500),
+        .offset = try p.positive("offset", 0),
         .scope = try scopeOf(self, p),
     });
 }
@@ -979,6 +980,7 @@ fn impactMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
         .depth = @min(try p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
         .limit = try p.positive("limit", 500),
+        .offset = try p.positive("offset", 0),
         .scope = scope,
     };
     const ref = p.str("ref");
@@ -1216,6 +1218,7 @@ fn diffMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, 
         .depth = @min(try p.positive("depth", 1), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
         .limit = try p.positive("limit", 500),
+        .offset = try p.positive("offset", 0),
         .scope = try scopeOf(self, p),
     }, &detail) catch |err| {
         self.err_detail = detail;

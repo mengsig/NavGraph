@@ -374,7 +374,24 @@ pub const Direction = enum { callers, callees };
 pub const BlastOptions = struct {
     depth: u32,
     direction: Direction,
+    /// How many `nodes`/matching `edges` the response materializes, starting
+    /// at `offset` — an output-page size, not a walk cutoff (the walk always
+    /// covers the full `depth`-bounded reachable set; see `computeBlast`).
     limit: u32,
+    /// Page start within the full, depth-bounded reachable set (BFS order,
+    /// stable across calls). Pairs with the response's `next` for
+    /// continuation — B1: a truncated response must offer a way to fetch the
+    /// rest, not just say more exists.
+    offset: u32 = 0,
+    scope: Scope,
+};
+
+/// What `computeBlast` needs to walk the graph — deliberately narrower than
+/// `BlastOptions`: the walk has no notion of an output page, only depth,
+/// direction and scope.
+const WalkOptions = struct {
+    depth: u32,
+    direction: Direction,
     scope: Scope,
 };
 
@@ -395,7 +412,6 @@ const BlastEdge = struct {
 const BlastResult = struct {
     nodes: std.ArrayList(BlastNode),
     edges: std.ArrayList(BlastEdge),
-    truncated: bool,
 
     fn deinit(self: *BlastResult, gpa: std.mem.Allocator) void {
         for (self.nodes.items) |*n| n.via.deinit(gpa);
@@ -410,11 +426,18 @@ const BlastResult = struct {
 /// Each symbol appears once, at the shallowest depth it was reached; `via`
 /// records the depth-1 neighbours it was reached through. Edges are always
 /// caller→callee whichever direction the walk ran.
+///
+/// Always walks the *entire* `depth`-bounded reachable set — no output cap
+/// here (B1: a response that stops the walk early can never report an honest
+/// total). This is safe: `seen` dedupes, so the walk is bounded by the graph's
+/// own size (every symbol expands at most once), the same cost a `limit` big
+/// enough to cover the true blast radius already paid. `writeBlast`/
+/// `writeImpact` apply the output page (`opts.limit`/`opts.offset`) afterward.
 fn computeBlast(
     gpa: std.mem.Allocator,
     ctx: Ctx,
     roots: []const SymbolId,
-    opts: BlastOptions,
+    opts: WalkOptions,
 ) !BlastResult {
     const idx = ctx.index();
     var nodes: std.ArrayList(BlastNode) = .empty;
@@ -436,13 +459,8 @@ fn computeBlast(
     var lines: std.ArrayList(u32) = .empty;
     defer lines.deinit(idx.gpa);
 
-    var truncated = false;
     for (roots) |id| {
         if (seen.contains(id)) continue;
-        if (nodes.items.len >= opts.limit) {
-            truncated = true;
-            break;
-        }
         try seen.put(gpa, id, nodes.items.len);
         try nodes.append(gpa, .{ .id = id, .depth = 0, .exact = true, .via = .empty });
     }
@@ -461,11 +479,6 @@ fn computeBlast(
 
             const gop = try seen.getOrPut(gpa, n.id);
             if (!gop.found_existing) {
-                if (nodes.items.len >= opts.limit) {
-                    truncated = true;
-                    _ = seen.remove(n.id);
-                    continue;
-                }
                 gop.value_ptr.* = nodes.items.len;
                 try nodes.append(gpa, .{ .id = n.id, .depth = depth + 1, .exact = n.exact, .via = .empty });
             }
@@ -490,12 +503,12 @@ fn computeBlast(
         }
     }
 
-    return .{ .nodes = nodes, .edges = edges, .truncated = truncated };
+    return .{ .nodes = nodes, .edges = edges };
 }
 
-fn writeBlastNodesAndEdges(w: *Writer, ctx: Ctx, result: BlastResult) !void {
+fn writeBlastNodesAndEdges(w: *Writer, ctx: Ctx, nodes: []const BlastNode, edges: []const BlastEdge) !void {
     try w.writeAll("\"nodes\":[");
-    for (result.nodes.items, 0..) |n, i| {
+    for (nodes, 0..) |n, i| {
         if (i != 0) try w.writeByte(',');
         try w.writeAll("{\"symbol\":");
         try payload.writeSymbolId(w, ctx, n.id);
@@ -504,14 +517,43 @@ fn writeBlastNodesAndEdges(w: *Writer, ctx: Ctx, result: BlastResult) !void {
         try w.print(",\"exact\":{}}}", .{n.exact});
     }
     try w.writeAll("],\"edges\":[");
-    for (result.edges.items, 0..) |e, i| {
+    for (edges, 0..) |e, i| {
         if (i != 0) try w.writeByte(',');
         try payload.writeEdge(w, e.from, e.to, e.exact, e.lines);
     }
     try w.writeByte(']');
 }
 
-/// Write the contract's blast result: `computeBlast`'s walk from `roots`.
+/// The `[offset, offset+limit)` slice of `nodes` (clamped to length) — the
+/// output page `writeBlast`/`writeImpact` actually materialize.
+fn blastPage(nodes: []const BlastNode, offset: u32, limit: u32) []const BlastNode {
+    const total = nodes.len;
+    const start = @min(@as(usize, offset), total);
+    const end = @min(start + @as(usize, limit), total);
+    return nodes[start..end];
+}
+
+/// `edges` restricted to those whose `from` node is in `page` — keeps the
+/// response self-contained (an edge never points from a node the client
+/// cannot see in this page) and bounds `edges`' own size by the same page
+/// `nodes` is bounded by. Caller frees the returned slice.
+fn edgesForPage(gpa: std.mem.Allocator, page: []const BlastNode, edges: []const BlastEdge) ![]const BlastEdge {
+    var in_page: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+    defer in_page.deinit(gpa);
+    for (page) |n| try in_page.put(gpa, n.id, {});
+    var out: std.ArrayList(BlastEdge) = .empty;
+    errdefer out.deinit(gpa);
+    for (edges) |e| if (in_page.contains(e.from)) try out.append(gpa, e);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Write the contract's blast result: `computeBlast`'s full walk from `roots`,
+/// windowed to `opts.offset`/`opts.limit` for `nodes`/`edges`. `summary`
+/// covers the same page (`symbols` keeps its established "shown" meaning,
+/// unchanged for the 1.0 `navgraph/blast`/`navgraph/diff` callers), plus a new
+/// `total` — the true depth-bounded reachable count, independent of paging
+/// (B1). `next` is the offset for the following page, or `null` once nothing
+/// remains.
 pub fn writeBlast(
     w: *Writer,
     gpa: std.mem.Allocator,
@@ -519,15 +561,24 @@ pub fn writeBlast(
     roots: []const SymbolId,
     opts: BlastOptions,
 ) !void {
-    var result = try computeBlast(gpa, ctx, roots, opts);
+    var result = try computeBlast(gpa, ctx, roots, .{ .depth = opts.depth, .direction = opts.direction, .scope = opts.scope });
     defer result.deinit(gpa);
+
+    const total = result.nodes.items.len;
+    const page = blastPage(result.nodes.items, opts.offset, opts.limit);
+    const page_edges = try edgesForPage(gpa, page, result.edges.items);
+    defer gpa.free(page_edges);
+    const shown_end = @as(usize, opts.offset) + page.len;
+    const truncated = shown_end < total;
 
     try w.writeAll("{\"roots\":");
     try payload.writeSymbolArray(w, ctx, roots);
     try w.writeByte(',');
-    try writeBlastNodesAndEdges(w, ctx, result);
+    try writeBlastNodesAndEdges(w, ctx, page, page_edges);
     try w.writeAll(",\"summary\":");
-    try writeBlastSummary(w, gpa, ctx, result.nodes.items, result.truncated);
+    try writeBlastSummary(w, gpa, ctx, page, total, truncated);
+    try w.writeAll(",\"next\":");
+    if (truncated) try w.print("{d}", .{shown_end}) else try w.writeAll("null");
     try w.writeByte('}');
 }
 
@@ -536,6 +587,7 @@ fn writeBlastSummary(
     gpa: std.mem.Allocator,
     ctx: Ctx,
     nodes: []const BlastNode,
+    total: usize,
     truncated: bool,
 ) !void {
     const idx = ctx.index();
@@ -571,8 +623,8 @@ fn writeBlastSummary(
         }
     }.lt);
 
-    try w.print("{{\"symbols\":{d},\"files\":{d},\"tests\":{d},\"maxDepth\":{d},\"truncated\":{},\"byDepth\":[", .{
-        nodes.len, ranked.len, tests, max_depth, truncated,
+    try w.print("{{\"symbols\":{d},\"total\":{d},\"files\":{d},\"tests\":{d},\"maxDepth\":{d},\"truncated\":{},\"byDepth\":[", .{
+        nodes.len, total, ranked.len, tests, max_depth, truncated,
     });
     for (by_depth, 0..) |c, i| {
         if (i != 0) try w.writeByte(',');
@@ -1806,6 +1858,7 @@ pub const DiffOptions = struct {
     depth: u32 = 1,
     direction: Direction = .callers,
     limit: u32 = 500,
+    offset: u32 = 0,
     scope: Scope,
 };
 
@@ -1834,6 +1887,7 @@ pub fn writeDiff(
         .depth = opts.depth,
         .direction = opts.direction,
         .limit = opts.limit,
+        .offset = opts.offset,
         .scope = opts.scope,
     });
     try w.writeByte('}');
@@ -1847,6 +1901,9 @@ pub const ImpactOptions = struct {
     depth: u32,
     direction: Direction,
     limit: u32,
+    /// Page start within the blast radius's full reachable set — see
+    /// `BlastOptions.offset`.
+    offset: u32 = 0,
     scope: Scope,
 };
 
@@ -1912,6 +1969,9 @@ fn changeId(idx: *const Index, hunks: []const ImpactHunk) u64 {
 /// client hand navgraph a hunk it already knows about instead of requiring an
 /// overlay to already differ from disk. No hunks -> the documented zero
 /// result (`roots`/`nodes`/`edges` empty, a zeroed `summary`), not an error.
+/// `nodes`/`edges` are the `opts.offset`/`opts.limit` page of the full,
+/// depth-bounded blast radius; `summary.total` and `next` (B1) let a client
+/// learn the true size and fetch the rest.
 pub fn writeImpact(
     w: *Writer,
     gpa: std.mem.Allocator,
@@ -1995,17 +2055,25 @@ pub fn writeImpact(
     var result = try computeBlast(gpa, ctx, roots.items, .{
         .depth = opts.depth,
         .direction = opts.direction,
-        .limit = opts.limit,
         .scope = opts.scope,
     });
     defer result.deinit(gpa);
 
+    const total = result.nodes.items.len;
+    const page = blastPage(result.nodes.items, opts.offset, opts.limit);
+    const page_edges = try edgesForPage(gpa, page, result.edges.items);
+    defer gpa.free(page_edges);
+    const shown_end = @as(usize, opts.offset) + page.len;
+    const truncated = shown_end < total;
+
     try w.writeAll("{\"roots\":");
     try payload.writeSymbolArray(w, ctx, roots.items);
     try w.writeByte(',');
-    try writeBlastNodesAndEdges(w, ctx, result);
+    try writeBlastNodesAndEdges(w, ctx, page, page_edges);
     try w.writeAll(",\"summary\":");
-    try writeBlastSummary(w, gpa, ctx, result.nodes.items, result.truncated);
+    try writeBlastSummary(w, gpa, ctx, page, total, truncated);
+    try w.writeAll(",\"next\":");
+    if (truncated) try w.print("{d}", .{shown_end}) else try w.writeAll("null");
     try w.writeAll(",\"hunks\":[");
     for (hunks.items, hunk_roots.items, 0..) |h, hr, i| {
         if (i != 0) try w.writeByte(',');
