@@ -219,6 +219,12 @@ pub fn build(b: *std.Build) void {
     const accuracy_step = b.step("bench", "Score the indexer against the golden accuracy corpora");
     accuracy_step.dependOn(&accuracy_cmd.step);
 
+    // Formatting is a gate, not a habit: nothing else in CI runs `zig fmt`, so
+    // unformatted files accumulated silently until a rename collided with an
+    // unrelated branch's realignment of the same table.
+    const fmt_check = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--check", "src", "tests", "build.zig" });
+    fmt_check.setCwd(b.path("."));
+
     // docs/accuracy.md's "After the wave" table is generated from a bench run.
     // It was retyped by hand once and went stale by two commits, so the suite
     // now fails while the document disagrees with the measurement.
@@ -242,6 +248,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&accuracy_cmd.step);
     test_step.dependOn(&run_accuracy_bench_tests.step);
     test_step.dependOn(&doc_table_cmd.step);
+    test_step.dependOn(&fmt_check.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

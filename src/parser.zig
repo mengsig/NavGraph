@@ -1203,27 +1203,28 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
 
 /// Leading words a C/C++ declarator may carry before its type.
 const c_decl_modifiers = KeywordSet.initComptime(.{
-    .{"const"},  .{"static"},   .{"volatile"}, .{"mutable"}, .{"register"},
-    .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
-    .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
-    .{"class"},  .{"auto"},     .{"typename"},
+    .{"const"},     .{"static"},    .{"volatile"}, .{"mutable"},  .{"register"},
+    .{"extern"},    .{"constexpr"}, .{"inline"},   .{"unsigned"}, .{"signed"},
+    .{"long"},      .{"short"},     .{"struct"},   .{"enum"},     .{"union"},
+    .{"class"},     .{"auto"},      .{"typename"},
     // Java/C# field and parameter modifiers. `public`/`private`/`protected`
     // are also C++ access labels; a trailing `:` leaves the declarator nameless,
     // so the label still yields no binding.
-    .{"public"}, .{"private"},  .{"protected"}, .{"final"},   .{"readonly"},
-    .{"internal"}, .{"abstract"}, .{"sealed"},  .{"override"}, .{"virtual"},
-    .{"partial"}, .{"synchronized"}, .{"transient"},
+    .{"public"},   .{"private"},
+    .{"protected"}, .{"final"},     .{"readonly"}, .{"internal"}, .{"abstract"},
+    .{"sealed"},    .{"override"},  .{"virtual"},  .{"partial"},  .{"synchronized"},
+    .{"transient"},
 });
 
 /// Words that open a statement rather than a declaration, so a run starting
 /// with one is never `Type name`.
 const c_statement_keywords = KeywordSet.initComptime(.{
-    .{"if"},     .{"for"},       .{"while"},     .{"switch"}, .{"return"},
-    .{"else"},   .{"do"},        .{"case"},      .{"goto"},   .{"break"},
-    .{"continue"}, .{"sizeof"},  .{"new"},       .{"delete"}, .{"throw"},
-    .{"try"},    .{"catch"},     .{"using"},     .{"namespace"}, .{"typedef"},
-    .{"template"}, .{"public"},  .{"private"},   .{"protected"}, .{"friend"},
-    .{"virtual"}, .{"operator"}, .{"default"},
+    .{"if"},       .{"for"},      .{"while"},   .{"switch"},    .{"return"},
+    .{"else"},     .{"do"},       .{"case"},    .{"goto"},      .{"break"},
+    .{"continue"}, .{"sizeof"},   .{"new"},     .{"delete"},    .{"throw"},
+    .{"try"},      .{"catch"},    .{"using"},   .{"namespace"}, .{"typedef"},
+    .{"template"}, .{"public"},   .{"private"}, .{"protected"}, .{"friend"},
+    .{"virtual"},  .{"operator"}, .{"default"},
 });
 
 /// Modifiers that are a complete type on their own, so the declarator may carry
@@ -4584,12 +4585,12 @@ fn parseRustMacro(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) 
 // ---------------------------------------------------------------------------
 
 const ruby_keywords = KeywordSet.initComptime(.{
-    .{"def"},    .{"end"},    .{"if"},    .{"elsif"},   .{"else"},             .{"unless"},
-    .{"while"},  .{"until"},  .{"for"},   .{"in"},      .{"do"},               .{"begin"},
-    .{"rescue"}, .{"ensure"}, .{"retry"}, .{"return"},  .{"yield"},            .{"then"},
-    .{"case"},   .{"when"},   .{"class"}, .{"module"},  .{"self"},             .{"nil"},
-    .{"true"},   .{"false"},  .{"and"},   .{"or"},      .{"not"},
-    .{"break"},  .{"next"},   .{"redo"},  .{"require"}, .{"require_relative"},
+    .{"def"},    .{"end"},    .{"if"},      .{"elsif"},            .{"else"},  .{"unless"},
+    .{"while"},  .{"until"},  .{"for"},     .{"in"},               .{"do"},    .{"begin"},
+    .{"rescue"}, .{"ensure"}, .{"retry"},   .{"return"},           .{"yield"}, .{"then"},
+    .{"case"},   .{"when"},   .{"class"},   .{"module"},           .{"self"},  .{"nil"},
+    .{"true"},   .{"false"},  .{"and"},     .{"or"},               .{"not"},   .{"break"},
+    .{"next"},   .{"redo"},   .{"require"}, .{"require_relative"},
 });
 
 /// Whether the `do` at `i` merely re-marks a block already opened by a
