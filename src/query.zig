@@ -196,6 +196,10 @@ pub const Options = struct {
     /// `outline`/`files --no-recurse`: only files directly in the given
     /// directory, not its subtrees (Go "outline this package", not the world).
     no_recurse: bool = false,
+    /// `status --full`: include the item-level freshness/parse/resolution
+    /// dump. Default is a bounded summary — the dump scales with project size
+    /// and made `status` the most expensive first command an agent ran.
+    status_full: bool = false,
     /// Add inferred protocol/interface implementation edges to graph walks.
     impls: bool = false,
     /// Include per-method override relationships in `hierarchy`.
@@ -580,9 +584,13 @@ fn statusWithRoot(w: *Writer, io: std.Io, idx: *const Index, filter: []const u8,
     defer report.deinit(idx.gpa);
     if (opts.format == .json) return json_out.status(w, idx, filter, report, opts);
     if (opts.format == .jsonl) return json_out.statusJsonl(w, idx, filter, report, opts);
-    try renderStatusSummary(w, idx, filter, report);
-    try renderStatusFreshness(w, idx, report);
-    try renderStatusDiagnostics(w, idx, filter, report, opts);
+    try renderStatusSummary(w, idx, filter, opts, report);
+    if (opts.status_full) {
+        try renderStatusFreshness(w, idx, report);
+        try renderStatusDiagnostics(w, idx, filter, report, opts);
+    } else {
+        try renderStatusCompactDiagnostics(w, report);
+    }
     return true;
 }
 
@@ -768,10 +776,47 @@ fn statChanged(snapshot: cache.FileStat, current: std.Io.File.Stat) bool {
         snapshot.ctime_ns != current.ctime.nanoseconds or snapshot.size != current.size;
 }
 
-fn renderStatusSummary(w: *Writer, idx: *const Index, filter: []const u8, report: StatusReport) !void {
+pub const language_field_count = @typeInfo(language.Language).@"enum".fields.len;
+pub const backend_field_count = @typeInfo(model.Backend).@"enum".fields.len;
+
+/// Per-language file counts within `filter`'s scope, indexed by `@intFromEnum`.
+pub fn statusLanguageCounts(idx: *const Index, filter: []const u8, opts: Options) [language_field_count]u32 {
+    var counts = [_]u32{0} ** language_field_count;
+    for (idx.graph.files) |file| {
+        if (!statusFileSelected(file, filter, opts)) continue;
+        counts[@intFromEnum(file.language)] += 1;
+    }
+    return counts;
+}
+
+/// Per-backend file counts (which extractor actually produced each file's
+/// symbols — may differ from the requested `--backend` on a tree-sitter
+/// parse-error fallback).
+pub fn statusBackendCounts(idx: *const Index, filter: []const u8, opts: Options) [backend_field_count]u32 {
+    var counts = [_]u32{0} ** backend_field_count;
+    for (idx.graph.files) |file| {
+        if (!statusFileSelected(file, filter, opts)) continue;
+        counts[@intFromEnum(file.parse_health.backend)] += 1;
+    }
+    return counts;
+}
+
+fn renderStatusSummary(w: *Writer, idx: *const Index, filter: []const u8, opts: Options, report: StatusReport) !void {
     try w.print("index root: {s}\n", .{idx.root});
     try w.print("snapshot: {d} files, {d} symbols", .{ idx.graph.files.len, idx.graph.symbols.len });
     if (filter.len != 0) try w.print("; scope '{s}': {d} files, {d} symbols", .{ filter, report.scope_files, report.scope_symbols });
+    try w.writeByte('\n');
+    try w.writeAll("languages:");
+    const lang_counts = statusLanguageCounts(idx, filter, opts);
+    inline for (@typeInfo(language.Language).@"enum".fields, 0..) |f, i| {
+        if (lang_counts[i] != 0) try w.print(" {s} {d}", .{ (@as(language.Language, @enumFromInt(f.value))).tag(), lang_counts[i] });
+    }
+    try w.writeByte('\n');
+    try w.writeAll("backend:");
+    const backend_counts = statusBackendCounts(idx, filter, opts);
+    inline for (@typeInfo(model.Backend).@"enum".fields, 0..) |f, i| {
+        if (backend_counts[i] != 0) try w.print(" {s} {d}", .{ f.name, backend_counts[i] });
+    }
     try w.writeByte('\n');
     const state = idx.cache_snapshot;
     if (!state.enabled) {
@@ -780,6 +825,31 @@ fn renderStatusSummary(w: *Writer, idx: *const Index, filter: []const u8, report
         try w.print("cache: loaded={}, entries={d}, hits={d}/{d}, rewrite={s}\n", .{
             state.loaded, state.loaded_entries, state.hits, idx.graph.files.len, @tagName(state.rewrite),
         });
+    }
+}
+
+/// Bounded default tail: counts only, no per-item listing. `--full` gets the
+/// item-level freshness/parse/resolution dump via `renderStatusFreshness` +
+/// `renderStatusDiagnostics` instead (eval finding 3: status cost 5.5k-16k
+/// tokens and was the first command an agent ran).
+fn renderStatusCompactDiagnostics(w: *Writer, report: StatusReport) !void {
+    if (report.root_error.len != 0) {
+        try w.print("freshness: unavailable ({s})\n", .{report.root_error});
+    } else if (report.changes.len == 0) {
+        try w.writeAll("freshness: current\n");
+    } else {
+        try w.print("freshness: {d} indexed file{s} changed since build\n", .{ report.changes.len, if (report.changes.len == 1) "" else "s" });
+    }
+    try w.print("parse health: {d} warning{s}\n", .{ report.parse_warnings, if (report.parse_warnings == 1) "" else "s" });
+    try w.print("resolution health: {d} likely-local miss{s}; {d} external/unmodeled edge{s}\n", .{
+        report.likely_local_refs,
+        if (report.likely_local_refs == 1) "" else "es",
+        report.external_or_unmodeled_refs,
+        if (report.external_or_unmodeled_refs == 1) "" else "s",
+    });
+    try w.print("skipped: {d}\n", .{report.skipped});
+    if (report.changes.len != 0 or report.parse_warnings != 0 or report.unresolved_refs != 0 or report.skipped != 0) {
+        try w.writeAll("(--full for file-level detail)\n");
     }
 }
 
@@ -7980,7 +8050,7 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     defer json_buf.deinit(testing.allocator);
     var json_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &json_buf);
     defer json_writer.deinit();
-    try testing.expect(try status(&json_writer.writer, io, &idx, "", .{ .format = .json, .limit = 4 }));
+    try testing.expect(try status(&json_writer.writer, io, &idx, "", .{ .format = .json, .limit = 4, .status_full = true }));
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_writer.written(), .{});
     defer parsed.deinit();
     const root_obj = parsed.value.object;
@@ -8022,7 +8092,7 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     defer jsonl_buf.deinit(testing.allocator);
     var jsonl_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &jsonl_buf);
     defer jsonl_writer.deinit();
-    _ = try status(&jsonl_writer.writer, io, &idx, "", .{ .format = .jsonl, .limit = 2 });
+    _ = try status(&jsonl_writer.writer, io, &idx, "", .{ .format = .jsonl, .limit = 2, .status_full = true });
     var lines = std.mem.tokenizeScalar(u8, jsonl_writer.written(), '\n');
     var line_count: u32 = 0;
     while (lines.next()) |line| {
@@ -8034,6 +8104,69 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     try testing.expectEqual(@as(u32, 3), line_count);
     try testing.expect(std.mem.indexOf(u8, jsonl_writer.written(), "\"cache\":") != null);
     try testing.expect(std.mem.indexOf(u8, jsonl_writer.written(), "\"freshness_current\":false") != null);
+}
+
+test "status default is a bounded summary; --full restores the item-level dump (eval finding 3)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var idx = try index_mod.build(testing.allocator, io, "src", false, .auto);
+    defer idx.deinit();
+
+    var text_buf: std.ArrayList(u8) = .empty;
+    defer text_buf.deinit(testing.allocator);
+    var text_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &text_buf);
+    defer text_writer.deinit();
+    try testing.expect(try status(&text_writer.writer, io, &idx, "", .{}));
+    // ~4 bytes/token: 4096 bytes has ample headroom over today's measured
+    // ~300 bytes (well under the 1k-token target) without flaking on growth.
+    try testing.expect(text_writer.written().len < 4096);
+    try testing.expect(std.mem.indexOf(u8, text_writer.written(), "languages:") != null);
+    try testing.expect(std.mem.indexOf(u8, text_writer.written(), "backend:") != null);
+    try testing.expect(std.mem.indexOf(u8, text_writer.written(), "[likely-local]") == null);
+    try testing.expect(std.mem.indexOf(u8, text_writer.written(), "[external]") == null);
+
+    var json_buf: std.ArrayList(u8) = .empty;
+    defer json_buf.deinit(testing.allocator);
+    var json_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &json_buf);
+    defer json_writer.deinit();
+    try testing.expect(try status(&json_writer.writer, io, &idx, "", .{ .format = .json }));
+    try testing.expect(json_writer.written().len < 4096);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_writer.written(), .{});
+    defer parsed.deinit();
+    const compact_obj = parsed.value.object;
+    try testing.expect(compact_obj.get("languages") != null);
+    try testing.expect(compact_obj.get("backend") != null);
+    try testing.expect(compact_obj.get("unresolved_references").?.object.get("items") == null);
+    try testing.expect(compact_obj.get("parse_health").?.object.get("items") == null);
+    try testing.expect(compact_obj.get("skipped").?.object.get("paths") == null);
+
+    var jsonl_buf: std.ArrayList(u8) = .empty;
+    defer jsonl_buf.deinit(testing.allocator);
+    var jsonl_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &jsonl_buf);
+    defer jsonl_writer.deinit();
+    // Compact --jsonl pages just the one summary row, regardless of `-l`.
+    try testing.expect(try status(&jsonl_writer.writer, io, &idx, "", .{ .format = .jsonl, .limit = 300 }));
+    var compact_lines = std.mem.tokenizeScalar(u8, jsonl_writer.written(), '\n');
+    try testing.expect(compact_lines.next() != null);
+    try testing.expect(compact_lines.next() != null);
+    try testing.expect(compact_lines.next() == null);
+
+    var full_buf: std.ArrayList(u8) = .empty;
+    defer full_buf.deinit(testing.allocator);
+    var full_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &full_buf);
+    defer full_writer.deinit();
+    try testing.expect(try status(&full_writer.writer, io, &idx, "", .{ .status_full = true }));
+    try testing.expect(full_writer.written().len > text_writer.written().len);
+    try testing.expect(std.mem.indexOf(u8, full_writer.written(), "resolution health:") != null);
+
+    var full_json_buf: std.ArrayList(u8) = .empty;
+    defer full_json_buf.deinit(testing.allocator);
+    var full_json_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &full_json_buf);
+    defer full_json_writer.deinit();
+    try testing.expect(try status(&full_json_writer.writer, io, &idx, "", .{ .format = .json, .status_full = true }));
+    var full_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, full_json_writer.written(), .{});
+    defer full_parsed.deinit();
+    try testing.expect(full_parsed.value.object.get("unresolved_references").?.object.get("items") != null);
 }
 
 test "sourceRange maps post-image lines to exact indexed bytes" {

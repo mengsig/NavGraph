@@ -1327,6 +1327,9 @@ pub fn unused(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) 
     return shown > 0;
 }
 
+/// Default is the bounded summary (`statusCompact`); `--full` opts into the
+/// item-level freshness/parse/resolution dump (eval finding 3: `-j` status
+/// was ~3x the human format and cost 5.5k-16k tokens as an agent's first call).
 pub fn status(
     w: *Writer,
     idx: *const Index,
@@ -1336,12 +1339,15 @@ pub fn status(
 ) !bool {
     std.debug.assert(opts.limit > 0);
     std.debug.assert(report.scope_files <= idx.graph.files.len);
+    if (!opts.status_full) return statusCompact(w, idx, filter, report, opts);
     try w.writeAll("{\"root\":");
     try writeString(w, idx.root);
     try w.print(",\"snapshot\":{{\"files\":{},\"symbols\":{}}}", .{ idx.graph.files.len, idx.graph.symbols.len });
     try w.writeAll(",\"scope\":{\"filter\":");
     try writeString(w, filter);
     try w.print(",\"files\":{},\"symbols\":{}}}", .{ report.scope_files, report.scope_symbols });
+    try writeLanguageBreakdown(w, idx, filter, opts);
+    try writeBackendBreakdown(w, idx, filter, opts);
     try writeCacheSnapshot(w, idx);
     try writeFreshness(w, idx, report);
     try writeSkippedStatus(w, idx, filter, report);
@@ -1351,6 +1357,71 @@ pub fn status(
     return true;
 }
 
+/// Bounded default: project counts, per-language/backend breakdown, cache
+/// state, and headline counts only — no per-file/per-reference item arrays.
+fn statusCompact(
+    w: *Writer,
+    idx: *const Index,
+    filter: []const u8,
+    report: query.StatusReport,
+    opts: Options,
+) !bool {
+    try w.writeAll("{\"root\":");
+    try writeString(w, idx.root);
+    try w.print(",\"snapshot\":{{\"files\":{},\"symbols\":{}}}", .{ idx.graph.files.len, idx.graph.symbols.len });
+    try w.writeAll(",\"scope\":{\"filter\":");
+    try writeString(w, filter);
+    try w.print(",\"files\":{},\"symbols\":{}}}", .{ report.scope_files, report.scope_symbols });
+    try writeLanguageBreakdown(w, idx, filter, opts);
+    try writeBackendBreakdown(w, idx, filter, opts);
+    try writeCacheSnapshot(w, idx);
+    const freshness_current = report.root_error.len == 0 and report.changes.len == 0;
+    try w.print(",\"freshness\":{{\"current\":{},\"changed_files\":{}", .{ freshness_current, report.changes.len });
+    if (report.root_error.len != 0) {
+        try w.writeAll(",\"root_error\":");
+        try writeString(w, report.root_error);
+    }
+    try w.writeByte('}');
+    try w.print(",\"parse_health\":{{\"count\":{}}}", .{report.parse_warnings});
+    try w.print(",\"unresolved_references\":{{\"count\":{},\"categories\":{{\"likely_local\":{},\"external_or_unmodeled\":{}}}}}", .{
+        report.unresolved_refs, report.likely_local_refs, report.external_or_unmodeled_refs,
+    });
+    try w.print(",\"skipped\":{{\"count\":{}}}", .{report.skipped});
+    try w.writeAll("}\n");
+    return true;
+}
+
+fn writeLanguageBreakdown(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    const counts = query.statusLanguageCounts(idx, filter, opts);
+    try w.writeAll(",\"languages\":{");
+    var first = true;
+    inline for (@typeInfo(language.Language).@"enum".fields, 0..) |f, i| {
+        if (counts[i] != 0) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("\"{s}\":{d}", .{ (@as(language.Language, @enumFromInt(f.value))).tag(), counts[i] });
+        }
+    }
+    try w.writeByte('}');
+}
+
+fn writeBackendBreakdown(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !void {
+    const counts = query.statusBackendCounts(idx, filter, opts);
+    try w.writeAll(",\"backend\":{");
+    var first = true;
+    inline for (@typeInfo(model.Backend).@"enum".fields, 0..) |f, i| {
+        if (counts[i] != 0) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("\"{s}\":{d}", .{ f.name, counts[i] });
+        }
+    }
+    try w.writeByte('}');
+}
+
+/// Default (bounded) page is just the one summary row. `--full` pages the
+/// item-level freshness/skipped/parse-health/unresolved-reference rows too
+/// (eval finding 3: `--jsonl` status dumped every row regardless of scale).
 pub fn statusJsonl(
     w: *Writer,
     idx: *const Index,
@@ -1359,41 +1430,44 @@ pub fn statusJsonl(
     opts: Options,
 ) !bool {
     std.debug.assert(opts.limit > 0);
-    const total: usize = 1 + report.changes.len + report.skipped + report.parse_warnings + report.unresolved_refs;
+    const item_total: usize = if (opts.status_full) report.changes.len + report.skipped + report.parse_warnings + report.unresolved_refs else 0;
+    const total: usize = 1 + item_total;
     var page = JsonlPage{ .after = opts.after, .limit = opts.limit };
     var ordinal: u32 = 0;
     if (page.accepts(ordinal)) {
         try jsonlHead(w, page.last);
-        try statusSummaryItem(w, idx, filter, report);
+        try statusSummaryItem(w, idx, filter, report, opts);
         try w.writeAll("}\n");
     }
     ordinal += 1;
-    for (report.changes) |change| {
-        if (page.accepts(ordinal)) {
-            try jsonlHead(w, page.last);
-            try statusChangeObject(w, idx, change);
-            try w.writeAll("}\n");
+    if (opts.status_full) {
+        for (report.changes) |change| {
+            if (page.accepts(ordinal)) {
+                try jsonlHead(w, page.last);
+                try statusChangeObject(w, idx, change);
+                try w.writeAll("}\n");
+            }
+            ordinal += 1;
         }
-        ordinal += 1;
-    }
-    for (idx.skipped_dirs) |path| {
-        if (filter.len != 0 and !query.matchesFilter(path, filter)) continue;
-        if (page.accepts(ordinal)) {
-            try jsonlHead(w, page.last);
-            try w.writeAll("{\"kind\":\"skipped\",\"path\":");
-            try writeString(w, path);
-            try w.writeAll("}}\n");
+        for (idx.skipped_dirs) |path| {
+            if (filter.len != 0 and !query.matchesFilter(path, filter)) continue;
+            if (page.accepts(ordinal)) {
+                try jsonlHead(w, page.last);
+                try w.writeAll("{\"kind\":\"skipped\",\"path\":");
+                try writeString(w, path);
+                try w.writeAll("}}\n");
+            }
+            ordinal += 1;
         }
-        ordinal += 1;
+        ordinal = try statusJsonlHealth(w, idx, filter, opts, &page, ordinal);
+        ordinal = try statusJsonlUnresolved(w, idx, filter, opts, &page, ordinal);
     }
-    ordinal = try statusJsonlHealth(w, idx, filter, opts, &page, ordinal);
-    ordinal = try statusJsonlUnresolved(w, idx, filter, opts, &page, ordinal);
     std.debug.assert(ordinal == total);
     try jsonlFinish(w, page, total);
     return page.emitted != 0;
 }
 
-fn statusSummaryItem(w: *Writer, idx: *const Index, filter: []const u8, report: query.StatusReport) !void {
+fn statusSummaryItem(w: *Writer, idx: *const Index, filter: []const u8, report: query.StatusReport, opts: Options) !void {
     try w.writeAll("{\"kind\":\"summary\",\"root\":");
     try writeString(w, idx.root);
     try w.print(",\"files\":{},\"symbols\":{},\"scope_files\":{},\"scope_symbols\":{}", .{
@@ -1403,6 +1477,8 @@ fn statusSummaryItem(w: *Writer, idx: *const Index, filter: []const u8, report: 
         try w.writeAll(",\"filter\":");
         try writeString(w, filter);
     }
+    try writeLanguageBreakdown(w, idx, filter, opts);
+    try writeBackendBreakdown(w, idx, filter, opts);
     try writeCacheSnapshot(w, idx);
     const freshness_current = report.root_error.len == 0 and report.changes.len == 0;
     try w.print(",\"freshness_current\":{},\"parse_warnings\":{},\"unresolved_references\":{},\"changed_files\":{},\"skipped\":{}", .{

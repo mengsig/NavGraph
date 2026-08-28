@@ -11,7 +11,8 @@ TypeScript/TSX, Lua, Go, Rust, and Ruby.
 
 ## Default workflow
 
-1. Orient: `status -j`, `files --sort symbols`, `hot`, or `outline <path>`.
+1. Orient: `status -j` (a bounded summary; `--full` for the freshness/parse/
+   resolution dump), `files --sort symbols`, `hot`, or `outline <path>`.
 2. Locate evidence: `search <name>`, `def <symbol> -v full`, `docs`, `strings`,
    or `todos`.
 3. Follow structure: `neighbors`, `calls`, `callers`, `path`, `imports`,

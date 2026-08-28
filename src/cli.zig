@@ -165,6 +165,8 @@ const usage_text =
     \\                                         (finds `Order` without every `createOrder`)
     \\  --no-recurse                           outline/files/status: only files directly in the
     \\                                         given dir, not its subtrees
+    \\  --full                                  status: item-level freshness/parse/resolution
+    \\                                         dump (default is a bounded summary)
     \\  -t, --tests <with|without|only>        Unified test-scope for outline/search/
     \\                                         callers/hot/unused: with (default) |
     \\                                         without | only. A test is a Zig `test`
@@ -632,6 +634,11 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     if (std.mem.eql(u8, f.name, "--exact-source")) {
         out.used_options.insert(.exact_source);
         out.options.exact_source = true;
+        return i;
+    }
+    if (std.mem.eql(u8, f.name, "--full")) {
+        out.used_options.insert(.full);
+        out.options.status_full = true;
         return i;
     }
     if (eqAny(f.name, &.{ "-i", "--impls" })) {
@@ -1838,6 +1845,12 @@ test "status and exact-source options are scoped and structured-output aware" {
     try std.testing.expectEqual(Command.status, status_request.command);
     try std.testing.expectEqualStrings("src", status_request.arg);
     try std.testing.expectEqual(query.OutputFormat.jsonl, status_request.options.format);
+    try std.testing.expect(!status_request.options.status_full);
+
+    const full_request = try parse(&.{ "status", "--full" });
+    try std.testing.expect(full_request.options.status_full);
+    try std.testing.expect(full_request.used_options.contains(.full));
+    try std.testing.expectError(error.BadValue, parse(&.{ "status", "--full=x" }));
 
     const diff_request = try parse(&.{ "diff", "HEAD~1", "--exact-source", "--budget", "1000", "-j" });
     try std.testing.expect(diff_request.options.exact_source);

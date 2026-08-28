@@ -40,11 +40,20 @@ first command does it and caches the result:
 ```
 $ navgraph status
 index root: .
-snapshot: 50 files, 3911 symbols
-cache: loaded=false, entries=0, hits=0/50, rewrite=written
+snapshot: 51 files, 4115 symbols
+languages: zig 51
+backend: heuristic 51
+cache: loaded=false, entries=0, hits=0/51, rewrite=written
 freshness: current
-... (plus a parse/resolution health dump)
+parse health: 0 warnings
+resolution health: 12 likely-local misses; 9674 external/unmodeled edges
+skipped: 0
+(--full for file-level detail)
 ```
+
+That's the whole default output — bounded on purpose, since `status` is the
+first command most agents run. `navgraph status --full` adds the file-level
+freshness/parse/resolution dump (also `--full -j` for the full JSON payload).
 
 Find a symbol:
 
@@ -217,7 +226,7 @@ navgraph <command> [arg] [flags]
 | `churn [path]`     | Rank current symbols by historical commits or added plus removed/replaced hunk lines (`--sort commits|lines`, `--last`, `--since`). |
 | `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. Returns the top 25 unless `-l N` asks for more. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
-| `status [filter]`  | Index/cache snapshot, changed-since-build files, skipped paths, parse health, and unresolved/external graph-reference diagnostics. |
+| `status [filter]`  | Bounded summary: project/language/backend counts, cache state, and headline freshness/parse/resolution counts. `--full` adds the file-level dump (changed files, skipped paths, per-warning/reference detail). |
 | `read <file[:A-B]>`| Paged numbered source; ranges are validated/merged, `-l` and hard `--budget` bound pages, and `--after <next>` resumes. |
 | `strings <pattern>`| Search inside string literals (URLs, log/error text, regexes). |
 | `todos [path]`     | Find `TODO`/`FIXME`/`HACK` markers in real comment tokens. |
@@ -270,6 +279,7 @@ list of flags that actually *do* something is `navgraph capabilities -j`
 | `--members`                   | `collisions`: include class/container members. |
 | `-e, --exact`                 | `search`: name must equal the pattern (no substring hits). |
 | `--no-recurse`                | `outline`/`files`/`status`: only files directly in the given dir, not subtrees. |
+| `--full`                      | `status`: include the file-level freshness/parse/resolution dump (default is the bounded summary). |
 | `-s, --strict`                | Follow only exact edges (drop inferred/heuristic `?` edges, including structural implementation edges). |
 | `-i, --impls`                 | On `calls`/`callers`/`neighbors`/`path`/`reaches`/`affected`, cross Protocol/interface ↔ implementation edges (`⇒impl`). |
 | `--clients`                   | `routes`: show resolved client call sites, tagged by source language. |
@@ -329,7 +339,7 @@ navgraph calls negotiate -d 3 --max-nodes 40 --summary
 navgraph outline packages --budget 4000
 navgraph search Handler --jsonl -l 100
 navgraph search Handler --jsonl -l 100 --after v1:100
-navgraph status --jsonl -l 100             # freshness + diagnostics
+navgraph status --full --jsonl -l 100      # file-level freshness + diagnostics
 ```
 
 Preview a mechanical rename before applying it, and inspect intent comments:
