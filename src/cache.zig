@@ -78,6 +78,15 @@ pub const Store = struct {
 
     /// Restore a file into `arena` iff the cache holds a matching (mtime, size)
     /// entry for `path`; otherwise null (caller re-parses).
+    /// The parse health recorded for `path`, read from the blob's header without
+    /// materializing its text and symbols. Null when the entry is absent or its
+    /// header is unreadable — both are ordinary "rebuild this file" answers.
+    pub fn parseHealthOf(self: *const Store, path: []const u8) ?model.ParseHealth {
+        const e = self.entries.get(path) orelse return null;
+        var cur = Cursor{ .bytes = e.blob };
+        return readHealth(&cur) catch null;
+    }
+
     pub fn restore(self: *const Store, arena: std.mem.Allocator, path: []const u8, stat: FileStat) ?Restored {
         const e = self.entries.get(path) orelse return null;
         if (e.stat.mtime_ns != stat.mtime_ns or e.stat.ctime_ns != stat.ctime_ns or

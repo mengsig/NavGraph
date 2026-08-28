@@ -64,13 +64,13 @@ pub fn build(b: *std.Build) void {
     // keep serving stale (buggy) results. The key is content-addressed: the same
     // source always yields the same key, so switching git branches reuses each
     // branch's matching cache instead of thrashing it.
+    const grammars = selectGrammars(b);
     const build_opts = b.addOptions();
-    build_opts.addOption(u64, "cache_key", srcFingerprint(b));
+    build_opts.addOption(u64, "cache_key", buildKey(b, grammars));
     // Release/packaging systems may supply a VCS revision without making the
     // build graph invoke git (which would be non-hermetic and fail in source
     // archives). The source fingerprint remains authoritative when omitted.
     build_opts.addOption([]const u8, "revision", b.option([]const u8, "revision", "source revision embedded in capability metadata") orelse "");
-    const grammars = selectGrammars(b);
     build_opts.addOption(bool, "ts_python", grammars.python);
     build_opts.addOption(bool, "ts_typescript", grammars.typescript);
     build_opts.addOption(bool, "ts_tsx", grammars.tsx);
@@ -239,18 +239,27 @@ pub fn build(b: *std.Build) void {
     // and reading its source code will allow you to master it.
 }
 
-/// A content hash of every `src/**.zig` file, used as the parse-cache version
-/// key. Any edit to the indexer/parser changes this value, so a cache produced
-/// by a different build is transparently ignored (a safe rebuild). Best-effort:
-/// if the tree can't be read for any reason we return 0 — the cache still works,
-/// it just falls back to the coarser layout-magic guard.
-fn srcFingerprint(b: *std.Build) u64 {
+/// Content hash of the source plus the build variant, used as the parse-cache
+/// version key and as the published source fingerprint. Any edit to the
+/// indexer/parser changes it, so a cache produced by a different build is
+/// transparently ignored (a safe rebuild). Best-effort: if the tree can't be
+/// read for any reason we return 0 — the cache still works, it just falls back
+/// to the coarser layout-magic guard.
+fn buildKey(b: *std.Build, grammars: Grammars) u64 {
     var hasher = std.hash.Wyhash.init(0);
     // `src/queries/**.scm` is @embedFile'd into the tree-sitter backend, so a
     // query edit changes parse output without touching any .zig file — it must
     // be keyed too, or a stale cache masks the change.
     hashTree(b, &hasher, "src", ".zig") catch return 0;
     hashTree(b, &hasher, "src", ".scm") catch return 0;
+    // The linked grammar set changes what the SAME source extracts, so it is
+    // part of the build's identity: without it a `-Dtree-sitter=none` binary
+    // accepts (and serves) a grammar-linked binary's cache.
+    hasher.update(&[_]u8{
+        @intFromBool(grammars.python),
+        @intFromBool(grammars.typescript),
+        @intFromBool(grammars.tsx),
+    });
     return hasher.final();
 }
 

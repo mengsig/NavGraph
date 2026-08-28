@@ -458,7 +458,12 @@ fn addFile(
         .size = file_stat.size,
     };
 
-    if (b.store) |*s| {
+    if (b.store) |*s| usable: {
+        // The entry must have been produced by the backend that owns this file
+        // under the current `--backend`, or the flag selects nothing whenever a
+        // cache exists.
+        const health = s.parseHealthOf(rel_path) orelse break :usable;
+        if (!backends.cacheEntryUsable(lang, b.backend, health)) break :usable;
         if (s.restore(b.arena, rel_path, stat)) |hit| {
             std.debug.assert(hit.text.len == stat.size);
             try appendFile(b, rel_path, lang, hit.text, hit.symbols, hit.parse_health, stat);

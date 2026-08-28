@@ -724,3 +724,68 @@ fn memberOrTopLevel(other: *const index.Index, from: *const index.Index, sym: mo
     }
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// Cache identity
+// ---------------------------------------------------------------------------
+
+fn symbolCount(gpa: std.mem.Allocator, root: []const u8, use_cache: bool, choice: backends.Choice) !usize {
+    var idx = try index.build(gpa, testing.io, root, use_cache, choice);
+    defer idx.deinit();
+    return idx.graph.symbols.len;
+}
+
+test "a warm cache never serves the other backend's symbols" {
+    // F1. `--backend` is a flag whose entire job is to pick the backend; before
+    // this the on-disk cache was keyed on the source alone, so whichever backend
+    // ran first answered for every later run on the default (cache-on) path.
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.ts", .data =
+        \\export class Store {
+        \\  private items: Map<string, number> = new Map();
+        \\
+        \\  size(): number {
+        \\    return this.items.size;
+        \\  }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const cold_heuristic = try symbolCount(gpa, root, false, .heuristic);
+    const cold_tree_sitter = try symbolCount(gpa, root, false, .tree_sitter);
+    // The fixture must actually distinguish the backends, or the test is empty.
+    try testing.expect(cold_heuristic != cold_tree_sitter);
+
+    // Heuristic first, then tree-sitter over the same cache.
+    try testing.expectEqual(cold_heuristic, try symbolCount(gpa, root, true, .heuristic));
+    try testing.expectEqual(cold_tree_sitter, try symbolCount(gpa, root, true, .tree_sitter));
+    // …and back, so the rewritten cache does not trap the other direction.
+    try testing.expectEqual(cold_heuristic, try symbolCount(gpa, root, true, .heuristic));
+}
+
+test "a cache entry may only answer for the backend that produced it" {
+    const ts: model.ParseHealth = .{ .backend = .tree_sitter };
+    const heur: model.ParseHealth = .{ .backend = .heuristic };
+    // A file the grammar could not parse cleanly was re-parsed heuristically on
+    // purpose: that entry is right for tree-sitter and wrong for heuristic.
+    const fell_back: model.ParseHealth = .{ .backend = .heuristic, .tree_sitter_fallback = true };
+
+    try testing.expect(backends.cacheEntryUsable(.python, .heuristic, heur));
+    try testing.expect(!backends.cacheEntryUsable(.python, .heuristic, ts));
+    try testing.expect(!backends.cacheEntryUsable(.python, .heuristic, fell_back));
+
+    if (!ts_backend.any_grammar) return;
+    try testing.expect(backends.cacheEntryUsable(.python, .tree_sitter, ts));
+    try testing.expect(backends.cacheEntryUsable(.python, .tree_sitter, fell_back));
+    try testing.expect(!backends.cacheEntryUsable(.python, .tree_sitter, heur));
+    // A language no grammar covers stays on the heuristic scanner under every
+    // choice, so its heuristic entry is the only usable one.
+    try testing.expect(backends.cacheEntryUsable(.go, .tree_sitter, heur));
+    try testing.expect(!backends.cacheEntryUsable(.go, .tree_sitter, ts));
+}

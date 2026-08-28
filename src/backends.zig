@@ -62,6 +62,25 @@ fn owner(lang: Language, choice: Choice) model.Backend {
     };
 }
 
+/// Whether this build links any grammar at all. Re-exported here so the CLI and
+/// the capability manifest read the backend seam, not the parser internals.
+pub const any_grammar = ts_backend.any_grammar;
+
+/// Whether a cache entry parsed as `health` may answer for `lang` under
+/// `choice`. The cache stores extracted symbols, not the backend that produced
+/// them, so without this check `--backend` decides nothing on the default
+/// (cache-on) path: whichever backend ran first wins for every later run.
+///
+/// A file the tree-sitter backend fell back on was parsed heuristically *on
+/// purpose*, so its entry is the right answer for `.tree_sitter` and the wrong
+/// one for `.heuristic`.
+pub fn cacheEntryUsable(lang: Language, choice: Choice, health: model.ParseHealth) bool {
+    return switch (owner(lang, choice)) {
+        .tree_sitter => health.backend == .tree_sitter or health.tree_sitter_fallback,
+        .heuristic => health.backend == .heuristic and !health.tree_sitter_fallback,
+    };
+}
+
 /// Whether any language could reach the tree-sitter backend under `choice`.
 /// Lets the CLI reject `--backend tree-sitter` on a grammar-less build instead
 /// of silently serving heuristic results under a tree-sitter flag.

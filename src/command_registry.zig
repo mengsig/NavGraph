@@ -6,6 +6,7 @@
 //! deliberately a smaller and safer first step than rewriting every handler.
 
 const std = @import("std");
+const backends = @import("backends.zig");
 
 pub const Command = enum {
     outline,
@@ -140,10 +141,18 @@ pub const OptionDescriptor = struct {
     minimum: ?u32 = null,
 };
 
+/// `--backend tree-sitter` is a hard error on a build that links no grammar, so
+/// the manifest must not advertise it: the manifest IS the agent contract, and
+/// an agent has no other way to discover what this binary can do.
+const backend_values: []const []const u8 = if (backends.any_grammar)
+    &.{ "auto", "heuristic", "tree-sitter" }
+else
+    &.{ "auto", "heuristic" };
+
 pub const option_descriptors = [_]OptionDescriptor{
     .{ .option = .root, .name = "root", .spellings = &.{ valueFlag("-C"), valueFlag("--root") }, .value_kind = .string },
     .{ .option = .no_cache, .name = "no_cache", .spellings = &.{trueFlag("--no-cache")}, .value_kind = .boolean },
-    .{ .option = .backend, .name = "backend", .spellings = &.{valueFlag("--backend")}, .value_kind = .enumeration, .values = &.{ "auto", "heuristic", "tree-sitter" } },
+    .{ .option = .backend, .name = "backend", .spellings = &.{valueFlag("--backend")}, .value_kind = .enumeration, .values = backend_values },
     .{ .option = .verbosity, .name = "verbosity", .spellings = &.{ valueFlag("-v"), valueFlag("--verbosity") }, .value_kind = .enumeration, .values = &.{ "names", "sig", "doc", "full" } },
     .{ .option = .depth, .name = "depth", .spellings = &.{ valueFlag("-d"), valueFlag("--depth") }, .value_kind = .integer, .minimum = 0 },
     .{ .option = .limit, .name = "limit", .spellings = &.{ valueFlag("-l"), valueFlag("--limit") }, .value_kind = .integer, .minimum = 1 },
