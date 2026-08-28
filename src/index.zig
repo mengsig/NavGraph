@@ -858,13 +858,17 @@ fn followFunctionAlias(idx: *const Index, ref: *model.Reference) void {
         if (found == invalid) found = cid;
     }
     if (matches != 1) return;
-    // Re-derive confidence for the alias's own target rather than inheriting
-    // whatever reason resolved `ref` to the alias constant — a unique
-    // same-file function name is exact evidence in its own right.
+    // The chain is only as strong as its weakest link. This hop (alias -> a
+    // unique same-file callable) is proven, but the hop that reached the alias
+    // may have been an unprovable global-name guess — two files each exporting
+    // `const doubler = ...` is a coin flip. Overwriting `exact` there put a
+    // guessed edge inside `--strict`, which is the one consumer that must be
+    // trustworthy. Only an already-proven chain re-derives its confidence.
     ref.target = found;
-    ref.exact = true;
-    ref.resolution_status = .exact;
-    ref.resolution_reason = .same_file_fallback;
+    if (ref.exact) {
+        ref.resolution_status = .exact;
+        ref.resolution_reason = .same_file_fallback;
+    }
 }
 
 /// The sole identifier a declaration is initialized to, or null when the
@@ -2877,6 +2881,54 @@ test "js: a multi-declarator alias binds each name to its own initializer" {
     try testing.expect(call_a.exact);
     try testing.expectEqual(second_fn, call_b.target);
     try testing.expect(call_b.exact);
+}
+
+test "js: following a function alias keeps the exactness of the hop that found it" {
+    // Regression (merge-gate F3): `followFunctionAlias` set `exact = true`
+    // unconditionally. The alias -> implementation hop is proven, but the hop
+    // that reached the alias may not be: two files each export a different
+    // `doubler`, so the pick is a coin flip. Promoting it put a guessed edge
+    // inside `--strict`, the one consumer that must be trustworthy.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.mjs", .data =
+        \\function alphaImpl() { return 1; }
+        \\export const doubler = alphaImpl;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.mjs", .data =
+        \\function betaImpl() { return 2; }
+        \\export const doubler = betaImpl;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.mjs", .data =
+        \\export function run() { return doubler(3); }
+    });
+    // The provable shape, for contrast: one file, one `doubler`, no guess.
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.mjs", .data =
+        \\function soloImpl() { return 3; }
+        \\const solo = soloImpl;
+        \\export function runSolo() { return solo(4); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Still retargeted through the alias — the edge is useful, just not proven.
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const guessed = refByName(run, "doubler").?;
+    try testing.expectEqual(idx.lookup("alphaImpl")[0], guessed.target);
+    try testing.expect(!guessed.exact);
+    try testing.expect(guessed.resolution_status != .exact);
+
+    const run_solo = idx.graph.symbols[idx.lookup("runSolo")[0]];
+    const proven = refByName(run_solo, "solo").?;
+    try testing.expectEqual(idx.lookup("soloImpl")[0], proven.target);
+    try testing.expect(proven.exact);
+    try testing.expectEqual(model.ResolutionReason.same_file_fallback, proven.resolution_reason);
 }
 
 test "ts: a generic type argument is not a declarator boundary" {
