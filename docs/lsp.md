@@ -318,8 +318,8 @@ Params: `{ path?:string, limit?:int (25) } & Scope` →
 
 Functions/methods ranked by connectivity — the load-bearing symbols. `*Exact`
 counts exclude heuristic (name-collision) edges; `fanInTest` is the share of
-callers living in test files. `scope.strict` drops entries whose connectivity
-is entirely heuristic.
+callers living in test files. `strict` drops entries whose connectivity is
+entirely heuristic. Ranking and ordering are the CLI's own, tie-break included.
 
 ### `navgraph/unused`
 
@@ -327,7 +327,7 @@ Params: `{ path?:string, noPublic?:bool, followImports?:bool, limit?:int (300)
 } & Scope` → `{ items:[{symbol,testOnly}] }`.
 
 Zero-caller function/method/type definitions — removal candidates, not broken
-code. `scope.tests`: `with` (default) lists code dead in the whole graph;
+code. `tests`: `with` (default) lists code dead in the whole graph;
 `without` also flags code used only by tests (`testOnly: true`); `only` lists
 unused test helpers. `noPublic` drops exported symbols (possible public API).
 `followImports` disambiguates same-name symbols by import reachability instead
@@ -395,8 +395,8 @@ the *view* (the path filter and test scope), so re-requesting it overwrites
 that one file in place instead of leaving one page per edit behind. The write
 is an atomic rename that refuses to follow a symlink planted at the path, and a
 write failure is reported rather than swallowed. `path` is returned
-root-relative; open it in a browser. `scope.tests` selects whether test symbols
-appear in the graph (`scope.strict` has no effect here).
+root-relative; open it in a browser. `tests` selects whether test symbols
+appear in the graph (`strict` has no effect here).
 
 The page holds at most `nodes` of `nodesTotal` symbols — the renderer's own
 node cap, which the HTML has nowhere to report. `truncated` says the view is

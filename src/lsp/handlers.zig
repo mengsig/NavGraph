@@ -2169,6 +2169,35 @@ test "navgraph/hot ranks tokenize above the leaf push/pop methods" {
     try testing.expectEqual(@as(i64, 3), items[0].object.get("fanInExact").?.integer);
 }
 
+test "navgraph/hot honors an explicit limit at 300, unlike the CLI's sentinel default (F9)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // 30 functions each calling a shared `common`, so every one of them (plus
+    // `common` itself) has fan_out/fan_in > 0 and is a `hot` candidate.
+    var src: Writer.Allocating = .init(alloc);
+    try src.writer.writeAll("pub fn common() void {}\n");
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) {
+        try src.writer.print("pub fn f{d}() void {{ common(); }}\n", .{i});
+    }
+    const files = [_][2][]const u8{.{ "many.zig", src.written() }};
+
+    const ts = try TestServer.init(testing.allocator, testing.io, &files);
+    defer ts.deinit();
+    try ts.start();
+
+    // The CLI treats an explicit `-l 300` as its own unset-default sentinel
+    // and silently falls back to 25; the adapter has no such sentinel.
+    var res = try ts.request(53,
+        \\{"jsonrpc":"2.0","id":53,"method":"navgraph/hot","params":{"limit":300}}
+    );
+    defer res.deinit();
+    const items = (try resultOf(res)).object.get("items").?.array.items;
+    try testing.expect(items.len > 25);
+}
+
 test "navgraph/unused finds stack.zig's private, uncalled growHint" {
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
     defer ts.deinit();

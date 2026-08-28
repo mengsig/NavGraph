@@ -2393,6 +2393,59 @@ test "outline json verbosity adds sig, then doc, then body" {
     try testing.expect(try V.field(.full, &idx, "doc"));
 }
 
+test "outline json honors the tests scope like the text path (F8)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data =
+        \\pub fn real() void {}
+        \\
+        \\test "a check" {}
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    const V = struct {
+        fn names(idxp: *const Index, scope: query.TestScope) ![]const []const u8 {
+            var aw = tjWriter();
+            defer aw.deinit();
+            _ = try outline(&aw.writer, idxp, "", .{ .format = .json, .tests = scope });
+            var p = try tjParse(aw.written());
+            defer p.deinit();
+            var out: std.ArrayList([]const u8) = .empty;
+            if (p.value.array.items.len == 0) return out.toOwnedSlice(testing.allocator);
+            for (p.value.array.items[0].object.get("symbols").?.array.items) |s| {
+                try out.append(testing.allocator, try testing.allocator.dupe(u8, s.object.get("name").?.string));
+            }
+            return out.toOwnedSlice(testing.allocator);
+        }
+    };
+
+    const with = try V.names(&idx, .with);
+    defer {
+        for (with) |n| testing.allocator.free(n);
+        testing.allocator.free(with);
+    }
+    try testing.expectEqual(@as(usize, 2), with.len);
+
+    const without = try V.names(&idx, .without);
+    defer {
+        for (without) |n| testing.allocator.free(n);
+        testing.allocator.free(without);
+    }
+    try testing.expectEqual(@as(usize, 1), without.len);
+    try testing.expectEqualStrings("real", without[0]);
+
+    const only = try V.names(&idx, .only);
+    defer {
+        for (only) |n| testing.allocator.free(n);
+        testing.allocator.free(only);
+    }
+    try testing.expectEqual(@as(usize, 1), only.len);
+    try testing.expectEqualStrings("a check", only[0]);
+}
+
 test "outline json empties on a non-matching filter and truncates at the limit" {
     const testing = std.testing;
     const io = testing.io;

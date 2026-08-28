@@ -30,3 +30,10 @@ All notable changes to NavGraph are documented here. Format loosely follows
 - README: an install-from-release path (`gh release download`), and a
   pointer to [epicenter.nvim](https://github.com/mengsig/epicenter.nvim) as
   the reference Neovim client for `navgraph lsp`.
+
+### Fixed
+
+- `navgraph/path` reported an ambiguous endpoint as "no path"; it now returns
+  the candidates so the question can be re-asked with `Parent.name`.
+- `navgraph/graph` reported neither that the renderer's node cap had truncated
+  the page nor that the write had failed.
