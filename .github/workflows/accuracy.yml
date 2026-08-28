@@ -9,13 +9,21 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only: nothing here writes to the repository or publishes anything.
+permissions:
+  contents: read
+
 jobs:
   accuracy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      # Third-party actions pinned by commit SHA, not a mutable tag — matches
+      # this repo's other workflows (ci.yml).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+      - name: Test
+        run: zig build test --summary all
       - name: Score the golden corpora
         run: zig build bench
