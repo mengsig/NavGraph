@@ -186,6 +186,9 @@ pub const Reference = struct {
 pub const Binding = struct {
     name: []const u8,
     type_name: []const u8,
+    /// True for a function/method parameter, false for a body-local or field
+    /// binding — distinguishes `navgraph/types.users[].kind` "param" vs "local".
+    is_param: bool = false,
 };
 
 /// A definition discovered in a source file.

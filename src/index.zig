@@ -6268,6 +6268,7 @@ fn expectEquivalentBindings(expected: []const model.Binding, actual: []const mod
     for (expected, actual) |left, right| {
         try testing.expectEqualStrings(left.name, right.name);
         try testing.expectEqualStrings(left.type_name, right.type_name);
+        try testing.expectEqual(left.is_param, right.is_param);
     }
 }
 
