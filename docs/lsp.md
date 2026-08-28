@@ -459,7 +459,14 @@ re-parsed its slot takes a private arena holding the newer copy; the arena the
 *live* index still points into is retired and freed only once the replacement
 index is in place. So a re-index never frees memory a served response might
 still reference, and steady-state memory is the initial walk plus one arena per
-currently-edited file.
+currently-edited file — under realistic editing. There is no leak (the Debug
+build's leak-detecting allocator is silent over long runs); on **ReleaseFast**
+specifically, the allocator retains rather than reuses freed per-generation
+arenas, so RSS grows roughly linearly under an edit pattern dominated by
+*brand-new* symbol names — about 72 kB per re-index at 600 new names per edit.
+Realistic edits (existing names, growing bodies, a handful of new names) show
+no measurable growth; only heavy sustained refactoring of a large file will
+drift RSS above the steady-state figure below.
 
 ## Measured performance
 
