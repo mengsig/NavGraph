@@ -13,7 +13,7 @@ const std = @import("std");
 
 /// Ids whose replies must carry a `result`. Each is a request sent *behind* a
 /// hostile one, so answering it proves the server survived and stayed in sync.
-const must_succeed = [_]i64{ 1, 11, 13, 77, 14, 15 };
+const must_succeed = [_]i64{ 1, 11, 13, 77, 14, 15, 16, 17, 18 };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -171,6 +171,24 @@ fn buildSession(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     try frame(gpa, &out,
         \\{"jsonrpc":"2.0","id":14,"method":"navgraph/blast","params":{"symbol":"helper","depth":1}}
     );
+
+    // 1.1: a callHierarchy round-trip (prepare -> incomingCalls) survives too.
+    const util_uri = try std.fmt.allocPrint(arena, "file://{s}/util.zig", .{root});
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"textDocument/prepareCallHierarchy\"," ++
+            "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":0,\"character\":7}}}}}}",
+        .{util_uri},
+    ));
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":17,"method":"callHierarchy/incomingCalls","params":{"item":{"data":{"qualified":"helper","file":"util.zig"}}}}
+    );
+
+    // 1.1: navgraph/impact over the open (unsaved, disk-absent) min.js overlay.
+    try frame(gpa, &out,
+        \\{"jsonrpc":"2.0","id":18,"method":"navgraph/impact","params":{}}
+    );
+
     try frame(gpa, &out,
         \\{"jsonrpc":"2.0","id":15,"method":"shutdown"}
     );
@@ -256,6 +274,23 @@ fn checkReplies(gpa: std.mem.Allocator, out: []const u8) !void {
     }
     if (blast.get("edges").?.array.items.len == 0) fail("blast found no edge", .{});
     if (replies.get(15).?.object.get("result").? != .null) fail("shutdown must return null", .{});
+
+    // callHierarchy round-trip: prepare finds `helper`, incomingCalls finds `run`.
+    const prepared = replies.get(16).?.object.get("result").?.array.items;
+    if (prepared.len != 1) fail("prepareCallHierarchy returned {d} items, want 1", .{prepared.len});
+    if (!std.mem.eql(u8, prepared[0].object.get("name").?.string, "helper")) {
+        fail("prepareCallHierarchy resolved '{s}', want 'helper'", .{prepared[0].object.get("name").?.string});
+    }
+    const incoming = replies.get(17).?.object.get("result").?.array.items;
+    if (incoming.len != 1) fail("incomingCalls returned {d} items, want 1", .{incoming.len});
+    const caller_name = incoming[0].object.get("from").?.object.get("name").?.string;
+    if (!std.mem.eql(u8, caller_name, "run")) fail("incomingCalls' caller is '{s}', want 'run'", .{caller_name});
+
+    // impact round-trip: the open min.js overlay (absent from disk) is one hunk.
+    const impact = replies.get(18).?.object.get("result").?.object;
+    const hunks = impact.get("hunks").?.array.items;
+    if (hunks.len == 0) fail("navgraph/impact found no hunks for the open overlay", .{});
+    if (impact.get("changeId").? != .string) fail("navgraph/impact's changeId is not a string", .{});
 }
 
 fn clip(s: []const u8) []const u8 {
