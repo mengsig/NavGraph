@@ -23,6 +23,9 @@ const Mods = model.Mods;
 /// A symbol as discovered within a single file, before global ids are assigned.
 pub const ParsedSymbol = struct {
     name: []const u8,
+    /// True when `name` was built by the parser (Ruby's `attr_writer`-generated
+    /// `x=`) instead of pointing into the source, so tests know to free it.
+    name_owned: bool = false,
     kind: SymbolKind,
     line: u32,
     span_start: u32,
@@ -45,6 +48,8 @@ pub const ParsedSymbol = struct {
     receiver: []const u8 = "",
     /// Trait named by Rust's `impl Trait for Type`; empty for inherent impls.
     impl_protocol: []const u8 = "",
+    /// Declared/inferred type of this symbol (see `model.Symbol.declared_type`).
+    declared_type: []const u8 = "",
 };
 
 /// References plus local bindings collected from one symbol body.
@@ -107,53 +112,99 @@ pub fn parse(
     out: *std.ArrayList(ParsedSymbol),
 ) !ParseHealth {
     std.debug.assert(source.len <= std.math.maxInt(u32));
-    const cfg = language.configFor(lang);
-    var toks: std.ArrayList(Token) = .empty;
-    defer toks.deinit(gpa);
-    try lexer.tokenize(gpa, source, cfg, &toks);
-    std.debug.assert(toks.items.len >= 1); // always an eof token
-    const health = scanHealth(source, toks.items);
-
-    const close = try buildMatches(gpa, source, toks.items);
-    defer gpa.free(close);
-
-    var ctx = Ctx{
-        .gpa = gpa,
-        .arena = arena,
-        .source = source,
-        .cfg = cfg,
-        .toks = toks.items,
-        .close = close,
-        .out = out,
-        .ckw = switch (lang) {
-            .csharp => cs_keywords,
-            .go => go_keywords,
-            .rust => rust_keywords,
-            .ruby => ruby_keywords,
-            .java => java_keywords,
-            else => c_keywords,
-        },
-    };
-    const n: u32 = @intCast(toks.items.len - 1); // exclude eof from scans
+    var scan = try Scan.open(gpa, arena, source, lang, out);
+    defer scan.deinit(gpa);
+    const ctx = &scan.ctx;
+    const health = scanHealth(source, scan.toks.items);
+    const n: u32 = @intCast(scan.toks.items.len - 1); // exclude eof from scans
     switch (lang.family()) {
-        .zig => try parseZigScope(&ctx, 0, n, null),
-        .c, .csharp => try parseCScope(&ctx, 0, n, null),
-        .js => try parseJsScope(&ctx, 0, n, null),
-        .python => try parsePython(&ctx),
-        .lua => try parseLuaScope(&ctx, 0, n, null),
+        .zig => try parseZigScope(ctx, 0, n, null),
+        .c, .csharp => try parseCScope(ctx, 0, n, null),
+        .js => try parseJsScope(ctx, 0, n, null),
+        .python => try parsePython(ctx),
+        .lua => try parseLuaScope(ctx, 0, n, null),
         .go => {
-            try parseGoScope(&ctx, 0, n, null);
-            attachGoReceivers(&ctx);
+            try parseGoScope(ctx, 0, n, null);
+            attachGoReceivers(ctx);
         },
-        .rust => try parseRustScope(&ctx, 0, n, null, false),
-        .ruby => try parseRubyScope(&ctx, 0, n, null),
-        .java => try parseCScope(&ctx, 0, n, null),
+        .rust => try parseRustScope(ctx, 0, n, null, false),
+        .ruby => try parseRubyScope(ctx, 0, n, null),
+        .java => try parseCScope(ctx, 0, n, null),
         .other => {},
     }
-    try detectApi(&ctx, n);
-    try removeNestedReferenceOwnership(&ctx);
+    try detectApi(ctx, n);
+    try removeNestedReferenceOwnership(ctx);
     return health;
 }
+
+/// Append the framework-recognition symbols that `parse` adds as a post-pass:
+/// HTTP `route` definitions, `route_mount` directives, and the `route_call`
+/// references they attach to whichever symbol in `out` encloses each client
+/// call. Exposed for an alternative backend (`ts_backend`) that produced the
+/// definitions itself — route recognition is token/framework-shaped and is
+/// deliberately owned in one place rather than duplicated per backend.
+pub fn appendApiSymbols(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    source: []const u8,
+    lang: language.Language,
+    out: *std.ArrayList(ParsedSymbol),
+) !void {
+    std.debug.assert(source.len <= std.math.maxInt(u32));
+    var scan = try Scan.open(gpa, arena, source, lang, out);
+    defer scan.deinit(gpa);
+    try detectApi(&scan.ctx, @intCast(scan.toks.items.len - 1));
+}
+
+/// The tokenize + bracket-match setup shared by `parse` and `appendApiSymbols`.
+/// Owns the token list and the bracket table; `ctx` borrows both, so `close`
+/// must outlive every use of `ctx`.
+const Scan = struct {
+    toks: std.ArrayList(Token),
+    close: []u32,
+    ctx: Ctx,
+
+    fn open(
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        source: []const u8,
+        lang: language.Language,
+        out: *std.ArrayList(ParsedSymbol),
+    ) !Scan {
+        const cfg = language.configFor(lang);
+        var toks: std.ArrayList(Token) = .empty;
+        errdefer toks.deinit(gpa);
+        try lexer.tokenize(gpa, source, cfg, &toks);
+        std.debug.assert(toks.items.len >= 1); // always an eof token
+        const close = try buildMatches(gpa, source, toks.items);
+        return .{
+            .toks = toks,
+            .close = close,
+            .ctx = .{
+                .gpa = gpa,
+                .arena = arena,
+                .source = source,
+                .cfg = cfg,
+                .toks = toks.items,
+                .close = close,
+                .out = out,
+                .ckw = switch (lang) {
+                    .csharp => cs_keywords,
+                    .go => go_keywords,
+                    .rust => rust_keywords,
+                    .ruby => ruby_keywords,
+                    .java => java_keywords,
+                    else => c_keywords,
+                },
+            },
+        };
+    }
+
+    fn deinit(self: *Scan, gpa: std.mem.Allocator) void {
+        gpa.free(self.close);
+        self.toks.deinit(gpa);
+    }
+};
 
 /// Detect a tokenizer desync: an unterminated single-line string/char literal
 /// (opened by `"` or `'`) that ran to end-of-file. Its closing delimiter is
@@ -453,6 +504,7 @@ fn enclosingSymbol(ctx: *const Ctx, off: u32, hi: u32) ?u32 {
 /// Build the bracket-matching table for `()`, `{}`, `[]`.
 fn buildMatches(gpa: std.mem.Allocator, source: []const u8, toks: []const Token) ![]u32 {
     const close = try gpa.alloc(u32, toks.len);
+    errdefer gpa.free(close); // the bracket stack below can still fail
     @memset(close, sentinel);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
@@ -567,8 +619,21 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     while (i < hi) : (i += 1) {
         const t = ctx.toks[i];
         if (t.kind != .identifier) continue;
-        const name = t.text(ctx.source);
-        if (name.len < 2 or kw.has(name)) continue;
+        var name = t.text(ctx.source);
+        // A one-letter name is a real definition (`pub fn a()`) and a real call
+        // site: length is not evidence. Locals and parameters are already
+        // filtered by their bindings during resolution.
+        if (kw.has(name)) continue;
+        // Ruby predicate/bang methods carry a trailing sigil that lexes as its
+        // own adjacent token but belongs to the name, exactly as at the `def`.
+        // `a != b` must not read as a call to `a!`.
+        var last = i;
+        if (ctx.cfg.language == .ruby and i + 1 < hi and ctx.toks[i + 1].start == t.end and
+            (ctx.isPunct(i + 1, '?') or (ctx.isPunct(i + 1, '!') and !ctx.isPunct(i + 2, '='))))
+        {
+            name = ctx.source[t.start..ctx.toks[i + 1].end];
+            last = i + 1;
+        }
         const receiver = memberQualifier(ctx, i, lo);
         // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
         // `.{ .value = x }`) are labels, not references to a same-named symbol.
@@ -577,6 +642,13 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // strict agent queries. Preserve real receivers such as `value.field`
         // and `make().field`.
         if (isZigReceiverlessMember(ctx, i, lo, receiver.name)) continue;
+        if (isScopeQualifierOnly(ctx, i, lo, hi)) continue;
+        // A member reached through an expression we cannot name
+        // (`static_cast<Derived*>(this)->step()`, `make().field`) has an unknown
+        // receiver, not an absent one. Recording it as a bare reference would
+        // hand it to the global name match, which is how a CRTP call ended up
+        // on an unrelated same-named function.
+        if (isUnnamedReceiverMember(ctx, i, lo, receiver.name)) continue;
         const assignment = assignmentAccess(ctx, i, hi);
         const qualifier = if (assignment.write and receiver.name.len == 0)
             enclosingCallQualifier(ctx, i, lo)
@@ -593,7 +665,13 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // reference to a same-named binding — don't emit an edge for either.
         if (receiver.name.len == 0 and
             (isJsObjectKey(ctx, i, lo, hi) or isGoLiteralFieldKey(ctx, i, lo, hi))) continue;
-        const is_call = referenceCallOpen(ctx, i, hi) != null;
+        // Ruby has no public fields and needs no parentheses: `book.to_row` and
+        // `map(&:to_row)` are calls, not data reads. A bare `super` invokes the
+        // ancestor's method exactly as `super()` does — it is never a read.
+        const is_call = referenceCallOpen(ctx, last, hi) != null or
+            (ctx.cfg.language == .ruby and !assignment.write and
+                (receiver.name.len != 0 or isRubySymbolBlock(ctx, i, lo) or
+                    std.mem.eql(u8, name, "super")));
         if (assignment.read) {
             try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
         }
@@ -612,6 +690,52 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         .refs = try ctx.arena.dupe(Reference, refs.items),
         .bindings = try collectBindings(ctx, params_open, lo, hi),
     };
+}
+
+/// Whether the identifier at `i` is a member access (`.name` / `->name`) whose
+/// receiver `memberQualifier` could not name. Zig's receiverless `.tag` labels
+/// have their own rule; Java and Ruby keep an explicit method guess for a
+/// receiverless call (a chained `line.item().sku()`, a `&:sym` block), so for
+/// them the reference is still worth resolving.
+fn isUnnamedReceiverMember(ctx: *const Ctx, i: u32, lo: u32, qualifier: []const u8) bool {
+    if (qualifier.len != 0 or i <= lo) return false;
+    switch (ctx.cfg.language) {
+        .zig, .java, .ruby => return false,
+        else => {},
+    }
+    if (ctx.isPunct(i - 1, '.')) return true;
+    return i >= lo + 2 and ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-');
+}
+
+/// A type name that only scopes the *function* after it — Ruby's
+/// `Tricky::Ledger.created`, Rust's `Cents::from_value` — names no dependency
+/// of its own: the edge is to that function. A constructor (`::new` / `.new`)
+/// is different, since it genuinely uses the type, and so is an uppercase
+/// member (`Val::Number`), which names an enum variant of the type.
+fn isScopeQualifierOnly(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    const member: u32 = switch (ctx.cfg.language) {
+        // Ruby scopes the type with `::` and then calls with `.`.
+        .ruby => blk: {
+            if (!(i >= lo + 2 and ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':'))) return false;
+            if (!ctx.isPunct(i + 1, '.')) return false;
+            break :blk i + 2;
+        },
+        .rust => blk: {
+            if (!(ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, ':'))) return false;
+            break :blk i + 3;
+        },
+        else => return false,
+    };
+    if (member >= hi or ctx.toks[member].kind != .identifier) return false;
+    const name = ctx.textOf(member);
+    if (name.len == 0 or std.ascii.isUpper(name[0])) return false;
+    return !std.mem.eql(u8, name, "new");
+}
+
+/// Ruby's `&:name` block shorthand — `map(&:to_row)` calls `to_row` on each
+/// element, so the symbol names a method, not a value.
+fn isRubySymbolBlock(ctx: *const Ctx, i: u32, lo: u32) bool {
+    return i >= lo + 2 and ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, '&');
 }
 
 fn isZigReceiverlessMember(ctx: *const Ctx, i: u32, lo: u32, qualifier: []const u8) bool {
@@ -1068,7 +1192,7 @@ fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]Binding {
     var list: std.ArrayList(Binding) = .empty;
     defer list.deinit(ctx.gpa);
     if (params_open != sentinel) {
-        if (ctx.cfg.language.family() == .c)
+        if (ctx.cfg.language.declaresTypeBeforeName())
             try collectCParamBindings(ctx, params_open, &list)
         else
             try collectParamBindings(ctx, params_open, &list);
@@ -1128,21 +1252,28 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
 
 /// Leading words a C/C++ declarator may carry before its type.
 const c_decl_modifiers = KeywordSet.initComptime(.{
-    .{"const"},  .{"static"},   .{"volatile"}, .{"mutable"}, .{"register"},
-    .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
-    .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
-    .{"class"},  .{"auto"},     .{"typename"},
+    .{"const"},     .{"static"},    .{"volatile"}, .{"mutable"},  .{"register"},
+    .{"extern"},    .{"constexpr"}, .{"inline"},   .{"unsigned"}, .{"signed"},
+    .{"long"},      .{"short"},     .{"struct"},   .{"enum"},     .{"union"},
+    .{"class"},     .{"auto"},      .{"typename"},
+    // Java/C# field and parameter modifiers. `public`/`private`/`protected`
+    // are also C++ access labels; a trailing `:` leaves the declarator nameless,
+    // so the label still yields no binding.
+    .{"public"},   .{"private"},
+    .{"protected"}, .{"final"},     .{"readonly"}, .{"internal"}, .{"abstract"},
+    .{"sealed"},    .{"override"},  .{"virtual"},  .{"partial"},  .{"synchronized"},
+    .{"transient"},
 });
 
 /// Words that open a statement rather than a declaration, so a run starting
 /// with one is never `Type name`.
 const c_statement_keywords = KeywordSet.initComptime(.{
-    .{"if"},     .{"for"},       .{"while"},     .{"switch"}, .{"return"},
-    .{"else"},   .{"do"},        .{"case"},      .{"goto"},   .{"break"},
-    .{"continue"}, .{"sizeof"},  .{"new"},       .{"delete"}, .{"throw"},
-    .{"try"},    .{"catch"},     .{"using"},     .{"namespace"}, .{"typedef"},
-    .{"template"}, .{"public"},  .{"private"},   .{"protected"}, .{"friend"},
-    .{"virtual"}, .{"operator"}, .{"default"},
+    .{"if"},       .{"for"},      .{"while"},   .{"switch"},    .{"return"},
+    .{"else"},     .{"do"},       .{"case"},    .{"goto"},      .{"break"},
+    .{"continue"}, .{"sizeof"},   .{"new"},     .{"delete"},    .{"throw"},
+    .{"try"},      .{"catch"},    .{"using"},   .{"namespace"}, .{"typedef"},
+    .{"template"}, .{"public"},   .{"private"}, .{"protected"}, .{"friend"},
+    .{"virtual"},  .{"operator"}, .{"default"},
 });
 
 /// Modifiers that are a complete type on their own, so the declarator may carry
@@ -1165,7 +1296,8 @@ fn endsCDeclarator(ctx: *const Ctx, i: u32, limit: u32) bool {
 /// project type, and its job is to shadow a same-named global. Anything without
 /// a name yields nothing, so an expression statement is not a declaration.
 fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
-    if (c_statement_keywords.has(ctx.textOf(start))) return null;
+    const head = ctx.textOf(start);
+    if (!c_decl_modifiers.has(head) and c_statement_keywords.has(head)) return null;
     var i = start;
     var scalar = false;
     while (i < limit and ctx.toks[i].kind == .identifier and
@@ -1180,9 +1312,7 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
         type_name = ctx.textOf(i);
         i += 1;
         if (i < limit and ctx.isPunct(i, '<')) {
-            const close = ctx.close[i];
-            if (close == sentinel or close >= limit) return null;
-            i = close + 1;
+            i = skipGenericArgs(ctx, i, limit) orelse return null;
         }
         if (i + 1 < limit and ctx.isPunct(i, ':') and ctx.isPunct(i + 1, ':')) {
             i += 2;
@@ -1197,7 +1327,7 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
     if (i < limit and ctx.toks[i].kind == .identifier and
         !c_decl_modifiers.has(ctx.textOf(i)) and !c_statement_keywords.has(ctx.textOf(i)))
     {
-        if (!endsCDeclarator(ctx, i + 1, limit)) return null;
+        if (!endsCDeclarator(ctx, i + 1, limit) and !isDirectInit(ctx, i + 1, limit)) return null;
         const name = ctx.textOf(i);
         if (type_name) |t| return .{ .name = name, .type_name = t };
         // `long *p;` — the modifier is the type.
@@ -1211,6 +1341,42 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
     return if (endsCDeclarator(ctx, i, limit)) .{ .name = name, .type_name = "" } else null;
 }
 
+/// Index just past the `>` that closes the generic argument list opened at `i`.
+/// The bracket table matches only `()[]{}` — `<` is ambiguous with comparison —
+/// so this counts depth itself and gives up at a token that cannot appear
+/// inside a type argument list, leaving `a < b && c > d` unmatched.
+fn skipGenericArgs(ctx: *const Ctx, i: u32, limit: u32) ?u32 {
+    std.debug.assert(ctx.isPunct(i, '<'));
+    var depth: u32 = 0;
+    var j = i;
+    while (j < limit) : (j += 1) {
+        if (ctx.toks[j].kind != .punct) continue;
+        switch (ctx.ch(j)) {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if (depth == 0) return j + 1;
+            },
+            ';', '{', '}', '(', ')', '=' => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Whether `Type name(` at `i` opens a direct-initialization (`Weights w({1.0})`)
+/// rather than a function declaration (`double area(int)`). Only a literal or a
+/// braced initializer as the first argument decides it: everything else is the
+/// most vexing parse, where a declaration is the safer reading.
+fn isDirectInit(ctx: *const Ctx, i: u32, limit: u32) bool {
+    if (!ctx.isPunct(i, '(') or i + 1 >= limit) return false;
+    if (ctx.isPunct(i + 1, '{')) return true;
+    return switch (ctx.toks[i + 1].kind) {
+        .number, .string => true,
+        else => false,
+    };
+}
+
 /// Record `name -> Type` for each C/C++ parameter in `(...)`.
 fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Binding)) !void {
     const close = ctx.close[open];
@@ -1218,7 +1384,11 @@ fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Bindin
     var start = open + 1;
     var i = start;
     while (i < close) {
-        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '<')) {
+        if (ctx.isPunct(i, '<')) {
+            i = skipGenericArgs(ctx, i, close) orelse i + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
             const inner = ctx.close[i];
             i = if (inner == sentinel or inner >= close) i + 1 else inner + 1;
             continue;
@@ -1254,6 +1424,16 @@ fn goShortDeclName(ctx: *const Ctx, i: u32, hi: u32, lo: u32) bool {
     return j + 1 < hi and ctx.isPunct(j, ':') and ctx.isPunct(j + 1, '=');
 }
 
+/// Whether `name: Type` at statement start declares a binding in this language.
+/// Excludes the languages whose object/table literals spell `key: value` the
+/// same way (JS/TS, Lua, Ruby), where it would invent bindings from data.
+fn annotatesTypeAfterName(lang: language.Language) bool {
+    return switch (lang) {
+        .rust, .python, .zig => true,
+        else => false,
+    };
+}
+
 fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
     const t = ctx.toks[i];
     if (t.kind != .identifier) return null;
@@ -1265,7 +1445,12 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
             ctx.toks[i - 1].line == t.line) return null;
         return cDeclarator(ctx, i, hi);
     }
-    const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
+    // Lua declares locals with `local x = …`, exactly where `const`/`let` sit in
+    // the other languages. `local function f()` declares a function, not a
+    // variable, so it is not a binding.
+    const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let") or
+        (ctx.cfg.language == .lua and ctx.identEql(i, "local") and
+            i + 1 < hi and !ctx.identEql(i + 1, "function"));
     if (is_decl) {
         if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
         // Capture the name even when no type can be inferred: an untyped local
@@ -1299,6 +1484,28 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
         const single = ctx.isPunct(i + 1, ':');
         const ty = if (single) typeFromRhs(ctx, i + 3, hi) orelse "" else "";
         return .{ .name = ctx.textOf(i), .type_name = ty };
+    }
+    // Java/C# write `[modifiers] Type name` — the type precedes the name, so the
+    // assignment rules below never see the declared name. A plain assignment
+    // yields nothing here and still falls through to them.
+    if (ctx.cfg.language.declaresTypeBeforeName()) {
+        const at_declarator_start = i == lo or ctx.toks[i - 1].line != t.line or
+            ctx.isPunct(i - 1, '(') or ctx.isPunct(i - 1, ';') or
+            ctx.isPunct(i - 1, '{') or ctx.isPunct(i - 1, '}');
+        if (at_declarator_start) {
+            if (cDeclarator(ctx, i, hi)) |b| return b;
+        }
+    }
+    // Annotated declaration `name: Type` — a struct/class field or an annotated
+    // local. Restricted to languages with no `key: value` literal at statement
+    // level, and to a type written as an identifier right after the colon, so a
+    // mapping entry is never read as a declaration. A leading visibility word
+    // (`pub name: Type`) keeps the name off the line start.
+    if (annotatesTypeAfterName(ctx.cfg.language) and ctx.isPunct(i + 1, ':') and
+        i + 2 < hi and ctx.toks[i + 2].kind == .identifier and
+        (i == lo or ctx.toks[i - 1].line != t.line or ctx.identEql(i - 1, "pub")))
+    {
+        if (typeFromChain(ctx, i + 2, hi)) |ty| return .{ .name = ctx.textOf(i), .type_name = ty };
     }
     const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
     if (!first_on_line) return null;
@@ -1349,6 +1556,12 @@ fn typeFromRhs(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
     while (i < hi and ctx.toks[i].kind == .identifier and n < segs.len) {
         segs[n] = i;
         n += 1;
+        // Ruby scopes a nested type with `::` (`Catalog::Shelf.new`), which
+        // chains the same way `.` does.
+        if (ctx.cfg.language == .ruby and ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, ':')) {
+            i += 3;
+            continue;
+        }
         if (!ctx.isPunct(i + 1, '.')) break;
         i += 2;
     }
@@ -1684,6 +1897,8 @@ fn emitZigContainer(ctx: *Ctx, a: EmitContainer) !u32 {
         .exported = a.exported,
         .parent_local = a.parent,
         .refs = &.{},
+        // Field types only, so `self.field.m()` has a receiver type.
+        .bindings = try collectMemberBindings(ctx, a.open + 1, close),
     });
     try parseZigScope(ctx, a.open + 1, close, my_idx);
     return close + 1;
@@ -2053,6 +2268,9 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         .exported = true,
         .parent_local = parent,
         .refs = &.{},
+        // Field types only: `self.field.m()` and a bare `field.m()` need the
+        // field's declared type to resolve.
+        .bindings = try collectMemberBindings(ctx, open + 1, close),
     });
     // C++ class/struct bodies hold methods; C# class/struct/interface bodies do
     // too. Parse them as members (enums do not hold methods).
@@ -2062,6 +2280,25 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         try parseCppMembers(ctx, open + 1, close, my_idx);
     }
     return close + 1;
+}
+
+/// Field bindings declared directly in a class/struct body: `[modifiers] Type
+/// name;`. Every bracketed run is skipped, so a parameter list and a method
+/// body cannot leak a local into the type's field table.
+fn collectMemberBindings(ctx: *Ctx, lo: u32, hi: u32) ![]Binding {
+    var list: std.ArrayList(Binding) = .empty;
+    defer list.deinit(ctx.gpa);
+    var i = lo;
+    while (i < hi) {
+        if (ctx.isPunct(i, '{') or ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
+            const next = skipBracket(ctx, i);
+            i = if (next > i) next else i + 1;
+            continue;
+        }
+        if (detectBinding(ctx, i, hi, lo)) |b| try list.append(ctx.gpa, b);
+        i += 1;
+    }
+    return ctx.arena.dupe(Binding, list.items);
 }
 
 /// Parse the members of a C++ class/struct body [lo, hi): method definitions and
@@ -2654,19 +2891,71 @@ fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exp
     if (arrow_body.is_fn and arrow_body.arrow_i != sentinel) {
         return emitJsArrowExpr(ctx, start_i, name_i, arrow_body.arrow_i, parent, exported, arrow_mods, hi);
     }
+    return parseJsPlainDeclarators(ctx, start_i, name_i, semi_i, hi, parent, exported);
+}
+
+/// Index of the comma that ends the declarator starting at `from`, or
+/// `sentinel`. Skips bracketed runs like `findNext`, and additionally generic
+/// argument lists: `const cache: Map<string, number>` is ONE declarator, and
+/// reading its type argument's comma as a separator emitted `number` as a
+/// top-level variable. `skipGenericArgs` gives up on a token no type argument
+/// list may contain, so `a < b, c` still splits on its comma.
+fn findDeclaratorComma(ctx: *const Ctx, from: u32, hi: u32) u32 {
+    var i = from;
+    while (i < hi) {
+        if (ctx.isPunct(i, ',')) return i;
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '{') or ctx.isPunct(i, '[')) {
+            i = skipBracket(ctx, i);
+            continue;
+        }
+        if (ctx.isPunct(i, '<')) {
+            if (skipGenericArgs(ctx, i, hi)) |after| {
+                i = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    return sentinel;
+}
+
+/// Emit one `.variable` symbol per comma-separated declarator in a plain
+/// `const`/`let`/`var` statement (`const a = f, b = g;`), each scoped to just
+/// its own `NAME [= INIT]` clause. A shared span across declarators let
+/// `aliasInitializerName` see every sibling's `=` and pick the wrong one.
+fn parseJsPlainDeclarators(ctx: *Ctx, start_i: u32, first_name_i: u32, semi_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
+    const stmt_end = if (semi_i != sentinel) semi_i else hi;
+    var name_i = first_name_i;
+    var first = true;
+    while (true) {
+        const comma_i = findDeclaratorComma(ctx, name_i + 1, stmt_end);
+        // A middle declarator's span stops just before its comma; the last one
+        // spans through the statement's `;`, matching a single-declarator span.
+        const span_end = if (comma_i != sentinel)
+            ctx.toks[comma_i - 1].end
+        else if (semi_i != sentinel)
+            ctx.toks[semi_i].end
+        else
+            ctx.toks[name_i].end;
+        _ = try emit(ctx, .{
+            .name = ctx.textOf(name_i),
+            .kind = .variable,
+            .line = ctx.toks[name_i].line,
+            .span_start = if (first) lineStartOffset(ctx, start_i) else ctx.toks[name_i].start,
+            .span_end = span_end,
+            .sig_end = span_end,
+            .doc = if (first) collectDoc(ctx, start_i) else "",
+            .exported = exported,
+            .parent_local = parent,
+            .refs = &.{},
+        });
+        if (comma_i == sentinel) break;
+        const next_name = comma_i + 1;
+        if (next_name >= stmt_end or ctx.toks[next_name].kind != .identifier) break;
+        name_i = next_name;
+        first = false;
+    }
     const end_i = if (semi_i != sentinel) semi_i else name_i;
-    _ = try emit(ctx, .{
-        .name = ctx.textOf(name_i),
-        .kind = .variable,
-        .line = ctx.toks[name_i].line,
-        .span_start = lineStartOffset(ctx, start_i),
-        .span_end = ctx.toks[end_i].end,
-        .sig_end = ctx.toks[end_i].end,
-        .doc = collectDoc(ctx, start_i),
-        .exported = exported,
-        .parent_local = parent,
-        .refs = &.{},
-    });
     return tokenAfterOffset(ctx, ctx.toks[end_i].end, hi);
 }
 
@@ -4084,6 +4373,9 @@ fn parseRustRecord(ctx: *Ctx, doc_i: u32, kw_i: u32, hi: u32, parent: ?u32, expo
         .exported = exported,
         .parent_local = parent,
         .refs = &.{},
+        // Field types only: a record body declares no calls, and `self.f.m()`
+        // needs `f`'s declared type to resolve.
+        .bindings = try collectBindings(ctx, sentinel, open + 1, close),
     });
     // A trait body holds method signatures and default methods.
     if (kind == .interface) try parseRustScope(ctx, open + 1, close, my, true);
@@ -4342,12 +4634,12 @@ fn parseRustMacro(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) 
 // ---------------------------------------------------------------------------
 
 const ruby_keywords = KeywordSet.initComptime(.{
-    .{"def"},    .{"end"},    .{"if"},    .{"elsif"},   .{"else"},             .{"unless"},
-    .{"while"},  .{"until"},  .{"for"},   .{"in"},      .{"do"},               .{"begin"},
-    .{"rescue"}, .{"ensure"}, .{"retry"}, .{"return"},  .{"yield"},            .{"then"},
-    .{"case"},   .{"when"},   .{"class"}, .{"module"},  .{"self"},             .{"nil"},
-    .{"true"},   .{"false"},  .{"and"},   .{"or"},      .{"not"},              .{"super"},
-    .{"break"},  .{"next"},   .{"redo"},  .{"require"}, .{"require_relative"},
+    .{"def"},    .{"end"},    .{"if"},      .{"elsif"},            .{"else"},  .{"unless"},
+    .{"while"},  .{"until"},  .{"for"},     .{"in"},               .{"do"},    .{"begin"},
+    .{"rescue"}, .{"ensure"}, .{"retry"},   .{"return"},           .{"yield"}, .{"then"},
+    .{"case"},   .{"when"},   .{"class"},   .{"module"},           .{"self"},  .{"nil"},
+    .{"true"},   .{"false"},  .{"and"},     .{"or"},               .{"not"},   .{"break"},
+    .{"next"},   .{"redo"},   .{"require"}, .{"require_relative"},
 });
 
 /// Whether the `do` at `i` merely re-marks a block already opened by a
@@ -4406,7 +4698,54 @@ fn parseRubyStmt(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     if (ctx.identEql(i, "module")) return parseRubyContainer(ctx, i, hi, parent, .module);
     if (ctx.identEql(i, "require") or ctx.identEql(i, "require_relative"))
         return parseRubyRequire(ctx, i, hi);
+    if (parent != null and (ctx.identEql(i, "attr_accessor") or ctx.identEql(i, "attr_reader") or
+        ctx.identEql(i, "attr_writer")))
+        return parseRubyAttr(ctx, i, hi, parent.?);
     return i;
+}
+
+/// `attr_accessor :id, :title` and friends. Ruby generates a reader `id` and a
+/// writer `id=` method per symbol; both are real definitions that call sites
+/// name, so both are emitted on the enclosing class at the declaration's line.
+fn parseRubyAttr(ctx: *Ctx, kw_i: u32, hi: u32, parent: u32) AllocError!u32 {
+    const reads = !ctx.identEql(kw_i, "attr_writer");
+    const writes = !ctx.identEql(kw_i, "attr_reader");
+    const line = ctx.toks[kw_i].line;
+    const span_start = lineStartOffset(ctx, kw_i);
+    const span_end = lineEndOffset(ctx, ctx.toks[kw_i].start);
+    var j = kw_i + 1;
+    if (ctx.isPunct(j, '(')) j += 1;
+    while (j + 1 < hi and ctx.isPunct(j, ':') and ctx.toks[j + 1].kind == .identifier and
+        ctx.toks[j + 1].line == line)
+    {
+        const attr = ctx.textOf(j + 1);
+        if (reads) _ = try emit(ctx, rubyAttrSymbol(attr, false, line, span_start, span_end, parent));
+        if (writes) {
+            const setter = try std.fmt.allocPrint(ctx.arena, "{s}=", .{attr});
+            _ = try emit(ctx, rubyAttrSymbol(setter, true, line, span_start, span_end, parent));
+        }
+        j += 2;
+        if (!ctx.isPunct(j, ',')) break;
+        j += 1;
+    }
+    return tokenAfterOffset(ctx, span_end, hi);
+}
+
+fn rubyAttrSymbol(name: []const u8, owned: bool, line: u32, span_start: u32, span_end: u32, parent: u32) ParsedSymbol {
+    return .{
+        .name = name,
+        .name_owned = owned,
+        .kind = .method,
+        .line = line,
+        .span_start = span_start,
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = true,
+        .parent_local = parent,
+        .refs = &.{},
+        .modifiers = .{ .getter = !owned, .setter = owned },
+    };
 }
 
 fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
@@ -4416,6 +4755,14 @@ fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     if (j + 1 < hi and ctx.toks[j].kind == .identifier and ctx.isPunct(j + 1, '.')) {
         is_singleton = true;
         j += 2;
+    }
+    // `def +(other)`, `def <=>(other)`, `def [](i)`: an operator method's name is
+    // punctuation, not an identifier.
+    if (j < hi and ctx.toks[j].kind == .punct) {
+        if (rubyOperatorName(ctx, j, hi)) |op| {
+            return parseRubyDefBody(ctx, def_i, j, op.name, op.after, hi, parent, is_singleton);
+        }
+        return def_i;
     }
     if (j >= hi or ctx.toks[j].kind != .identifier) return def_i;
     const name_i = j;
@@ -4430,6 +4777,44 @@ fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         name = ctx.source[ctx.toks[name_i].start..ctx.toks[after].end];
         after += 1;
     }
+    return parseRubyDefBody(ctx, def_i, name_i, name, after, hi, parent, is_singleton);
+}
+
+/// The operator method name spelled by the adjacent punctuation run at `i`, and
+/// the token index just past it. Only Ruby's real operator method names match,
+/// so `def` followed by stray punctuation still parses as nothing.
+fn rubyOperatorName(ctx: *const Ctx, i: u32, hi: u32) ?struct { name: []const u8, after: u32 } {
+    const operators = [_][]const u8{
+        "<=>", "===", "[]=", "**", "==", "!=", "<=", ">=", "<<", ">>",
+        "[]",  "=~",  "+@",  "-@", "+",  "-",  "*",  "/",  "%",  "<",
+        ">",   "&",   "|",   "^",  "~",  "!",
+    };
+    var end = i;
+    while (end + 1 < hi and ctx.toks[end + 1].kind == .punct and
+        ctx.toks[end + 1].start == ctx.toks[end].end and end - i < 3) end += 1;
+    // Longest adjacent run first, so `<=>` wins over `<`.
+    var last = end;
+    while (true) {
+        const text = ctx.source[ctx.toks[i].start..ctx.toks[last].end];
+        for (operators) |op| {
+            if (std.mem.eql(u8, op, text)) return .{ .name = text, .after = last + 1 };
+        }
+        if (last == i) return null;
+        last -= 1;
+    }
+}
+
+fn parseRubyDefBody(
+    ctx: *Ctx,
+    def_i: u32,
+    name_i: u32,
+    name: []const u8,
+    params_i: u32,
+    hi: u32,
+    parent: ?u32,
+    is_singleton: bool,
+) AllocError!u32 {
+    var after = params_i;
     if (ctx.isPunct(after, '(')) {
         const pc = ctx.close[after];
         if (pc == sentinel) return def_i;
@@ -5825,6 +6210,7 @@ fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {
 
 fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     for (out.items) |s| {
+        if (s.name_owned) testing.allocator.free(s.name);
         for (s.refs) |ref| {
             if (ref.lines.len != 0) testing.allocator.free(ref.lines);
             if (ref.offsets.len != 0) testing.allocator.free(ref.offsets);
@@ -6851,6 +7237,43 @@ test "java: package, imports, class, methods, and body refs" {
     try testing.expect(tally.parent_local != null);
     try testing.expect(hasCallRef(tally, "add"));
     try testing.expectEqual(SymbolKind.method, findSym(out.items, "add").?.kind);
+}
+
+test "java: a parameter and a generic field bind name -> declared type" {
+    const src =
+        \\public class Svc {
+        \\    private final Repo<Product> store;
+        \\    private int count = 0;
+        \\    public void register(Product product, String key) {
+        \\        store.add(key, product);
+        \\    }
+        \\}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    // Java writes the type before the name, so the parameter binds
+    // `product -> Product` (it used to bind the *type* as the name).
+    const register = findSym(out.items, "register").?;
+    try testing.expectEqualStrings("Product", bindingType(register.bindings, "product").?);
+    try testing.expectEqualStrings("String", bindingType(register.bindings, "key").?);
+    // The class body carries its field types, generic arguments skipped.
+    const svc = findSym(out.items, "Svc").?;
+    try testing.expectEqualStrings("Repo", bindingType(svc.bindings, "store").?);
+    try testing.expectEqualStrings("int", bindingType(svc.bindings, "count").?);
+}
+
+test "rust: a record body carries its field types as bindings" {
+    const src =
+        \\pub struct Ledger {
+        \\    pub entries: Vec<Entry>,
+        \\    owner: Account,
+        \\}
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+    const ledger = findSym(out.items, "Ledger").?;
+    try testing.expectEqualStrings("Vec", bindingType(ledger.bindings, "entries").?);
+    try testing.expectEqualStrings("Account", bindingType(ledger.bindings, "owner").?);
 }
 
 test "java: interface, enum, and record are their own kinds" {

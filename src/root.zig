@@ -11,6 +11,8 @@ pub const gitutil = @import("gitutil.zig");
 pub const history = @import("history.zig");
 pub const imports = @import("imports.zig");
 pub const parser = @import("parser.zig");
+pub const ts_backend = @import("ts_backend.zig");
+pub const backends = @import("backends.zig");
 pub const index = @import("index.zig");
 pub const impls = @import("impls.zig");
 pub const hierarchy = @import("hierarchy.zig");
@@ -29,6 +31,7 @@ pub const command_registry = @import("command_registry.zig");
 pub const capabilities = @import("capabilities.zig");
 pub const workspace_path = @import("workspace_path.zig");
 pub const cli = @import("cli.zig");
+pub const lsp = @import("lsp.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

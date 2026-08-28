@@ -703,7 +703,7 @@ test "exception trace stops at the nearest matching handler" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try scan.collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -757,7 +757,7 @@ test "exception subtype is caught by a nominal base handler" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try scan.collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -786,7 +786,7 @@ test "external standard exception bases match heuristically" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try scan.collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -826,7 +826,7 @@ test "catches treats converging caller branches as one propagation state" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try scan.collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -864,7 +864,7 @@ test "Ruby bare rescue does not claim to handle SystemExit" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try scan.collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -893,7 +893,7 @@ test "strict catches excludes conditional C# catch filters" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try scan.collect(testing.allocator, &idx);
     defer analysis.deinit();

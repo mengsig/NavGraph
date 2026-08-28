@@ -785,7 +785,7 @@ test "symbol renders name/sig/doc/full for a documented function" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // names: kind + name + location, no signature.
@@ -825,7 +825,7 @@ test "doc verbosity emits no doc line when the symbol is undocumented" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const s = try renderByName(&idx, "bare", .doc, false);
@@ -849,7 +849,7 @@ test "writeLocation is a bare line for single-line and a range for multi-line" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // single-line -> bare `L1`, no range.
@@ -894,7 +894,7 @@ test "writeSigSuffix shows params for functions and values for consts, nothing f
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // function -> parameter/return slice.
@@ -930,7 +930,7 @@ test "writeSigSuffix renders Java's leading method return type" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const method = try renderByName(&idx, "format", .sig, false);
@@ -953,7 +953,7 @@ test "writeSigSuffix caps a long const value with an ellipsis" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const s = try renderByName(&idx, "MSG", .sig, false);
@@ -980,7 +980,7 @@ test "writeQualifiedName prefixes the enclosing parent for a method" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // method carries `Store.load`.
@@ -1011,7 +1011,7 @@ test "writeFullBody widens the slice to include leading decorators" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const s = try renderByName(&idx, "value", .full, false);
@@ -1034,7 +1034,7 @@ test "symbolSite annotates a single call-site edge with counts and heuristic mar
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const sym = idx.graph.symbols[idx.lookup("target")[0]];
@@ -1081,7 +1081,7 @@ test "symbolSite lists multiple call-site lines and adds a count only past them"
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const sym = idx.graph.symbols[idx.lookup("target")[0]];
@@ -1115,7 +1115,7 @@ test "symbol delegates to symbolSite with no edge annotation" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const sym = idx.graph.symbols[idx.lookup("foo")[0]];
@@ -1143,7 +1143,7 @@ test "symbol honors indent depth for the leading field" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const sym = idx.graph.symbols[idx.lookup("foo")[0]];

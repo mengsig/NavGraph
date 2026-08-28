@@ -1,0 +1,29 @@
+# Accuracy gate: score the indexer against the hand-verified golden corpora and
+# fail when any language drops below its recorded floor in
+# tests/golden/floors.json. The floors are a ratchet, so this job only ever
+# catches a regression; a wave that improves a language re-records them.
+name: accuracy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only: nothing here writes to the repository or publishes anything.
+permissions:
+  contents: read
+
+jobs:
+  accuracy:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions pinned by commit SHA, not a mutable tag — matches
+      # this repo's other workflows (ci.yml).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+      - name: Run the test suite (fmt check, doc-table check, unit tests)
+        run: zig build test --summary all
+      - name: Score the golden corpora
+        run: zig build bench

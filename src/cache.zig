@@ -27,7 +27,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE11";
+const magic = "NGCACHE12";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -74,6 +74,15 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.entries.deinit(self.gpa);
         self.gpa.free(self.bytes);
+    }
+
+    /// The parse health recorded for `path`, read from the blob's header without
+    /// materializing its text and symbols. Null when the entry is absent or its
+    /// header is unreadable — both are ordinary "rebuild this file" answers.
+    pub fn parseHealthOf(self: *const Store, path: []const u8) ?model.ParseHealth {
+        const e = self.entries.get(path) orelse return null;
+        var cur = Cursor{ .bytes = e.blob };
+        return readHealth(&cur) catch null;
     }
 
     /// Restore a file into `arena` iff the cache holds a matching (mtime, size)
@@ -142,6 +151,7 @@ fn skipSymbol(cur: *Cursor) !void {
     _ = try cur.getStr(); // import_path
     _ = try cur.getStr(); // receiver
     _ = try cur.getStr(); // impl_protocol
+    _ = try cur.getStr(); // declared_type
     const ref_count = try cur.getU32();
     var r: u32 = 0;
     while (r < ref_count) : (r += 1) {
@@ -185,12 +195,22 @@ fn materialize(arena: std.mem.Allocator, blob: []const u8) !Restored {
 fn readHealth(cur: *Cursor) !model.ParseHealth {
     const from_raw = try cur.getU32();
     const to = try cur.getU32();
+    const backend_raw = try cur.getU8();
+    if (backend_raw > @intFromEnum(model.Backend.tree_sitter)) return error.BadParseHealth;
+    const backend: model.Backend = @enumFromInt(backend_raw);
+    const fell_back = (try cur.getU8()) != 0;
+    if (fell_back and backend != .heuristic) return error.BadParseHealth;
     if (from_raw == 0) {
         if (to != 0) return error.BadParseHealth;
-        return .{};
+        return .{ .backend = backend, .tree_sitter_fallback = fell_back };
     }
     if (to < from_raw) return error.BadParseHealth;
-    return .{ .desync_from = from_raw, .desync_to = to };
+    return .{
+        .desync_from = from_raw,
+        .desync_to = to,
+        .backend = backend,
+        .tree_sitter_fallback = fell_back,
+    };
 }
 
 fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
@@ -207,6 +227,7 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
     const import_path = try arena.dupe(u8, try cur.getStr());
     const receiver = try arena.dupe(u8, try cur.getStr());
     const impl_protocol = try arena.dupe(u8, try cur.getStr());
+    const declared_type = try arena.dupe(u8, try cur.getStr());
     std.debug.assert(span_start <= sig_end and sig_end <= span_end);
     return .{
         .name = name,
@@ -224,6 +245,7 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
         .receiver = receiver,
         .impl_protocol = impl_protocol,
         .import_path = import_path,
+        .declared_type = declared_type,
     };
 }
 
@@ -352,6 +374,7 @@ fn writeSymbol(
     try putStr(gpa, buf, sym.import_path);
     try putStr(gpa, buf, sym.receiver);
     try putStr(gpa, buf, sym.impl_protocol);
+    try putStr(gpa, buf, sym.declared_type);
     try putU32(gpa, buf, @intCast(sym.refs.len));
     for (sym.refs) |ref| {
         try putStr(gpa, buf, ref.name);
@@ -391,8 +414,11 @@ fn localParent(sym: model.Symbol, base: u32, end: u32) u32 {
 fn putHealth(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), health: model.ParseHealth) !void {
     const from = health.desync_from orelse 0;
     std.debug.assert((from == 0) == (health.desync_to == 0));
+    std.debug.assert(!health.tree_sitter_fallback or health.backend == .heuristic);
     try putU32(gpa, buf, from);
     try putU32(gpa, buf, health.desync_to);
+    try buf.append(gpa, @intFromEnum(health.backend));
+    try buf.append(gpa, @intFromBool(health.tree_sitter_fallback));
 }
 
 fn putU8(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: u8) !void {
@@ -609,6 +635,7 @@ fn encSym(
     try putStr(a, buf, import_path);
     try putStr(a, buf, ""); // receiver
     try putStr(a, buf, ""); // impl_protocol
+    try putStr(a, buf, ""); // declared_type
     try putU32(a, buf, @intCast(refs.len));
     for (refs) |r| {
         try putStr(a, buf, r.name);
@@ -679,6 +706,7 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
     try t.expectEqualStrings(expected.import_path, got.import_path);
     try t.expectEqualStrings(expected.receiver, got.receiver);
     try t.expectEqualStrings(expected.impl_protocol, got.impl_protocol);
+    try t.expectEqualStrings(expected.declared_type, got.declared_type);
     if (expected.parent == model.invalid_symbol) {
         try t.expectEqual(@as(?u32, null), got.parent_local);
     } else {
@@ -1089,14 +1117,61 @@ test "materialize rejects inconsistent parse health" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
 
-    try putU32(testing.allocator, &buf, 0);
-    try putU32(testing.allocator, &buf, 3);
+    // desync_from == 0 with a non-zero desync_to.
+    try putHealthRaw(testing.allocator, &buf, 0, 3, 0, 0);
     try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
 
+    // desync_to before desync_from.
     buf.clearRetainingCapacity();
-    try putU32(testing.allocator, &buf, 7);
-    try putU32(testing.allocator, &buf, 6);
+    try putHealthRaw(testing.allocator, &buf, 7, 6, 0, 0);
     try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
+
+    // A backend byte outside the enum.
+    buf.clearRetainingCapacity();
+    try putHealthRaw(testing.allocator, &buf, 0, 0, 9, 0);
+    try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
+
+    // "fell back to the heuristic" recorded against the tree-sitter backend.
+    buf.clearRetainingCapacity();
+    try putHealthRaw(testing.allocator, &buf, 0, 0, @intFromEnum(model.Backend.tree_sitter), 1);
+    try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
+}
+
+/// Hand-encode a parse-health header, bypassing `putHealth`'s asserts so a test
+/// can feed the reader a combination the writer would never produce.
+fn putHealthRaw(
+    a: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    from: u32,
+    to: u32,
+    backend_byte: u8,
+    fallback_byte: u8,
+) !void {
+    try putU32(a, buf, from);
+    try putU32(a, buf, to);
+    try putU8(a, buf, backend_byte);
+    try putU8(a, buf, fallback_byte);
+}
+
+test "parse health round-trips the backend and fallback flags" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    try putHealth(testing.allocator, &buf, .{ .backend = .tree_sitter });
+    var cur = Cursor{ .bytes = buf.items };
+    const ts = try readHealth(&cur);
+    try testing.expectEqual(model.Backend.tree_sitter, ts.backend);
+    try testing.expect(!ts.tree_sitter_fallback);
+
+    buf.clearRetainingCapacity();
+    try putHealth(testing.allocator, &buf, .{ .backend = .heuristic, .tree_sitter_fallback = true });
+    cur = Cursor{ .bytes = buf.items };
+    const fell = try readHealth(&cur);
+    try testing.expectEqual(model.Backend.heuristic, fell.backend);
+    try testing.expect(fell.tree_sitter_fallback);
 }
 
 test "write emits the versioned magic and build key header" {

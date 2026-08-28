@@ -81,9 +81,9 @@ pub fn openFile(root: std.Io.Dir, io: std.Io, path: []const u8) !std.Io.File {
     try validateRelative(path);
 
     var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try root.realPath(io, &root_buf);
+    const root_len = root.realPath(io, &root_buf) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     var resolved_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const resolved_len = try root.realPathFile(io, path, &resolved_buf);
+    const resolved_len = root.realPathFile(io, path, &resolved_buf) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     if (!isWithin(root_buf[0..root_len], resolved_buf[0..resolved_len])) return error.OutsideRoot;
 
     return openFileKnownRoot(root, io, root_buf[0..root_len], path);
@@ -101,10 +101,12 @@ pub fn openFileKnownRoot(
 ) !std.Io.File {
     try validateRelative(path);
 
-    var file = try root.openFile(io, path, .{
+    // The kernel's resolve-beneath refusal IS the escape signal, but macOS
+    // reports it as an errno std cannot classify -- score it, never leak it.
+    var file = root.openFile(io, path, .{
         .follow_symlinks = true,
         .resolve_beneath = true,
-    });
+    }) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     errdefer file.close(io);
 
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -127,10 +129,12 @@ pub fn openFileKnownTarget(
     try validateRelative(path);
     try validateRelative(expected_target);
 
-    var file = try root.openFile(io, path, .{
+    // The kernel's resolve-beneath refusal IS the escape signal, but macOS
+    // reports it as an errno std cannot classify -- score it, never leak it.
+    var file = root.openFile(io, path, .{
         .follow_symlinks = true,
         .resolve_beneath = true,
-    });
+    }) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     errdefer file.close(io);
 
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -150,7 +154,7 @@ pub fn openedRelativePath(
     canonical_root: []const u8,
     buffer: []u8,
 ) ![]const u8 {
-    const file_len = try file.realPath(io, buffer);
+    const file_len = file.realPath(io, buffer) catch |err| return escapeOnUnexpected(@TypeOf(err), err);
     return relativeWithin(canonical_root, buffer[0..file_len]) orelse error.OutsideRoot;
 }
 
@@ -185,6 +189,30 @@ fn relativeWithin(root: []const u8, target: []const u8) ?[]const u8 {
     if (root.len == 0 or !std.fs.path.isSep(root[root.len - 1])) start += 1;
     if (start >= target.len) return null;
     return target[start..];
+}
+
+/// Canonicalization is the only proof that an opened descriptor stayed inside
+/// `root`; a platform whose canonicalization syscall fails with an errno std
+/// cannot classify (e.g. macOS `fcntl(F_GETPATH)` under a sandboxed/virtiofs
+/// CI mount, surfacing as `error.Unexpected`) leaves containment unproven, not
+/// disproven. Fail closed: score that the same as a caught escape instead of
+/// letting an uncategorized error cross this boundary.
+fn escapeOnUnexpected(comptime E: type, err: E) (E || ValidationError) {
+    return if (err == error.Unexpected) error.OutsideRoot else err;
+}
+
+test "an unclassifiable canonicalization errno is scored as a proven escape, not propagated raw" {
+    const RealPathError = error{ Unexpected, FileNotFound, NameTooLong };
+    // escapeOnUnexpected returns a bare error value; wrap it in a real error
+    // union so expectError has something to match against.
+    const call = struct {
+        fn run(err: RealPathError) !void {
+            return escapeOnUnexpected(RealPathError, err);
+        }
+    }.run;
+    try std.testing.expectError(error.OutsideRoot, call(error.Unexpected));
+    try std.testing.expectError(error.FileNotFound, call(error.FileNotFound));
+    try std.testing.expectError(error.NameTooLong, call(error.NameTooLong));
 }
 
 test "relative path validation rejects absolute and parent traversal" {

@@ -12,7 +12,9 @@ const registry = @import("command_registry.zig");
 const language = @import("language.zig");
 const agent_api = @import("agent_api.zig");
 
-pub const product_version = "0.1.0";
+/// The release version, read from `build.zig.zon` at build time. Single source
+/// of truth: the release workflow gates the pushed tag on that same value.
+pub const product_version = build_options.version;
 pub const capability_schema = "navgraph.capabilities.v1";
 pub const capability_schema_version: u32 = 1;
 pub const agent_protocol_version = "1.0";
@@ -128,6 +130,26 @@ pub fn writeBinaryId(w: *std.Io.Writer) !void {
     }
 }
 
+/// The tree-sitter grammars linked into THIS binary. `--backend tree-sitter` is
+/// refused when the list is empty, so a client must be able to read it rather
+/// than discover the refusal by exit code.
+pub fn writeGrammars(w: *std.Io.Writer) !void {
+    try w.writeByte('[');
+    var first = true;
+    inline for (.{
+        .{ build_options.ts_python, "python" },
+        .{ build_options.ts_typescript, "typescript" },
+        .{ build_options.ts_tsx, "tsx" },
+    }) |entry| {
+        if (entry[0]) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try string(w, entry[1]);
+        }
+    }
+    try w.writeByte(']');
+}
+
 pub fn writeManifest(w: *std.Io.Writer) !void {
     try w.writeByte('{');
     try writeContractIdentity(w);
@@ -146,7 +168,9 @@ pub fn writeManifest(w: *std.Io.Writer) !void {
     try quotedBinaryId(w);
     try w.writeAll(",\"revision\":");
     if (source_revision.len == 0) try w.writeAll("null") else try string(w, source_revision);
-    try w.print(",\"sourceFingerprint\":\"{x:0>16}\",\"sourceFingerprintAlgorithm\":\"wyhash64(sorted src/**/*.zig paths+contents)\"", .{source_fingerprint});
+    try w.print(",\"sourceFingerprint\":\"{x:0>16}\",\"sourceFingerprintAlgorithm\":\"wyhash64(sorted src/**/*.{{zig,scm}} paths+contents, then the linked grammar set)\"", .{source_fingerprint});
+    try w.writeAll(",\"grammars\":");
+    try writeGrammars(w);
     try w.writeAll(",\"compiler\":");
     try string(w, builtin.zig_version_string);
     try w.writeAll(",\"target\":{\"arch\":");
@@ -558,4 +582,30 @@ test "capability manifest advertises Java and exact CLI/MCP contract anchors" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "per_reference_and_relation_edge") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "directly_runnable_query") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "phase3") == null);
+}
+
+test "the manifest advertises exactly the grammars this build links" {
+    // F8. `--backend tree-sitter` exits 2 on a grammar-less build, so a manifest
+    // that lists the value promises something the binary refuses — and the
+    // manifest is the only way an agent can discover the difference.
+    const bytes = try manifestOwned(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const backends = @import("backends.zig");
+    if (backends.any_grammar) {
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"values\":[\"auto\",\"heuristic\",\"tree-sitter\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"grammars\":[]") == null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"values\":[\"auto\",\"heuristic\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "tree-sitter") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"grammars\":[]") != null);
+    }
+    inline for (.{
+        .{ build_options.ts_python, "python" },
+        .{ build_options.ts_typescript, "typescript" },
+        .{ build_options.ts_tsx, "tsx" },
+    }) |entry| {
+        const listed = std.mem.indexOf(u8, bytes, "\"grammars\":") != null and
+            std.mem.indexOf(u8, bytes[std.mem.indexOf(u8, bytes, "\"grammars\":").?..][0..64], "\"" ++ entry[1] ++ "\"") != null;
+        try std.testing.expectEqual(entry[0], listed);
+    }
 }
