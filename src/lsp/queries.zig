@@ -1627,33 +1627,38 @@ pub const OutlineOptions = struct {
 pub fn writeOutline(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: OutlineOptions) !void {
     const idx = ctx.index();
     var shown: u32 = 0;
+    var total: u32 = 0;
     var first_file = true;
     try w.writeAll("{\"files\":[");
     for (idx.graph.files) |file| {
         if (!query.matchesFilter(file.path, path_filter)) continue;
-        if (shown >= opts.limit) break;
-        if (try writeOutlineFile(w, ctx, file, opts, &shown, !first_file)) first_file = false;
+        if (try writeOutlineFile(w, ctx, file, opts, &shown, &total, !first_file)) first_file = false;
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{total > shown});
 }
 
+/// Writes up to `opts.limit` symbols (via `shown`) but keeps counting past it
+/// (via `total`) so the caller can report `truncated`.
 fn writeOutlineFile(
     w: *Writer,
     ctx: Ctx,
     file: model.SourceFile,
     opts: OutlineOptions,
     shown: *u32,
+    total: *u32,
     sep: bool,
 ) !bool {
     const idx = ctx.index();
     var wrote_any = false;
     var i = file.sym_start;
-    while (i < file.sym_end and shown.* < opts.limit) : (i += 1) {
+    while (i < file.sym_end) : (i += 1) {
         const sym = idx.graph.symbols[i];
         if (sym.kind == .import) continue;
         if (!sym.kind.isTopLevelInteresting() and sym.parent == invalid) continue;
         if (opts.kinds.len != 0 and !query.kindAllowed(sym.kind, opts.kinds)) continue;
         if (!opts.scope.admits(idx, sym)) continue;
+        total.* += 1;
+        if (shown.* >= opts.limit) continue;
         if (!wrote_any) {
             if (sep) try w.writeByte(',');
             try w.writeAll("{\"file\":");
@@ -1690,9 +1695,11 @@ pub fn writeHot(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: HotOptions)
     query.sortHot(idx, ranked, .default);
     try w.writeAll("{\"items\":[");
     var shown: u32 = 0;
+    var total: u32 = 0;
     for (ranked) |e| {
         if (opts.scope.strict and e.fan_in_exact == 0 and e.fan_out_exact == 0) continue;
-        if (shown >= opts.limit) break;
+        total += 1;
+        if (shown >= opts.limit) continue;
         if (shown != 0) try w.writeByte(',');
         shown += 1;
         try w.writeAll("{\"symbol\":");
@@ -1701,7 +1708,7 @@ pub fn writeHot(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: HotOptions)
             e.fan_in, e.fan_in_exact, e.fan_in_test, e.fan_out, e.fan_out_exact,
         });
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{total > shown});
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,17 +1736,19 @@ pub fn writeUnused(w: *Writer, ctx: Ctx, path_filter: []const u8, opts: UnusedOp
 
     try w.writeAll("{\"items\":[");
     var shown: u32 = 0;
+    var total: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (!try query.isDeadCandidateScoped(idx, sym, path_filter, &refs, opts.scope.tests)) continue;
         if (!query.deadCandidateShown(idx, sym, cli_opts, &refs)) continue;
+        total += 1;
+        if (shown >= opts.limit) continue;
         if (shown != 0) try w.writeByte(',');
         try w.writeAll("{\"symbol\":");
         try payload.writeSymbolId(w, ctx, sym.id);
         try w.print(",\"testOnly\":{}}}", .{refs.testsContains(query.familyOf(idx, sym), sym.name)});
         shown += 1;
-        if (shown >= opts.limit) break;
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{total > shown});
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,15 +1974,17 @@ pub fn writeRoutes(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void {
     const idx = ctx.index();
     try w.writeAll("{\"items\":[");
     var shown: u32 = 0;
+    var total: u32 = 0;
     for (idx.graph.symbols) |sym| {
         if (sym.kind != .route) continue;
         if (filter.len != 0 and std.mem.indexOf(u8, sym.name, filter) == null) continue;
-        if (shown >= limit) break;
+        total += 1;
+        if (shown >= limit) continue;
         if (shown != 0) try w.writeByte(',');
         try writeRouteItem(w, ctx, sym);
         shown += 1;
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{total > shown});
 }
 
 fn writeRouteItem(w: *Writer, ctx: Ctx, route: Symbol) !void {
@@ -2012,7 +2023,7 @@ pub fn writeEvents(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void {
     try w.writeAll("{\"groups\":[");
     var shown_keys: u32 = 0;
     var i: usize = 0;
-    while (i < sites.len) {
+    while (i < sites.len and shown_keys < limit) {
         const key = sites[i].ref.key;
         if (shown_keys != 0) try w.writeByte(',');
         try w.writeAll("{\"key\":");
@@ -2026,9 +2037,8 @@ pub fn writeEvents(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void {
         }
         try w.writeAll("]}");
         shown_keys += 1;
-        if (shown_keys >= limit) break;
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{i < sites.len});
 }
 
 fn writeEventSite(w: *Writer, ctx: Ctx, site: query.EventSite) !void {
@@ -2065,10 +2075,12 @@ pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void 
     try w.writeAll("{\"files\":[");
     var first = true;
     var shown: u32 = 0;
+    var total: u32 = 0;
     for (idx.graph.files) |file| {
         const imps = idx.importsOf(file.id);
         if (imps.len == 0 or !query.matchesFilter(file.path, filter)) continue;
-        if (shown >= limit) break;
+        total += 1;
+        if (shown >= limit) continue;
         shown += 1;
         if (!first) try w.writeByte(',');
         first = false;
@@ -2090,7 +2102,7 @@ pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void 
         }
         try w.writeAll("]}");
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{total > shown});
 }
 
 /// Write `{files:[{file,uri,importers:[{file,uri}]}]}`: files that import
@@ -2102,7 +2114,7 @@ pub fn writeImports(w: *Writer, ctx: Ctx, filter: []const u8, limit: u32) !void 
 /// target, which was quadratic in file count for a broad filter (F13). Not
 /// cached across requests: `index.zig` (generation lifecycle, cache
 /// invalidation) is out of scope for this change.
-pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8) !void {
+pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8, limit: u32) !void {
     const idx = ctx.index();
     const gpa = idx.gpa;
 
@@ -2128,8 +2140,13 @@ pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8) !void {
 
     try w.writeAll("{\"files\":[");
     var first = true;
+    var shown: u32 = 0;
+    var total: u32 = 0;
     for (idx.graph.files) |target| {
         if (!query.matchesFilter(target.path, path)) continue;
+        total += 1;
+        if (shown >= limit) continue;
+        shown += 1;
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -2150,7 +2167,7 @@ pub fn writeImporters(w: *Writer, ctx: Ctx, path: []const u8) !void {
         }
         try w.writeAll("]}");
     }
-    try w.writeAll("]}");
+    try w.print("],\"truncated\":{}}}", .{total > shown});
 }
 
 // ---------------------------------------------------------------------------

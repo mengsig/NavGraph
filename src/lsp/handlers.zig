@@ -1185,9 +1185,10 @@ fn importsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Valu
 fn importersMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
     try self.flushPending(arena, .change);
     const c = try self.ctx();
-    const path = Params.from(params).str("path") orelse return error.InvalidParams;
+    const p = Params.from(params);
+    const path = p.str("path") orelse return error.InvalidParams;
     if (path.len == 0) return error.InvalidParams;
-    try queries.writeImporters(w, c, path);
+    try queries.writeImporters(w, c, path, p.positive("limit", 300));
 }
 
 fn graphMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -2891,6 +2892,23 @@ test "navgraph/outline lists vm.zig's symbols" {
     try testing.expect(found);
 }
 
+test "navgraph/outline reports truncated once the limit caps the symbol count" {
+    const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
+    defer ts.deinit();
+    try ts.start();
+    var capped = try ts.request(52,
+        \\{"jsonrpc":"2.0","id":52,"method":"navgraph/outline","params":{"limit":1}}
+    );
+    defer capped.deinit();
+    try testing.expect((try resultOf(capped)).object.get("truncated").?.bool);
+
+    var full = try ts.request(53,
+        \\{"jsonrpc":"2.0","id":53,"method":"navgraph/outline","params":{}}
+    );
+    defer full.deinit();
+    try testing.expect(!(try resultOf(full)).object.get("truncated").?.bool);
+}
+
 test "a nested scope object is rejected instead of silently ignored (F10)" {
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
     defer ts.deinit();
@@ -2954,8 +2972,16 @@ test "navgraph/hot honors an explicit limit at 300, unlike the CLI's sentinel de
         \\{"jsonrpc":"2.0","id":53,"method":"navgraph/hot","params":{"limit":300}}
     );
     defer res.deinit();
-    const items = (try resultOf(res)).object.get("items").?.array.items;
+    const r = (try resultOf(res)).object;
+    const items = r.get("items").?.array.items;
     try testing.expect(items.len > 25);
+    try testing.expect(!r.get("truncated").?.bool);
+
+    var capped = try ts.request(54,
+        \\{"jsonrpc":"2.0","id":54,"method":"navgraph/hot","params":{"limit":5}}
+    );
+    defer capped.deinit();
+    try testing.expect((try resultOf(capped)).object.get("truncated").?.bool);
 }
 
 test "navgraph/unused finds stack.zig's private, uncalled growHint" {
@@ -3362,6 +3388,35 @@ test "navgraph/importers lists store.py's reverse dependencies" {
     );
     defer missing.deinit();
     try testing.expectEqual(@as(i64, -32602), try errorCodeOf(missing));
+}
+
+test "navgraph/importers honors an explicit limit and reports truncated" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &.{
+        .{ "shared.zig", "pub fn helper() void {}\n" },
+        .{ "a.zig", "const shared = @import(\"shared.zig\");\npub fn useA() void { shared.helper(); }\n" },
+        .{ "b.zig", "const shared = @import(\"shared.zig\");\npub fn useB() void { shared.helper(); }\n" },
+    });
+    defer ts.deinit();
+    try ts.start();
+
+    // Both `a.zig` and `b.zig` import `shared.zig`; only `shared.zig` (and
+    // trivially `a.zig`/`b.zig`, which import nothing) match the filter, but
+    // the *files listed* cap still applies across all 3.
+    var capped = try ts.request(88,
+        \\{"jsonrpc":"2.0","id":88,"method":"navgraph/importers","params":{"limit":1}}
+    );
+    defer capped.deinit();
+    const capped_r = (try resultOf(capped)).object;
+    try testing.expectEqual(@as(usize, 1), capped_r.get("files").?.array.items.len);
+    try testing.expect(capped_r.get("truncated").?.bool);
+
+    var full = try ts.request(89,
+        \\{"jsonrpc":"2.0","id":89,"method":"navgraph/importers","params":{}}
+    );
+    defer full.deinit();
+    const full_r = (try resultOf(full)).object;
+    try testing.expectEqual(@as(usize, 3), full_r.get("files").?.array.items.len);
+    try testing.expect(!full_r.get("truncated").?.bool);
 }
 
 test "navgraph/graph writes an HTML file under .navgraph and returns its path" {
