@@ -480,12 +480,12 @@ method Server.start (self):  app/server.py:15
 
 `navgraph lsp` runs NavGraph as a long-lived editor server: a standard LSP
 server (a subset) plus custom `navgraph/*` methods that expose the graph verbs.
-The whole graph stays in memory, an edit re-indexes in single-digit
-milliseconds, and blast-radius / search / call-graph queries answer in well
-under a millisecond.
+The whole graph stays in memory, an edit re-indexes in tens of milliseconds or
+less, and blast-radius / search / call-graph queries answer in single-digit
+milliseconds.
 
 ```
-navgraph lsp [--root <dir>] [--log <file>] [--log-level error|info|debug]
+navgraph lsp [-C|--root <dir>] [--log <file>] [--log-level error|info|debug]
 ```
 
 - **Standard LSP** — `definition`, `references`, `hover`, `documentSymbol`,

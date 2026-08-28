@@ -1,15 +1,15 @@
 # NavGraph editor protocol — v1
 
 `navgraph lsp` runs NavGraph as a resident editor
-server: the whole code graph stays in memory, an edit re-indexes in single-digit
-milliseconds, and blast-radius / search / call-graph queries answer in under a
-millisecond.
+server: the whole code graph stays in memory, an edit re-indexes in tens of
+milliseconds or less, and blast-radius / search / call-graph queries answer in
+single-digit milliseconds. Measured figures are in the table below.
 
 It is a standard LSP server (a subset) **plus** custom `navgraph/*` methods.
 Neovim's built-in client (`vim.lsp.start`) is the reference client.
 
 ```
-navgraph lsp [--root <dir>] [--log <file>] [--log-level error|info|debug]
+navgraph lsp [-C|--root <dir>] [--log <file>] [--log-level error|info|debug]
 ```
 
 - **Transport** — JSON-RPC 2.0 over stdio with LSP framing
@@ -39,14 +39,14 @@ CLI prints them.
 | Method | Notes |
 | --- | --- |
 | `initialize` | Capabilities below. |
-| `initialized` (notif) | Builds the index (using `.navgraph/cache` like the CLI), reports `$/progress`, and always ends with `navgraph/indexed`. |
+| `initialized` (notif) | Builds the index (using `.navgraph/cache` like the CLI), reports `$/progress`, and ends with `navgraph/indexed` — or, if indexing failed, with `window/logMessage` and no index. |
 | `shutdown` → `null`, `exit` | `exit` after `shutdown` exits 0, without it exits 1. stdin EOF exits 0. |
 | `textDocument/didOpen` `didChange` `didSave` `didClose` | Overlay store; see below. |
 | `textDocument/definition` → `Location[]` | The identifier at the position, resolved with the same rules as `calls`. |
 | `textDocument/references` → `Location[]` | Every use site; the declaration is included when `context.includeDeclaration`. |
 | `textDocument/hover` | Markdown: `kind name`, the fenced signature, `file:line-endLine`, `← N callers → M callees`, then the doc comment. |
 | `textDocument/documentSymbol` → `DocumentSymbol[]` | Nested; `range` spans `line..endLine`, `selectionRange` covers the name. Reflects the overlay. |
-| `workspace/symbol` → `SymbolInformation[]` | Ranked like `navgraph/search`. |
+| `workspace/symbol` → `SymbolInformation[]` | Ranked like `navgraph/search`; `limit` defaults to 200. The test scope is the server's `initializationOptions` one; per-request `strict`/`tests` are not read. |
 | `workspace/didChangeWatchedFiles` (notif) | Re-stats the listed files and re-indexes. |
 | `$/cancelRequest`, `$/setTrace` (notif) | Accepted and ignored. |
 
@@ -70,7 +70,7 @@ CLI prints them.
 | --- | --- | --- |
 | `tests` | `"with"` | `with` \| `without` \| `only` — the test-code scope. |
 | `strict` | `false` | Follow only high-confidence (type/self-bound) edges. |
-| `debounceMs` | `120` | How long an edit waits before re-indexing. |
+| `debounceMs` | `120` | How long an edit waits before re-indexing. `0` and negatives mean "use the default", not "no debounce". |
 | `watch` | `true` | Poll file mtimes for out-of-editor changes. |
 | `watchIntervalMs` | `2000` | Poll interval. |
 | `depth` | `3` | Default graph depth (max 10). |
@@ -95,11 +95,13 @@ disappears again when the buffer is closed.
 | `-32601` | Unknown method. |
 | `-32602` | Bad params: a missing/ill-typed field, an unknown `direction` or `tests` scope, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. |
 | `-32603` | Internal failure (allocation, IO). |
-| `-32001` | A `Target` that resolves to nothing — `{"message": "…: symbol not found", …}`. |
+| `-32001` | A `Target` that resolves to nothing — `{"code": -32001, "message": "…: symbol not found"}`. An error object never carries `data`. |
 | `-32002` | The request could not be completed: currently only a grep regex that exhausts one of the bounds below. |
 
-A malformed *notification* gets no reply, per JSON-RPC. Nothing a client can
-send kills the server.
+A malformed *notification* gets no reply, per JSON-RPC — with one exception: a
+body the server cannot parse at all has no id to identify it as a notification,
+so it is answered with `-32700` and `"id": null`. Nothing a client can send
+kills the server.
 
 ### Resynchronizing
 
@@ -250,6 +252,9 @@ hangs and never takes the server down.
 ### `navgraph/callers` / `navgraph/calls`
 
 Params: `Target & { depth?:int (1), refs?:bool } & Scope` → `{ root:Node }`.
+`{ file }` and `{ ref }` are accepted too, as for `navgraph/blast`, but a tree
+has one root: only the first definition they resolve to is walked. Send a
+`Target` unless you mean that.
 
 Mirrors the CLI's `callers`/`calls -j` tree. `lines` on a child is every
 call-site line of the edge to its parent; `ext` lists unresolved call targets;
@@ -259,14 +264,22 @@ call-site line of the edge to its parent; `ext` lists unresolved call targets;
 ### `navgraph/rescan` `{ full?:bool }` → the `navgraph/status` shape
 
 Re-walks the tree, so files created or deleted outside the editor are picked up
-(a git checkout, a formatter). `full: true` ignores the on-disk cache. Open
-documents are re-applied afterwards, so unsaved edits survive a rescan.
+(a git checkout, a formatter). `full: true` ignores the on-disk cache (and then
+does not write one back). Open documents are re-applied afterwards, so unsaved
+edits survive a rescan. The `navgraph/indexed` that follows carries the disk
+delta in `changedFiles`: files created, deleted, or re-read with new content.
+An open document is not listed — the index holds its buffer, which a rescan
+does not touch.
 
 ## Notifications (server → client)
 
 - **`navgraph/indexed`** `{ reason:"initial"|"change"|"save"|"rescan"|"watch",
   files:int, symbols:int, edges:int, ms:int, changedFiles:string[] }` — sent
-  after **every** (re)index. Clients refresh open views on it.
+  after every (re)index that produced a graph. Clients refresh open views on it.
+  `changedFiles` is the dirty set for an edit and the disk delta for a rescan;
+  it is empty for `"initial"`. A *failed* index sends `window/logMessage` (and
+  a `$/progress` end) instead, and leaves the server without an index — every
+  graph request then answers `-32600`.
 - **`$/progress`** for the initial index, after a
   `window/workDoneProgress/create` request, and only when the client advertised
   `window.workDoneProgress`. The client's answer to that request is accepted
@@ -335,7 +348,8 @@ particular varies with page-cache warmth.
 
 Against the v1 targets: initial index of this repo < 1 s (36–46 ms), single-file
 re-index < 100 ms on a 50k-line tree (7–19 ms), search / grep / blast(3) each
-< 30 ms (≤ 3.4 ms), resident memory < 200 MB at 100k lines (≈ 35 MB).
+< 30 ms (≤ 6.6 ms, on the 59k-line tree), resident memory < 200 MB at 100k lines
+(≈ 35 MB).
 
 **Targeted re-resolution was measured and is not needed.** A re-index re-parses
 only the changed file and re-assembles the graph from the already-parsed rest;
@@ -379,7 +393,8 @@ and requires the process to exit 0. CI runs it against the ReleaseFast build.
 
 ```lua
 vim.api.nvim_create_autocmd("FileType", {
-  pattern = { "zig", "python", "javascript", "typescript", "go", "rust", "ruby", "lua", "c", "cpp", "cs" },
+  pattern = { "zig", "python", "javascript", "javascriptreact", "typescript",
+              "typescriptreact", "go", "rust", "ruby", "lua", "c", "cpp", "cs" },
   callback = function(args)
     local root = vim.fs.root(args.buf, { ".git", "build.zig", "package.json", "go.mod", "Cargo.toml" })
     if not root then return end
