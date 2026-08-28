@@ -319,7 +319,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"n
 printf '%s\n' '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"navgraph.query","arguments":{"operation":"map","query":"authority_a_after_rename","limit":5}}}' >&3
 printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"navgraph.query","arguments":{"operation":"source","path":"ignored/config.txt"}}}' >&3
 printf '%s\n' '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"navgraph","arguments":{"args":["read","ignored/config.txt","-j"]}}}' >&3
-printf '%s\n' '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"navgraph","arguments":{"args":["status","-j"]}}}' >&3
+printf '%s\n' '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"navgraph","arguments":{"args":["status","--full","-j"]}}}' >&3
 printf '%s\n' '{"jsonrpc":"2.0","id":12,"method":"shutdown"}' >&3
 exec 3>&-
 wait "$server_pid"
@@ -393,6 +393,10 @@ expect_contains "$tmp/tools.json" '"code":"no_such_line"'
 expect_not_contains "$tmp/tools.json" 'budget_too_small'
 expect_contains "$tmp/tools.json" '"after":"v1:2"'
 expect_contains "$tmp/tools.json" '"view":"likely_local"'
+# Regression guard for the diagnostics envelope silently losing its item source
+# (agent_api.zig must set status_full so unresolved_references carries items).
+expect_contains "$tmp/tools.json" '"resolution":"likely_local"'
+expect_contains "$tmp/tools.json" '"kind":"unresolved_reference"'
 
 "$bin" capabilities >"$tmp/capabilities.json"
 expect_contains "$tmp/capabilities.json" '"unsupported":["c","cpp","csharp","go"]'
