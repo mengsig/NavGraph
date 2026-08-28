@@ -1010,7 +1010,35 @@ fn contextMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Valu
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
-    try queries.writeContext(w, arena, c, roots[0], .{ .budget = try p.positive("budget", 2000) });
+    const include = try includeOf(p);
+    try queries.writeContext(w, arena, c, roots[0], .{ .budget = try p.positive("budget", 2000), .include = include });
+}
+
+/// `include?:("callers"|"callees"|"types"|"tests"|"body")[]` — absent means
+/// every section; present (even empty) is a strict allow-list, rejecting an
+/// unknown entry rather than silently dropping it (coldstart F5).
+fn includeOf(p: Params) Error!queries.ContextInclude {
+    const v = p.get("include") orelse return .{};
+    if (v != .array) return error.InvalidParams;
+    var inc = queries.ContextInclude.none;
+    for (v.array.items) |item| {
+        if (item != .string) return error.InvalidParams;
+        const s = item.string;
+        if (std.mem.eql(u8, s, "callers")) {
+            inc.callers = true;
+        } else if (std.mem.eql(u8, s, "callees")) {
+            inc.callees = true;
+        } else if (std.mem.eql(u8, s, "types")) {
+            inc.types = true;
+        } else if (std.mem.eql(u8, s, "tests")) {
+            inc.tests = true;
+        } else if (std.mem.eql(u8, s, "body")) {
+            inc.body = true;
+        } else {
+            return error.InvalidParams;
+        }
+    }
+    return inc;
 }
 
 /// `navgraph/where`: the symbol enclosing `{uri, line}` and its breadcrumb
@@ -3273,6 +3301,44 @@ test "navgraph/context drops sections in order under a tight budget, but never c
     try testing.expectEqual(@as(usize, 0), r.get("tests").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), r.get("callers").?.array.items.len);
     try testing.expect(r.get("truncated").?.bool);
+}
+
+test "navgraph/context honors include as a strict section allow-list (F5)" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(85,
+        \\{"jsonrpc":"2.0","id":85,"method":"navgraph/context","params":{"symbol":"mid","include":["callers"]}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqual(@as(usize, 1), r.get("callers").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("types").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("tests").?.array.items.len);
+}
+
+test "navgraph/context with an empty include drops every optional section, not the full bundle" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(86,
+        \\{"jsonrpc":"2.0","id":86,"method":"navgraph/context","params":{"symbol":"mid","include":[]}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqual(@as(usize, 0), r.get("callers").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
+    // Body dropped too: definition.text falls back to the bare signature.
+    try testing.expect(std.mem.indexOf(u8, r.get("definition").?.object.get("text").?.string, "util.helper()") == null);
+}
+
+test "navgraph/context rejects an unknown include entry" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(87,
+        \\{"jsonrpc":"2.0","id":87,"method":"navgraph/context","params":{"symbol":"mid","include":["bogus"]}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(res));
 }
 
 test "navgraph/context on an unresolved symbol is a symbol-not-found error" {

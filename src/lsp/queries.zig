@@ -692,11 +692,25 @@ pub fn writeTestsFor(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, target: Symbo
 // Context (one-call symbol briefing for an editing agent)
 // ---------------------------------------------------------------------------
 
+/// Which sections `navgraph/context` computes and returns — a mask applied
+/// before budget trimming (coldstart F5). Absent `include` in the request
+/// means "everything", the all-true default.
+pub const ContextInclude = struct {
+    callers: bool = true,
+    callees: bool = true,
+    types: bool = true,
+    tests: bool = true,
+    body: bool = true,
+
+    pub const none: ContextInclude = .{ .callers = false, .callees = false, .types = false, .tests = false, .body = false };
+};
+
 pub const ContextOptions = struct {
     /// Rough token budget; sections drop in order (bodies, tests, types,
     /// callees — callers never drop) until the estimate fits, or nothing is
     /// left to drop.
     budget: u32 = 2000,
+    include: ContextInclude = .{},
 };
 
 /// A rough tokens-from-characters estimate (~4 chars/token), the same order
@@ -730,11 +744,11 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
     const sig = sym.signature(file.text);
     const body_text = sym.body(file.text);
     const doc = render.stripDoc(sym.doc);
-    const callers = idx.callersOf(id);
+    const callers = if (opts.include.callers) idx.callersOf(id) else &.{};
 
     var callees: std.ArrayList(SymbolId) = .empty;
     defer callees.deinit(gpa);
-    {
+    if (opts.include.callees) {
         var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
         defer seen.deinit(gpa);
         var it = Neighbours.init(idx, id, .callees, false);
@@ -746,7 +760,7 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
 
     var types: std.ArrayList(SymbolId) = .empty;
     defer types.deinit(gpa);
-    {
+    if (opts.include.types) {
         var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
         defer seen.deinit(gpa);
         if (impls.isContainer(sym)) {
@@ -768,34 +782,38 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
         }
     }
 
-    var reach = try reachingWalk(gpa, idx, id);
-    defer freeReachNodes(gpa, &reach);
     var tests_list: std.ArrayList(SymbolId) = .empty;
     defer tests_list.deinit(gpa);
-    for (reach.items[1..]) |n| {
-        if (query.isTestSymbol(idx, idx.graph.symbols[n.id])) try tests_list.append(gpa, n.id);
+    if (opts.include.tests) {
+        var reach = try reachingWalk(gpa, idx, id);
+        defer freeReachNodes(gpa, &reach);
+        for (reach.items[1..]) |n| {
+            if (query.isTestSymbol(idx, idx.graph.symbols[n.id])) try tests_list.append(gpa, n.id);
+        }
     }
 
-    // Level 0 keeps everything; each higher level drops one more section, in
-    // the contract's stated order. Stop at the first level that fits, or the
-    // last level if none does.
+    // Level 0 keeps everything `include` allows; each higher level drops one
+    // more section, in the contract's stated order. A section `include`
+    // excludes stays dropped at every level (F5) — the mask applies before
+    // budget trimming. Stop at the first level that fits, or the last if none does.
     var level: u32 = 0;
     var chars: usize = 0;
     while (true) : (level += 1) {
-        const with_body = level < 1;
-        const with_tests = level < 2;
-        const with_types = level < 3;
-        const with_callees = level < 4;
-        chars = doc.len + (if (with_body) body_text.len else sig.len) + sigCharsSum(idx, callers);
+        const with_body = level < 1 and opts.include.body;
+        const with_tests = level < 2 and opts.include.tests;
+        const with_types = level < 3 and opts.include.types;
+        const with_callees = level < 4 and opts.include.callees;
+        chars = doc.len + (if (with_body) body_text.len else sig.len);
+        if (opts.include.callers) chars += sigCharsSum(idx, callers);
         if (with_callees) chars += sigCharsSum(idx, callees.items);
         if (with_types) chars += sigCharsSum(idx, types.items);
         if (with_tests) chars += sigCharsSum(idx, tests_list.items);
         if (estimateTokens(chars) <= opts.budget or level >= 4) break;
     }
-    const with_body = level < 1;
-    const with_tests = level < 2;
-    const with_types = level < 3;
-    const with_callees = level < 4;
+    const with_body = level < 1 and opts.include.body;
+    const with_tests = level < 2 and opts.include.tests;
+    const with_types = level < 3 and opts.include.types;
+    const with_callees = level < 4 and opts.include.callees;
 
     try w.writeAll("{\"symbol\":");
     try payload.writeSymbolId(w, ctx, id);
