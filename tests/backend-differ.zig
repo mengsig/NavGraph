@@ -543,3 +543,184 @@ test "auto keeps every language on the heuristic backend" {
     try testing.expectEqual(model.Backend.heuristic, health.backend);
     try testing.expect(!health.tree_sitter_fallback);
 }
+
+// ---------------------------------------------------------------------------
+// Receiver chain heads
+// ---------------------------------------------------------------------------
+
+fn refByQual(sym: model.Symbol, qualifier: []const u8, name: []const u8) ?model.Reference {
+    for (sym.refs) |ref| {
+        if (std.mem.eql(u8, ref.qualifier, qualifier) and std.mem.eql(u8, ref.name, name)) return ref;
+    }
+    return null;
+}
+
+fn memberSymbolIn(idx: *const index.Index, file: []const u8, parent: []const u8, child: []const u8) ?model.Symbol {
+    for (idx.graph.symbols) |sym| {
+        if (sym.parent == model.invalid_symbol) continue;
+        if (!std.mem.eql(u8, sym.name, child)) continue;
+        if (!std.mem.eql(u8, idx.graph.files[sym.file].path, file)) continue;
+        if (std.mem.eql(u8, idx.graph.symbols[sym.parent].name, parent)) return sym;
+    }
+    return null;
+}
+
+const ChainCase = struct {
+    /// Method holding the `store.fetch()` call site.
+    caller: []const u8,
+    /// `receiver_root` the reference must carry: "self" is spelled per language.
+    root: []const u8,
+};
+
+const chain_cases = [_]ChainCase{
+    // `self.store` / `this.store`: the enclosing instance heads the chain, so
+    // the resolver may read Api's own field table.
+    .{ .caller = "direct", .root = "self" },
+    // Another object heads the chain. Losing this root is the mis-resolution
+    // PR #7 landed to kill: Api's field table would answer for Holder's field.
+    .{ .caller = "cross", .root = "o" },
+    // A bare qualifier heads its own chain, so no field table may answer.
+    .{ .caller = "bare", .root = "" },
+};
+
+/// Assert the three chain shapes carry the chain head the resolver reads, and
+/// that none of them is confidently resolved. Container field tables are Go-only
+/// today (`collectGoFieldBindings`), so a TS/Python chain cannot yet produce an
+/// exact edge — the roots are what must be right when it can.
+fn expectChainCases(idx: *const index.Index, file: []const u8, self_word: []const u8) !void {
+    for (chain_cases) |case| {
+        const caller = memberSymbolIn(idx, file, "Api", case.caller) orelse {
+            std.debug.print("navgraph differ: no Api.{s} in {s}\n", .{ case.caller, file });
+            return error.TestExpectedEqual;
+        };
+        const ref = refByQual(caller, "store", "fetch") orelse {
+            std.debug.print("navgraph differ: {s} Api.{s} has no store.fetch reference\n", .{ file, case.caller });
+            return error.TestExpectedEqual;
+        };
+        const want_root = if (std.mem.eql(u8, case.root, "self")) self_word else case.root;
+        testing.expectEqualStrings(want_root, ref.receiver_root) catch |err| {
+            std.debug.print("navgraph differ: {s} Api.{s} chain head\n", .{ file, case.caller });
+            return err;
+        };
+        try testing.expect(!ref.exact);
+    }
+}
+
+test "the tree-sitter backend records the receiver chain head the resolver needs" {
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.py", .data =
+        \\class Store:
+        \\    def fetch(self):
+        \\        return 1
+        \\
+        \\class Cache:
+        \\    def fetch(self):
+        \\        return 2
+        \\
+        \\class Holder:
+        \\    def __init__(self):
+        \\        self.store: Store = Store()
+        \\
+        \\class Api:
+        \\    def __init__(self):
+        \\        self.store: Cache = Cache()
+        \\
+        \\    def direct(self):
+        \\        return self.store.fetch()
+        \\
+        \\    def cross(self, o: Holder):
+        \\        return o.store.fetch()
+        \\
+        \\    def bare(self):
+        \\        return store.fetch()
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.ts", .data =
+        \\export class Store {
+        \\  fetch(): number {
+        \\    return 1;
+        \\  }
+        \\}
+        \\
+        \\export class Cache {
+        \\  fetch(): number {
+        \\    return 2;
+        \\  }
+        \\}
+        \\
+        \\export class Holder {
+        \\  store: Store = new Store();
+        \\}
+        \\
+        \\export class Api {
+        \\  store: Cache = new Cache();
+        \\
+        \\  direct(): number {
+        \\    return this.store.fetch();
+        \\  }
+        \\
+        \\  cross(o: Holder): number {
+        \\    return o.store.fetch();
+        \\  }
+        \\
+        \\  bare(): number {
+        \\    return store.fetch();
+        \\  }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var ts_idx = try index.build(testing.allocator, io, root, false, .tree_sitter);
+    defer ts_idx.deinit();
+    var heuristic = try index.build(testing.allocator, io, root, false, .heuristic);
+    defer heuristic.deinit();
+    for ([_]*const index.Index{ &ts_idx, &heuristic }) |idx| {
+        try expectChainCases(idx, "app.py", "self");
+        try expectChainCases(idx, "app.ts", "this");
+    }
+}
+
+test "no reference loses its chain head on the fixture trees" {
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var compared: u32 = 0;
+    var mismatched: u32 = 0;
+    for (fixture_trees) |tree| {
+        var pair = try Pair.open(gpa, tree);
+        defer pair.close();
+        for (pair.heuristic.graph.symbols) |sym| {
+            if (!grammarBacked(pair.heuristic.graph.files[sym.file].language)) continue;
+            const twin = memberOrTopLevel(&pair.tree_sitter, &pair.heuristic, sym) orelse continue;
+            for (sym.refs) |ref| {
+                if (ref.receiver_root.len == 0) continue;
+                const other = refByQual(twin, ref.qualifier, ref.name) orelse continue;
+                compared += 1;
+                if (std.mem.eql(u8, other.receiver_root, ref.receiver_root)) continue;
+                mismatched += 1;
+                std.debug.print(
+                    "navgraph differ: {s} {s}.{s}.{s} chain head \"{s}\" -> \"{s}\"\n",
+                    .{ tree, sym.name, ref.qualifier, ref.name, ref.receiver_root, other.receiver_root },
+                );
+            }
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), mismatched);
+    // A silent zero would make the assertion above vacuous.
+    try testing.expect(compared > 0);
+}
+
+/// The tree-sitter build's counterpart of a heuristic symbol, matched on the
+/// identity users navigate by (file + name + line); symbol ids differ per build.
+fn memberOrTopLevel(other: *const index.Index, from: *const index.Index, sym: model.Symbol) ?model.Symbol {
+    const path = from.graph.files[sym.file].path;
+    for (other.graph.symbols) |cand| {
+        if (cand.line != sym.line or !std.mem.eql(u8, cand.name, sym.name)) continue;
+        if (!std.mem.eql(u8, other.graph.files[cand.file].path, path)) continue;
+        return cand;
+    }
+    return null;
+}

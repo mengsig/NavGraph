@@ -16,6 +16,12 @@
   attribute: (identifier) @ref.call))
 
 (attribute object: (identifier) @qualifier attribute: (identifier) @ref)
+; A deeper chain keeps the innermost qualifier (`a.store.limit` -> "store"),
+; exactly as the heuristic scanner does; the extractor derives the chain head
+; from the tree and records it as `receiver_root`.
+(attribute
+  object: (attribute attribute: (identifier) @qualifier)
+  attribute: (identifier) @ref)
 
 (assignment left: (identifier) @ref.write)
 (assignment left: (attribute

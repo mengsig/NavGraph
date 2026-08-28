@@ -382,6 +382,9 @@ const Def = struct {
 const Site = struct {
     name: []const u8,
     qualifier: []const u8 = "",
+    /// Identifier heading the receiver chain when the qualifier is itself a
+    /// member (`o.store.Get()` -> "o"); "" when the qualifier heads it.
+    receiver_root: []const u8 = "",
     line: u32,
     call: bool = false,
     write: bool = false,
@@ -836,6 +839,42 @@ fn ownerOf(defs: []const Def, offset: u32) ?u32 {
     return best;
 }
 
+/// The `object`/`property` pair of a member access (`a.b`), whichever field
+/// names the grammar uses: Python spells it `attribute`, TS `property`.
+fn memberProperty(node: TSNode) ?TSNode {
+    return fieldChild(node, "property") orelse fieldChild(node, "attribute");
+}
+
+/// Identifier heading the receiver chain of a member access, mirroring the
+/// heuristic backend's `receiverChainRoot`: `o.store.Get()` -> "o", and "" when
+/// the qualifier already heads the chain (`store.Get()`) or the head is not a
+/// plain identifier (`make().store.Get()`). `model.Reference.receiver_root`
+/// carries it so the resolver can tell a field access from a bare module
+/// qualifier; dropping it lets the enclosing type's field table answer for
+/// another object's field.
+fn chainRoot(source: []const u8, node: TSNode) []const u8 {
+    const parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) return "";
+    const property = memberProperty(parent) orelse return "";
+    // `node` is the receiver, not the member being named: it heads its own chain.
+    if (ts_node_start_byte(property) != ts_node_start_byte(node)) return "";
+
+    var object = fieldChild(parent, "object") orelse return "";
+    var depth: u32 = 0;
+    while (memberProperty(object) != null) : (depth += 1) {
+        // Grammars nest member accesses linearly; the bound only guards against
+        // a malformed tree turning this into a hang.
+        if (depth > max_chain_depth) return "";
+        object = fieldChild(object, "object") orelse return "";
+    }
+    if (depth == 0) return ""; // the immediate qualifier heads the chain
+    const kind = std.mem.span(ts_node_type(object));
+    if (!std.mem.eql(u8, kind, "identifier") and !std.mem.eql(u8, kind, "this")) return "";
+    return nodeText(source, object);
+}
+
+const max_chain_depth: u32 = 64;
+
 fn attachRefs(
     c: *Compiled,
     cursor: *TSQueryCursor,
@@ -883,7 +922,11 @@ fn attachRefs(
         if (name.len < 2) continue; // the heuristic backend also skips 1-char names
         const gop = try sites.getOrPut(gpa, ts_node_start_byte(node));
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .name = name, .line = nodeLine(node) };
+            gop.value_ptr.* = .{
+                .name = name,
+                .receiver_root = chainRoot(source, node),
+                .line = nodeLine(node),
+            };
         }
         const site = gop.value_ptr;
         if (qualifier.len != 0) site.qualifier = qualifier;
@@ -907,9 +950,9 @@ fn attachRefs(
         // A bare self-reference is recursion noise, exactly as in the heuristic.
         if (site.qualifier.len == 0 and std.mem.eql(u8, site.name, defs[owner].name)) continue;
         if (!site.suppress_read)
-            try acc.record(owner, site.name, site.qualifier, site.line, offset, site.call, false);
+            try acc.record(owner, site, offset, site.call, false);
         if (site.write)
-            try acc.record(owner, site.name, site.qualifier, site.line, offset, false, true);
+            try acc.record(owner, site, offset, false, true);
     }
     try acc.finish(symbols);
 }
@@ -958,45 +1001,59 @@ const RefAccumulator = struct {
     fn record(
         self: *RefAccumulator,
         owner: u32,
-        name: []const u8,
-        qualifier: []const u8,
-        line: u32,
+        site: Site,
         offset: u32,
         is_call: bool,
         write: bool,
     ) !void {
         std.debug.assert(owner < self.symbol_count);
-        const key = try std.fmt.allocPrint(self.gpa, "{d}\x00{s}\x00{s}\x00{c}", .{
-            owner, qualifier, name, if (write) @as(u8, 'w') else 'r',
+        // The chain root participates in deduplication for the same reason the
+        // heuristic includes it: `a.store.Get()` and `o.store.Get()` reach
+        // different objects and must resolve independently.
+        const key = try std.fmt.allocPrint(self.gpa, "{d}\x00{s}\x00{s}\x00{s}\x00{c}", .{
+            owner, site.receiver_root, site.qualifier, site.name, if (write) @as(u8, 'w') else 'r',
         });
-        const gop = try self.seen.getOrPut(self.gpa, key);
-        if (gop.found_existing) {
+        if (self.seen.get(key)) |idx| {
             self.gpa.free(key);
-            const idx = gop.value_ptr.*;
             self.refs.items[idx].count += 1;
             if (is_call) self.refs.items[idx].kind = .call;
             const ll = &self.lines.items[idx];
-            if (ll.items.len == 0 or ll.items[ll.items.len - 1] != line) try ll.append(self.gpa, line);
+            if (ll.items.len == 0 or ll.items[ll.items.len - 1] != site.line) try ll.append(self.gpa, site.line);
             try self.offsets.items[idx].append(self.gpa, offset);
             return;
         }
-        try self.keys.append(self.gpa, key);
-        gop.value_ptr.* = @intCast(self.refs.items.len);
-        try self.refs.append(self.gpa, .{
-            .name = name,
-            .qualifier = qualifier,
-            .line = line,
+        {
+            errdefer self.gpa.free(key);
+            try self.keys.append(self.gpa, key);
+        }
+        // `keys` owns `key` from here, so any later failure still frees it.
+        var line_list: std.ArrayList(u32) = .empty;
+        errdefer line_list.deinit(self.gpa);
+        try line_list.append(self.gpa, site.line);
+        var offset_list: std.ArrayList(u32) = .empty;
+        errdefer offset_list.deinit(self.gpa);
+        try offset_list.append(self.gpa, offset);
+
+        // Reserve every parallel slot before publishing: the appends below must
+        // not fail partway and leave `refs`/`owners`/`lines` out of step.
+        try self.seen.ensureUnusedCapacity(self.gpa, 1);
+        try self.refs.ensureUnusedCapacity(self.gpa, 1);
+        try self.owners.ensureUnusedCapacity(self.gpa, 1);
+        try self.lines.ensureUnusedCapacity(self.gpa, 1);
+        try self.offsets.ensureUnusedCapacity(self.gpa, 1);
+        self.seen.putAssumeCapacity(key, @intCast(self.refs.items.len));
+        self.refs.appendAssumeCapacity(.{
+            .name = site.name,
+            .qualifier = site.qualifier,
+            .receiver_root = site.receiver_root,
+            .line = site.line,
             .kind = if (is_call) .call else .read,
             .write = write,
             .count = 1,
         });
-        try self.owners.append(self.gpa, owner);
-        var ll: std.ArrayList(u32) = .empty;
-        try ll.append(self.gpa, line);
-        try self.lines.append(self.gpa, ll);
-        var ol: std.ArrayList(u32) = .empty;
-        try ol.append(self.gpa, offset);
-        try self.offsets.append(self.gpa, ol);
+        self.owners.appendAssumeCapacity(owner);
+        self.lines.appendAssumeCapacity(line_list);
+        self.offsets.appendAssumeCapacity(offset_list);
     }
 
     /// Split the flat accumulation into one arena-owned slice per symbol.

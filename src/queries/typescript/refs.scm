@@ -19,6 +19,11 @@
 (new_expression constructor: (identifier) @ref.call)
 
 (member_expression object: (identifier) @qualifier property: (property_identifier) @ref)
+; A deeper chain keeps the innermost qualifier (`a.store.limit` -> "store");
+; the extractor derives the chain head from the tree as `receiver_root`.
+(member_expression
+  object: (member_expression property: (property_identifier) @qualifier)
+  property: (property_identifier) @ref)
 
 (assignment_expression left: (identifier) @ref.write)
 (assignment_expression left: (member_expression
