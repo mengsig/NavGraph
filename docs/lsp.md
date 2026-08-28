@@ -712,8 +712,9 @@ Trimmed to `budget` (B2: this is an enforced bound, not a suggestion), **in
 order**: the body (`definition.text` falls back to the bare `signature`),
 then `tests`, then `types`, then `callees`. `callers` is never dropped as a
 whole section, but — unlike the others — it is count-capped to whatever
-budget remains once every other section has settled: highest-priority first
-(an exact call edge outranks a heuristic one), with a floor of one shown
+budget remains once every other section has settled: production code before
+any test block, then an exact call edge over a heuristic one, then proximity
+to the target (same file, then same directory), with a floor of one shown
 whenever the symbol has any caller at all, so an extreme budget still answers
 "who calls this" rather than going empty. `callersTotal` is the true caller
 count regardless of the cap; `offset` pages through that priority order and
@@ -785,7 +786,8 @@ truncated response with no route to the rest, and no way to size what's
 missing, is a contract violation — the independent evaluation's finding #4,
 also flagged for the 1.0 `map`/`source`/`read` helpers' own `next`).
 `offset` pages a stable priority order (BFS order for the blast-radius
-methods, highest-value-first for `context`'s `callers`); the response's
+methods; for `context`'s `callers`, production code before any test block,
+then exactness, then proximity — see `navgraph/context` below); the response's
 `next` is the `offset` for the following page, or `null` once nothing
 remains; `summary.total` / `callersTotal` report the true count independent
 of paging.
