@@ -8112,10 +8112,26 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     try testing.expect(std.mem.indexOf(u8, jsonl_writer.written(), "\"freshness_current\":false") != null);
 }
 
+// Compact and --full compute languages/backend counts independently
+// (statusCompact's own aggregation vs. the shared per-file counters) and
+// must agree; json.Value equality is unreliable across two separately
+// parsed documents, so compare the integer entries directly.
+fn expectSameIntObject(a: std.json.ObjectMap, b: std.json.ObjectMap) !void {
+    try std.testing.expectEqual(a.count(), b.count());
+    var it = a.iterator();
+    while (it.next()) |entry| {
+        const other = b.get(entry.key_ptr.*) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(entry.value_ptr.integer, other.integer);
+    }
+}
+
 test "status default is a bounded summary; --full restores the item-level dump (eval finding 3)" {
     const testing = std.testing;
     const io = testing.io;
-    var idx = try index_mod.build(testing.allocator, io, "src", false, .auto);
+    // testenv exercises every supported language across both backends, so the
+    // 4096-byte compact bound is actually tested against realistic growth
+    // (a single-language src/ index left it with ~9x headroom, never at risk).
+    var idx = try index_mod.build(testing.allocator, io, "testenv", false, .auto);
     defer idx.deinit();
 
     var text_buf: std.ArrayList(u8) = .empty;
@@ -8123,8 +8139,8 @@ test "status default is a bounded summary; --full restores the item-level dump (
     var text_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &text_buf);
     defer text_writer.deinit();
     try testing.expect(try status(&text_writer.writer, io, &idx, "", .{}));
-    // ~4 bytes/token: 4096 bytes has ample headroom over today's measured
-    // ~300 bytes (well under the 1k-token target) without flaking on growth.
+    // ~4 bytes/token: 4096 bytes has headroom over the measured worst case in
+    // this repo (13 languages x 2 backends: ~350B text, ~550B JSON/JSONL).
     try testing.expect(text_writer.written().len < 4096);
     try testing.expect(std.mem.indexOf(u8, text_writer.written(), "languages:") != null);
     try testing.expect(std.mem.indexOf(u8, text_writer.written(), "backend:") != null);
@@ -8174,7 +8190,43 @@ test "status default is a bounded summary; --full restores the item-level dump (
     try testing.expect(try status(&full_json_writer.writer, io, &idx, "", .{ .format = .json, .status_full = true }));
     var full_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, full_json_writer.written(), .{});
     defer full_parsed.deinit();
-    try testing.expect(full_parsed.value.object.get("unresolved_references").?.object.get("items") != null);
+    const full_obj = full_parsed.value.object;
+    try testing.expect(full_obj.get("unresolved_references").?.object.get("items") != null);
+
+    // The compact summary's counts must equal --full's — a miscount in
+    // statusCompact's own aggregation (as opposed to the shared per-file
+    // counters) would otherwise pass unnoticed.
+    const full_scope = full_obj.get("scope").?.object;
+    try expectSameIntObject(compact_scope.get("languages").?.object, full_scope.get("languages").?.object);
+    try expectSameIntObject(compact_scope.get("backend").?.object, full_scope.get("backend").?.object);
+    try testing.expectEqual(
+        compact_obj.get("skipped").?.object.get("count").?.integer,
+        full_obj.get("skipped").?.object.get("count").?.integer,
+    );
+    try testing.expectEqual(
+        compact_obj.get("parse_health").?.object.get("count").?.integer,
+        full_obj.get("parse_health").?.object.get("count").?.integer,
+    );
+    try testing.expectEqual(
+        compact_obj.get("unresolved_references").?.object.get("count").?.integer,
+        full_obj.get("unresolved_references").?.object.get("count").?.integer,
+    );
+
+    // The filtered / --no-recurse breakdown path through statusFileSelected:
+    // a single-directory, non-recursive scope must report only that scope's
+    // languages/backend, not the whole project's.
+    var scoped_buf: std.ArrayList(u8) = .empty;
+    defer scoped_buf.deinit(testing.allocator);
+    var scoped_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &scoped_buf);
+    defer scoped_writer.deinit();
+    try testing.expect(try status(&scoped_writer.writer, io, &idx, "go_service", .{ .format = .json, .no_recurse = true }));
+    var scoped_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, scoped_writer.written(), .{});
+    defer scoped_parsed.deinit();
+    const scoped_scope = scoped_parsed.value.object.get("scope").?.object;
+    const scoped_languages = scoped_scope.get("languages").?.object;
+    try testing.expectEqual(@as(usize, 1), scoped_languages.count());
+    try testing.expect(scoped_languages.get("go") != null);
+    try testing.expect(scoped_scope.get("files").?.integer < parsed.value.object.get("snapshot").?.object.get("files").?.integer);
 }
 
 test "sourceRange maps post-image lines to exact indexed bytes" {
