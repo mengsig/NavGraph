@@ -823,7 +823,10 @@ whole-graph re-resolution, not parsing, is the actual cost driver; see
 - `limit:0`/`budget:0` on any method is not honored as "no cap" — it is
   silently reinterpreted as "use the default" (500/200/2000/…), matching the
   1.0 helper's existing behavior. An explicit `0` and an absent `limit` are
-  indistinguishable on the wire; send a real cap instead of `0`.
+  indistinguishable on the wire; send a real cap instead of `0`. The CLI's own
+  `-l/--limit` diverges from this on purpose: `--limit 0` is a usage error
+  (`-l/--limit must be at least 1`), not a silent default, on every CLI
+  command that takes it — including `hunks`/`context`'s mirrored flags.
 - `navgraph/types.supertypes` and `typeHierarchy/supertypes` drop a base the
   resolver could not place in the index (an external/ambiguous base) rather
   than reporting it — the CLI's `navgraph hierarchy` shows it as `~ external/
