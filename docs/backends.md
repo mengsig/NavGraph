@@ -108,8 +108,8 @@ to the binding that owns the literal (`h.save` above), the same rule.
 (`o.store.Get()` -> `o`), which is how the resolver tells a field access from a
 bare module qualifier. The tree-sitter backend derives it from the tree rather
 than from a capture — a capture would need one pattern per chain depth — and
-the differ asserts it matches the heuristic scanner's for every shared
-reference.
+the differ asserts it matches the heuristic scanner's in both directions, so a
+chain head either backend invents where the other emits none is caught too.
 
 Owner attribution (which callable a reference site belongs to) is linear in
 nesting depth, not in the file's definition count: `defs` is sorted

@@ -1465,7 +1465,7 @@ fn writeParseStatus(w: *Writer, idx: *const Index, filter: []const u8, report: q
     try w.print(",\"parse_health\":{{\"count\":{},\"items\":[", .{report.parse_warnings});
     var first = true;
     for (idx.graph.files) |file| {
-        if (!query.statusFileSelected(file, filter, opts) or file.parse_health.reliable()) continue;
+        if (!query.statusFileSelected(file, filter, opts) or !file.parse_health.hasDiagnostic()) continue;
         if (!first) try w.writeByte(',');
         first = false;
         try parseHealthObject(w, file);
@@ -1506,7 +1506,7 @@ fn writeUnresolvedStatus(
 fn statusJsonlHealth(w: *Writer, idx: *const Index, filter: []const u8, opts: Options, page: *JsonlPage, start: u32) !u32 {
     var ordinal = start;
     for (idx.graph.files) |file| {
-        if (!query.statusFileSelected(file, filter, opts) or file.parse_health.reliable()) continue;
+        if (!query.statusFileSelected(file, filter, opts) or !file.parse_health.hasDiagnostic()) continue;
         if (page.accepts(ordinal)) {
             try jsonlHead(w, page.last);
             try parseHealthObject(w, file);
@@ -1538,11 +1538,17 @@ fn statusJsonlUnresolved(w: *Writer, idx: *const Index, filter: []const u8, opts
 }
 
 fn parseHealthObject(w: *Writer, file: model.SourceFile) !void {
-    const from = file.parse_health.desync_from orelse unreachable;
-    std.debug.assert(file.parse_health.desync_to >= from);
+    std.debug.assert(file.parse_health.hasDiagnostic());
     try w.writeAll("{\"kind\":\"parse_health\",\"file\":");
     try writeString(w, file.path);
-    try w.print(",\"diagnostic\":\"tokenizer_desync\",\"from_line\":{},\"to_line\":{}}}", .{ from, file.parse_health.desync_to });
+    if (file.parse_health.desync_from) |from| {
+        std.debug.assert(file.parse_health.desync_to >= from);
+        try w.print(",\"diagnostic\":\"tokenizer_desync\",\"from_line\":{},\"to_line\":{}", .{ from, file.parse_health.desync_to });
+    }
+    // F5: a silent tree-sitter -> heuristic substitution used to be invisible
+    // on every structured surface — stderr-only, per coldstart F13.
+    if (file.parse_health.tree_sitter_fallback) try w.writeAll(",\"tree_sitter_fallback\":true");
+    try w.writeAll("}");
 }
 
 fn unresolvedObject(w: *Writer, idx: *const Index, sym: Symbol, ref: model.Reference) !void {
@@ -1912,14 +1918,22 @@ fn nodeHead(w: *Writer, idx: *const Index, sym: Symbol) !void {
     try writeModifiers(w, sym);
 }
 
-/// Emit a named parse-health field only when tokenization was unreliable.
+/// Emit a named parse-health field whenever there is something to report: a
+/// tokenizer desync, a silent tree-sitter -> heuristic substitution (F5), or
+/// both.
 fn writeParseHealthField(w: *Writer, name: []const u8, health: model.ParseHealth) !void {
-    const from = health.desync_from orelse return;
+    if (!health.hasDiagnostic()) return;
     std.debug.assert(name.len > 0);
-    std.debug.assert(health.desync_to >= from);
     try w.writeAll(",\"");
     try w.writeAll(name);
-    try w.print("\":{{\"kind\":\"tokenizer_desync\",\"from_line\":{},\"to_line\":{}}}", .{ from, health.desync_to });
+    try w.writeAll("\":{");
+    if (health.desync_from) |from| {
+        std.debug.assert(health.desync_to >= from);
+        try w.print("\"kind\":\"tokenizer_desync\",\"from_line\":{},\"to_line\":{}", .{ from, health.desync_to });
+        if (health.tree_sitter_fallback) try w.writeByte(',');
+    }
+    if (health.tree_sitter_fallback) try w.writeAll("\"tree_sitter_fallback\":true");
+    try w.writeAll("}");
 }
 
 fn writeModifiers(w: *Writer, sym: Symbol) !void {

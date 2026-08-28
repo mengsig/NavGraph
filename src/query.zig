@@ -575,7 +575,7 @@ fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Option
         if (!statusFileSelected(file, filter, opts)) continue;
         report.scope_files += 1;
         report.scope_symbols += file.sym_end - file.sym_start;
-        if (!file.parse_health.reliable()) report.parse_warnings += 1;
+        if (file.parse_health.hasDiagnostic()) report.parse_warnings += 1;
         const resolution = unresolvedInFile(idx, file);
         report.likely_local_refs += resolution.likely_local;
         report.external_or_unmodeled_refs += resolution.external_or_unmodeled;
@@ -784,8 +784,12 @@ fn renderStatusDiagnostics(w: *Writer, idx: *const Index, filter: []const u8, re
     try w.print("parse health: {d} warning{s}\n", .{ report.parse_warnings, if (report.parse_warnings == 1) "" else "s" });
     for (idx.graph.files) |file| {
         if (!statusFileSelected(file, filter, opts)) continue;
-        const from = file.parse_health.desync_from orelse continue;
-        try w.print("  {s}:{d}-{d} tokenizer_desync\n", .{ file.path, from, file.parse_health.desync_to });
+        if (file.parse_health.desync_from) |from| {
+            try w.print("  {s}:{d}-{d} tokenizer_desync\n", .{ file.path, from, file.parse_health.desync_to });
+        }
+        if (file.parse_health.tree_sitter_fallback) {
+            try w.print("  {s} tree_sitter_fallback\n", .{file.path});
+        }
     }
     try w.print("skipped: {d}\n", .{report.skipped});
     for (idx.skipped_dirs) |path| if (filter.len == 0 or matchesFilter(path, filter)) try w.print("  {s}\n", .{path});

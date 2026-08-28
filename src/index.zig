@@ -3811,6 +3811,65 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
     }
 }
 
+test "cross-language: a typed receiver never resolves memberOfType across a language family" {
+    // F8 (round 2). memberOfType's family guard (a type name is not a
+    // cross-language namespace) was measured harmless but had no test of its
+    // own — this branch's only substantive src/index.zig change beyond
+    // backend plumbing. The call site is deliberately in a *third* file, not
+    // the one declaring either `Widget`, so `cand.file == from_file` cannot
+    // short-circuit the match before the family guard is reached — without
+    // the guard, the TypeScript candidate joins the Zig one in memberOfType's
+    // loop and the pick would be ambiguous, or bound to the wrong language's
+    // method outright.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub const Widget = struct {
+        \\    pub fn run(self: *Widget) void {}
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.ts", .data =
+        \\export class Widget {
+        \\  run(): void {}
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data =
+        \\const a = @import("a.zig");
+        \\pub fn use(f: *a.Widget) void {
+        \\    f.run();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false, .auto);
+    defer idx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), idx.lookup("run").len);
+    const zig_run = qualifiedIdInFile(&idx, "Widget", "run", "a.zig").?;
+    const ts_run = qualifiedIdInFile(&idx, "Widget", "run", "b.ts").?;
+    try testing.expect(zig_run != ts_run);
+
+    // `f.run()` is typed to the Zig Widget and must resolve exactly to it,
+    // never the TypeScript Widget's same-named method.
+    const use = idx.graph.symbols[idx.lookup("use")[0]];
+    var checked = false;
+    for (use.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "run")) continue;
+        try testing.expectEqual(zig_run, ref.target);
+        try testing.expect(ref.target != ts_run);
+        try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+        checked = true;
+    }
+    try testing.expect(checked);
+    // The TypeScript method has no caller at all.
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(ts_run).len);
+}
+
 // ===========================================================================
 // APPENDED HARDENING TESTS (build + resolution)
 // ===========================================================================

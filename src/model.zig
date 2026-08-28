@@ -298,6 +298,16 @@ pub const ParseHealth = struct {
     pub fn reliable(self: ParseHealth) bool {
         return self.desync_from == null;
     }
+
+    /// Whether this file has anything worth surfacing on a diagnostic feed: a
+    /// tokenizer desync (missing symbols suspected) or a silent backend
+    /// substitution (the requested backend was not the one that ran).
+    /// Deliberately distinct from `reliable`, which means "no missing-symbol
+    /// risk" and must stay that narrow — a fallback file's heuristic parse is
+    /// no less complete than any other heuristic-language file.
+    pub fn hasDiagnostic(self: ParseHealth) bool {
+        return self.desync_from != null or self.tree_sitter_fallback;
+    }
 };
 
 pub const SourceFile = struct {

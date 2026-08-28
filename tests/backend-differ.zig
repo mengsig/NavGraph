@@ -489,6 +489,53 @@ test "JSX in a .ts file falls back to the heuristic scanner, recorded in ParseHe
     try testing.expect(out.items.len > 0);
 }
 
+test "a tree-sitter fallback is visible on the structured surfaces, not just stderr" {
+    // F5 (round 2). ParseHealth.reliable() is desync_from == null, so a
+    // fallback file read as "reliable": status -j's parse_health.count/items
+    // and agent_api's parse_health field both read zero on a run that fell
+    // back, with stderr the only place it was ever recorded. That is
+    // invisible to an MCP client driving `serve --backend tree-sitter`, which
+    // never sees the CLI's stderr.
+    if (!ts_backend.supports(.typescript)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "jsx.ts", .data = "export const X = () => <div>hi</div>;\n" });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index.build(gpa, io, root, false, .tree_sitter);
+    defer idx.deinit();
+
+    var found: ?model.ParseHealth = null;
+    for (idx.graph.files) |file| {
+        if (std.mem.eql(u8, file.path, "jsx.ts")) found = file.parse_health;
+    }
+    const health = found orelse return error.TestUnexpectedResult;
+    try testing.expect(health.tree_sitter_fallback);
+    try testing.expect(health.reliable()); // no tokenizer desync — a distinct fact
+    try testing.expect(health.hasDiagnostic()); // but still worth surfacing
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var w: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer w.deinit();
+    try testing.expect(try navgraph.query.status(&w.writer, io, &idx, "", .{ .format = .json }));
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, w.written(), .{});
+    defer parsed.deinit();
+    const health_obj = parsed.value.object.get("parse_health").?.object;
+    try testing.expect(health_obj.get("count").?.integer >= 1);
+    const items = health_obj.get("items").?.array.items;
+    var saw_fallback = false;
+    for (items) |item| {
+        if (!std.mem.eql(u8, item.object.get("file").?.string, "jsx.ts")) continue;
+        try testing.expect(item.object.get("tree_sitter_fallback").?.bool);
+        saw_fallback = true;
+    }
+    try testing.expect(saw_fallback);
+}
+
 test "a clean parse is recorded as the tree-sitter backend" {
     if (!ts_backend.supports(.python)) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -685,10 +732,17 @@ test "the tree-sitter backend records the receiver chain head the resolver needs
 }
 
 test "no reference loses its chain head on the fixture trees" {
+    // F4 (round 2). The sweep only ever iterated the heuristic index, so a
+    // chain head the tree-sitter backend *invents* where the heuristic emits
+    // none was never compared — and a spurious root is not harmless,
+    // index.zig refuses field-table resolution outright when receiver_root is
+    // non-empty. Run it in both directions, each with its own vacuity guard.
     if (!ts_backend.any_grammar) return error.SkipZigTest;
     const gpa = testing.allocator;
-    var compared: u32 = 0;
-    var mismatched: u32 = 0;
+    var forward_compared: u32 = 0;
+    var forward_mismatched: u32 = 0;
+    var reverse_compared: u32 = 0;
+    var reverse_mismatched: u32 = 0;
     for (fixture_trees) |tree| {
         var pair = try Pair.open(gpa, tree);
         defer pair.close();
@@ -698,19 +752,36 @@ test "no reference loses its chain head on the fixture trees" {
             for (sym.refs) |ref| {
                 if (ref.receiver_root.len == 0) continue;
                 const other = refByQual(twin, ref.qualifier, ref.name) orelse continue;
-                compared += 1;
+                forward_compared += 1;
                 if (std.mem.eql(u8, other.receiver_root, ref.receiver_root)) continue;
-                mismatched += 1;
+                forward_mismatched += 1;
                 std.debug.print(
                     "navgraph differ: {s} {s}.{s}.{s} chain head \"{s}\" -> \"{s}\"\n",
                     .{ tree, sym.name, ref.qualifier, ref.name, ref.receiver_root, other.receiver_root },
                 );
             }
         }
+        for (pair.tree_sitter.graph.symbols) |sym| {
+            if (!grammarBacked(pair.tree_sitter.graph.files[sym.file].language)) continue;
+            const twin = memberOrTopLevel(&pair.heuristic, &pair.tree_sitter, sym) orelse continue;
+            for (sym.refs) |ref| {
+                if (ref.receiver_root.len == 0) continue;
+                const other = refByQual(twin, ref.qualifier, ref.name) orelse continue;
+                reverse_compared += 1;
+                if (std.mem.eql(u8, other.receiver_root, ref.receiver_root)) continue;
+                reverse_mismatched += 1;
+                std.debug.print(
+                    "navgraph differ: {s} {s}.{s}.{s} chain head (tree-sitter) \"{s}\" -> (heuristic) \"{s}\"\n",
+                    .{ tree, sym.name, ref.qualifier, ref.name, ref.receiver_root, other.receiver_root },
+                );
+            }
+        }
     }
-    try testing.expectEqual(@as(u32, 0), mismatched);
-    // A silent zero would make the assertion above vacuous.
-    try testing.expect(compared > 0);
+    try testing.expectEqual(@as(u32, 0), forward_mismatched);
+    try testing.expectEqual(@as(u32, 0), reverse_mismatched);
+    // A silent zero on either side would make its assertion vacuous.
+    try testing.expect(forward_compared > 0);
+    try testing.expect(reverse_compared > 0);
 }
 
 /// The tree-sitter build's counterpart of a heuristic symbol, matched on the

@@ -24,9 +24,12 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         tree-sitter: [all, none]
     steps:
-      - uses: actions/checkout@v4
+      # F7 (round 2): third-party actions pinned by commit SHA, not a mutable
+      # tag — this workflow runs with the job token, so a compromised tag
+      # would run as CI. Comment names the tag the SHA resolves to.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
           cache-key: ${{ matrix.os }}-${{ matrix.tree-sitter }}

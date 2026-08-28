@@ -1063,7 +1063,9 @@ fn writeSuggestion(
 fn parseWarningCount(idx: *const index_mod.Index) u32 {
     var count: u32 = 0;
     for (idx.graph.files) |file| {
-        if (!file.parse_health.reliable()) count += 1;
+        // F5: a tree-sitter fallback belongs here too - an MCP client never
+        // sees the CLI's stderr warning, so this JSON field is its only signal.
+        if (file.parse_health.hasDiagnostic()) count += 1;
     }
     return count;
 }
