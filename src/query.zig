@@ -872,6 +872,9 @@ fn renderStatusFreshness(w: *Writer, idx: *const Index, report: StatusReport) !v
     }
 }
 
+// Line order matches the compact tail (freshness, parse health, resolution
+// health, skipped) so the two are diff-friendly rather than gratuitously
+// divergent on a line-oriented surface.
 fn renderStatusDiagnostics(w: *Writer, idx: *const Index, filter: []const u8, report: StatusReport, opts: Options) !void {
     try w.print("parse health: {d} warning{s}\n", .{ report.parse_warnings, if (report.parse_warnings == 1) "" else "s" });
     for (idx.graph.files) |file| {
@@ -883,9 +886,9 @@ fn renderStatusDiagnostics(w: *Writer, idx: *const Index, filter: []const u8, re
             try w.print("  {s} tree_sitter_fallback\n", .{file.path});
         }
     }
+    try renderUnresolvedStatus(w, idx, filter, report, opts);
     try w.print("skipped: {d}\n", .{report.skipped});
     for (idx.skipped_dirs) |path| if (filter.len == 0 or matchesFilter(path, filter)) try w.print("  {s}\n", .{path});
-    try renderUnresolvedStatus(w, idx, filter, report, opts);
 }
 
 fn renderUnresolvedStatus(w: *Writer, idx: *const Index, filter: []const u8, report: StatusReport, opts: Options) !void {
