@@ -40,13 +40,13 @@ first command does it and caches the result:
 ```
 $ navgraph status
 index root: .
-snapshot: 51 files, 4115 symbols
+snapshot: 51 files, 4117 symbols
 languages: zig 51
 backend: heuristic 51
 cache: loaded=false, entries=0, hits=0/51, rewrite=written
 freshness: current
 parse health: 0 warnings
-resolution health: 12 likely-local misses; 9674 external/unmodeled edges
+resolution health: 12 likely-local misses; 9709 external/unmodeled edges
 skipped: 0
 (--full for file-level detail)
 ```
