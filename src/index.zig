@@ -925,7 +925,16 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     ref.target = choice.id;
     ref.exact = choice.confident;
     if (ref.target != invalid) {
-        ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        // A `package` / `namespace` / `mod` clause is not a definition of the
+        // name it opens: the members the qualifier reaches live elsewhere, and
+        // a namespace declared in several files has no single clause to point
+        // at. Keep the edge as namespace evidence, never as one `--strict`
+        // follows. A genuinely ambiguous pick keeps saying so.
+        const is_module = idx.graph.symbols[ref.target].kind == .module;
+        ref.resolution_status = if (ref.exact and is_module) blk: {
+            ref.exact = false;
+            break :blk .inferred;
+        } else if (ref.exact) .exact else .ambiguous;
         ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
     }
     // A chained Java call such as `line.item().sku()` can lose its receiver in
@@ -2620,6 +2629,31 @@ test "go: a package-qualified type conversion is a type use, never a call" {
             const t = idx.graph.symbols[r.target];
             try testing.expect(isCallable(t) or mayHoldCallable(t.kind));
         }
+    }
+}
+
+test "a package/namespace clause is never an exact reference target" {
+    // Regression (F4): the bare qualifier of `store.Get()` / `geo::area()` bound
+    // to one file's `package store` / `namespace geo` clause as `exact`. The
+    // namespace spans every file that declares it, so a single clause is a
+    // stand-in — real evidence, but not something `--strict` should follow.
+    const testing = std.testing;
+    for ([_][]const u8{ "testenv/go_service", "testenv/cpp_app" }) |root| {
+        var idx = try build(testing.allocator, testing.io, root, false);
+        defer idx.deinit();
+
+        var seen: u32 = 0;
+        for (idx.graph.symbols) |sym| {
+            for (sym.refs) |ref| {
+                if (ref.target == invalid) continue;
+                if (idx.graph.symbols[ref.target].kind != .module) continue;
+                seen += 1;
+                try testing.expect(!ref.exact);
+                try testing.expect(ref.resolution_status == .inferred or
+                    ref.resolution_status == .ambiguous);
+            }
+        }
+        try testing.expect(seen > 0); // the assertion above must not be vacuous
     }
 }
 
