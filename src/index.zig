@@ -71,7 +71,8 @@ pub const Index = struct {
     cache_snapshot: CacheSnapshot = .{},
     /// Unique names of directories the walker pruned (build/vendor/fixture dirs
     /// from `ignored_dirs`). Surfaced on empty results so a skipped subtree reads
-    /// as "not indexed" rather than "absent". Arena-owned.
+    /// as "not indexed" rather than "absent". Borrowed from the `Sources` that
+    /// produced this index, so it lives as long as they do — never this arena.
     skipped_dirs: []const []const u8 = &.{},
     /// Go package name → files declaring it (`package caddy` in caddy.go,
     /// logging.go, …). Lets a package-qualified call (`caddy.Load(...)`) resolve
