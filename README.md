@@ -225,8 +225,8 @@ navgraph <command> [arg] [flags]
 | `rename <sym> <new>` | Apply a collision-checked exact rename; `--preview` emits a unified patch without writing. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
 | `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges, nodes_total, truncated}` JSON. `-l` caps the node set; the JSON reports the total and text says so on stderr. Respects `--tests`. |
-| `hunks [ref]`      | Working change's hunks, blast radius and roots — `navgraph/impact` mirror. Default ref is `HEAD`, like `affected`/`diff`. |
-| `context <symbol>` | One symbol's definition, callers/callees/types/tests in a single call, trimmed to `--budget` tokens — `navgraph/context` mirror. `--include` restricts sections (`callers,callees,types,tests,body`). |
+| `hunks [ref]`      | Working change's hunks, blast radius and roots — `navgraph/impact` mirror. Default ref is `HEAD`, like `affected`/`diff`. `--limit`/`--offset` page the blast radius; `--depth`/`--direction` control the walk. |
+| `context <symbol>` | One symbol's definition, callers/callees/types/tests in a single call, trimmed to `--budget` tokens — `navgraph/context` mirror. `--include` restricts sections (`callers,callees,types,tests,body`); `--offset` pages a budget-capped `callers` list. |
 | `where <file:line>`| Symbol enclosing a 1-based `file:line`, plus its breadcrumb chain — `navgraph/where` mirror (stack traces, diff hunks). |
 | `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. `navgraph.hunks`/`.context`/`.where` mirror the three commands above as MCP tools. |
 | `lsp`              | Run as a resident **editor server** (LSP over stdio) that keeps the graph in memory — see [Editor integration](#editor-integration). |
@@ -374,7 +374,8 @@ rejected. `navgraph.reload` accepts `{"noCache":true}` and atomically swaps in a
 fresh index only after the rebuild succeeds. A no-id `workspace/reload`
 notification refreshes the snapshot without emitting a response.
 
-`navgraph.hunks` (`{ref?}`), `navgraph.context` (`{symbol, budget?, include?}`)
+`navgraph.hunks` (`{ref?, depth?, direction?, limit?, offset?}`),
+`navgraph.context` (`{symbol, budget?, include?, offset?}`)
 and `navgraph.where` (`{file, line}`) mirror the `hunks`/`context`/`where` CLI
 verbs and `navgraph/impact`/`context`/`where`'s LSP wire shapes exactly — one
 symbol's full context, the working change's hunks, or the symbol enclosing a

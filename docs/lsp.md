@@ -166,24 +166,32 @@ Resolution order — the graph's own, not a fresh guess:
 ### `navgraph/blast`
 
 Params: `Target | { file:string } | { ref:string }`, plus
-`{ depth?:int, direction?:"callers"|"callees", limit?:int (500) } & Scope`.
+`{ depth?:int, direction?:"callers"|"callees", limit?:int (500), offset?:int
+(0) } & Scope`.
 
 ```
 { roots:Symbol[],
   nodes:[{ symbol:Symbol, depth:int, via:int[], exact:bool }],
   edges:Edge[],
-  summary:{ symbols:int, files:int, tests:int, maxDepth:int, truncated:bool,
-            byDepth:int[], byFile:[{file:string,count:int}] } }
+  summary:{ symbols:int, total:int, files:int, tests:int, maxDepth:int,
+            truncated:bool, byDepth:int[], byFile:[{file:string,count:int}] },
+  next:int|null }
 ```
 
 - `{ file }` unions every definition in that file. `{ ref }` is every definition
   changed since that git ref (`navgraph diff`'s rule) **plus** every definition
   in a file whose unsaved buffer differs from the copy on disk.
 - Breadth-first to `depth`; each symbol appears once, at its **minimum** depth.
+  The walk always covers the full depth-bounded reachable set — `nodes`/`edges`
+  are the `[offset, offset+limit)` page of it, in that same stable BFS order;
+  `edges` is restricted to edges whose caller/callee-walk source is on the page.
 - `via` names the depth-1 neighbours the node was reached through.
 - `edges` are always written caller→callee, whichever direction the walk ran.
-- `byFile` is ranked by count descending, then path.
-- `truncated` is set when `limit` stopped the walk.
+- `byFile`/`byDepth`/`maxDepth`/`tests` describe the page in `nodes`, matching
+  `symbols` (`nodes.length`) — `summary.total` is the true reachable count,
+  independent of paging.
+- `truncated` is set when the page doesn't reach `total`; `next` is the
+  `offset` for the following page, or `null` once nothing remains.
 
 ### `navgraph/search`
 
@@ -337,8 +345,8 @@ same-name twin, at the cost of depending on import resolution.
 ### `navgraph/diff`
 
 Params: `{ ref?:string ("HEAD"), depth?:int (1), direction?:"callers"|
-"callees" ("callers"), limit?:int (500) } & Scope` → `{ ref:string,
-blast: <the navgraph/blast result> }`.
+"callees" ("callers"), limit?:int (500), offset?:int (0) } & Scope` →
+`{ ref:string, blast: <the navgraph/blast result> }`.
 
 Definitions changed since `ref` **plus** every definition in a file whose
 unsaved buffer differs from disk, wrapped as a `navgraph/blast` walk from those
@@ -602,16 +610,20 @@ wire the lens straight into a `navgraph/blast` (or `navgraph/impact`) request.
 ### `navgraph/impact`
 
 Params: `({ uri?:string, range?:{start:{line,character},end:{line,character}} } |
-{ ref?:string }) & { depth?:int, direction?:"callers"|"callees", limit?:int(500) } & Scope`.
+{ ref?:string }) & { depth?:int, direction?:"callers"|"callees", limit?:int(500),
+offset?:int(0) } & Scope`.
 
 ```
-{ roots:Symbol[], nodes:[…], edges:Edge[], summary:{…},
+{ roots:Symbol[], nodes:[…], edges:Edge[], summary:{…}, next:int|null,
   hunks:[{ uri:string, range:Range, roots:Symbol[] }],
   changeId:string }
 ```
 
 The blast radius of the current **working change**, grouped by changed hunk —
-`navgraph/blast`'s result shape plus `hunks`. Two sources:
+`navgraph/blast`'s result shape (including its `offset`/`summary.total`/`next`
+paging — B1: a response with more blast radius than `limit` shows must report
+the true size and a working continuation, not a `truncated:true` dead end)
+plus `hunks`. Two sources:
 
 - No `ref`: the working change is every open document whose buffer differs
   from disk (overlay vs disk); `uri` narrows to one document. A hunk is the
@@ -626,11 +638,11 @@ The blast radius of the current **working change**, grouped by changed hunk —
   before a `didChange` for that edit has round-tripped.
 
 An empty change (nothing open differs from disk, or an empty diff against
-`ref`) is `{ roots:[], nodes:[], edges:[], summary:{ symbols:0, files:0,
-tests:0, maxDepth:0, truncated:false, byDepth:[], byFile:[] }, hunks:[],
-changeId:"0000000000000000" }` — a routine answer, not `-32001` (matches
-`navgraph/diff`'s own "nothing changed" rule). A bad `ref` **is** an error
-(`-32002`, git's own message), same as `navgraph/diff`.
+`ref`) is `{ roots:[], nodes:[], edges:[], summary:{ symbols:0, total:0,
+files:0, tests:0, maxDepth:0, truncated:false, byDepth:[], byFile:[] },
+next:null, hunks:[], changeId:"0000000000000000" }` — a routine answer, not
+`-32001` (matches `navgraph/diff`'s own "nothing changed" rule). A bad `ref`
+**is** an error (`-32002`, git's own message), same as `navgraph/diff`.
 
 `changeId` is a hash of the hunk set's shape (each hunk's file + line range,
 in file order) — stable for "this is still the same working change", distinct
@@ -679,25 +691,37 @@ best-effort clause for languages/kinds not yet modeled.
 
 ### `navgraph/context`
 
-Params: `Target & { budget?:int(2000, tokens) }`.
+Params: `Target & { budget?:int(2000, tokens), offset?:int(0) }`.
 
 ```
 { symbol:Symbol, definition:{ text:string, range:Range }, signature:string,
   doc?:string, callers:Symbol[], callees:Symbol[], types:Symbol[],
-  tests:Symbol[], truncated:bool, tokensEstimate:int }
+  tests:Symbol[], callersTotal:int, next:int|null, truncated:bool,
+  tokensEstimate:int }
 ```
 
 Everything an editing agent typically needs about one symbol, in a single
 call. `types` is `navgraph/types`'s best-effort scan applied to this one
 symbol: a container's declared supertypes, or a function/method's own typed
 binding types. `tests` is `navgraph/tests`'s reachability list for this
-symbol. `tokensEstimate` is a rough characters/4 estimate — good enough to
+symbol. `tokensEstimate` is the real serialized byte count of everything below
+(the whole response, not just signatures) divided by ~4 — good enough to
 shrink monotonically, not an exact tokenizer count.
 
-Trimmed to `budget` by dropping, **in order**: the body (`definition.text`
-falls back to the bare `signature`), then `tests`, then `types`, then
-`callees` — `callers` are never dropped. `truncated` is set once anything was
-dropped. An unresolved `Target` is `-32001`.
+Trimmed to `budget` (B2: this is an enforced bound, not a suggestion), **in
+order**: the body (`definition.text` falls back to the bare `signature`),
+then `tests`, then `types`, then `callees`. `callers` is never dropped as a
+whole section, but — unlike the others — it is count-capped to whatever
+budget remains once every other section has settled: highest-priority first
+(an exact call edge outranks a heuristic one), with a floor of one shown
+whenever the symbol has any caller at all, so an extreme budget still answers
+"who calls this" rather than going empty. `callersTotal` is the true caller
+count regardless of the cap; `offset` pages through that priority order and
+`next` is the offset for the following page, or `null` once nothing remains
+(B1). `truncated` is set when a section `include` asked for was actually
+dropped by the ladder, or `callers` is capped/paged past what this response
+shows — never merely because `include` never asked for a section. An
+unresolved `Target` is `-32001`.
 
 ### `navgraph/where`
 
@@ -755,6 +779,17 @@ Every `navgraph/*` list method now accepts `limit` and reports `truncated`:
 (`navgraph/blast`, `navgraph/search`, `navgraph/grep`, `navgraph/importers`,
 `navgraph/tests` and `navgraph/types` already reported it).
 
+`navgraph/blast`, `navgraph/diff`, `navgraph/impact` and `navgraph/context`
+additionally gain a working continuation past `truncated:true` (B1: a
+truncated response with no route to the rest, and no way to size what's
+missing, is a contract violation — the independent evaluation's finding #4,
+also flagged for the 1.0 `map`/`source`/`read` helpers' own `next`).
+`offset` pages a stable priority order (BFS order for the blast-radius
+methods, highest-value-first for `context`'s `callers`); the response's
+`next` is the `offset` for the following page, or `null` once nothing
+remains; `summary.total` / `callersTotal` report the true count independent
+of paging.
+
 ### Incremental re-parse (server-side only — not visible on the wire)
 
 `index.parseOne` takes a `ReparseHint{ old_tree:?*anyopaque, edits:[]TreeEdit }`
@@ -803,17 +838,23 @@ implementation with the LSP server verbatim (`src/lsp/mirrors.zig` calls
 `queries.writeImpact`/`writeContext`/`writeWhere` directly) — the query logic
 lives in exactly one place; only how a caller reaches it differs.
 
-- `navgraph hunks [ref] [-j]` — the working change's hunks, blast radius and
-  roots (`navgraph/impact`'s wire shape exactly, `roots`/`nodes`/`edges`/
-  `summary`/`hunks`/`changeId` included). Named `hunks`, not `impact`, because
-  `navgraph impact` was already taken (an alias of the pre-1.1 `navgraph
-  affected` command, an unrelated git-diff query). The CLI and MCP tool never
-  have an open-document overlay, so — unlike the wire method, which treats an
-  absent `ref` as "compare open buffers to disk" — a missing `ref` here always
-  means "compare disk to HEAD", the same default `navgraph diff`/`navgraph
-  affected` already use.
-- `navgraph context <symbol> [--budget N] [--include a,b,…] [-j]` —
-  `navgraph/context`'s wire shape exactly: definition, signature, doc,
+- `navgraph hunks [ref] [--depth N] [--direction callers|callees] [--limit N]
+  [--offset N] [-j]` — the working change's hunks, blast radius and roots
+  (`navgraph/impact`'s wire shape exactly, `roots`/`nodes`/`edges`/`summary`/
+  `next`/`hunks`/`changeId` included, `summary.total` and `next` among them —
+  B1/m6: these flags were previously unreachable from the CLI/MCP mirrors, the
+  mechanism that made a `limit`-truncated `hunks` response unrecoverable on
+  those two surfaces; `--limit` is the one that actually raises the 500-node
+  page). Named `hunks`, not `impact`, because `navgraph impact` was already
+  taken (an alias of the pre-1.1 `navgraph affected` command, an unrelated
+  git-diff query). The CLI and MCP tool never have an open-document overlay,
+  so — unlike the wire method, which treats an absent `ref` as "compare open
+  buffers to disk" — a missing `ref` here always means "compare disk to HEAD",
+  the same default `navgraph diff`/`navgraph affected` already use. Unset
+  `--depth` keeps the session's configured depth, not the CLI's generic
+  depth-1 default meant for `calls`/`callers`.
+- `navgraph context <symbol> [--budget N] [--include a,b,…] [--offset N]
+  [-j]` — `navgraph/context`'s wire shape exactly: definition, signature, doc,
   callers/callees/types/tests, trimmed to `--budget` tokens (default 2000; `0`
   is silently reinterpreted as the default, per the wire contract — never a
   usage error). `--include` is the same allow-list the wire `include` array
@@ -821,7 +862,9 @@ lives in exactly one place; only how a caller reaches it differs.
   every section, present-but-empty means none. `--budget` here is *not* the
   CLI's shared hard-byte-output `--budget` (a different unit and a different
   default entirely) — `context` is the one command where that flag means
-  tokens, matching the wire param it mirrors.
+  tokens, matching the wire param it mirrors. `--offset` pages a budget-capped
+  `callers` list (B1/B2), distinct from `--after`'s unrelated JSONL row-stream
+  cursor.
 - `navgraph where <file>:<line> [-j]` — the symbol enclosing a 1-based
   `file:line` and its breadcrumb chain, `navgraph/where`'s wire shape exactly.
   A file outside the index answers `{"enclosing":null,...}` (never an error,
