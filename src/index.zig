@@ -1109,6 +1109,18 @@ fn inheritedMemberFrom(
     visited[depth] = type_id;
 
     for (idx.type_bases.get(type_id) orelse return invalid) |base_id| {
+        // A Ruby mixin's reverse includer edge can close a cycle back onto a
+        // type already on this path (the includer itself, or an ancestor
+        // reached another way). Probing such a base's members directly found
+        // the *calling* method's own class, turning `super` into a self-edge.
+        var on_path = false;
+        for (visited[0 .. depth + 1]) |seen| {
+            if (seen == base_id) {
+                on_path = true;
+                break;
+            }
+        }
+        if (on_path) continue;
         const direct = memberOfParent(idx, base_id, name);
         if (direct.id != invalid) return direct.id;
         const inherited = inheritedMemberFrom(idx, base_id, name, visited, depth + 1);
@@ -4645,6 +4657,55 @@ test "cpp: a direct-initialized local types its receiver; an unnameable one abst
     try testing.expectEqual(@as(usize, 0), idx.callersOf(idx.lookup("step")[0]).len);
 }
 
+test "ruby: super in a class that includes a module terminates on the real ancestor, not itself" {
+    // Regression (F4): the reverse mixin edge (module -> includer) makes
+    // `type_bases` cyclic. `inheritedMemberFrom` only guarded against
+    // recursing back into a type already on the path — it never guarded the
+    // direct-member probe on each base, so `WithMixin`'s own `render` (the
+    // method calling `super`) was found through `Mix`'s reverse edge back to
+    // `WithMixin` before the walk ever reached `Parent`.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\module Mix
+        \\  def helper
+        \\    1
+        \\  end
+        \\end
+        \\
+        \\class Parent
+        \\  def render
+        \\    "parent"
+        \\  end
+        \\end
+        \\
+        \\class WithMixin < Parent
+        \\  include Mix
+        \\  def render
+        \\    super
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const parent_render = qualifiedId(&idx, "Parent", "render").?;
+    const with_mixin_render_id = qualifiedId(&idx, "WithMixin", "render").?;
+    const with_mixin_render = idx.graph.symbols[with_mixin_render_id];
+    const super_ref = refByName(with_mixin_render, "super").?;
+
+    // No self-recursive edge, and the real ancestor is found through Mix's
+    // dead end back to Parent.
+    try testing.expect(super_ref.target != with_mixin_render_id);
+    try testing.expectEqual(parent_render, super_ref.target);
+}
+
 test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {
     const testing = std.testing;
     const io = testing.io;
@@ -5434,3 +5495,4 @@ test "edit-requery cache stays identical to no-cache across rename add delete an
     try testing.expectEqual(@as(usize, 0), final.lookup("save").len);
     try testing.expectEqual(final.lookup("caller")[0], final.callersOf(final.lookup("twig")[0])[0]);
 }
+

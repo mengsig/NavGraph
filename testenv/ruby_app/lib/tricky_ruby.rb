@@ -26,6 +26,14 @@ module Tricky
     end
   end
 
+  # Mixin sharing no method name with the Ledger hierarchy, so a correct
+  # `super` walk through it must fall through to a real ancestor.
+  module Loud
+    def volume
+      1
+    end
+  end
+
   # Module of singleton (module-level) helpers.
   module Format
     # Defined with `def self.` inside a module: a module function.
@@ -115,6 +123,18 @@ module Tricky
     end
   end
 
+  # Regression: a class that both inherits from Ledger and mixes in Loud, then
+  # overrides an inherited method and calls `super`. `type_bases[LoudLedger]`
+  # used to close a cycle through the reverse mixin edge on `Loud`, so `super`
+  # here resolved to `LoudLedger#size` itself instead of `Ledger#size`.
+  class LoudLedger < Ledger
+    include Loud
+
+    def size
+      super + 1
+    end
+  end
+
   # Metaprogramming: three readers created at load time. A lexical scan sees
   # no `def scale_by_two`, only the loop that defines it.
   class Scaler
@@ -181,6 +201,10 @@ def tricky_run
   scaler = Tricky::Scaler.new
   scaled = scaler.scale_by_two(3) + scaler.scale_by_three(3)
 
+  loud = Tricky::LoudLedger.new("root", tag: "c")
+  loud.post({ id: 5, title: "Echo" })
+  loud_size = loud.size
+
   book = Book.from_hash(id: 4, title: "Ruby", author: "Y", copies: 2)
   shelf = Catalog::Shelf.new("new")
   shelf.add(book)
@@ -195,6 +219,7 @@ def tricky_run
     first[:title],
     DOUBLER.call(shadow_budget(BUDGET)),
     parse_body(BANNER).length,
-    Tricky::WIDTH
+    Tricky::WIDTH,
+    loud_size
   ].join(" ")
 end
