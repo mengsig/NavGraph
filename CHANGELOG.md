@@ -5,7 +5,9 @@ All notable changes to NavGraph are documented here. Format loosely follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-28
+## [1.0.0] - 2026-08-28
+
+First tagged release.
 
 ### Added
 
@@ -24,6 +26,8 @@ All notable changes to NavGraph are documented here. Format loosely follows
 - A tagged (`v*`) push now cross-compiles and publishes `ReleaseFast`
   binaries for x86_64/aarch64 Linux and macOS as GitHub release assets, after
   a tag-vs-version check and the full test suite both pass.
+- Data-flow and reachability queries (`flow`, `taint`, `reaches`, `affected`)
+  and Java language support landed on `main` (#4).
 
 ### Changed
 
@@ -37,3 +41,7 @@ All notable changes to NavGraph are documented here. Format loosely follows
   the candidates so the question can be re-asked with `Parent.name`.
 - `navgraph/graph` reported neither that the renderer's node cap had truncated
   the page nor that the write had failed.
+- A resolver review of #4 fixed four cross-file regressions (Rust `use`
+  bindings suppressing call edges, typed-receiver calls not resolving, Java
+  inherited-member resolution going quadratic) and three smaller defects
+  before it merged (#7).
