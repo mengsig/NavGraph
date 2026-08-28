@@ -232,6 +232,17 @@ fn reportable(kind: model.SymbolKind) bool {
     return kind != .import and kind != .route_mount;
 }
 
+/// The first line of `text`, capped at `max_len` bytes. A non-git root makes
+/// `git diff --no-index` write its whole ~5 KB usage dump to stderr; relaying
+/// that verbatim into a JSON-RPC error an editor pops up is a bad experience
+/// for one useful line, so keep the diagnostic and drop the manual (merge-gate
+/// review F3).
+fn firstLineCapped(text: []const u8, max_len: usize) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \n\r\t");
+    const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+    return trimmed[0..@min(line_end, max_len)];
+}
+
 /// Definitions touched since `spec` (`navgraph diff`'s rule) plus every
 /// definition in a file whose unsaved buffer differs from the copy on disk.
 /// A git failure — a bad ref, no git tree, git unavailable — is
@@ -257,7 +268,7 @@ fn changedSince(
     defer gpa.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         detail.* = try std.fmt.allocPrint(gpa, "git diff {s} failed: {s}", .{
-            ref, std.mem.trim(u8, result.stderr, " \n\r\t"),
+            ref, firstLineCapped(result.stderr, 300),
         });
         return error.GitFailed;
     }
