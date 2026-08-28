@@ -23,6 +23,9 @@ const Mods = model.Mods;
 /// A symbol as discovered within a single file, before global ids are assigned.
 pub const ParsedSymbol = struct {
     name: []const u8,
+    /// True when `name` was built by the parser (Ruby's `attr_writer`-generated
+    /// `x=`) instead of pointing into the source, so tests know to free it.
+    name_owned: bool = false,
     kind: SymbolKind,
     line: u32,
     span_start: u32,
@@ -567,11 +570,21 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     while (i < hi) : (i += 1) {
         const t = ctx.toks[i];
         if (t.kind != .identifier) continue;
-        const name = t.text(ctx.source);
+        var name = t.text(ctx.source);
         // A one-letter name is a real definition (`pub fn a()`) and a real call
         // site: length is not evidence. Locals and parameters are already
         // filtered by their bindings during resolution.
         if (kw.has(name)) continue;
+        // Ruby predicate/bang methods carry a trailing sigil that lexes as its
+        // own adjacent token but belongs to the name, exactly as at the `def`.
+        // `a != b` must not read as a call to `a!`.
+        var last = i;
+        if (ctx.cfg.language == .ruby and i + 1 < hi and ctx.toks[i + 1].start == t.end and
+            (ctx.isPunct(i + 1, '?') or (ctx.isPunct(i + 1, '!') and !ctx.isPunct(i + 2, '='))))
+        {
+            name = ctx.source[t.start..ctx.toks[i + 1].end];
+            last = i + 1;
+        }
         const receiver = memberQualifier(ctx, i, lo);
         // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
         // `.{ .value = x }`) are labels, not references to a same-named symbol.
@@ -580,6 +593,7 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // strict agent queries. Preserve real receivers such as `value.field`
         // and `make().field`.
         if (isZigReceiverlessMember(ctx, i, lo, receiver.name)) continue;
+        if (isRubyScopeQualifier(ctx, i, lo, hi)) continue;
         const assignment = assignmentAccess(ctx, i, hi);
         const qualifier = if (assignment.write and receiver.name.len == 0)
             enclosingCallQualifier(ctx, i, lo)
@@ -596,7 +610,11 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         // reference to a same-named binding — don't emit an edge for either.
         if (receiver.name.len == 0 and
             (isJsObjectKey(ctx, i, lo, hi) or isGoLiteralFieldKey(ctx, i, lo, hi))) continue;
-        const is_call = referenceCallOpen(ctx, i, hi) != null;
+        // Ruby has no public fields and needs no parentheses: `book.to_row` and
+        // `map(&:to_row)` are calls, not data reads.
+        const is_call = referenceCallOpen(ctx, last, hi) != null or
+            (ctx.cfg.language == .ruby and !assignment.write and
+                (receiver.name.len != 0 or isRubySymbolBlock(ctx, i, lo)));
         if (assignment.read) {
             try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
         }
@@ -615,6 +633,23 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         .refs = try ctx.arena.dupe(Reference, refs.items),
         .bindings = try collectBindings(ctx, params_open, lo, hi),
     };
+}
+
+/// A `::`-scoped Ruby constant that only scopes the call after it
+/// (`Tricky::Ledger.created`) names no dependency of its own — the edge is to
+/// the method. `Tricky::Ledger.new` is different: it constructs, so the type is
+/// genuinely used there.
+fn isRubyScopeQualifier(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    if (ctx.cfg.language != .ruby) return false;
+    if (!(i >= lo + 2 and ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':'))) return false;
+    if (!ctx.isPunct(i + 1, '.')) return false;
+    return i + 2 < hi and ctx.toks[i + 2].kind == .identifier and !ctx.identEql(i + 2, "new");
+}
+
+/// Ruby's `&:name` block shorthand — `map(&:to_row)` calls `to_row` on each
+/// element, so the symbol names a method, not a value.
+fn isRubySymbolBlock(ctx: *const Ctx, i: u32, lo: u32) bool {
+    return i >= lo + 2 and ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, '&');
 }
 
 fn isZigReceiverlessMember(ctx: *const Ctx, i: u32, lo: u32, qualifier: []const u8) bool {
@@ -1421,6 +1456,12 @@ fn typeFromRhs(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
     while (i < hi and ctx.toks[i].kind == .identifier and n < segs.len) {
         segs[n] = i;
         n += 1;
+        // Ruby scopes a nested type with `::` (`Catalog::Shelf.new`), which
+        // chains the same way `.` does.
+        if (ctx.cfg.language == .ruby and ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, ':')) {
+            i += 3;
+            continue;
+        }
         if (!ctx.isPunct(i + 1, '.')) break;
         i += 2;
     }
@@ -4445,7 +4486,7 @@ const ruby_keywords = KeywordSet.initComptime(.{
     .{"while"},  .{"until"},  .{"for"},   .{"in"},      .{"do"},               .{"begin"},
     .{"rescue"}, .{"ensure"}, .{"retry"}, .{"return"},  .{"yield"},            .{"then"},
     .{"case"},   .{"when"},   .{"class"}, .{"module"},  .{"self"},             .{"nil"},
-    .{"true"},   .{"false"},  .{"and"},   .{"or"},      .{"not"},              .{"super"},
+    .{"true"},   .{"false"},  .{"and"},   .{"or"},      .{"not"},
     .{"break"},  .{"next"},   .{"redo"},  .{"require"}, .{"require_relative"},
 });
 
@@ -4505,7 +4546,54 @@ fn parseRubyStmt(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     if (ctx.identEql(i, "module")) return parseRubyContainer(ctx, i, hi, parent, .module);
     if (ctx.identEql(i, "require") or ctx.identEql(i, "require_relative"))
         return parseRubyRequire(ctx, i, hi);
+    if (parent != null and (ctx.identEql(i, "attr_accessor") or ctx.identEql(i, "attr_reader") or
+        ctx.identEql(i, "attr_writer")))
+        return parseRubyAttr(ctx, i, hi, parent.?);
     return i;
+}
+
+/// `attr_accessor :id, :title` and friends. Ruby generates a reader `id` and a
+/// writer `id=` method per symbol; both are real definitions that call sites
+/// name, so both are emitted on the enclosing class at the declaration's line.
+fn parseRubyAttr(ctx: *Ctx, kw_i: u32, hi: u32, parent: u32) AllocError!u32 {
+    const reads = !ctx.identEql(kw_i, "attr_writer");
+    const writes = !ctx.identEql(kw_i, "attr_reader");
+    const line = ctx.toks[kw_i].line;
+    const span_start = lineStartOffset(ctx, kw_i);
+    const span_end = lineEndOffset(ctx, ctx.toks[kw_i].start);
+    var j = kw_i + 1;
+    if (ctx.isPunct(j, '(')) j += 1;
+    while (j + 1 < hi and ctx.isPunct(j, ':') and ctx.toks[j + 1].kind == .identifier and
+        ctx.toks[j + 1].line == line)
+    {
+        const attr = ctx.textOf(j + 1);
+        if (reads) _ = try emit(ctx, rubyAttrSymbol(attr, false, line, span_start, span_end, parent));
+        if (writes) {
+            const setter = try std.fmt.allocPrint(ctx.arena, "{s}=", .{attr});
+            _ = try emit(ctx, rubyAttrSymbol(setter, true, line, span_start, span_end, parent));
+        }
+        j += 2;
+        if (!ctx.isPunct(j, ',')) break;
+        j += 1;
+    }
+    return tokenAfterOffset(ctx, span_end, hi);
+}
+
+fn rubyAttrSymbol(name: []const u8, owned: bool, line: u32, span_start: u32, span_end: u32, parent: u32) ParsedSymbol {
+    return .{
+        .name = name,
+        .name_owned = owned,
+        .kind = .method,
+        .line = line,
+        .span_start = span_start,
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = true,
+        .parent_local = parent,
+        .refs = &.{},
+        .modifiers = .{ .getter = !owned, .setter = owned },
+    };
 }
 
 fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
@@ -5924,6 +6012,7 @@ fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {
 
 fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     for (out.items) |s| {
+        if (s.name_owned) testing.allocator.free(s.name);
         for (s.refs) |ref| {
             if (ref.lines.len != 0) testing.allocator.free(ref.lines);
             if (ref.offsets.len != 0) testing.allocator.free(ref.offsets);

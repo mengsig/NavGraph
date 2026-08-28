@@ -77,7 +77,12 @@ pub const Index = struct {
     /// ascending id order. Precomputed once so inherited-member lookup walks a
     /// short adjacency list instead of rescanning every symbol per reference.
     /// Arena-owned.
-    java_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
+    /// Other types an unqualified member lookup may continue into: a Java
+    /// type's declared supertypes, a Ruby class's superclass and mixins, and —
+    /// for a Ruby module — the classes that mix it in, since a mixin's methods
+    /// dispatch into the includer. Precomputed once per build; a per-reference
+    /// scan of the symbol table was quadratic in project size.
+    type_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -236,7 +241,7 @@ pub fn buildOpenDir(
     attachCrossFileMethodParents(&idx);
     try buildImportTable(&idx);
     try buildGoPackageTable(&idx);
-    try buildJavaBaseTable(&idx);
+    try buildTypeBaseTable(&idx);
     resolveReferences(&idx);
     // Persist BEFORE applying router mounts: the mount pass rewrites route
     // symbol names in place (prepending the mount prefix), and those rewritten
@@ -876,6 +881,32 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
         }
     }
 
+    // Ruby's implicit self: an unqualified call inside a class or module names
+    // that type's own method first, then one reached through its ancestors
+    // (superclass, mixins) or — inside a module — through a class that mixes it
+    // in. `super` names the ancestor's method of the *enclosing* method's name.
+    if (idx.graph.files[from.file].language == .ruby and from.parent != invalid) {
+        const wanted = if (std.mem.eql(u8, ref.name, "super")) from.name else ref.name;
+        if (!std.mem.eql(u8, ref.name, "super")) {
+            const own = memberOfParent(idx, from.parent, wanted);
+            if (own.id != invalid) {
+                ref.target = own.id;
+                ref.exact = own.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .lexical_member;
+                return;
+            }
+        }
+        ref.target = inheritedMember(idx, from, wanted);
+        if (ref.target != invalid) {
+            ref.exact = false;
+            ref.resolution_status = .inferred;
+            ref.resolution_reason = .inheritance;
+            return;
+        }
+        if (std.mem.eql(u8, ref.name, "super")) return;
+    }
+
     if (idx.graph.files[from.file].language == .java) {
         // Java permits an unqualified member access inside the declaring class.
         // The concrete parent id makes a unique direct member a proven edge;
@@ -893,7 +924,7 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
             // Inherited lookup is useful but intentionally inferred: this
             // dependency-free scanner does not build Java's complete classpath,
             // accessibility rules, overload set, or generic substitution.
-            ref.target = javaInheritedMember(idx, from, ref.name);
+            ref.target = inheritedMember(idx, from, ref.name);
             if (ref.target != invalid) {
                 ref.exact = false;
                 ref.resolution_status = .inferred;
@@ -938,9 +969,14 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
         ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
     }
     // A chained Java call such as `line.item().sku()` can lose its receiver in
-    // the lightweight token model. Keep a small same-language method guess
-    // visible, but never exact, after every lexical/import path failed.
-    if (ref.target == invalid and idx.graph.files[from.file].language == .java and ref.kind == .call) {
+    // the lightweight token model, and a Ruby `&:sym` block names a method with
+    // no receiver at all. Keep a small same-language method guess visible, but
+    // never exact, after every lexical/import path failed.
+    const guesses_bare_method = switch (idx.graph.files[from.file].language) {
+        .java, .ruby => true,
+        else => false,
+    };
+    if (ref.target == invalid and guesses_bare_method and ref.kind == .call) {
         ref.target = heuristicMethodTarget(idx, from, ref.name);
         ref.exact = false;
         if (ref.target != invalid) {
@@ -989,13 +1025,13 @@ fn importedBareTarget(idx: *const Index, file: FileId, name: []const u8) MemberM
 /// Resolve an unqualified Java member through the enclosing type's declared
 /// superclass/interfaces. The selected edge is always marked non-exact by the
 /// caller; this pass only finds a useful local candidate and refuses cycles.
-fn javaInheritedMember(idx: *const Index, from: model.Symbol, name: []const u8) SymbolId {
+fn inheritedMember(idx: *const Index, from: model.Symbol, name: []const u8) SymbolId {
     if (from.parent == invalid) return invalid;
     var visited: [16]SymbolId = @splat(invalid);
-    return javaInheritedMemberFrom(idx, from.parent, name, &visited, 0);
+    return inheritedMemberFrom(idx, from.parent, name, &visited, 0);
 }
 
-fn javaInheritedMemberFrom(
+fn inheritedMemberFrom(
     idx: *const Index,
     type_id: SymbolId,
     name: []const u8,
@@ -1006,22 +1042,23 @@ fn javaInheritedMemberFrom(
     for (visited[0..depth]) |seen| if (seen == type_id) return invalid;
     visited[depth] = type_id;
 
-    for (idx.java_bases.get(type_id) orelse return invalid) |base_id| {
+    for (idx.type_bases.get(type_id) orelse return invalid) |base_id| {
         const direct = memberOfParent(idx, base_id, name);
         if (direct.id != invalid) return direct.id;
-        const inherited = javaInheritedMemberFrom(idx, base_id, name, visited, depth + 1);
+        const inherited = inheritedMemberFrom(idx, base_id, name, visited, depth + 1);
         if (inherited != invalid) return inherited;
     }
     return invalid;
 }
 
-/// Precompute every Java type's declared supertypes into `Index.java_bases`.
-/// The lookup this replaces scanned the whole symbol table per unresolved Java
-/// reference, recursed 16 deep — O(references x symbols x depth), which made
-/// index build super-linear in file count. The table itself is arena-owned and
-/// dies with the index; the scratch used to build it is not, and is released
-/// here.
-fn buildJavaBaseTable(idx: *Index) !void {
+/// Precompute every type's declared supertypes into `Index.type_bases` (Java
+/// `extends`/`implements`, Ruby `<` and `include`/`extend`/`prepend`, plus the
+/// reverse mixin edge). The lookup this replaces scanned the whole symbol table
+/// per unresolved reference, recursed 16 deep — O(references x symbols x depth),
+/// which made index build super-linear in file count. The table itself is
+/// arena-owned and dies with the index; the scratch used to build it is not,
+/// and is released here.
+fn buildTypeBaseTable(idx: *Index) !void {
     const arena = idx.arena.allocator();
     const gpa = idx.gpa;
 
@@ -1032,7 +1069,7 @@ fn buildJavaBaseTable(idx: *Index) !void {
         by_name.deinit(gpa);
     }
     for (idx.graph.symbols) |sym| {
-        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        if (!hasBaseTable(idx, sym)) continue;
         const slot = try by_name.getOrPut(gpa, sym.name);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(gpa, sym.id);
@@ -1041,10 +1078,13 @@ fn buildJavaBaseTable(idx: *Index) !void {
     var bases: std.ArrayListUnmanaged(SymbolId) = .empty;
     defer bases.deinit(gpa);
     for (idx.graph.symbols) |sym| {
-        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        if (!hasBaseTable(idx, sym)) continue;
         bases.clearRetainingCapacity();
-        var it = JavaBaseIterator{ .signature = sym.signature(idx.graph.files[sym.file].text) };
-        while (it.next()) |base_name| {
+        const text = idx.graph.files[sym.file].text;
+        const ruby = idx.graph.files[sym.file].language == .ruby;
+        var java_it = JavaBaseIterator{ .signature = sym.signature(text) };
+        var ruby_it = RubyBaseIterator{ .signature = sym.signature(text), .body = sym.body(text) };
+        while (if (ruby) ruby_it.next() else java_it.next()) |base_name| {
             const candidates = by_name.get(base_name) orelse continue;
             // An explicit import of the base name disambiguates same-named
             // classes; otherwise any chosen base stays a non-exact hint.
@@ -1067,8 +1107,100 @@ fn buildJavaBaseTable(idx: *Index) !void {
             bases.items[unique] = id;
             unique += 1;
         }
-        try idx.java_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
+        try idx.type_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
     }
+    try addRubyMixinIncluders(idx, arena);
+}
+
+/// Whether `sym` is a type whose declared bases we can read from its own text.
+fn hasBaseTable(idx: *const Index, sym: model.Symbol) bool {
+    if (!isContainer(sym) and sym.kind != .module) return false;
+    return switch (idx.graph.files[sym.file].language) {
+        .java => isContainer(sym),
+        .ruby => true,
+        else => false,
+    };
+}
+
+/// A Ruby mixin's methods dispatch into the class that mixes it in, so an
+/// unqualified member of a module may be defined by an includer. Record that
+/// reverse edge, which the forward pass above only walks module-ward.
+fn addRubyMixinIncluders(idx: *Index, arena: std.mem.Allocator) !void {
+    const gpa = idx.gpa;
+    var includers: std.AutoHashMapUnmanaged(SymbolId, std.ArrayListUnmanaged(SymbolId)) = .empty;
+    defer {
+        var vit = includers.valueIterator();
+        while (vit.next()) |list| list.deinit(gpa);
+        includers.deinit(gpa);
+    }
+    for (idx.graph.symbols) |sym| {
+        if (idx.graph.files[sym.file].language != .ruby or sym.kind != .class) continue;
+        for (idx.type_bases.get(sym.id) orelse continue) |base_id| {
+            if (idx.graph.symbols[base_id].kind != .module) continue;
+            const slot = try includers.getOrPut(gpa, base_id);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            try slot.value_ptr.append(gpa, sym.id);
+        }
+    }
+    var it = includers.iterator();
+    while (it.next()) |entry| {
+        const module_id = entry.key_ptr.*;
+        var merged: std.ArrayListUnmanaged(SymbolId) = .empty;
+        defer merged.deinit(gpa);
+        try merged.appendSlice(gpa, idx.type_bases.get(module_id) orelse &.{});
+        try merged.appendSlice(gpa, entry.value_ptr.items);
+        std.mem.sort(SymbolId, merged.items, {}, std.sort.asc(SymbolId));
+        try idx.type_bases.put(arena, module_id, try arena.dupe(SymbolId, merged.items));
+    }
+}
+
+/// Iterates the type names a Ruby class/module inherits from: the superclass in
+/// `class Ebook < Book`, then every `include`/`extend`/`prepend` at the start of
+/// a line in its body. A `::`-qualified name yields its last segment, which is
+/// how the index names a nested type.
+const RubyBaseIterator = struct {
+    signature: []const u8,
+    body: []const u8,
+    superclass_done: bool = false,
+    i: usize = 0,
+
+    fn next(self: *RubyBaseIterator) ?[]const u8 {
+        if (!self.superclass_done) {
+            self.superclass_done = true;
+            if (std.mem.indexOfScalar(u8, self.signature, '<')) |lt| {
+                if (lastIdent(self.signature[lt + 1 ..])) |name| return name;
+            }
+        }
+        while (self.i < self.body.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.body, self.i, '\n') orelse self.body.len;
+            const line = std.mem.trim(u8, self.body[self.i..line_end], " \t\r");
+            self.i = line_end + 1;
+            for ([_][]const u8{ "include ", "extend ", "prepend " }) |kw| {
+                if (!std.mem.startsWith(u8, line, kw)) continue;
+                if (lastIdent(line[kw.len..])) |name| return name;
+            }
+        }
+        return null;
+    }
+};
+
+/// The last `::`-separated identifier at the start of `text` (`Catalog::Shelf`
+/// -> `Shelf`), or null when `text` does not begin with one.
+fn lastIdent(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+    var last: ?[]const u8 = null;
+    while (i < text.len and isIdentByte(text[i])) {
+        const start = i;
+        while (i < text.len and isIdentByte(text[i])) i += 1;
+        last = text[start..i];
+        if (i + 1 < text.len and text[i] == ':' and text[i + 1] == ':') {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    return last;
 }
 
 /// Iterates the type names a Java signature declares after `extends` /
@@ -1126,6 +1258,23 @@ fn isIdentByte(c: u8) bool {
 /// (self/this or a local binding), then by treating `recv` as an imported
 /// module bound to a file. If neither applies, leave it external.
 fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    // Ruby spells construction `Klass.new`, and the definition that call
+    // reaches is the class's `initialize`. Resolve under the name it is defined
+    // by; the reference keeps saying `new`.
+    if (idx.graph.files[from.file].language == .ruby and ref.kind == .call and
+        std.mem.eql(u8, ref.name, "new") and !isLocalBinding(from, ref.qualifier))
+    {
+        if (uniqueContainerNamed(idx, from.file, ref.qualifier)) |cls| {
+            const ctor = memberOfParent(idx, cls, "initialize");
+            if (ctor.id != invalid) {
+                ref.target = ctor.id;
+                ref.exact = ctor.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .type_qualifier;
+                return;
+            }
+        }
+    }
     // `self`/`this`: dispatch within the *exact* enclosing type (a concrete
     // parent symbol id), never another file's same-named class. Resolving by the
     // bare type name here let `self.put()` escape into a sibling package's class
@@ -1141,7 +1290,7 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
                 return;
             }
             if (idx.graph.files[from.file].language == .java) {
-                ref.target = javaInheritedMember(idx, from, ref.name);
+                ref.target = inheritedMember(idx, from, ref.name);
                 if (ref.target != invalid) {
                     ref.exact = false;
                     ref.resolution_status = .inferred;
@@ -3560,7 +3709,7 @@ test "the precomputed Java supertype table records declared bases only" {
     defer idx.deinit();
 
     const sub = idx.lookup("Sub")[0];
-    const bases = idx.java_bases.get(sub).?;
+    const bases = idx.type_bases.get(sub).?;
     try testing.expectEqual(@as(usize, 2), bases.len);
     // Ascending symbol-id order, and `Boxed` (a generic argument) is not a base.
     var names: [2][]const u8 = undefined;
@@ -3569,7 +3718,7 @@ test "the precomputed Java supertype table records declared bases only" {
     try testing.expect(std.mem.eql(u8, names[0], "Mixin") or std.mem.eql(u8, names[1], "Mixin"));
     try testing.expect(bases[0] < bases[1]);
     // A type with no `extends`/`implements` has no entry at all.
-    try testing.expect(idx.java_bases.get(idx.lookup("Base")[0]) == null);
+    try testing.expect(idx.type_bases.get(idx.lookup("Base")[0]) == null);
 }
 
 test "Java overloads never make an arbitrary bare member edge exact" {
@@ -4330,6 +4479,74 @@ test "a field of the enclosing type gives a bare receiver its declared type (jav
     try testing.expect(ref.exact);
     try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
     try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+}
+
+test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "shop.rb", .data =
+        \\module Identifiable
+        \\  def identifier
+        \\    tag()
+        \\  end
+        \\end
+        \\
+        \\class Item
+        \\  include Identifiable
+        \\
+        \\  attr_accessor :tag
+        \\
+        \\  def initialize(tag)
+        \\    @tag = tag
+        \\  end
+        \\
+        \\  def label
+        \\    identifier
+        \\  end
+        \\end
+        \\
+        \\class Boxed < Item
+        \\  def initialize(tag)
+        \\    super(tag)
+        \\  end
+        \\end
+        \\
+        \\def run
+        \\  Item.new("a").label
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `attr_accessor :tag` defines both the reader and the writer.
+    const reader = qualifiedId(&idx, "Item", "tag").?;
+    try testing.expect(qualifiedId(&idx, "Item", "tag=") != null);
+
+    // A module method's unqualified call reaches the including class's method.
+    const identifier = idx.graph.symbols[qualifiedId(&idx, "Identifiable", "identifier").?];
+    try testing.expectEqual(reader, refByName(identifier, "tag").?.target);
+
+    // Implicit self inside a class reaches a method mixed in by `include`.
+    const label = idx.graph.symbols[qualifiedId(&idx, "Item", "label").?];
+    try testing.expectEqual(identifier.id, refByName(label, "identifier").?.target);
+
+    // `super` names the ancestor's method of the enclosing method's own name.
+    const boxed_init = idx.graph.symbols[qualifiedId(&idx, "Boxed", "initialize").?];
+    const item_init = qualifiedId(&idx, "Item", "initialize").?;
+    try testing.expectEqual(item_init, refByName(boxed_init, "super").?.target);
+
+    // `Item.new` reaches the class's `initialize`, not a method literally
+    // named `new`.
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ctor = refByQual(run, "Item", "new").?;
+    try testing.expectEqual(item_init, ctor.target);
+    try testing.expect(ctor.exact);
 }
 
 test "one-letter names resolve as call sites in every language family" {
