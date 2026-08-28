@@ -783,12 +783,15 @@ whole-graph re-resolution, not parsing, is the actual cost driver; see
   one buffer into a single span (the reparse seam's own granularity) — two
   edits far apart in one file report as one hunk covering the whole span
   between them, not two.
-- The CLI (`navgraph context`, `navgraph where`) and `navgraph serve` (MCP)
-  mirrors of `navgraph/context` and `navgraph/where` are not implemented in
-  this delivery; `navgraph impact`/`affected` on the CLI predates 1.1 and
-  answers the git-ref question only (no overlay concept exists outside the
-  resident server), without hunk grouping. Tracked as follow-up scope, not
-  silently dropped.
+- `limit:0`/`budget:0` on any method is not honored as "no cap" — it is
+  silently reinterpreted as "use the default" (500/200/2000/…), matching the
+  1.0 helper's existing behavior. An explicit `0` and an absent `limit` are
+  indistinguishable on the wire; send a real cap instead of `0`.
+- `navgraph/types.supertypes` and `typeHierarchy/supertypes` drop a base the
+  resolver could not place in the index (an external/ambiguous base) rather
+  than reporting it — the CLI's `navgraph hierarchy` shows it as `~ external/
+  ambiguous base: Name ?`, but the LSP surface currently cannot distinguish
+  "no supertype" from "supertype outside the index".
 
 ## Neovim
 
