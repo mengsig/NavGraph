@@ -1179,18 +1179,23 @@ pub fn writeTypes(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, op
     try payload.writeSymbolId(w, ctx, id);
     var hgraph = try hierarchy.build(gpa, idx);
     defer hgraph.deinit();
+    var truncated = false;
     try w.writeAll(",\"supertypes\":[");
     {
         var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
         defer seen.deinit(gpa);
-        var wrote = false;
+        var shown: u32 = 0;
         for (hgraph.edges) |e| {
             if (e.subtype != id or e.supertype == invalid) continue;
             if ((try seen.getOrPut(gpa, e.supertype)).found_existing) continue;
             const super = idx.graph.symbols[e.supertype];
             if (!opts.scope.admits(idx, super)) continue;
-            if (wrote) try w.writeByte(',');
-            wrote = true;
+            if (shown >= opts.limit) {
+                truncated = true;
+                continue;
+            }
+            if (shown != 0) try w.writeByte(',');
+            shown += 1;
             try payload.writeSymbolId(w, ctx, e.supertype);
         }
     }
@@ -1198,14 +1203,18 @@ pub fn writeTypes(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, op
     {
         var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
         defer seen.deinit(gpa);
-        var wrote = false;
+        var shown: u32 = 0;
         for (hgraph.edges) |e| {
             if (e.supertype != id or e.subtype == invalid) continue;
             if ((try seen.getOrPut(gpa, e.subtype)).found_existing) continue;
             const sub = idx.graph.symbols[e.subtype];
             if (!opts.scope.admits(idx, sub)) continue;
-            if (wrote) try w.writeByte(',');
-            wrote = true;
+            if (shown >= opts.limit) {
+                truncated = true;
+                continue;
+            }
+            if (shown != 0) try w.writeByte(',');
+            shown += 1;
             try payload.writeSymbolId(w, ctx, e.subtype);
         }
     }
@@ -1215,34 +1224,29 @@ pub fn writeTypes(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, op
     {
         var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
         defer seen.deinit(gpa);
-        var wrote = false;
+        var shown: u32 = 0;
         for (pgraph.relations) |r| {
             if (r.port != id) continue;
             if ((try seen.getOrPut(gpa, r.implementation)).found_existing) continue;
             const impl_sym = idx.graph.symbols[r.implementation];
             if (!opts.scope.admits(idx, impl_sym)) continue;
-            if (wrote) try w.writeByte(',');
-            wrote = true;
+            if (shown >= opts.limit) {
+                truncated = true;
+                continue;
+            }
+            if (shown != 0) try w.writeByte(',');
+            shown += 1;
             try payload.writeSymbolId(w, ctx, r.implementation);
         }
     }
     try w.writeAll("],\"users\":[");
     var shown: u32 = 0;
-    var truncated = false;
     var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
     defer seen.deinit(gpa);
-    for (hgraph.edges) |e| {
-        if (e.supertype != id or e.subtype == invalid) continue;
-        if ((try seen.getOrPut(gpa, e.subtype)).found_existing) continue;
-        if (!opts.scope.admits(idx, idx.graph.symbols[e.subtype])) continue;
-        if (shown >= opts.limit) {
-            truncated = true;
-            continue;
-        }
-        if (shown != 0) try w.writeByte(',');
-        shown += 1;
-        try writeTypeUser(w, ctx, e.subtype, "extends");
-    }
+    // Implementors labeled first: a keyword-typed language (Java/TS/C#/Go/Ruby)
+    // records an `implements I` relation in BOTH tables (impls, plus a generic
+    // base-table edge), so whichever pass claims the id first wins the `seen`
+    // dedup — implements is the more specific, correct label (coldstart F3).
     for (pgraph.relations) |r| {
         if (r.port != id) continue;
         if ((try seen.getOrPut(gpa, r.implementation)).found_existing) continue;
@@ -1255,6 +1259,18 @@ pub fn writeTypes(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, op
         shown += 1;
         try writeTypeUser(w, ctx, r.implementation, "implements");
     }
+    for (hgraph.edges) |e| {
+        if (e.supertype != id or e.subtype == invalid) continue;
+        if ((try seen.getOrPut(gpa, e.subtype)).found_existing) continue;
+        if (!opts.scope.admits(idx, idx.graph.symbols[e.subtype])) continue;
+        if (shown >= opts.limit) {
+            truncated = true;
+            continue;
+        }
+        if (shown != 0) try w.writeByte(',');
+        shown += 1;
+        try writeTypeUser(w, ctx, e.subtype, "extends");
+    }
     for (idx.graph.symbols) |owner| {
         for (owner.bindings) |b| {
             if (!std.mem.eql(u8, b.type_name, sym.name)) continue;
@@ -1266,8 +1282,7 @@ pub fn writeTypes(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, op
             }
             if (shown != 0) try w.writeByte(',');
             shown += 1;
-            const owner_sig = owner.signature(idx.graph.files[owner.file].text);
-            const kind: []const u8 = if (std.mem.indexOf(u8, owner_sig, b.name) != null) "param" else "local";
+            const kind: []const u8 = if (b.is_param) "param" else "local";
             try writeTypeUser(w, ctx, owner.id, kind);
             break;
         }

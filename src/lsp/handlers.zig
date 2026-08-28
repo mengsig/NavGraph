@@ -2206,23 +2206,24 @@ test "navgraph/types reports the base/impl table and dedupes a user across exten
     try testing.expectEqual(@as(usize, 2), implementors.len);
 
     // `Partial` qualifies as both a subtype (extends) and an implementor
-    // (implements); it must appear exactly once in `users`, as "extends".
+    // (implements); it must appear exactly once in `users`, as the more
+    // specific "implements" (coldstart F3 — implementors are labeled first).
     const users = r.get("users").?.array.items;
     try testing.expectEqual(@as(usize, 2), users.len);
-    var saw_partial_extends = false;
+    var saw_partial_implements = false;
     var saw_memorystore_implements = false;
     for (users) |u| {
         const name = u.object.get("symbol").?.object.get("name").?.string;
         const kind = u.object.get("kind").?.string;
         if (std.mem.eql(u8, name, "Partial")) {
-            try testing.expectEqualStrings("extends", kind);
-            saw_partial_extends = true;
+            try testing.expectEqualStrings("implements", kind);
+            saw_partial_implements = true;
         } else if (std.mem.eql(u8, name, "MemoryStore")) {
             try testing.expectEqualStrings("implements", kind);
             saw_memorystore_implements = true;
         }
     }
-    try testing.expect(saw_partial_extends and saw_memorystore_implements);
+    try testing.expect(saw_partial_implements and saw_memorystore_implements);
     try testing.expect(!r.get("truncated").?.bool);
 }
 
