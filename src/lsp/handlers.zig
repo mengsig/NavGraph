@@ -931,6 +931,67 @@ fn typesMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value,
     try queries.writeTypes(w, arena, c, roots[0], .{ .limit = p.positive("limit", 200), .scope = scope });
 }
 
+/// `navgraph/impact`: the blast radius of the current working change
+/// (overlay vs disk), or of disk vs `ref` when given — grouped by hunk. `uri`
+/// narrows to one document; `range` (only meaningful with `uri`, outside
+/// `ref` mode) hands navgraph a hunk it already knows about instead of
+/// requiring an overlay to already differ from disk.
+fn impactMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const scope = try scopeOf(self, p);
+    const opts = queries.ImpactOptions{
+        .depth = @min(p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
+        .direction = try directionOf(p, .callers),
+        .limit = p.positive("limit", 500),
+        .scope = scope,
+    };
+    const ref = p.str("ref");
+    // A `uri` outside the workspace root can never match a real overlay path;
+    // force a no-match rather than silently falling back to "every document".
+    var uri_path: ?[]const u8 = null;
+    if (p.str("uri")) |uri| uri_path = (try pathOf(self, arena, uri)) orelse "\x00 outside workspace";
+    var range: ?queries.ImpactRange = null;
+    if (p.nested("range").obj != null) {
+        const rg = p.nested("range");
+        range = .{
+            .lo = @intCast(@max(rg.nested("start").int("line", 0), 0) + 1),
+            .hi = @intCast(@max(rg.nested("end").int("line", 0), 0) + 1),
+        };
+    }
+    var detail: ?[]const u8 = null;
+    queries.writeImpact(w, arena, c, ref, uri_path, range, opts, &detail) catch |err| {
+        self.err_detail = detail;
+        return err;
+    };
+}
+
+/// `navgraph/context`: everything an editing agent typically needs about one
+/// symbol in a single call, trimmed to `budget` tokens. See
+/// `queries.writeContext`'s doc for the drop order.
+fn contextMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const target = try targetOf(self, arena, p);
+    const roots = try resolveTargetOrErr(self, arena, c, target);
+    try queries.writeContext(w, arena, c, roots[0], .{ .budget = p.positive("budget", 2000) });
+}
+
+/// `navgraph/where`: the symbol enclosing `{uri, line}` and its breadcrumb
+/// chain. `line` is 1-based, like a stack trace or a diff hunk — unlike an
+/// LSP `position.line`, which is 0-based.
+fn whereMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const path = (try documentPath(self, arena, p)) orelse return error.InvalidParams;
+    const line = p.positive("line", 0);
+    if (line == 0) return error.InvalidParams;
+    try queries.writeWhere(w, arena, c, path, line);
+}
+
 fn searchMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
     try self.flushPending(arena, .change);
     const c = try self.ctx();
@@ -1168,6 +1229,9 @@ const requests = [_]Entry{
     .{ .name = "navgraph/blast", .run = blast },
     .{ .name = "navgraph/tests", .run = testsMethod },
     .{ .name = "navgraph/types", .run = typesMethod },
+    .{ .name = "navgraph/impact", .run = impactMethod },
+    .{ .name = "navgraph/context", .run = contextMethod },
+    .{ .name = "navgraph/where", .run = whereMethod },
     .{ .name = "navgraph/search", .run = searchMethod },
     .{ .name = "navgraph/grep", .run = grep },
     .{ .name = "navgraph/callers", .run = callersMethod },
@@ -2977,6 +3041,93 @@ test "navgraph/diff on a ref git rejects is a git-failed error, not an empty cha
     try testing.expectEqual(@as(i64, -32002), try errorCodeOf(res));
     const message = res.value.object.get("error").?.object.get("message").?.string;
     try testing.expect(std.mem.indexOf(u8, message, "no-such-ref-xyz") != null);
+}
+
+const impact_disk = "pub fn run() void {}\npub fn mid() void {}\n";
+const impact_project = [_][2][]const u8{.{ "app.zig", impact_disk }};
+
+test "navgraph/impact reports an empty change as all zeros, not an error" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &impact_project);
+    defer ts.deinit();
+    try ts.start();
+    var res = try ts.request(79,
+        \\{"jsonrpc":"2.0","id":79,"method":"navgraph/impact","params":{}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqual(@as(usize, 0), r.get("roots").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("nodes").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("edges").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("hunks").?.array.items.len);
+    try testing.expectEqual(@as(i64, 0), r.get("summary").?.object.get("symbols").?.integer);
+}
+
+test "navgraph/impact groups the working change into a hunk and blasts from its roots" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &impact_project);
+    defer ts.deinit();
+    try ts.start();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const uri = try ts.uri(alloc, "app.zig");
+
+    // Same bytes as `impact_disk`, plus one appended function -> a single
+    // hunk anchored at the new line (`index.computeEdit`'s common-prefix trim).
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"pub fn run() void {{}}\npub fn mid() void {{}}\npub fn added() void {{ mid(); }}\n"}}}}}}
+    , .{uri}));
+
+    var res = try ts.request(80,
+        \\{"jsonrpc":"2.0","id":80,"method":"navgraph/impact","params":{}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+
+    const hunks = r.get("hunks").?.array.items;
+    try testing.expectEqual(@as(usize, 1), hunks.len);
+    try testing.expect(std.mem.endsWith(u8, hunks[0].object.get("uri").?.string, "app.zig"));
+    var saw_added_in_hunk = false;
+    for (hunks[0].object.get("roots").?.array.items) |root| {
+        if (std.mem.eql(u8, root.object.get("name").?.string, "added")) saw_added_in_hunk = true;
+    }
+    try testing.expect(saw_added_in_hunk);
+
+    var saw_added_root = false;
+    for (r.get("roots").?.array.items) |root| {
+        if (std.mem.eql(u8, root.object.get("name").?.string, "added")) saw_added_root = true;
+    }
+    try testing.expect(saw_added_root);
+    try testing.expect(r.get("changeId").?.string.len > 0);
+}
+
+test "navgraph/impact narrows to the named uri when several documents changed" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const app_uri = try ts.uri(alloc, "app.zig");
+    const util_uri = try ts.uri(alloc, "util.zig");
+
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"const util = @import(\"util.zig\");\npub fn run() void {{\n    mid();\n}}\nfn mid() void {{\n    util.helper();\n}}\nfn extra() void {{}}\n"}}}}}}
+    , .{app_uri}));
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"pub const marker = \"needle-in-a-haystack\";\npub fn helper() void {{}}\npub fn extraUtil() void {{}}\n"}}}}}}
+    , .{util_uri}));
+
+    const body = try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","id":81,"method":"navgraph/impact","params":{{"uri":"{s}"}}}}
+    , .{util_uri});
+    var res = try ts.request(81, body);
+    defer res.deinit();
+    const hunks = (try resultOf(res)).object.get("hunks").?.array.items;
+    try testing.expectEqual(@as(usize, 1), hunks.len);
+    try testing.expect(std.mem.endsWith(u8, hunks[0].object.get("uri").?.string, "util.zig"));
 }
 
 test "navgraph/routes maps an HTTP route to its handler and its client caller" {

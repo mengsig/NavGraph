@@ -139,6 +139,34 @@ pub fn breadcrumbChain(idx: *const Index, gpa: std.mem.Allocator, id: SymbolId) 
     return chain.toOwnedSlice(gpa);
 }
 
+/// `navgraph/where`: the symbol enclosing 1-based `line` of `path` (stack
+/// traces and diff hunks are 1-based, unlike an LSP position) and its
+/// breadcrumb chain. `enclosing` is `null` — never an error — for a line with
+/// no enclosing definition (file scope, or a file outside the index).
+pub fn writeWhere(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, path: []const u8, line: u32) !void {
+    const idx = ctx.index();
+    const file_id = fileIdOf(idx, path) orelse {
+        try w.writeAll("{\"enclosing\":null,\"breadcrumbs\":[],\"file\":");
+        try payload.writeString(w, path);
+        try w.writeByte('}');
+        return;
+    };
+    const file = idx.graph.files[file_id];
+    const offset = position.lineStart(file.text, if (line == 0) 0 else line - 1) orelse file.text.len;
+    const enclosing = enclosingSymbol(idx, file, offset);
+    const enclosing_id = if (enclosing) |e| e.id else invalid;
+
+    try w.writeAll("{\"enclosing\":");
+    if (enclosing) |e| try payload.writeSymbol(w, ctx, e) else try w.writeAll("null");
+    try w.writeAll(",\"breadcrumbs\":");
+    const chain = try breadcrumbChain(idx, gpa, enclosing_id);
+    defer gpa.free(chain);
+    try payload.writeSymbolArray(w, ctx, chain);
+    try w.writeAll(",\"file\":");
+    try payload.writeString(w, file.path);
+    try w.writeByte('}');
+}
+
 /// The already-resolved target of a reference to `name` from `from`'s body.
 /// Prefers a reference on the cursor's own line and a matching receiver, so a
 /// name used several times in one body resolves at the right site.
@@ -656,6 +684,138 @@ pub fn writeTestsFor(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, target: Symbo
         try w.writeByte('}');
     }
     try w.print("],\"summary\":{{\"count\":{d},\"maxDepth\":{d},\"truncated\":{}}}}}", .{ count, max_depth, truncated });
+}
+
+// ---------------------------------------------------------------------------
+// Context (one-call symbol briefing for an editing agent)
+// ---------------------------------------------------------------------------
+
+pub const ContextOptions = struct {
+    /// Rough token budget; sections drop in order (bodies, tests, types,
+    /// callees — callers never drop) until the estimate fits, or nothing is
+    /// left to drop.
+    budget: u32 = 2000,
+};
+
+/// A rough tokens-from-characters estimate (~4 chars/token), the same order
+/// of magnitude every major tokenizer lands near for source code. Exactness
+/// is not the point — it only has to shrink monotonically as sections drop.
+fn estimateTokens(chars: usize) u32 {
+    return @intCast((chars + 3) / 4);
+}
+
+fn sigCharsSum(idx: *const Index, ids: []const SymbolId) usize {
+    var total: usize = 0;
+    for (ids) |id| {
+        const sym = idx.graph.symbols[id];
+        total += sym.signature(idx.graph.files[sym.file].text).len;
+    }
+    return total;
+}
+
+/// `navgraph/context`: everything an editing agent typically needs about one
+/// symbol in a single call — definition, callers/callees, related types, and
+/// covering tests — trimmed to `opts.budget` tokens by dropping, in order,
+/// the body (falling back to the signature alone), then tests, then types,
+/// then callees; callers are never dropped. `types` is best-effort: a
+/// container's declared supertypes, or (for a function/method) the resolved
+/// types of its own typed bindings — the same name-based binding scan
+/// `navgraph/types`'s `users` uses, so it shares that scan's limitations.
+pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, opts: ContextOptions) !void {
+    const idx = ctx.index();
+    const sym = idx.graph.symbols[id];
+    const file = idx.graph.files[sym.file];
+    const sig = sym.signature(file.text);
+    const body_text = sym.body(file.text);
+    const doc = render.stripDoc(sym.doc);
+    const callers = idx.callersOf(id);
+
+    var callees: std.ArrayList(SymbolId) = .empty;
+    defer callees.deinit(gpa);
+    {
+        var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+        defer seen.deinit(gpa);
+        var it = Neighbours.init(idx, id, .callees, false);
+        while (it.next()) |n| {
+            if ((try seen.getOrPut(gpa, n.id)).found_existing) continue;
+            try callees.append(gpa, n.id);
+        }
+    }
+
+    var types: std.ArrayList(SymbolId) = .empty;
+    defer types.deinit(gpa);
+    {
+        var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+        defer seen.deinit(gpa);
+        if (impls.isContainer(sym)) {
+            var hgraph = try hierarchy.build(gpa, idx);
+            defer hgraph.deinit();
+            for (hgraph.edges) |e| {
+                if (e.subtype != id or e.supertype == invalid) continue;
+                if ((try seen.getOrPut(gpa, e.supertype)).found_existing) continue;
+                try types.append(gpa, e.supertype);
+            }
+        } else {
+            var buf: [16]SymbolId = undefined;
+            for (sym.bindings) |b| {
+                const ids = query.resolveIds(idx, b.type_name, &buf);
+                if (ids.len != 1) continue;
+                if ((try seen.getOrPut(gpa, ids[0])).found_existing) continue;
+                try types.append(gpa, ids[0]);
+            }
+        }
+    }
+
+    var reach = try reachingWalk(gpa, idx, id);
+    defer freeReachNodes(gpa, &reach);
+    var tests_list: std.ArrayList(SymbolId) = .empty;
+    defer tests_list.deinit(gpa);
+    for (reach.items[1..]) |n| {
+        if (query.isTestSymbol(idx, idx.graph.symbols[n.id])) try tests_list.append(gpa, n.id);
+    }
+
+    // Level 0 keeps everything; each higher level drops one more section, in
+    // the contract's stated order. Stop at the first level that fits, or the
+    // last level if none does.
+    var level: u32 = 0;
+    var chars: usize = 0;
+    while (true) : (level += 1) {
+        const with_body = level < 1;
+        const with_tests = level < 2;
+        const with_types = level < 3;
+        const with_callees = level < 4;
+        chars = doc.len + (if (with_body) body_text.len else sig.len) + sigCharsSum(idx, callers);
+        if (with_callees) chars += sigCharsSum(idx, callees.items);
+        if (with_types) chars += sigCharsSum(idx, types.items);
+        if (with_tests) chars += sigCharsSum(idx, tests_list.items);
+        if (estimateTokens(chars) <= opts.budget or level >= 4) break;
+    }
+    const with_body = level < 1;
+    const with_tests = level < 2;
+    const with_types = level < 3;
+    const with_callees = level < 4;
+
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, id);
+    try w.writeAll(",\"definition\":{\"text\":");
+    try payload.writeString(w, if (with_body) body_text else sig);
+    try w.writeAll(",\"range\":");
+    try payload.writeDefRange(w, ctx, sym);
+    try w.writeAll("},\"signature\":");
+    try payload.writeCollapsed(w, sig);
+    if (doc.len != 0) {
+        try w.writeAll(",\"doc\":");
+        try payload.writeString(w, doc);
+    }
+    try w.writeAll(",\"callers\":");
+    try payload.writeSymbolArray(w, ctx, callers);
+    try w.writeAll(",\"callees\":");
+    try payload.writeSymbolArray(w, ctx, if (with_callees) callees.items else &.{});
+    try w.writeAll(",\"types\":");
+    try payload.writeSymbolArray(w, ctx, if (with_types) types.items else &.{});
+    try w.writeAll(",\"tests\":");
+    try payload.writeSymbolArray(w, ctx, if (with_tests) tests_list.items else &.{});
+    try w.print(",\"truncated\":{},\"tokensEstimate\":{d}}}", .{ level > 0, estimateTokens(chars) });
 }
 
 /// Iterate a symbol's graph neighbours in one direction, applying the same
