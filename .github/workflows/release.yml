@@ -16,7 +16,9 @@ jobs:
     name: verify tag matches build.zig.zon version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit; a moving major tag is write access to
+      # a workflow that holds `contents: write`.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Check ${{ github.ref_name }} == v<zon version>
         run: |
@@ -41,9 +43,9 @@ jobs:
       matrix:
         target: [x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           cache-key: release-${{ matrix.target }}
@@ -68,7 +70,7 @@ jobs:
           cp README.md CHANGELOG.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: navgraph-${{ matrix.target }}
           path: navgraph-${{ matrix.target }}.tar.gz
@@ -79,7 +81,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -88,7 +90,7 @@ jobs:
         working-directory: dist
         run: sha256sum navgraph-*.tar.gz > SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/navgraph-*.tar.gz
