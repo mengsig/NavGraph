@@ -108,15 +108,14 @@ pub const Vis = enum {
     }
 };
 
-/// Default result cap (also a sentinel: `limit == default_limit` means "the user
-/// did not pass -l", which `hot` uses to pick its own shorter default).
+/// Default result cap when the caller asked for none.
 pub const default_limit: u32 = 300;
 /// `hot`'s brief default when no explicit `-l` was given.
 pub const hot_default: u32 = 25;
 
 /// The effective cap for `hot`: its own short default unless `-l` was given.
 pub fn hotLimit(opts: Options) u32 {
-    return if (opts.limit == default_limit) hot_default else opts.limit;
+    return if (opts.limit_set) opts.limit else hot_default;
 }
 
 fn compactCap(opts: Options, base: u32, estimated_node_bytes: u32) u32 {
@@ -141,6 +140,10 @@ pub const Options = struct {
     verbosity: render.Verbosity = .sig,
     depth: u32 = 1,
     limit: u32 = default_limit,
+    /// Whether `limit` was asked for rather than defaulted. Lists that had no
+    /// cap before `-l` was declared on them consult it, as does `hot`'s shorter
+    /// default — an explicit `-l 300` must not read as "unset".
+    limit_set: bool = false,
     /// Traversal compaction: exact node cap, approximate output-byte budget,
     /// and compact rendering for retained/pruned branches.
     max_nodes: u32 = 0,
@@ -1710,7 +1713,7 @@ pub fn walk(w: *Writer, idx: *const Index, name: []const u8, incoming: bool, opt
     var budget: WalkBudget = .{};
     for (ids) |id| {
         visited.clearRetainingCapacity();
-        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 1, &.{}, true, false, &visited, &heuristic, &budget);
+        try walkNode(w, idx, if (impl_graph) |*g| g else null, id, incoming, opts, 0, 0, 0, 1, &.{}, true, false, &visited, &heuristic, &budget);
     }
     // If any ambiguous name-match (`?`) edges were shown, tell the agent how to
     // drop them rather than making it discover `-s` on its own. Only when they
@@ -1732,6 +1735,9 @@ fn walkNode(
     incoming: bool,
     opts: Options,
     indent: usize,
+    /// Edges followed from the root, tracked apart from `indent` so a view that
+    /// starts its children indented (neighbors) still honours `-d` from 1.
+    depth: usize,
     site: u32,
     sites: u32,
     lines: []const u32,
@@ -1749,7 +1755,7 @@ fn walkNode(
         try render.symbolSite(w, idx, idx.graph.symbols[id], v, indent, true, site, sites, lines, exact);
     }
     if (indent > 0 and !exact) heuristic.* += 1;
-    if (indent >= opts.depth) {
+    if (depth >= opts.depth) {
         if (impl_graph) |graph| try renderImplLeaves(w, idx, graph, id, incoming, opts, indent, visited, heuristic, budget);
         return;
     }
@@ -1758,9 +1764,9 @@ fn walkNode(
         return;
     }
     if (incoming) {
-        try walkCallers(w, idx, impl_graph, id, opts, indent, visited, heuristic, budget);
+        try walkCallers(w, idx, impl_graph, id, opts, indent, depth, visited, heuristic, budget);
     } else {
-        try walkCallees(w, idx, impl_graph, id, opts, indent, visited, heuristic, budget);
+        try walkCallees(w, idx, impl_graph, id, opts, indent, depth, visited, heuristic, budget);
     }
 }
 
@@ -1785,6 +1791,7 @@ fn walkCallees(
     id: SymbolId,
     opts: Options,
     indent: usize,
+    depth: usize,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
     budget: *WalkBudget,
@@ -1804,7 +1811,7 @@ fn walkCallees(
         if (ref.target != invalid and (!opts.strict or ref.exact)) {
             if (!opts.refs and isDataReadEdge(idx, ref)) continue;
             // The edge (this symbol → callee) lives at ref.line in this file.
-            try walkNode(w, idx, impl_graph, ref.target, false, opts, indent + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, heuristic, budget);
+            try walkNode(w, idx, impl_graph, ref.target, false, opts, indent + 1, depth + 1, ref.line, ref.count, ref.lines, ref.exact, false, visited, heuristic, budget);
         } else if (ref.target == invalid and (ref.kind == .call or ref.kind == .route_call)) {
             if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
             try externals.appendSlice(idx.gpa, ref.name);
@@ -1813,7 +1820,7 @@ fn walkCallees(
     if (impl_graph) |graph| {
         for (graph.edges) |edge| {
             if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
-            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
+            try walkNode(w, idx, impl_graph, edge.implementation_method, false, opts, indent + 1, depth + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
         }
     }
     if (externals.items.len != 0) {
@@ -1830,6 +1837,7 @@ fn walkCallers(
     id: SymbolId,
     opts: Options,
     indent: usize,
+    depth: usize,
     visited: *std.AutoHashMap(SymbolId, void),
     heuristic: *usize,
     budget: *WalkBudget,
@@ -1847,15 +1855,15 @@ fn walkCallers(
         if (!inTestScope(opts.tests, isTestSymbol(idx, idx.graph.symbols[cid]))) continue;
         // The edge (caller → this symbol) lives at its call site(s) in the caller.
         try callSiteLines(idx, cid, id, &lines);
-        try walkNode(w, idx, impl_graph, cid, true, opts, indent + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), false, visited, heuristic, budget);
+        try walkNode(w, idx, impl_graph, cid, true, opts, indent + 1, depth + 1, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id), false, visited, heuristic, budget);
     }
     if (impl_graph) |graph| {
         for (graph.edges) |edge| {
             if (opts.strict and !edge.exact) continue;
             if (edge.port_method == id) {
-                try walkNode(w, idx, impl_graph, edge.implementation_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
+                try walkNode(w, idx, impl_graph, edge.implementation_method, true, opts, indent + 1, depth + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
             } else if (edge.implementation_method == id) {
-                try walkNode(w, idx, impl_graph, edge.port_method, true, opts, indent + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
+                try walkNode(w, idx, impl_graph, edge.port_method, true, opts, indent + 1, depth + 1, 0, 1, &.{}, edge.exact, true, visited, heuristic, budget);
             }
         }
     }
@@ -3747,79 +3755,26 @@ pub fn neighbors(w: *Writer, idx: *const Index, name: []const u8, opts: Options)
     var impl_graph: ?impls_mod.Graph = if (opts.impls) try impls_mod.build(idx.gpa, idx) else null;
     defer if (impl_graph) |*graph| graph.deinit();
     var budget: WalkBudget = .{};
+    var visited: std.AutoHashMap(SymbolId, void) = .init(idx.gpa);
+    defer visited.deinit();
+    var heuristic: usize = 0;
     for (ids) |id| {
         if (!budget.take(idx, id, opts)) continue;
         const v: render.Verbosity = if (opts.summary) .names else opts.verbosity;
         try render.symbol(w, idx, idx.graph.symbols[id], v, 0, true);
+        // Each direction is its own walk from the root, so `-d` counts edges
+        // followed while the children stay indented under their heading.
         try w.writeAll("  ↓ calls\n");
-        try renderCallees(w, idx, id, opts, 2, &budget);
-        if (impl_graph) |*graph| {
-            for (graph.edges) |edge| {
-                if (edge.port_method != id or (opts.strict and !edge.exact)) continue;
-                if (!budget.take(idx, edge.implementation_method, opts)) continue;
-                const child_v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
-                try renderImplSymbol(w, idx, idx.graph.symbols[edge.implementation_method], child_v, 2, edge.exact);
-            }
-        }
+        visited.clearRetainingCapacity();
+        _ = try visited.getOrPut(id);
+        try walkCallees(w, idx, if (impl_graph) |*g| g else null, id, opts, 1, 0, &visited, &heuristic, &budget);
         try w.writeAll("  ↑ callers\n");
-        var lines: std.ArrayList(u32) = .empty;
-        defer lines.deinit(idx.gpa);
-        var ordered_callers: ?[]SymbolId = null;
-        defer if (ordered_callers) |callers_slice| idx.gpa.free(callers_slice);
-        if (compactEnabled(opts)) ordered_callers = try orderedCallers(idx.gpa, idx, idx.callersOf(id));
-        const callers_slice = ordered_callers orelse idx.callersOf(id);
-        for (callers_slice) |cid| {
-            if (opts.strict and !hasExactEdge(idx, cid, id)) continue;
-            if (!budget.take(idx, cid, opts)) continue;
-            try callSiteLines(idx, cid, id, &lines);
-            const caller_v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
-            try render.symbolSite(w, idx, idx.graph.symbols[cid], caller_v, 2, true, callSiteLine(idx, cid, id), callSiteCount(idx, cid, id), lines.items, hasExactEdge(idx, cid, id));
-        }
-        if (impl_graph) |*graph| {
-            for (graph.edges) |edge| {
-                if (opts.strict and !edge.exact) continue;
-                const target = if (edge.port_method == id)
-                    edge.implementation_method
-                else if (edge.implementation_method == id)
-                    edge.port_method
-                else
-                    continue;
-                if (!budget.take(idx, target, opts)) continue;
-                const peer_v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
-                try renderImplSymbol(w, idx, idx.graph.symbols[target], peer_v, 2, edge.exact);
-            }
-        }
+        visited.clearRetainingCapacity();
+        _ = try visited.getOrPut(id);
+        try walkCallers(w, idx, if (impl_graph) |*g| g else null, id, opts, 1, 0, &visited, &heuristic, &budget);
     }
     if (budget.pruned != 0) try w.print("… {} branch{s} elided (--budget/--max-nodes; {} nodes shown)\n", .{ budget.pruned, if (budget.pruned == 1) "" else "es", budget.nodes });
     return budget.nodes != 0;
-}
-
-/// Render the resolved callees of `id` at `indent`, listing unresolved names on
-/// a trailing `~ ext:` line (mirrors the `calls` tree's leaf formatting).
-fn renderCallees(w: *Writer, idx: *const Index, id: SymbolId, opts: Options, indent: usize, budget: *WalkBudget) !void {
-    const sym = idx.graph.symbols[id];
-    var externals: std.ArrayList(u8) = .empty;
-    defer externals.deinit(idx.gpa);
-    var ordered_refs: ?[]model.Reference = null;
-    defer if (ordered_refs) |refs| idx.gpa.free(refs);
-    if (compactEnabled(opts)) ordered_refs = try orderedRefs(idx.gpa, idx, sym.refs);
-    const refs = ordered_refs orelse sym.refs;
-    for (refs) |ref| {
-        if (ref.target != invalid and (!opts.strict or ref.exact)) {
-            if (!opts.refs and isDataReadEdge(idx, ref)) continue;
-            if (!budget.take(idx, ref.target, opts)) continue;
-            const v: render.Verbosity = if (opts.summary) .names else headerVerbosity(opts.verbosity);
-            try render.symbolSite(w, idx, idx.graph.symbols[ref.target], v, indent, true, ref.line, ref.count, ref.lines, ref.exact);
-        } else if (ref.target == invalid and (ref.kind == .call or ref.kind == .route_call)) {
-            if (externals.items.len != 0) try externals.appendSlice(idx.gpa, ", ");
-            try externals.appendSlice(idx.gpa, ref.name);
-        }
-    }
-    if (externals.items.len != 0) {
-        try indentLine(w, indent, "~ ext: ");
-        try w.writeAll(externals.items);
-        try w.writeByte('\n');
-    }
 }
 
 /// List functions/methods that have no callers — candidate dead code. Exported
@@ -4592,13 +4547,26 @@ fn isTestDirName(comp: []const u8) bool {
 
 /// List, per in-scope file, the local modules it imports (resolved edges only).
 /// Returns whether any in-scope file had imports to report.
+/// The `-l` cap for a list that had no limit before it was declared: `null`
+/// unless the caller actually asked for one, so default output is unchanged.
+pub fn listCap(opts: Options) ?u32 {
+    return if (opts.limit_set) opts.limit else null;
+}
+
 pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listImports(w, idx, filter, opts);
     var any = false;
+    var shown: u32 = 0;
+    var elided: u32 = 0;
     for (idx.graph.files) |file| {
         const imps = idx.importsOf(file.id);
         if (imps.len == 0 or !matchesFilter(file.path, filter)) continue;
         any = true;
+        if (listCap(opts)) |cap| if (shown >= cap) {
+            elided += 1;
+            continue;
+        };
+        shown += 1;
         try w.print("# {s}\n", .{file.path});
         for (imps) |imp| {
             try w.print("  → {s}", .{idx.graph.files[imp.target].path});
@@ -4606,6 +4574,7 @@ pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Opti
             try w.writeByte('\n');
         }
     }
+    if (elided != 0) try w.print("… {d} more file{s} elided (-l {d})\n", .{ elided, if (elided == 1) "" else "s", opts.limit });
     if (!any) try w.print("(no local imports under '{s}')\n", .{filter});
     return any;
 }
@@ -4615,19 +4584,27 @@ pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Opti
 pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !bool {
     if (opts.format == .json) return json_out.listImporters(w, idx, path, opts);
     var any = false;
+    var shown: u32 = 0;
+    var elided: u32 = 0;
     for (idx.graph.files) |target| {
         if (!matchesFilter(target.path, path)) continue;
         var printed_header = false;
         for (idx.graph.files) |src| {
             if (!fileImports(idx, src.id, target.id)) continue;
             if (!printed_header) {
+                any = true;
+                if (listCap(opts)) |cap| if (shown >= cap) {
+                    elided += 1;
+                    break;
+                };
+                shown += 1;
                 try w.print("# {s} ← imported by\n", .{target.path});
                 printed_header = true;
-                any = true;
             }
             try w.print("  {s}\n", .{src.path});
         }
     }
+    if (elided != 0) try w.print("… {d} more file{s} elided (-l {d})\n", .{ elided, if (elided == 1) "" else "s", opts.limit });
     if (!any) try w.print("(no importers of '{s}')\n", .{path});
     return any;
 }
@@ -6697,13 +6674,15 @@ test "parseRanges: single, comma list, empty, overflow, and a bad member" {
     try std.testing.expectError(error.TooManyRanges, parseRanges("1,2,3", &tiny));
 }
 
-test "hotLimit: short default only when -l was omitted (sentinel), else the given cap" {
-    // No -l: limit == default_limit sentinel → the brief hot_default.
+test "hotLimit: short default only when -l was omitted, else the given cap" {
+    // No -l: the brief hot_default.
     try std.testing.expectEqual(hot_default, hotLimit(.{}));
     try std.testing.expectEqual(hot_default, hotLimit(.{ .limit = default_limit }));
-    // An explicit -l overrides, even to a value below the default.
-    try std.testing.expectEqual(@as(u32, 5), hotLimit(.{ .limit = 5 }));
-    try std.testing.expectEqual(@as(u32, 1000), hotLimit(.{ .limit = 1000 }));
+    // An explicit -l overrides, even to a value below the default — and an
+    // explicit `-l 300` is a cap of 300, not the "unset" reading (F8).
+    try std.testing.expectEqual(@as(u32, 5), hotLimit(.{ .limit = 5, .limit_set = true }));
+    try std.testing.expectEqual(@as(u32, 1000), hotLimit(.{ .limit = 1000, .limit_set = true }));
+    try std.testing.expectEqual(default_limit, hotLimit(.{ .limit = default_limit, .limit_set = true }));
 }
 
 test "FileSort.parse: canonical names, aliases, and unknown rejection" {
@@ -7595,7 +7574,7 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
         defer buf.deinit(testing.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
         defer aw.deinit();
-        _ = try hot(&aw.writer, &idx, "", .{ .limit = 1 });
+        _ = try hot(&aw.writer, &idx, "", .{ .limit = 1, .limit_set = true });
         const out = aw.written();
         try testing.expect(std.mem.indexOf(u8, out, "shared") != null); // rank 1
         try testing.expect(std.mem.indexOf(u8, out, "more; raise -l to see them") != null);

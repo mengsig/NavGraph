@@ -1718,12 +1718,16 @@ fn covPct(num: u32, den: u32) f64 {
 
 /// Returns whether any in-scope file had imports to report.
 pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Options) !bool {
-    _ = opts;
     var first = true;
+    var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.files) |file| {
         const imps = idx.importsOf(file.id);
         if (imps.len == 0 or !query.matchesFilter(file.path, filter)) continue;
+        // `-l` caps emitted entries. The payload stays a bare array: a
+        // truncation envelope would be a breaking shape change for clients.
+        if (query.listCap(opts)) |cap| if (shown >= cap) break;
+        shown += 1;
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -1747,12 +1751,20 @@ pub fn listImports(w: *Writer, idx: *const Index, filter: []const u8, opts: Opti
 /// whether any importer was actually found (mirrors the text renderer, which
 /// counts a target with zero importers as nothing found).
 pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Options) !bool {
-    _ = opts;
     var first = true;
     var any_importer = false;
+    var shown: u32 = 0;
     try w.writeByte('[');
     for (idx.graph.files) |target| {
         if (!query.matchesFilter(target.path, path)) continue;
+        const importers = countImporters(idx, target.id);
+        // `-l` counts files that actually have importers, exactly as the text
+        // renderer does: a target with none is nothing found in either output.
+        if (importers != 0) {
+            if (query.listCap(opts)) |cap| if (shown >= cap) continue;
+            shown += 1;
+            any_importer = true;
+        }
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"file\":");
@@ -1764,12 +1776,20 @@ pub fn listImporters(w: *Writer, idx: *const Index, path: []const u8, opts: Opti
             if (wrote != 0) try w.writeByte(',');
             try writeString(w, src.path);
             wrote += 1;
-            any_importer = true;
         }
+        std.debug.assert(wrote == importers);
         try w.writeAll("]}");
     }
     try w.writeAll("]\n");
     return any_importer;
+}
+
+fn countImporters(idx: *const Index, target: model.FileId) u32 {
+    var n: u32 = 0;
+    for (idx.graph.files) |src| {
+        if (fileImports(idx, src.id, target)) n += 1;
+    }
+    return n;
 }
 
 fn fileImports(idx: *const Index, src: model.FileId, target: model.FileId) bool {
@@ -2009,36 +2029,72 @@ fn writeEscaped(w: *Writer, c: u8) !void {
 /// Write one UTF-8 unit starting at `s[0]` as JSON-safe output and return the
 /// number of input bytes consumed. ASCII bytes are escaped (control chars, quote,
 /// backslash); a valid multi-byte UTF-8 sequence is emitted verbatim (valid UTF-8
-/// is valid JSON); an invalid or truncated byte becomes U+FFFD so the emitted JSON
-/// is always well-formed UTF-8, even when the source contains raw non-UTF-8 bytes.
+/// is valid JSON); anything else becomes U+FFFD so the emitted JSON is always
+/// well-formed UTF-8, even when the source contains raw non-UTF-8 bytes.
+///
+/// Validation goes through `std.unicode`, not a lead-byte/continuation-bit check:
+/// that check admits overlong encodings (`E0 80 8E`), surrogate halves
+/// (`ED A0 80`) and code points above U+10FFFF (`F4 A2 B6 AA`), each of which a
+/// strict decoder (Python `json`, `vim.json.decode`, Go `encoding/json`) rejects
+/// — taking the whole document down over one stray byte.
 fn writeUtf8Unit(w: *Writer, s: []const u8) !usize {
     const c = s[0];
     if (c < 0x80) {
         try writeEscaped(w, c);
         return 1;
     }
-    const len: usize = switch (c) {
-        0xC2...0xDF => 2,
-        0xE0...0xEF => 3,
-        0xF0...0xF4 => 4,
-        else => 0, // continuation byte, overlong lead (C0/C1), or 0xF5..0xFF
+    const replacement = "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
+    const len: usize = std.unicode.utf8ByteSequenceLength(c) catch {
+        try w.writeAll(replacement);
+        return 1;
     };
-    if (len >= 2 and len <= s.len) {
-        var ok = true;
-        var i: usize = 1;
-        while (i < len) : (i += 1) {
-            if (s[i] & 0xC0 != 0x80) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
+    if (len <= s.len) {
+        const decoded: ?u21 = switch (len) {
+            2 => std.unicode.utf8Decode2(s[0..2].*) catch null,
+            3 => std.unicode.utf8Decode3(s[0..3].*) catch null,
+            4 => std.unicode.utf8Decode4(s[0..4].*) catch null,
+            else => null,
+        };
+        if (decoded != null) {
             try w.writeAll(s[0..len]);
             return len;
         }
     }
-    try w.writeAll("\xEF\xBF\xBD"); // U+FFFD REPLACEMENT CHARACTER
+    try w.writeAll(replacement);
     return 1;
+}
+
+test "writeUtf8Unit replaces overlong, surrogate and out-of-range sequences" {
+    // Regression: the hand-rolled lead-byte/continuation check emitted these
+    // three classes verbatim, so one stray byte made the whole -j document
+    // undecodable to a strict JSON reader.
+    const testing = std.testing;
+    const cases = [_][]const u8{
+        "\xe0\x80\x8e", // overlong: 3 bytes encoding U+000E
+        "\xed\xa0\x80", // surrogate half U+D800
+        "\xf4\xa2\xb6\xaa", // above U+10FFFF
+        "\xc0\xaf", // overlong 2-byte slash
+        "\xf8\x88\x80\x80", // 5-byte lead, not UTF-8 at all
+        "\x80", // bare continuation byte
+        "\xe2\x9c", // truncated 3-byte sequence
+    };
+    for (cases) |bytes| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        var consumed: usize = 0;
+        while (consumed < bytes.len) consumed += try writeUtf8Unit(&aw.writer, bytes[consumed..]);
+        try testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
+        // Nothing from the invalid input survives as raw bytes.
+        try testing.expect(std.mem.indexOf(u8, aw.written(), bytes) == null);
+    }
+
+    // Valid sequences of every length are still emitted verbatim.
+    const valid = "a\xc3\xa9\xe2\x9c\x93\xf0\x9f\x8e\x89";
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var consumed: usize = 0;
+    while (consumed < valid.len) consumed += try writeUtf8Unit(&aw.writer, valid[consumed..]);
+    try testing.expectEqualStrings(valid, aw.written());
 }
 
 test "json output is well-formed and escapes control characters" {
@@ -3287,6 +3343,42 @@ test "imports and importers json describe the file dependency edges" {
         try testing.expectEqual(@as(usize, 1), users.len);
         try testing.expect(std.mem.endsWith(u8, users[0].string, "app.zig"));
     }
+}
+
+test "importers -l counts the same files in json as in text" {
+    // Regression (F8): the json renderer counted the cap over every matched
+    // target, the text one over targets that actually have importers, so the
+    // two disagreed on what `-l N` shows.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn a() void {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data =
+        \\pub fn b() void {}
+    });
+    // Only a.zig and b.zig have importers; user.zig has none.
+    try tmp.dir.writeFile(io, .{ .sub_path = "user.zig", .data =
+        \\const a = @import("a.zig");
+        \\const b = @import("b.zig");
+        \\pub fn use() void { a.a(); b.b(); }
+    });
+    var idx = try tjBuild(&tmp);
+    defer idx.deinit();
+
+    var aw = tjWriter();
+    defer aw.deinit();
+    _ = try listImporters(&aw.writer, &idx, ".zig", .{ .format = .json, .limit = 1, .limit_set = true });
+    var p = try tjParse(aw.written());
+    defer p.deinit();
+
+    var with_importers: usize = 0;
+    for (p.value.array.items) |entry| {
+        if (entry.object.get("importers").?.array.items.len != 0) with_importers += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), with_importers);
 }
 
 // --- path -----------------------------------------------------------------

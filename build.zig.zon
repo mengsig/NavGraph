@@ -74,8 +74,13 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        // The `test` step also drives the three black-box contract suites in
+        // `tests/`, which query the checked-in fixture repos under `testenv/`
+        // and assert on the docs in `README.md`/`prompt.md`. Without all four,
+        // `zig build test` is broken in a package archive.
+        "tests",
+        "testenv",
+        "README.md",
+        "prompt.md",
     },
 }

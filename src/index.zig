@@ -7,6 +7,7 @@
 //! returned and moved without invalidating allocator pointers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const model = @import("model.zig");
 const language = @import("language.zig");
 const parser = @import("parser.zig");
@@ -72,6 +73,11 @@ pub const Index = struct {
     /// logging.go, …). Lets a package-qualified call (`caddy.Load(...)`) resolve
     /// to the package's top-level definitions. Arena-owned.
     go_packages: std.StringHashMapUnmanaged([]const FileId) = .empty,
+    /// Java type id → the ids of the supertypes its signature declares, in
+    /// ascending id order. Precomputed once so inherited-member lookup walks a
+    /// short adjacency list instead of rescanning every symbol per reference.
+    /// Arena-owned.
+    java_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -230,6 +236,7 @@ pub fn buildOpenDir(
     attachCrossFileMethodParents(&idx);
     try buildImportTable(&idx);
     try buildGoPackageTable(&idx);
+    try buildJavaBaseTable(&idx);
     resolveReferences(&idx);
     // Persist BEFORE applying router mounts: the mount pass rewrites route
     // symbol names in place (prepending the mount prefix), and those rewritten
@@ -490,14 +497,34 @@ fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile
     return .{ .symbols = try b.arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
 }
 
-fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
+/// Write the parse-health warning for `rel_path` into `w`, or nothing when the
+/// file tokenized cleanly. Kept apart from the stderr sink so tests cover the
+/// message and its assertions without writing to the test binary's stderr.
+fn writeParseHealthWarning(w: *std.Io.Writer, rel_path: []const u8, health: model.ParseHealth) std.Io.Writer.Error!void {
     const from = health.desync_from orelse return;
     std.debug.assert(rel_path.len > 0);
     std.debug.assert(health.desync_to >= from);
-    std.debug.print(
+    try w.print(
         "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
         .{ rel_path, from, health.desync_to },
     );
+}
+
+/// Warn on stderr that a file's tokenization desynced. Silent under test: the
+/// Zig build runner prints its `failed command:` reproduction hint whenever a
+/// test binary writes to stderr, so a fixture with a deliberately unterminated
+/// string made a fully green run read as a failure. The health data itself is
+/// unaffected — it stays on the index and is reported by `status` and the
+/// `parse_health` JSON field.
+fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
+    if (builtin.is_test) return;
+    if (health.desync_from == null) return;
+    // Diagnostic only, and the authoritative data is on the index, so a path too
+    // long for the buffer is printed truncated rather than dropped.
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeParseHealthWarning(&w, rel_path, health) catch {};
+    std.debug.print("{s}", .{w.buffered()});
 }
 
 /// Assign global ids to `parsed`, append its symbols and the owning `SourceFile`
@@ -599,9 +626,28 @@ fn attachCrossFileMethodParents(idx: *Index) void {
     }
 }
 
+/// Whether a call site can legitimately name this definition. Function-like
+/// macros count: `DS_ARRAY_LEN(x)` in C is a call as far as the graph cares.
+fn isCallable(sym: model.Symbol) bool {
+    return switch (sym.kind) {
+        .function, .method, .macro => true,
+        else => false,
+    };
+}
+
 fn isContainer(sym: model.Symbol) bool {
     return switch (sym.kind) {
         .class, .interface, .@"struct", .@"enum", .type => true,
+        else => false,
+    };
+}
+
+/// Whether a value binding of this kind may hold a function: `const f = g;` and
+/// `const router = express.Router()` are both called through their name. The
+/// index does not type values, so a call to one is kept rather than deleted.
+fn mayHoldCallable(kind: model.SymbolKind) bool {
+    return switch (kind) {
+        .variable, .constant => true,
         else => false,
     };
 }
@@ -736,12 +782,22 @@ fn buildGoPackageTable(idx: *Index) !void {
     }
 }
 
-/// Resolve a Go package-qualified call (`caddy.Load(...)`) to a top-level
+/// Resolve a Go package-qualified reference (`caddy.Load(...)`) to a top-level
 /// definition in one of the files declaring `package <qualifier>`. Exact when
 /// exactly one package file defines the name; a cross-package name collision
 /// binds the first hit as ambiguous.
 fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference) bool {
     if (idx.graph.files[from.file].language != .go) return false;
+    // A package qualifier always heads its chain (`models.WidgetID(n)`). In
+    // `a.store.Stats()` the qualifier is a *field* that happens to share a
+    // package name; the receiver-scoped paths own that, and letting the package
+    // answer bound the call to the package's `struct Stats`.
+    if (ref.receiver_root.len != 0) return false;
+    // A local named like an imported package shadows it — ordinary Go
+    // (`store := cache.New()`, `for _, store := range xs`). The binding is the
+    // evidence, typed or not; the same guard fronts the type-qualifier and
+    // imported-container branches in `resolveQualified`.
+    if (isLocalBinding(from, ref.qualifier)) return false;
     const files = idx.go_packages.get(ref.qualifier) orelse return false;
     var found: SymbolId = invalid;
     var hits: u32 = 0;
@@ -753,6 +809,9 @@ fn goPackageTarget(idx: *const Index, from: model.Symbol, ref: *model.Reference)
         if (found == invalid) found = t;
     }
     if (found == invalid) return false;
+    // `pkg.Type(x)` is a conversion, not a call: keep the edge, but as the type
+    // use it is, so the call graph never carries a call bound to a non-callable.
+    if (ref.kind == .call and isContainer(idx.graph.symbols[found])) ref.kind = .type_use;
     ref.target = found;
     ref.exact = hits == 1;
     ref.resolution_status = if (ref.exact) .exact else .ambiguous;
@@ -764,8 +823,23 @@ fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
             resolveOne(idx, sym.*, ref);
+            dropMisboundCall(idx, sym.*, ref);
         }
     }
+}
+
+/// Invariant: a call site never binds to a *type*, unless the language spells
+/// construction as a call. Values stay legal call targets — nothing here types
+/// them, and a function-valued binding is genuinely callable.
+fn dropMisboundCall(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    if (ref.kind != .call or ref.target == invalid) return;
+    const target = idx.graph.symbols[ref.target];
+    if (isCallable(target) or mayHoldCallable(target.kind)) return;
+    if (isContainer(target) and idx.graph.files[from.file].language.callMayTargetType()) return;
+    ref.target = invalid;
+    ref.exact = false;
+    ref.resolution_status = .unresolved;
+    ref.resolution_reason = .none;
 }
 
 /// Resolve a single reference to a target definition and set its confidence.
@@ -851,7 +925,16 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     ref.target = choice.id;
     ref.exact = choice.confident;
     if (ref.target != invalid) {
-        ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        // A `package` / `namespace` / `mod` clause is not a definition of the
+        // name it opens: the members the qualifier reaches live elsewhere, and
+        // a namespace declared in several files has no single clause to point
+        // at. Keep the edge as namespace evidence, never as one `--strict`
+        // follows. A genuinely ambiguous pick keeps saying so.
+        const is_module = idx.graph.symbols[ref.target].kind == .module;
+        ref.resolution_status = if (ref.exact and is_module) blk: {
+            ref.exact = false;
+            break :blk .inferred;
+        } else if (ref.exact) .exact else .ambiguous;
         ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
     }
     // A chained Java call such as `line.item().sku()` can lose its receiver in
@@ -923,63 +1006,117 @@ fn javaInheritedMemberFrom(
     for (visited[0..depth]) |seen| if (seen == type_id) return invalid;
     visited[depth] = type_id;
 
-    const subtype = idx.graph.symbols[type_id];
-    const signature = subtype.signature(idx.graph.files[subtype.file].text);
-    for (idx.graph.symbols) |base| {
-        if (base.id == type_id or !isContainer(base)) continue;
-        if (idx.graph.files[base.file].language != .java) continue;
-        if (!javaDeclaresBase(signature, base.name)) continue;
-
-        // An explicit import of the base name disambiguates same-named classes;
-        // otherwise any chosen base remains a non-exact hint at the call site.
-        if (importTarget(idx, subtype.file, base.name)) |target_file| {
-            if (base.file != target_file) continue;
-        }
-        const direct = memberOfParent(idx, base.id, name);
+    for (idx.java_bases.get(type_id) orelse return invalid) |base_id| {
+        const direct = memberOfParent(idx, base_id, name);
         if (direct.id != invalid) return direct.id;
-        const inherited = javaInheritedMemberFrom(idx, base.id, name, visited, depth + 1);
+        const inherited = javaInheritedMemberFrom(idx, base_id, name, visited, depth + 1);
         if (inherited != invalid) return inherited;
     }
     return invalid;
 }
 
-/// Whether a Java type signature declares `name` after `extends` or
-/// `implements`. Generic arguments are skipped so `extends Box<Product>` does
-/// not pretend that `Product` is itself a base class.
-fn javaDeclaresBase(signature: []const u8, name: []const u8) bool {
-    var i: usize = 0;
-    var in_bases = false;
-    var angle_depth: u32 = 0;
-    while (i < signature.len) {
-        const c = signature[i];
-        if (c == '<') {
-            angle_depth += 1;
-            i += 1;
-            continue;
-        }
-        if (c == '>') {
-            angle_depth -|= 1;
-            i += 1;
-            continue;
-        }
-        if (!isIdentByte(c)) {
-            i += 1;
-            continue;
-        }
-        const start = i;
-        i += 1;
-        while (i < signature.len and isIdentByte(signature[i])) i += 1;
-        const word = signature[start..i];
-        if (angle_depth != 0) continue;
-        if (std.mem.eql(u8, word, "extends") or std.mem.eql(u8, word, "implements")) {
-            in_bases = true;
-            continue;
-        }
-        if (in_bases and std.mem.eql(u8, word, "permits")) return false;
-        if (in_bases and std.mem.eql(u8, word, name)) return true;
+/// Precompute every Java type's declared supertypes into `Index.java_bases`.
+/// The lookup this replaces scanned the whole symbol table per unresolved Java
+/// reference, recursed 16 deep — O(references x symbols x depth), which made
+/// index build super-linear in file count. The table itself is arena-owned and
+/// dies with the index; the scratch used to build it is not, and is released
+/// here.
+fn buildJavaBaseTable(idx: *Index) !void {
+    const arena = idx.arena.allocator();
+    const gpa = idx.gpa;
+
+    var by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(SymbolId)) = .empty;
+    defer {
+        var vit = by_name.valueIterator();
+        while (vit.next()) |list| list.deinit(gpa);
+        by_name.deinit(gpa);
     }
-    return false;
+    for (idx.graph.symbols) |sym| {
+        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        const slot = try by_name.getOrPut(gpa, sym.name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(gpa, sym.id);
+    }
+
+    var bases: std.ArrayListUnmanaged(SymbolId) = .empty;
+    defer bases.deinit(gpa);
+    for (idx.graph.symbols) |sym| {
+        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        bases.clearRetainingCapacity();
+        var it = JavaBaseIterator{ .signature = sym.signature(idx.graph.files[sym.file].text) };
+        while (it.next()) |base_name| {
+            const candidates = by_name.get(base_name) orelse continue;
+            // An explicit import of the base name disambiguates same-named
+            // classes; otherwise any chosen base stays a non-exact hint.
+            const imported = importTarget(idx, sym.file, base_name);
+            for (candidates.items) |cid| {
+                if (cid == sym.id) continue;
+                if (imported) |target_file| {
+                    if (idx.graph.symbols[cid].file != target_file) continue;
+                }
+                try bases.append(gpa, cid);
+            }
+        }
+        if (bases.items.len == 0) continue;
+        // Ascending, deduped: the scan this replaces visited candidate bases in
+        // symbol-id order and took the first that resolved the member.
+        std.mem.sort(SymbolId, bases.items, {}, std.sort.asc(SymbolId));
+        var unique: usize = 0;
+        for (bases.items) |id| {
+            if (unique != 0 and bases.items[unique - 1] == id) continue;
+            bases.items[unique] = id;
+            unique += 1;
+        }
+        try idx.java_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
+    }
 }
+
+/// Iterates the type names a Java signature declares after `extends` /
+/// `implements`. Generic arguments are skipped so `extends Box<Product>` does
+/// not pretend `Product` is a base; a `permits` clause ends the list.
+const JavaBaseIterator = struct {
+    signature: []const u8,
+    i: usize = 0,
+    in_bases: bool = false,
+    angle_depth: u32 = 0,
+    stopped: bool = false,
+
+    fn next(self: *JavaBaseIterator) ?[]const u8 {
+        while (!self.stopped and self.i < self.signature.len) {
+            const c = self.signature[self.i];
+            if (c == '<') {
+                self.angle_depth += 1;
+                self.i += 1;
+                continue;
+            }
+            if (c == '>') {
+                self.angle_depth -|= 1;
+                self.i += 1;
+                continue;
+            }
+            if (!isIdentByte(c)) {
+                self.i += 1;
+                continue;
+            }
+            const start = self.i;
+            self.i += 1;
+            while (self.i < self.signature.len and isIdentByte(self.signature[self.i])) self.i += 1;
+            const word = self.signature[start..self.i];
+            if (self.angle_depth != 0) continue;
+            if (std.mem.eql(u8, word, "extends") or std.mem.eql(u8, word, "implements")) {
+                self.in_bases = true;
+                continue;
+            }
+            if (!self.in_bases) continue;
+            if (std.mem.eql(u8, word, "permits")) {
+                self.stopped = true;
+                return null;
+            }
+            return word;
+        }
+        return null;
+    }
+};
 
 fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
@@ -1014,7 +1151,7 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             }
         }
         // No such member on the own class (inherited/mixin): heuristic below.
-    } else if (receiverType(idx, from, ref.qualifier)) |type_name| {
+    } else if (receiverType(idx, from, ref)) |type_name| {
         const m = memberOfType(idx, from.file, type_name, ref.name);
         if (m.id != invalid) {
             ref.target = m.id;
@@ -1198,6 +1335,10 @@ fn importTarget(idx: *const Index, file: FileId, binding: []const u8) ?FileId {
 
 fn hasNonLocalImportBinding(idx: *const Index, file: FileId, binding: []const u8) bool {
     if (binding.len == 0) return false;
+    // Only a language whose import forms we actually resolve can *prove* a
+    // binding is non-local. For Rust `use` (unmodelled) every binding looks
+    // non-local, and the guard silently deleted every cross-file call edge.
+    if (!idx.graph.files[file].language.resolvesImportBindings()) return false;
     for (idx.importOutcomesOf(file)) |outcome| {
         if (outcome.status == .resolved_local or outcome.binding.len == 0) continue;
         if (std.mem.eql(u8, outcome.binding, binding)) return true;
@@ -1379,17 +1520,60 @@ fn isSelfReceiver(qualifier: []const u8) bool {
 }
 
 /// The type name a *named* receiver identifier refers to inside `from`'s body: a
-/// local `var -> type` binding. `self`/`this` are handled separately (scoped by
-/// the concrete parent id, see `memberOfParent`).
-fn receiverType(idx: *const Index, from: model.Symbol, qualifier: []const u8) ?[]const u8 {
-    _ = idx;
-    // Return only a *typed* binding: bindings now also carry untyped locals and
-    // parameters (name-only, empty type) to shadow same-named globals in bare
-    // resolution, but those give no receiver type to scope a member access by.
+/// local `var -> type` binding, or a field of the type heading the receiver
+/// chain. `self`/`this` are handled separately (scoped by the concrete parent
+/// id, see `memberOfParent`).
+fn receiverType(idx: *const Index, from: model.Symbol, ref: *const model.Reference) ?[]const u8 {
+    // A binding for the qualifier always answers, even an untyped one: bindings
+    // carry name-only locals and parameters to shadow same-named globals, and a
+    // local `store := &Cache{}` provably shadows a field `store *Store`. Letting
+    // the field table answer past it produced a confidently-wrong exact edge.
     for (from.bindings) |b| {
-        if (std.mem.eql(u8, b.name, qualifier) and b.type_name.len > 0) return b.type_name;
+        if (!std.mem.eql(u8, b.name, ref.qualifier)) continue;
+        return if (b.type_name.len > 0) b.type_name else null;
+    }
+    // `a.store.Get()` keeps only `store` as the qualifier, so the field table of
+    // the type at the head of the chain is the type evidence. It answers only
+    // for a chain whose head has a known type — a bare `store.Get()` (a package
+    // qualifier) or `o.store.Get()` on another struct must not borrow the
+    // enclosing type's fields.
+    const owner = chainRootType(idx, from, ref.receiver_root) orelse return null;
+    for (idx.graph.symbols[owner].bindings) |b| {
+        if (std.mem.eql(u8, b.name, ref.qualifier) and b.type_name.len > 0) return b.type_name;
     }
     return null;
+}
+
+/// The container symbol whose field table a receiver chain rooted at `root`
+/// should be read from: the enclosing type for `self`/`this`, else the declared
+/// type of a typed local (a method receiver is one). Null when the qualifier
+/// heads the chain, or the head's type is unknown or ambiguous.
+fn chainRootType(idx: *const Index, from: model.Symbol, root: []const u8) ?SymbolId {
+    if (root.len == 0) return null;
+    if (isSelfReceiver(root)) return if (from.parent == invalid) null else from.parent;
+    for (from.bindings) |b| {
+        if (!std.mem.eql(u8, b.name, root)) continue;
+        if (b.type_name.len == 0) return null;
+        return uniqueContainerNamed(idx, from.file, b.type_name);
+    }
+    return null;
+}
+
+/// The container type named `name`, preferring one declared in `from_file`.
+/// Null when no container has that name, or several files do and none is local
+/// — an arbitrary pick would manufacture a field table for the wrong type.
+fn uniqueContainerNamed(idx: *const Index, from_file: FileId, name: []const u8) ?SymbolId {
+    const candidates = idx.by_name.get(name) orelse return null;
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
+    for (candidates) |cid| {
+        const cand = idx.graph.symbols[cid];
+        if (!isContainer(cand)) continue;
+        if (cand.file == from_file) return cid;
+        matches += 1;
+        if (found == invalid) found = cid;
+    }
+    return if (matches == 1) found else null;
 }
 
 /// The member named `name` defined directly on the exact type `parent_id`. This
@@ -2072,6 +2256,697 @@ test "member calls: typed receiver is exact; unknown receiver is a heuristic gue
     try testing.expect(checked);
 }
 
+test "go: a member call through a struct field of declared type resolves by type" {
+    // Regression (F-9): `a.store.Get(id)` where `store store.Store`. The compact
+    // reference keeps only `store` as the qualifier, so the declaring struct's
+    // field table is the receiver's only type evidence.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const store_get = qualifiedId(&idx, "Store", "Get").?;
+    const get_widget = idx.graph.symbols[qualifiedId(&idx, "API", "GetWidget").?];
+    var checked = false;
+    for (get_widget.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "Get")) continue;
+        try testing.expectEqual(store_get, ref.target);
+        // The field's declared type is known, so this is not a name guess.
+        try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "go: a call never binds to a type that shares the package-qualified name" {
+    // Regression (F-9): `a.store.Stats()` bound to `struct Stats` — the type,
+    // not the method — and was not flagged, so `--strict` kept it.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const stats_struct = idx.lookup("Stats")[0];
+    try testing.expectEqual(model.SymbolKind.@"struct", idx.graph.symbols[stats_struct].kind);
+    const store_stats = qualifiedId(&idx, "Store", "Stats").?;
+
+    const api_stats = idx.graph.symbols[qualifiedId(&idx, "API", "Stats").?];
+    var checked = false;
+    for (api_stats.refs) |ref| {
+        if (ref.kind != .call or !std.mem.eql(u8, ref.name, "Stats")) continue;
+        try testing.expect(ref.target != stats_struct);
+        try testing.expectEqual(store_stats, ref.target);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "go: a shadowing local and another struct's field both beat the field table" {
+    // Regression (F1): the enclosing type's field table answered for *any*
+    // qualifier without a typed binding, so `store.Get()` bound to the
+    // enclosing `API.store` even when the chain reached a different object.
+    // Both mis-binds were marked exact, so `--strict` could not drop them.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data =
+        \\package app
+        \\
+        \\type Store struct{}
+        \\
+        \\func (s *Store) Get() int { return 1 }
+        \\
+        \\type Cache struct{}
+        \\
+        \\func (c *Cache) Get() int { return 2 }
+        \\
+        \\type API struct {
+        \\    store *Store
+        \\}
+        \\
+        \\type Other struct {
+        \\    store *Cache
+        \\}
+        \\
+        \\func (a *API) shadowed() int {
+        \\    store := &Cache{}
+        \\    return store.Get()
+        \\}
+        \\
+        \\func (a *API) declared() int {
+        \\    var store *Cache
+        \\    return store.Get()
+        \\}
+        \\
+        \\func (a *API) crossType(o *Other) int {
+        \\    return o.store.Get()
+        \\}
+        \\
+        \\func (a *API) direct() int {
+        \\    return a.store.Get()
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const store_get = qualifiedId(&idx, "Store", "Get").?;
+    const cache_get = qualifiedId(&idx, "Cache", "Get").?;
+
+    // A local of a known type wins over the same-named field, in both spellings
+    // that used to yield an untyped binding (`:= &T{}` and `var x *T`).
+    for ([_][]const u8{ "shadowed", "declared" }) |caller| {
+        const sym = idx.graph.symbols[qualifiedId(&idx, "API", caller).?];
+        const ref = refByQual(sym, "store", "Get").?;
+        try testing.expectEqual(cache_get, ref.target);
+        try testing.expect(ref.exact);
+    }
+
+    // The chain head is another struct, so its field table answers, not API's.
+    const cross = idx.graph.symbols[qualifiedId(&idx, "API", "crossType").?];
+    const cross_ref = refByQual(cross, "store", "Get").?;
+    try testing.expectEqualStrings("o", cross_ref.receiver_root);
+    try testing.expectEqual(cache_get, cross_ref.target);
+    try testing.expect(cross_ref.exact);
+
+    // The receiver's own field still resolves exactly (the F-9 fix is kept).
+    const direct = idx.graph.symbols[qualifiedId(&idx, "API", "direct").?];
+    const direct_ref = refByQual(direct, "store", "Get").?;
+    try testing.expectEqualStrings("a", direct_ref.receiver_root);
+    try testing.expectEqual(store_get, direct_ref.target);
+    try testing.expect(direct_ref.exact);
+    try testing.expectEqual(model.ResolutionReason.typed_receiver, direct_ref.resolution_reason);
+}
+
+test "cpp: a same-named field on another class never yields a wrong exact edge" {
+    // F1 analogue. C++ classes carry no field table, so the only outcomes
+    // allowed are the right method or a non-exact guess — never a confident
+    // edge to the enclosing class's `store`.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.cpp", .data =
+        \\struct Store { int get() { return 1; } };
+        \\struct Cache { int get() { return 2; } };
+        \\struct Other { Cache* store; };
+        \\struct API {
+        \\    Store* store;
+        \\    int shadowed() { Cache* store = new Cache(); return store->get(); }
+        \\    int crossType(Other* o) { return o->store->get(); }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const cache_get = qualifiedId(&idx, "Cache", "get").?;
+    const shadowed = idx.graph.symbols[qualifiedId(&idx, "API", "shadowed").?];
+    const shadowed_ref = refByQual(shadowed, "store", "get").?;
+    try testing.expectEqual(cache_get, shadowed_ref.target);
+    try testing.expect(shadowed_ref.exact);
+
+    const cross = idx.graph.symbols[qualifiedId(&idx, "API", "crossType").?];
+    const cross_ref = refByQual(cross, "store", "get").?;
+    try testing.expectEqualStrings("o", cross_ref.receiver_root);
+    try testing.expect(cross_ref.target == cache_get or !cross_ref.exact);
+}
+
+test "python: a same-named attribute on another object never yields a wrong exact edge" {
+    // F1 analogue, same contract as the C++ case.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\class Store:
+        \\    def get(self):
+        \\        return 1
+        \\
+        \\class Cache:
+        \\    def get(self):
+        \\        return 2
+        \\
+        \\class API:
+        \\    def __init__(self):
+        \\        self.store = Store()
+        \\
+        \\    def shadowed(self):
+        \\        store = Cache()
+        \\        return store.get()
+        \\
+        \\    def cross_type(self, o):
+        \\        return o.store.get()
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const cache_get = qualifiedId(&idx, "Cache", "get").?;
+    const shadowed = idx.graph.symbols[qualifiedId(&idx, "API", "shadowed").?];
+    const shadowed_ref = refByQual(shadowed, "store", "get").?;
+    try testing.expectEqual(cache_get, shadowed_ref.target);
+    try testing.expect(shadowed_ref.exact);
+
+    const cross = idx.graph.symbols[qualifiedId(&idx, "API", "cross_type").?];
+    const cross_ref = refByQual(cross, "store", "get").?;
+    try testing.expectEqualStrings("o", cross_ref.receiver_root);
+    try testing.expect(cross_ref.target == cache_get or !cross_ref.exact);
+}
+
+test "a call through a function-valued const keeps its edge" {
+    // Regression (F2): the no-call-to-a-non-callable rule deleted every call
+    // whose target was a value, so a function alias lost its edge — including
+    // `const partMatches = exactOrGlob;` in NavGraph's own query.zig.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub fn exactOrGlob(a: []const u8) bool {
+        \\    return a.len > 0;
+        \\}
+        \\pub const Holder = struct {
+        \\    const alias = exactOrGlob;
+        \\    pub fn use(x: []const u8) bool {
+        \\        return alias(x);
+        \\    }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const alias = qualifiedId(&idx, "Holder", "alias").?;
+    try testing.expectEqual(model.SymbolKind.constant, idx.graph.symbols[alias].kind);
+    const use = idx.graph.symbols[qualifiedId(&idx, "Holder", "use").?];
+    const ref = refByName(use, "alias").?;
+    try testing.expectEqual(model.RefKind.call, ref.kind);
+    try testing.expectEqual(alias, ref.target);
+}
+
+test "an express sub-router mount keeps its router handler" {
+    // Regression (F2): `app.use('/admin', adminRouter)` mounts a router held in
+    // a `const`; deleting calls to values dropped the handler entirely.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/js_express", false);
+    defer idx.deinit();
+
+    var checked = false;
+    for (idx.graph.symbols) |sym| {
+        if (sym.kind != .route or !std.mem.eql(u8, sym.name, "ANY /admin")) continue;
+        // `routeHandler` reads the route's first resolved call ref.
+        const handler = refByName(sym, "adminRouter").?;
+        try testing.expectEqual(model.RefKind.call, handler.kind);
+        try testing.expect(handler.target != invalid);
+        try testing.expectEqualStrings("adminRouter", idx.graph.symbols[handler.target].name);
+        try testing.expectEqual(model.SymbolKind.variable, idx.graph.symbols[handler.target].kind);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "c: a modifier-only declarator still shadows a same-named global" {
+    // Regression (F4): `long alpha = 0;` yielded no binding, because the type
+    // loop read the *variable* as the type name. The local then failed to
+    // shadow the global `alpha`, producing four confident false call edges.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "e.c", .data =
+        \\void alpha(void) {}
+        \\void beta(void) {}
+        \\void gamma(void) {}
+        \\void delta(void) {}
+        \\
+        \\int probe(int n) {
+        \\    long alpha = 0;
+        \\    unsigned beta = 0;
+        \\    int gamma = 0;
+        \\    struct Thing *delta = 0;
+        \\    return (int)(alpha + beta + gamma + n) + (delta != 0);
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const probe = idx.graph.symbols[idx.lookup("probe")[0]];
+    for (probe.refs) |ref| {
+        try testing.expect(ref.target == invalid);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |name| {
+        try testing.expect(isLocalBinding(probe, name));
+    }
+}
+
+test "cpp: an `auto` local shadows a same-named global" {
+    // Regression (F4), same declarator shape: `auto item = first;` and
+    // `const auto total = 0;` bound to the globals `item`/`total`.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.cpp", .data =
+        \\struct Item { void render(); };
+        \\void item() {}
+        \\void total() {}
+        \\void count() {}
+        \\
+        \\void draw(Item* first) {
+        \\    auto item = first;
+        \\    const auto total = 0;
+        \\    unsigned long count = 0;
+        \\    item->render();
+        \\    (void)total;
+        \\    (void)count;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const draw = idx.graph.symbols[idx.lookup("draw")[0]];
+    for ([_][]const u8{ "item", "total", "count" }) |name| {
+        try testing.expect(isLocalBinding(draw, name));
+        // No bare edge to the same-named free function.
+        if (refByQual(draw, "", name)) |ref| try testing.expect(ref.target == invalid);
+    }
+}
+
+test "go: a composite-literal field key is not a reference to a same-named package" {
+    // Regression (F5): `return &API{store: s}` bound the field key `store` to
+    // the imported package `store`.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const new_api = idx.graph.symbols[idx.lookup("NewAPI")[0]];
+    try testing.expect(refByQual(new_api, "", "store") == null);
+}
+
+test "go: a package-qualified type conversion is a type use, never a call" {
+    // Regression (F5/F1): `models.WidgetID(n)` is a Go conversion. Refusing
+    // every call-to-a-type threw the edge away; keeping it as a *call* put a
+    // call on a non-callable and made Go a callMayTargetType language, which
+    // re-opened the exact-call-to-a-type class the PR was blocked for. The edge
+    // is kept, reclassified.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    defer idx.deinit();
+
+    const widget_id = idx.lookup("WidgetID")[0];
+    try testing.expectEqual(model.SymbolKind.type, idx.graph.symbols[widget_id].kind);
+    const parse_id = idx.graph.symbols[idx.lookup("parseID")[0]];
+    const ref = refByQual(parse_id, "models", "WidgetID").?;
+    try testing.expectEqual(model.RefKind.type_use, ref.kind);
+    try testing.expectEqual(widget_id, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionReason.go_package, ref.resolution_reason);
+    // No call edge anywhere in the project binds to a non-callable.
+    for (idx.graph.symbols) |sym| {
+        for (sym.refs) |r| {
+            if (r.kind != .call or r.target == invalid) continue;
+            const t = idx.graph.symbols[r.target];
+            try testing.expect(isCallable(t) or mayHoldCallable(t.kind));
+        }
+    }
+}
+
+test "a package/namespace clause is never an exact reference target" {
+    // Regression (F4): the bare qualifier of `store.Get()` / `geo::area()` bound
+    // to one file's `package store` / `namespace geo` clause as `exact`. The
+    // namespace spans every file that declares it, so a single clause is a
+    // stand-in — real evidence, but not something `--strict` should follow.
+    const testing = std.testing;
+    for ([_][]const u8{ "testenv/go_service", "testenv/cpp_app" }) |root| {
+        var idx = try build(testing.allocator, testing.io, root, false);
+        defer idx.deinit();
+
+        var seen: u32 = 0;
+        for (idx.graph.symbols) |sym| {
+            for (sym.refs) |ref| {
+                if (ref.target == invalid) continue;
+                if (idx.graph.symbols[ref.target].kind != .module) continue;
+                seen += 1;
+                try testing.expect(!ref.exact);
+                try testing.expect(ref.resolution_status == .inferred or
+                    ref.resolution_status == .ambiguous);
+            }
+        }
+        try testing.expect(seen > 0); // the assertion above must not be vacuous
+    }
+}
+
+test "go: a local shadowing a package wins, and no call binds to a type" {
+    // Regression (F1): a Go local named like an imported package
+    // (`store`, `models`) bound the call to the *package* — including to the
+    // package's `struct Stats` / `type WidgetID`, `exact`, so `--strict` could
+    // not drop it. Two roots: `goPackageTarget` ignored local bindings, and
+    // `for _, x := range` / `x, err :=` / `if x, ok :=` produced no binding at
+    // all. Rows below cover both, plus the receiver-chain cases they must not
+    // regress.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "store");
+    try tmp.dir.createDirPath(io, "models");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/store.go", .data =
+        \\package store
+        \\
+        \\type Store struct{ n int }
+        \\
+        \\type Stats struct{ Hits int }
+        \\
+        \\func (s *Store) Get() int { return s.n }
+        \\
+        \\func (s *Store) Stats() Stats { return Stats{} }
+        \\
+        \\func Get() int { return 7 }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/models.go", .data =
+        \\package models
+        \\
+        \\type WidgetID int
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "cache/cache.go", .data =
+        \\package cache
+        \\
+        \\type Cache struct{ n int }
+        \\
+        \\func (c *Cache) Get() int { return c.n }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data =
+        \\package main
+        \\
+        \\import (
+        \\    "app/cache"
+        \\    "app/models"
+        \\    "app/store"
+        \\)
+        \\
+        \\type API struct {
+        \\    store *store.Store
+        \\}
+        \\
+        \\type Other struct {
+        \\    store *cache.Cache
+        \\}
+        \\
+        \\type Local struct{ n int }
+        \\
+        \\type Reg struct{}
+        \\
+        \\func (l *Local) Stats() int { return l.n }
+        \\
+        \\func (l *Local) WidgetID(n int) int { return n }
+        \\
+        \\func build() (*cache.Cache, error) { return nil, nil }
+        \\
+        \\func widenC(store, other *Local) int { return store.Stats() }
+        \\
+        \\func widenD(models, other *Local) int { return models.WidgetID(1) }
+        \\
+        \\func rangeShadow(xs []*cache.Cache) int {
+        \\    total := 0
+        \\    for _, store := range xs {
+        \\        total += store.Get()
+        \\    }
+        \\    return total
+        \\}
+        \\
+        \\func multiShadow() int {
+        \\    store, err := build()
+        \\    _ = err
+        \\    return store.Get()
+        \\}
+        \\
+        \\func ifShadow(fs map[string]*cache.Cache) int {
+        \\    if store, ok := fs["a"]; ok {
+        \\        return store.Get()
+        \\    }
+        \\    return 0
+        \\}
+        \\
+        \\func guardShadow(xs []*Local) int {
+        \\    for _, Reg := range xs {
+        \\        return Reg.Stats()
+        \\    }
+        \\    return 0
+        \\}
+        \\
+        \\func (a *API) statsCall() int { return a.store.Stats().Hits }
+        \\
+        \\func (a *API) crossType(o *Other) int { return o.store.Get() }
+        \\
+        \\func (a *API) pkgFunc() int { return store.Get() }
+        \\
+        \\func (a *API) conversion(n int) models.WidgetID { return models.WidgetID(n) }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const Case = struct {
+        caller: []const u8,
+        qualifier: []const u8,
+        name: []const u8,
+        kind: model.RefKind = .call,
+        exact: bool,
+        /// Required target: `null` demands nothing beyond the invariants below,
+        /// `""` the sole top-level symbol named `name`, else its parent type.
+        parent: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        // Grouped Go parameters share the trailing type, so the shadowing
+        // local is typed and the right method is provable.
+        .{ .caller = "widenC", .qualifier = "store", .name = "Stats", .exact = true, .parent = "Local" },
+        .{ .caller = "widenD", .qualifier = "models", .name = "WidgetID", .exact = true, .parent = "Local" },
+        // Untyped shadowing bindings: the package must not answer, and without
+        // a type the edge may only be a heuristic guess.
+        .{ .caller = "rangeShadow", .qualifier = "store", .name = "Get", .exact = false },
+        .{ .caller = "multiShadow", .qualifier = "store", .name = "Get", .exact = false },
+        .{ .caller = "ifShadow", .qualifier = "store", .name = "Get", .exact = false },
+        .{ .caller = "guardShadow", .qualifier = "Reg", .name = "Stats", .exact = false },
+        // A conversion keeps its edge, as a type use rather than a call.
+        .{ .caller = "conversion", .qualifier = "models", .name = "WidgetID", .kind = .type_use, .exact = true, .parent = "" },
+        // Receiver-chain cases the package guard must not regress.
+        .{ .caller = "statsCall", .qualifier = "store", .name = "Stats", .exact = true, .parent = "Store" },
+        .{ .caller = "crossType", .qualifier = "store", .name = "Get", .exact = true, .parent = "Cache" },
+        // A real package qualifier still resolves: no local named `store` here.
+        .{ .caller = "pkgFunc", .qualifier = "store", .name = "Get", .exact = true, .parent = "" },
+    };
+    for (cases) |c| {
+        const caller = idx.graph.symbols[idx.lookup(c.caller)[0]];
+        const ref = refByQual(caller, c.qualifier, c.name) orelse {
+            std.debug.assert(false);
+            unreachable;
+        };
+        try testing.expectEqual(c.kind, ref.kind);
+        try testing.expectEqual(c.exact, ref.exact);
+        if (c.parent) |parent| {
+            const want = if (parent.len == 0) topLevelNamed(&idx, c.name).? else qualifiedId(&idx, parent, c.name).?;
+            try testing.expectEqual(want, ref.target);
+        }
+        // The invariant every row shares: a call never lands on a type.
+        if (ref.kind == .call and ref.target != invalid) {
+            try testing.expect(!isContainer(idx.graph.symbols[ref.target]));
+        }
+    }
+
+    // Each new binding form shadows its same-named global, so the bare
+    // identifier is a value read rather than an edge to the package or struct.
+    const shadowed = [_][2][]const u8{
+        .{ "rangeShadow", "store" },
+        .{ "multiShadow", "store" },
+        .{ "ifShadow", "store" },
+        .{ "multiShadow", "err" },
+        .{ "ifShadow", "ok" },
+        .{ "guardShadow", "Reg" },
+    };
+    for (shadowed) |pair| {
+        const caller = idx.graph.symbols[idx.lookup(pair[0])[0]];
+        try testing.expect(isLocalBinding(caller, pair[1]));
+        if (refByQual(caller, "", pair[1])) |ref| try testing.expect(ref.target == invalid);
+    }
+
+    // Project-wide: no call edge binds to a non-callable.
+    for (idx.graph.symbols) |sym| {
+        for (sym.refs) |ref| {
+            if (ref.kind != .call or ref.target == invalid) continue;
+            const target = idx.graph.symbols[ref.target];
+            try testing.expect(isCallable(target) or mayHoldCallable(target.kind));
+        }
+    }
+}
+
+test "cpp: a member call through a typed pointer resolves to that type's method" {
+    // Regression (F-9): `for (const Shape* s : shapes) s->area()`.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/cpp_app", false);
+    defer idx.deinit();
+
+    const shape_area = qualifiedId(&idx, "Shape", "area").?;
+    const shape_name = qualifiedId(&idx, "Shape", "name").?;
+    const summarize = idx.graph.symbols[idx.lookup("summarize")[0]];
+    var saw_area = false;
+    var saw_name = false;
+    for (summarize.refs) |ref| {
+        if (!std.mem.eql(u8, ref.qualifier, "s")) continue;
+        if (std.mem.eql(u8, ref.name, "area")) {
+            try testing.expectEqual(shape_area, ref.target);
+            try testing.expect(ref.exact);
+            saw_area = true;
+        } else if (std.mem.eql(u8, ref.name, "name")) {
+            try testing.expectEqual(shape_name, ref.target);
+            saw_name = true;
+        }
+    }
+    try testing.expect(saw_area and saw_name);
+}
+
+test "lua: a colon method call records its receiver and keeps the edge" {
+    // Regression (F-9): `world:step(dt)` lost its qualifier entirely, so the
+    // member call fell into bare resolution and was dropped.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/lua_game", false);
+    defer idx.deinit();
+
+    const step = qualifiedId(&idx, "Game", "step").?;
+    const update = idx.graph.symbols[idx.lookup("update")[0]];
+    var checked = false;
+    for (update.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "step")) continue;
+        try testing.expectEqualStrings("world", ref.qualifier);
+        try testing.expectEqual(step, ref.target);
+        // `world` is assigned in another function: the receiver type is a
+        // guess, so the edge must stay heuristic for `--strict`.
+        try testing.expect(!ref.exact);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "an unknown receiver still abstains when many same-named members exist" {
+    // The tightening this PR makes is *kept*: on NavGraph's own src/ it removed
+    // ~610 false `x.deinit()` edges that bound to an arbitrary same-named
+    // member. Restoring typed receivers must not bring that class back.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data =
+        \\pub const A = struct {
+        \\    pub fn deinit(self: *A) void {}
+        \\};
+        \\pub const B = struct {
+        \\    pub fn deinit(self: *B) void {}
+        \\};
+        \\pub const C = struct {
+        \\    pub fn deinit(self: *C) void {}
+        \\};
+        \\pub const D = struct {
+        \\    pub fn deinit(self: *D) void {}
+        \\};
+        \\pub const E = struct {
+        \\    pub fn deinit(self: *E) void {}
+        \\};
+        \\pub fn release(a: *A) void {
+        \\    a.deinit();
+        \\    unknown.deinit();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const a_deinit = qualifiedId(&idx, "A", "deinit").?;
+    const release = idx.graph.symbols[idx.lookup("release")[0]];
+    var saw_typed = false;
+    var saw_unknown = false;
+    for (release.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "deinit")) continue;
+        if (std.mem.eql(u8, ref.qualifier, "a")) {
+            // Known type: resolved, and exactly.
+            try testing.expectEqual(a_deinit, ref.target);
+            try testing.expect(ref.exact);
+            saw_typed = true;
+        } else if (std.mem.eql(u8, ref.qualifier, "unknown")) {
+            // Unknown receiver among many same-named members: abstain.
+            try testing.expectEqual(invalid, ref.target);
+            saw_unknown = true;
+        }
+    }
+    try testing.expect(saw_typed and saw_unknown);
+}
+
 test "a bare identifier never binds to a same-named class member" {
     const testing = std.testing;
     const io = testing.io;
@@ -2095,6 +2970,18 @@ test "a bare identifier never binds to a same-named class member" {
 
     const field = qualifiedId(&idx, "Ctx", "name").?;
     try testing.expectEqual(@as(usize, 0), idx.callersOf(field).len);
+}
+
+/// The sole top-level (unparented) symbol named `name`, or null when the name
+/// is absent or shared — a test that pins a target must not pick arbitrarily.
+fn topLevelNamed(idx: *const Index, name: []const u8) ?SymbolId {
+    var found: SymbolId = invalid;
+    for (idx.lookup(name)) |id| {
+        if (idx.graph.symbols[id].parent != invalid) continue;
+        if (found != invalid) return null;
+        found = id;
+    }
+    return if (found == invalid) null else found;
 }
 
 fn qualifiedId(idx: *const Index, parent: []const u8, child: []const u8) ?SymbolId {
@@ -2474,6 +3361,150 @@ test "checked-in Java corpus resolves lexical, static-import, and inherited memb
     try testing.expectEqual(model.ResolutionReason.inheritance, cents_ref.resolution_reason);
 }
 
+/// Timed repetitions per size. Runner jitter is one-sided — it only ever makes
+/// a build slower — so the fastest of a few runs is the size's real cost, and
+/// the ratio between the two sizes stops swinging with it.
+const perf_reps = 3;
+
+/// Write a Java corpus of `groups` files, each declaring `per_group` subclasses
+/// of a shared `Base`, and return how long indexing it took in milliseconds.
+/// Deliberately file-light so the timing measures resolution, not file I/O.
+fn javaInheritanceBuildMs(tmp: *std.testing.TmpDir, groups: usize, per_group: usize) !i64 {
+    const testing = std.testing;
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "Base.java", .data =
+        \\public class Base {
+        \\    public int shared() { return 1; }
+        \\}
+    });
+
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    var name_buf: [64]u8 = undefined;
+    for (0..groups) |g| {
+        source.clearRetainingCapacity();
+        for (0..per_group) |c| {
+            try source.print(testing.allocator,
+                \\class C{d}_{d} extends Base {{
+                \\    public int use{d}_{d}() {{ return shared(); }}
+                \\}}
+                \\
+            , .{ g, c, g, c });
+        }
+        const sub_path = try std.fmt.bufPrint(&name_buf, "Group{d}.java", .{g});
+        try tmp.dir.writeFile(io, .{ .sub_path = sub_path, .data = source.items });
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var best_ms: i64 = std.math.maxInt(i64);
+    var rep: usize = 0;
+    while (rep < perf_reps) : (rep += 1) {
+        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        var idx = try build(testing.allocator, io, root, false);
+        defer idx.deinit();
+        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
+        best_ms = @min(best_ms, @as(i64, @intCast(elapsed_ms)));
+
+        // Every subclass still reaches the inherited member — the table is a
+        // speedup, not a drop in recall.
+        const shared = idx.lookup("shared")[0];
+        try testing.expectEqual(groups * per_group, idx.callersOf(shared).len);
+    }
+    return best_ms;
+}
+
+test "Java inherited-member resolution stays linear in symbol count" {
+    // Regression (perf): the inherited-member lookup scanned the whole symbol
+    // table per unresolved Java reference, so index build went quadratic in
+    // project size (4,192 files: 120 ms -> 4.4 s warm).
+    //
+    // Bound is a ratio measured in this same run, not wall-clock: a saturated
+    // runner slows both builds together, so the assertion does not drift with
+    // machine load (F6). The two constants below are measured, not guessed
+    // (F2) — 10 idle samples of each build at 20x scale on a 16-core box:
+    //
+    //   linear (this tree)  elapsed/small 12.9 .. 44.6  (expectation 20)
+    //   quadratic (pre-fix) elapsed/small  257 .. 295
+    //
+    // 8x the linear expectation lands between them: >= 3.6x headroom over the
+    // worst linear sample, and it still fails the quadratic build with ~1.6x to
+    // spare. The 20x scale is what opens that gap — at 10x the quadratic
+    // penalty was only ~6x linear, too close to the noise to bound safely. The
+    // floor keeps a sub-millisecond baseline from making the bound meaningless.
+    const testing = std.testing;
+    const per_group = 40;
+    const small_groups = 6;
+    const groups = 120;
+
+    var small_tmp = testing.tmpDir(.{ .iterate = true });
+    defer small_tmp.cleanup();
+    const small_ms = try javaInheritanceBuildMs(&small_tmp, small_groups, per_group);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const elapsed_ms = try javaInheritanceBuildMs(&tmp, groups, per_group);
+
+    const scale: i64 = groups / small_groups;
+    const linear_bound = 8 * scale * small_ms + 50;
+    try testing.expect(elapsed_ms <= linear_bound);
+}
+
+test "the parse-health warning names the file and the desynced line range" {
+    // Regression (F7): the whole diagnostic was `if (builtin.is_test) return;`,
+    // so nothing exercised its assertions or its message. The stderr *sink* is
+    // still silent under test — a test binary that writes to stderr makes the
+    // build runner print its `failed command:` hint on a green run.
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    try writeParseHealthWarning(&w, "src/broken.zig", .{ .desync_from = 12, .desync_to = 40 });
+    const written = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, written, "src/broken.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "lines 12-40") != null);
+
+    // A clean file writes nothing at all.
+    var clean_buf: [256]u8 = undefined;
+    var clean: std.Io.Writer = .fixed(&clean_buf);
+    try writeParseHealthWarning(&clean, "src/ok.zig", .{});
+    try testing.expectEqual(@as(usize, 0), clean.buffered().len);
+}
+
+test "the precomputed Java supertype table records declared bases only" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Base.java", .data = "public class Base {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Mixin.java", .data = "public interface Mixin {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Boxed.java", .data = "public class Boxed {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Sub.java", .data =
+        \\public class Sub extends Base implements Mixin {
+        \\    Box<Boxed> held;
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const sub = idx.lookup("Sub")[0];
+    const bases = idx.java_bases.get(sub).?;
+    try testing.expectEqual(@as(usize, 2), bases.len);
+    // Ascending symbol-id order, and `Boxed` (a generic argument) is not a base.
+    var names: [2][]const u8 = undefined;
+    for (bases, 0..) |id, i| names[i] = idx.graph.symbols[id].name;
+    try testing.expect(std.mem.eql(u8, names[0], "Base") or std.mem.eql(u8, names[1], "Base"));
+    try testing.expect(std.mem.eql(u8, names[0], "Mixin") or std.mem.eql(u8, names[1], "Mixin"));
+    try testing.expect(bases[0] < bases[1]);
+    // A type with no `extends`/`implements` has no entry at all.
+    try testing.expect(idx.java_bases.get(idx.lookup("Base")[0]) == null);
+}
+
 test "Java overloads never make an arbitrary bare member edge exact" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -2511,6 +3542,48 @@ test "checked-in Rust corpus parents a cross-file nominal impl on its type" {
         saw_impl = true;
     }
     try testing.expect(saw_impl);
+}
+
+test "checked-in Rust corpus: `use` bindings keep their cross-file call edges" {
+    // Regression: the non-local-import guard fired on Rust `use` bindings, which
+    // the indexer does not model, deleting every Rust cross-file call edge.
+    const testing = std.testing;
+    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    defer idx.deinit();
+
+    const run = idx.lookup("run")[0];
+    const parse_str = idx.lookup("parse_str")[0];
+    const tokenize = idx.lookup("tokenize")[0];
+
+    // `use parser::parse_str;` then `parse_str(src)` in main.rs::run.
+    try testing.expectEqual(run, idx.callersOf(parse_str)[0]);
+    // `use crate::lexer::{tokenize, Token};` then `tokenize(src)` in parse_str.
+    try testing.expectEqual(parse_str, idx.callersOf(tokenize)[0]);
+}
+
+test "a JS import binding still blocks the global-name fallback" {
+    // The guard's original purpose: an imported `run` must not bind to an
+    // unrelated workspace `run`. Scoping it by language must not lose this.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "local.js", .data =
+        \\export function run() { return 1; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.js", .data =
+        \\import run from "some-external-pkg";
+        \\export function boot() { return run(); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const local_run = idx.lookup("run")[0];
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(local_run).len);
 }
 
 test "Rust cross-file impl parenting survives a warm cache restore" {

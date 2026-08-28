@@ -43,6 +43,31 @@ pub const Language = enum {
         };
     }
 
+    /// True when the indexer actually resolves this language's import bindings.
+    /// Only then is a non-`resolved_local` outcome *evidence* that a name is
+    /// external; elsewhere it just means the import form was never parsed.
+    /// Mirrors the manifest split in `capabilities.zig`: Rust `use` and Java
+    /// wildcards are declared partial, C/C++/C#/Go unsupported.
+    pub fn resolvesImportBindings(self: Language) bool {
+        return switch (self) {
+            .zig, .python, .javascript, .typescript, .tsx, .lua, .ruby => true,
+            .c, .cpp, .csharp, .go, .rust, .java, .unknown => false,
+        };
+    }
+
+    /// True where `T(...)` legitimately invokes the type itself — a Python/Ruby
+    /// class call, a C++/Java/C#/Rust constructor, a JS factory. Elsewhere a
+    /// *call* bound to a type is always a mis-binding. Go is excluded even
+    /// though it spells conversion as a call: `goPackageTarget` records
+    /// `models.WidgetID(n)` as a `.type_use`, so nothing is lost and a Go local
+    /// shadowing a package can no longer produce an exact call to a type.
+    pub fn callMayTargetType(self: Language) bool {
+        return switch (self) {
+            .python, .ruby, .javascript, .typescript, .tsx, .cpp, .csharp, .java, .rust => true,
+            .zig, .c, .go, .lua, .unknown => false,
+        };
+    }
+
     /// Family groups languages that resolve references against each other.
     pub fn family(self: Language) Family {
         return switch (self) {

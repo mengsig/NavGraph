@@ -103,6 +103,7 @@ navgraph graph src --no-tests > graph.html   # then open graph.html in a browser
 navgraph graph                                # whole repo (tests hidden in the initial view)
 navgraph graph -C src/lexer.zig > lexer.html  # scope to a single file
 navgraph graph -j > graph.json                # raw {nodes, edges} model for other tools
+navgraph graph -j -l 200                      # capped: `nodes_total` + `truncated` say what was withheld
 ```
 
 > Tip: GitHub won't run the page's JavaScript inline, so a repo shows a
@@ -143,7 +144,7 @@ navgraph <command> [arg] [flags]
 | `history <symbol>` | Symbol-range Git history and patches, bounded by `--last` (default 10). Alias: `hist`. |
 | `blame <symbol>`   | Per-line author, commit, and summary provenance for a current symbol range. |
 | `churn [path]`     | Rank current symbols by historical commits or added plus removed/replaced hunk lines (`--sort commits|lines`, `--last`, `--since`). |
-| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. |
+| `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. Returns the top 25 unless `-l N` asks for more. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
 | `status [filter]`  | Index/cache snapshot, changed-since-build files, skipped paths, parse health, and unresolved/external graph-reference diagnostics. |
 | `read <file[:A-B]>`| Paged numbered source; ranges are validated/merged, `-l` and hard `--budget` bound pages, and `--after <next>` resumes. |
@@ -152,18 +153,27 @@ navgraph <command> [arg] [flags]
 | `edits <symbol>`   | List exact definition and resolved-reference edit sites, with source offsets. |
 | `rename <sym> <new>` | Apply a collision-checked exact rename; `--preview` emits a unified patch without writing. |
 | `coverage [path]`  | Per-file % of `fn`/`method` symbols reachable in the call graph from a test — a dependency-free, language-agnostic substitute for line coverage. |
-| `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges}` JSON. Respects `--tests`. |
+| `graph [path]`     | **Interactive HTML** of the code graph (nodes = symbols, sized by fan-in, colored by file; edges = calls/type uses). Redirect stdout to a `.html` file and open it; `-j` emits the raw `{nodes, edges, nodes_total, truncated}` JSON. `-l` caps the node set; the JSON reports the total and text says so on stderr. Respects `--tests`. |
 | `serve`            | Keep the index in memory and serve newline-delimited JSON-RPC/MCP; `navgraph.reload` / `workspace/reload` atomically refresh it. Alias: `mcp`. |
 | `help [command]`   | Show the full catalogue or concise registry-derived help for one command. |
 
 **Flags**
 
+Flags come in two classes. The **global-class** flags — `-v`, `-d`, `-C`, `-l`,
+`-t`, `-s`, `-r`, `-j`, `--no-cache` — are accepted on every command, so a client
+can append one standard flag set to any argv. A command that has no use for one
+ignores it and says so on stderr, keeping exit 0; the authoritative per-command
+list of flags that actually *do* something is `navgraph capabilities -j`
+(`commands[].options`). Every other flag is command-specific and is a usage error
+(exit 2) on a command that does not declare it. A format a command cannot emit
+(`serve -j`, `def --jsonl`) is likewise an error, not an ignored flag.
+
 | Flag                          | Meaning                                    |
 |-------------------------------|--------------------------------------------|
 | `-v, --verbosity <level>`     | `names` \| `sig` \| `doc` \| `full` (default `sig`). |
-| `-d, --depth <N>`             | Graph depth for call walks and `raises` propagation (default `1`). |
+| `-d, --depth <N>`             | Graph depth for call walks, `neighbors`, and `raises` propagation (default `1`). |
 | `-C, --root <path>`           | Index root: a directory, or a single file to scope to it (default `.`). |
-| `-l, --limit <N>`             | Max results (default `300`).               |
+| `-l, --limit <N>`             | Max results (default `300`; `hot`'s own default is `25`). The flag is explicit, not a sentinel: on `imports`/`importers`/`graph`/`hot` a value you give is a real cap — `300` included — and leaving it off keeps the first three unbounded and `hot` at 25. |
 | `--budget <bytes>`            | On commands declaring this option, a hard serialized stdout ceiling (minimum 64 bytes); results are importance-ranked, compacted, and marked/cursored when truncated. |
 | `--max-nodes <N>`             | Exact retained-node cap; `--summary` renders retained nodes at name detail and reports elision. |
 | `--since <ref>`               | Git comparison ref for `affected` or the lower history bound for `churn`. |
@@ -193,7 +203,7 @@ navgraph <command> [arg] [flags]
 | `-j, --json`                  | Emit JSON (stable, for tooling/MCP).       |
 | `--jsonl`                     | Stream one item per JSON line plus a page record. `--after v1:N` resumes from its stable ordinal cursor. Supported by `outline`, `search`, `hot`, `todos`, `reaches`, `affected`, `edits`, and `status`. |
 | `--sort <key>`                | `files`: `path|symbols`; `outline`/`search`: `line|name|span|callers|callees`; `hot`: `fan_in|fan_in_exact|fan_out|fan_out_exact|span`; `churn`: `commits|lines`. Numeric metrics rank descending with stable path/line ties. |
-| `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild.  |
+| `--no-cache`                  | Ignore the `.navgraph/cache` and rebuild. Accepted by `read`, which never uses the cache either way. |
 | `--no-public`                 | `unused`: drop exported symbols (possible public API). |
 | `--follow-imports`            | `unused`: disambiguate same-name symbols by import reachability. |
 
@@ -492,9 +502,22 @@ Everything for one run lives in a single arena that is freed on exit.
 
 - Resolution is **heuristic**, not compiler-grade. It is type-scoped (a member
   call binds only to a member of the receiver's inferred type — `self`/`this`,
-  typed params, local `Foo{…}`/`Foo.init()` bindings) and import-aware, but a
-  call on an untracked receiver falls back to a name match, marked heuristic
-  (`?`); `--strict` drops those. Treat the graph as high-recall guidance.
+  typed params including C-family `const Shape* s`, local `Foo{…}`/`Foo.init()`
+  bindings, and fields of the enclosing type declared with one, such as Go
+  `store store.Store` behind `a.store.Get()`) and import-aware, but a call on an
+  untracked receiver falls back to a name match, marked heuristic (`?`);
+  `--strict` drops those. A call never binds to a non-callable: a type is a call
+  target only where the language spells construction as a call (Python/Ruby
+  classes, C++/Java/C#/Rust constructors, JS factories), while a `var`/`const`
+  stays legal because nothing here types values and a function-valued binding is
+  genuinely callable. A Go conversion (`models.WidgetID(n)`) is recorded as a
+  type use rather than a call. A local shadows a same-named package —
+  `for _, store := range xs` binds `store.Get()` to the local, not to package
+  `store` — and a bare qualifier that names a package/namespace resolves to that
+  clause as an inferred edge, never an exact one. Import evidence only
+  suppresses a name match for languages whose import forms are actually
+  resolved — Rust `use` is unmodelled, so it does not. Treat the graph as
+  high-recall guidance.
 - `affected` and `reaches --from-tests` are structural call-graph impact, not
   runtime coverage. Dynamic dispatch still needs `--impls` or may remain unknown;
   pure deletions cannot be seeded from symbols absent from the current index.

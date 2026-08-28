@@ -50,7 +50,9 @@ pub const ParsedSymbol = struct {
 /// References plus local bindings collected from one symbol body.
 const BodyInfo = struct {
     refs: []Reference,
-    bindings: []const Binding,
+    /// Mutable so a language that discovers an extra binding after the body scan
+    /// (the Go method receiver) can grow the slice instead of abandoning it.
+    bindings: []Binding,
 };
 
 const sentinel: u32 = std.math.maxInt(u32);
@@ -567,31 +569,36 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (t.kind != .identifier) continue;
         const name = t.text(ctx.source);
         if (name.len < 2 or kw.has(name)) continue;
-        const member_qualifier = memberQualifier(ctx, i, lo);
+        const receiver = memberQualifier(ctx, i, lo);
         // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
         // `.{ .value = x }`) are labels, not references to a same-named symbol.
         // Keeping them as bare refs lets a unique unrelated definition become
         // an "exact" call/read edge later, which is especially dangerous in
         // strict agent queries. Preserve real receivers such as `value.field`
         // and `make().field`.
-        if (isZigReceiverlessMember(ctx, i, lo, member_qualifier)) continue;
+        if (isZigReceiverlessMember(ctx, i, lo, receiver.name)) continue;
         const assignment = assignmentAccess(ctx, i, hi);
-        const qualifier = if (assignment.write and member_qualifier.len == 0)
+        const qualifier = if (assignment.write and receiver.name.len == 0)
             enclosingCallQualifier(ctx, i, lo)
         else
-            member_qualifier;
+            receiver.name;
+        // Only a real member access has a chain to walk: a constructor-keyword
+        // qualifier is synthesised, not read off the token stream.
+        const root = if (receiver.name.len != 0) receiverChainRoot(ctx, receiver.tok, lo) else "";
         // Skip only a *bare* self-reference (recursion noise). A qualified call
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
-        // A JS/TS object-literal property key (`{ count: ... }`) names a field,
-        // not a reference to a same-named binding — don't emit an edge for it.
-        if (member_qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
+        // A JS/TS object-literal property key (`{ count: ... }`) and a Go
+        // composite-literal field key (`API{store: s}`) name a field, not a
+        // reference to a same-named binding — don't emit an edge for either.
+        if (receiver.name.len == 0 and
+            (isJsObjectKey(ctx, i, lo, hi) or isGoLiteralFieldKey(ctx, i, lo, hi))) continue;
         const is_call = referenceCallOpen(ctx, i, hi) != null;
         if (assignment.read) {
-            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, is_call, false);
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
         }
         if (assignment.write) {
-            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, t.line, t.start, false, true);
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, false, true);
         }
     }
     // Keep the distinct-line list only when a ref spans more than one line; a
@@ -692,24 +699,39 @@ fn enclosingCallQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     return "";
 }
 
+/// The receiver of a member access: its identifier text plus the token index it
+/// sits at, so the chain can be walked one link further back. `name` is "" when
+/// token `i` is not a member access.
+const Receiver = struct {
+    name: []const u8 = "",
+    tok: u32 = 0,
+};
+
 /// If token `i` is the trailing member of a member access, return the receiver
-/// identifier; otherwise "".
-fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+/// identifier; otherwise an empty `Receiver`.
+fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) Receiver {
     std.debug.assert(lo <= i);
     std.debug.assert(i < ctx.toks.len);
     // `recv.name`
     if (i >= lo + 2 and ctx.isPunct(i - 1, '.')) {
         if (ctx.toks[i - 2].kind == .identifier) {
-            if (ctx.cfg.language != .zig or !zig_keywords.has(ctx.textOf(i - 2))) return ctx.textOf(i - 2);
+            if (ctx.cfg.language != .zig or !zig_keywords.has(ctx.textOf(i - 2))) return ident(ctx, i - 2);
         }
         if (ctx.isPunct(i - 2, '>')) return genericReceiver(ctx, i - 2, lo);
+    }
+    // Lua method call `recv:name(...)`: the colon is sugar for passing `recv`
+    // as self, so the receiver scopes the member exactly as `recv.name` does.
+    if (ctx.cfg.language == .lua and i >= lo + 2 and ctx.isPunct(i - 1, ':') and
+        ctx.toks[i - 2].kind == .identifier)
+    {
+        return ident(ctx, i - 2);
     }
     // Zig postfix unwrap/deref: `opt.?.name` / `ptr.*.name`.
     if (ctx.cfg.language == .zig and i >= lo + 4 and ctx.isPunct(i - 1, '.') and
         (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '*')) and ctx.isPunct(i - 3, '.') and
         ctx.toks[i - 4].kind == .identifier)
     {
-        return ctx.textOf(i - 4);
+        return ident(ctx, i - 4);
     }
     // Two-punct member operators, receiver two tokens back:
     //   `recv?.name` / `recv!.name` — JS/TS optional-chaining & non-null assertion
@@ -718,17 +740,38 @@ fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
     if (i >= lo + 3) {
         if (ctx.toks[i - 3].kind == .identifier) {
             if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
-                return ctx.textOf(i - 3);
-            if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
-            if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
+                return ident(ctx, i - 3);
+            if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ident(ctx, i - 3);
+            if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ident(ctx, i - 3);
         }
         if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':') and ctx.isPunct(i - 3, '>'))
             return genericReceiver(ctx, i - 3, lo);
     }
-    return "";
+    return .{};
 }
 
-fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) []const u8 {
+fn ident(ctx: *const Ctx, i: u32) Receiver {
+    return .{ .name = ctx.textOf(i), .tok = i };
+}
+
+/// The identifier heading the receiver chain that ends at token `tok`
+/// (`a.store` at `store` -> "a"), or "" when `tok` already heads the chain.
+/// Walks the same member-access shapes `memberQualifier` recognises, one link
+/// at a time; each step moves strictly left, so the walk terminates.
+fn receiverChainRoot(ctx: *const Ctx, tok: u32, lo: u32) []const u8 {
+    var cursor = tok;
+    var root: []const u8 = "";
+    while (cursor > lo) {
+        const prev = memberQualifier(ctx, cursor, lo);
+        if (prev.name.len == 0) break;
+        std.debug.assert(prev.tok < cursor);
+        root = prev.name;
+        cursor = prev.tok;
+    }
+    return root;
+}
+
+fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) Receiver {
     std.debug.assert(lo <= close);
     std.debug.assert(ctx.isPunct(close, '>'));
     var depth: u32 = 1;
@@ -739,12 +782,12 @@ fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) []const u8 {
         if (!ctx.isPunct(cursor, '<')) continue;
         depth -= 1;
         if (depth != 0) continue;
-        if (cursor > lo and ctx.toks[cursor - 1].kind == .identifier) return ctx.textOf(cursor - 1);
+        if (cursor > lo and ctx.toks[cursor - 1].kind == .identifier) return ident(ctx, cursor - 1);
         if (cursor >= lo + 3 and ctx.isPunct(cursor - 1, ':') and ctx.isPunct(cursor - 2, ':') and ctx.toks[cursor - 3].kind == .identifier)
-            return ctx.textOf(cursor - 3);
-        return "";
+            return ident(ctx, cursor - 3);
+        return .{};
     }
-    return "";
+    return .{};
 }
 
 /// Whether token `i` is a JS/TS object-literal property key: an identifier
@@ -759,6 +802,50 @@ fn isJsObjectKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
     return ctx.isPunct(i - 1, '{') or ctx.isPunct(i - 1, ',');
 }
 
+/// Whether token `i` is a Go composite-literal field key (`&API{store: s}`): an
+/// identifier after `{` or `,` and before `:`. Such a key names a field, not a
+/// reference to a same-named package or variable. Map/slice/array literals
+/// (`map[K]V{…}`, `[]T{…}`) keep their keys — there the key is an expression.
+fn isGoLiteralFieldKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    if (ctx.cfg.language != .go) return false;
+    if (i <= lo or i + 1 >= hi) return false;
+    if (!ctx.isPunct(i + 1, ':') or ctx.isPunct(i + 2, '=')) return false;
+    if (!ctx.isPunct(i - 1, '{') and !ctx.isPunct(i - 1, ',')) return false;
+    const open = enclosingBraceOpen(ctx, i, lo) orelse return false;
+    return goLiteralTypeIsNamed(ctx, open, lo);
+}
+
+/// The `{` opening the block token `i` sits directly inside, or null when the
+/// nearest enclosing bracket is a `(`/`[` or there is none in range.
+fn enclosingBraceOpen(ctx: *const Ctx, i: u32, lo: u32) ?u32 {
+    var depth: u32 = 0;
+    var j = i;
+    while (j > lo) {
+        j -= 1;
+        if (ctx.isPunct(j, '}') or ctx.isPunct(j, ')') or ctx.isPunct(j, ']')) {
+            depth += 1;
+            continue;
+        }
+        if (!ctx.isPunct(j, '{') and !ctx.isPunct(j, '(') and !ctx.isPunct(j, '[')) continue;
+        if (depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        return if (ctx.isPunct(j, '{')) j else null;
+    }
+    return null;
+}
+
+/// Whether the composite literal opened at `open` names a plain type (`API{`,
+/// `models.Widget{`) rather than a map/slice/array whose `]` precedes the type.
+fn goLiteralTypeIsNamed(ctx: *const Ctx, open: u32, lo: u32) bool {
+    if (open == lo) return false;
+    var j = open - 1;
+    if (ctx.toks[j].kind != .identifier) return false;
+    while (j >= lo + 2 and ctx.isPunct(j - 1, '.') and ctx.toks[j - 2].kind == .identifier) j -= 2;
+    return j == lo or !ctx.isPunct(j - 1, ']');
+}
+
 fn recordRef(
     ctx: *Ctx,
     refs: *std.ArrayList(Reference),
@@ -767,6 +854,7 @@ fn recordRef(
     seen: *std.StringHashMap(u32),
     name: []const u8,
     qualifier: []const u8,
+    receiver_root: []const u8,
     line: u32,
     offset: u32,
     is_call: bool,
@@ -776,9 +864,11 @@ fn recordRef(
     std.debug.assert(offset < ctx.source.len);
     std.debug.assert(!is_call or !write);
     // Direction participates in deduplication so a read and write of the same
-    // member retain separate source lines and access modes.
-    var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}\x00{c}", .{ qualifier, name, if (write) @as(u8, 'w') else 'r' }) catch name;
+    // member retain separate source lines and access modes. So does the chain
+    // root: `a.store.Get()` and `o.store.Get()` reach different objects and must
+    // resolve independently.
+    var key_buf: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}\x00{s}\x00{c}", .{ receiver_root, qualifier, name, if (write) @as(u8, 'w') else 'r' }) catch name;
     if (seen.get(key)) |idx| {
         var r = &refs.items[idx];
         r.count += 1;
@@ -794,6 +884,7 @@ fn recordRef(
     try refs.append(ctx.gpa, .{
         .name = name,
         .qualifier = qualifier,
+        .receiver_root = receiver_root,
         .line = line,
         .kind = if (is_call) .call else .read,
         .write = write,
@@ -973,10 +1064,15 @@ const factory_names = std.StaticStringMap(void).initComptime(.{
 
 /// Scan a body for `const/var/let NAME [: T] = ...` and `NAME = T(...)` and
 /// record inferred `NAME -> T` bindings used for receiver resolution.
-fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]const Binding {
+fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]Binding {
     var list: std.ArrayList(Binding) = .empty;
     defer list.deinit(ctx.gpa);
-    if (params_open != sentinel) try collectParamBindings(ctx, params_open, &list);
+    if (params_open != sentinel) {
+        if (ctx.cfg.language.family() == .c)
+            try collectCParamBindings(ctx, params_open, &list)
+        else
+            try collectParamBindings(ctx, params_open, &list);
+    }
     var i = lo;
     while (i < hi) : (i += 1) {
         const b = detectBinding(ctx, i, hi, lo) orelse continue;
@@ -990,6 +1086,8 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
     const close = ctx.close[open];
     if (close == sentinel) return;
     var expect_name = true;
+    // First name of the Go parameter group still waiting for its shared type.
+    var group_start = list.items.len;
     var i = open + 1;
     while (i < close) {
         if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '{')) {
@@ -1011,17 +1109,162 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
             var ty: []const u8 = "";
             if (ctx.isPunct(i + 1, ':')) {
                 if (typeFromChain(ctx, i + 2, close)) |t| ty = t;
+            } else if (ctx.cfg.language == .go and i + 1 < close and !ctx.isPunct(i + 1, ',')) {
+                // Go writes `name T` with no separator (`o *Other`, `w http.ResponseWriter`).
+                if (typeFromChain(ctx, i + 1, close)) |t| ty = t;
             }
             try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
+            // A Go group shares one type written after the last name
+            // (`store, other *Local`): back-fill the names that parsed untyped.
+            if (ctx.cfg.language == .go and ty.len != 0) {
+                for (list.items[group_start..]) |*b| b.type_name = ty;
+                group_start = list.items.len;
+            }
         }
         expect_name = false;
         i += 1;
     }
 }
 
+/// Leading words a C/C++ declarator may carry before its type.
+const c_decl_modifiers = KeywordSet.initComptime(.{
+    .{"const"},  .{"static"},   .{"volatile"}, .{"mutable"}, .{"register"},
+    .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
+    .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
+    .{"class"},  .{"auto"},     .{"typename"},
+});
+
+/// Words that open a statement rather than a declaration, so a run starting
+/// with one is never `Type name`.
+const c_statement_keywords = KeywordSet.initComptime(.{
+    .{"if"},     .{"for"},       .{"while"},     .{"switch"}, .{"return"},
+    .{"else"},   .{"do"},        .{"case"},      .{"goto"},   .{"break"},
+    .{"continue"}, .{"sizeof"},  .{"new"},       .{"delete"}, .{"throw"},
+    .{"try"},    .{"catch"},     .{"using"},     .{"namespace"}, .{"typedef"},
+    .{"template"}, .{"public"},  .{"private"},   .{"protected"}, .{"friend"},
+    .{"virtual"}, .{"operator"}, .{"default"},
+});
+
+/// Modifiers that are a complete type on their own, so the declarator may carry
+/// no type identifier at all (`long alpha = 0;`, `const auto x = f();`).
+const c_scalar_modifiers = KeywordSet.initComptime(.{
+    .{"unsigned"}, .{"signed"}, .{"long"}, .{"short"}, .{"auto"},
+});
+
+/// Whether token `i` closes a declarator (`; = , ) : [ {`). A `(` means a call
+/// or a function declaration, never a variable we can type.
+fn endsCDeclarator(ctx: *const Ctx, i: u32, limit: u32) bool {
+    if (i >= limit or ctx.toks[i].kind != .punct) return false;
+    const c = ctx.ch(i);
+    return c == ';' or c == '=' or c == ',' or c == ')' or c == ':' or c == '[' or c == '{';
+}
+
+/// Parse a C/C++ declarator `[modifiers] [Type[::Q][<...>]] [*&]* name` ending
+/// at `; = , ) : [ {`, returning `name -> Type`. A scalar modifier can be the
+/// whole type (`long alpha`), in which case the binding is untyped: it names no
+/// project type, and its job is to shadow a same-named global. Anything without
+/// a name yields nothing, so an expression statement is not a declaration.
+fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
+    if (c_statement_keywords.has(ctx.textOf(start))) return null;
+    var i = start;
+    var scalar = false;
+    while (i < limit and ctx.toks[i].kind == .identifier and
+        c_decl_modifiers.has(ctx.textOf(i))) : (i += 1)
+    {
+        if (c_scalar_modifiers.has(ctx.textOf(i))) scalar = true;
+    }
+
+    // Type chain: `A`, `a::B`, each optionally followed by `<...>`.
+    var type_name: ?[]const u8 = null;
+    while (i < limit and ctx.toks[i].kind == .identifier) {
+        type_name = ctx.textOf(i);
+        i += 1;
+        if (i < limit and ctx.isPunct(i, '<')) {
+            const close = ctx.close[i];
+            if (close == sentinel or close >= limit) return null;
+            i = close + 1;
+        }
+        if (i + 1 < limit and ctx.isPunct(i, ':') and ctx.isPunct(i + 1, ':')) {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+
+    const after_type = i;
+    while (i < limit and (ctx.isPunct(i, '*') or ctx.isPunct(i, '&'))) : (i += 1) {}
+
+    if (i < limit and ctx.toks[i].kind == .identifier and
+        !c_decl_modifiers.has(ctx.textOf(i)) and !c_statement_keywords.has(ctx.textOf(i)))
+    {
+        if (!endsCDeclarator(ctx, i + 1, limit)) return null;
+        const name = ctx.textOf(i);
+        if (type_name) |t| return .{ .name = name, .type_name = t };
+        // `long *p;` — the modifier is the type.
+        return if (scalar) .{ .name = name, .type_name = "" } else null;
+    }
+
+    // `long alpha = 0;` — no name followed the type chain, so what it consumed
+    // *is* the name and the scalar modifier was the type.
+    if (!scalar or i != after_type) return null;
+    const name = type_name orelse return null;
+    return if (endsCDeclarator(ctx, i, limit)) .{ .name = name, .type_name = "" } else null;
+}
+
+/// Record `name -> Type` for each C/C++ parameter in `(...)`.
+fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Binding)) !void {
+    const close = ctx.close[open];
+    if (close == sentinel) return;
+    var start = open + 1;
+    var i = start;
+    while (i < close) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '<')) {
+            const inner = ctx.close[i];
+            i = if (inner == sentinel or inner >= close) i + 1 else inner + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, ',')) {
+            if (cDeclarator(ctx, start, i + 1)) |b| try list.append(ctx.gpa, b);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < close) {
+        if (cDeclarator(ctx, start, close + 1)) |b| try list.append(ctx.gpa, b);
+    }
+}
+
+/// Statement keywords a Go short declaration may follow directly, so the
+/// declared name is not the first token on its line.
+const go_short_decl_openers = KeywordSet.initComptime(.{
+    .{"for"}, .{"if"}, .{"switch"}, .{"case"},
+});
+
+/// Whether identifier `i` is a declared name on the left of a Go short
+/// declaration. The name list runs `ident (, ident)*` up to `:=`, and `i` must
+/// itself start a list item — statement start, a preceding statement keyword,
+/// or the list's own comma — so a call argument never looks like a declaration.
+fn goShortDeclName(ctx: *const Ctx, i: u32, hi: u32, lo: u32) bool {
+    const starts_item = i == lo or ctx.toks[i - 1].line != ctx.toks[i].line or
+        ctx.isPunct(i - 1, ',') or ctx.isPunct(i - 1, ';') or
+        (ctx.toks[i - 1].kind == .identifier and go_short_decl_openers.has(ctx.textOf(i - 1)));
+    if (!starts_item) return false;
+    var j = i + 1;
+    while (j + 1 < hi and ctx.isPunct(j, ',') and ctx.toks[j + 1].kind == .identifier) j += 2;
+    return j + 1 < hi and ctx.isPunct(j, ':') and ctx.isPunct(j + 1, '=');
+}
+
 fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
     const t = ctx.toks[i];
     if (t.kind != .identifier) return null;
+    // C/C++ put the type before the name (`const Shape* s`), so the
+    // `const`-introduces-a-name rule below would read the *type* as the name.
+    if (ctx.cfg.language.family() == .c) {
+        if (i != lo and !ctx.isPunct(i - 1, ';') and !ctx.isPunct(i - 1, '{') and
+            !ctx.isPunct(i - 1, '}') and !ctx.isPunct(i - 1, '(') and
+            ctx.toks[i - 1].line == t.line) return null;
+        return cDeclarator(ctx, i, hi);
+    }
     const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
     if (is_decl) {
         if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
@@ -1045,9 +1288,21 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
         }
         return null;
     }
+    // Go short declarations bind *every* name on the left, and start after a
+    // statement keyword as often as at line start: `x, err := f()`,
+    // `for _, x := range xs`, `if x, ok := m[k]; ok`. A missing binding here let
+    // a local shadowing an imported package resolve to the package instead.
+    if (ctx.cfg.language == .go and goShortDeclName(ctx, i, hi, lo)) {
+        if (ctx.identEql(i, "_")) return null; // blank identifier declares nothing
+        // Only the single-name form has a typeable RHS; a tuple RHS stays
+        // untyped, which still shadows a same-named package or global.
+        const single = ctx.isPunct(i + 1, ':');
+        const ty = if (single) typeFromRhs(ctx, i + 3, hi) orelse "" else "";
+        return .{ .name = ctx.textOf(i), .type_name = ty };
+    }
     const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
     if (!first_on_line) return null;
-    // Go short declaration `name := …` (tokens `:` `=`).
+    // Short declaration `name := …` (tokens `:` `=`) outside Go.
     if (ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, '=')) {
         return .{ .name = ctx.textOf(i), .type_name = typeFromRhs(ctx, i + 3, hi) orelse "" };
     }
@@ -1064,6 +1319,8 @@ fn inferDeclType(ctx: *const Ctx, name_i: u32, hi: u32) ?[]const u8 {
     const j = name_i + 1;
     if (ctx.isPunct(j, ':')) return typeFromChain(ctx, j + 1, hi);
     if (ctx.isPunct(j, '=')) return typeFromRhs(ctx, j + 1, hi);
+    // Go `var x T` / `var x *T`: the type follows the name with no separator.
+    if (ctx.cfg.language == .go) return typeFromChain(ctx, j, hi);
     return null;
 }
 
@@ -1104,8 +1361,10 @@ fn typeFromRhs(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
 }
 
 fn isRhsSkip(ctx: *const Ctx, i: u32) bool {
+    // `&` leads Go/Rust address-of construction (`store := &Cache{}`), which
+    // names the same type as the plain literal.
     return ctx.identEql(i, "new") or ctx.identEql(i, "try") or
-        ctx.identEql(i, "await") or ctx.identEql(i, "comptime");
+        ctx.identEql(i, "await") or ctx.identEql(i, "comptime") or ctx.isPunct(i, '&');
 }
 
 fn emit(ctx: *Ctx, sym: ParsedSymbol) !u32 {
@@ -3312,11 +3571,14 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     var j = func_i + 1;
     var is_method = false;
     var receiver: []const u8 = "";
+    var receiver_name: []const u8 = "";
     // Optional receiver: `func (r T) Name(...)`.
     if (j < hi and ctx.isPunct(j, '(')) {
         const rc = ctx.close[j];
         if (rc == sentinel) return func_i;
         receiver = goReceiverType(ctx, j, rc);
+        if (rc > j + 1 and ctx.toks[j + 1].kind == .identifier and !std.mem.eql(u8, ctx.textOf(j + 1), receiver))
+            receiver_name = ctx.textOf(j + 1);
         j = rc + 1;
         is_method = true;
     }
@@ -3339,6 +3601,7 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     const body = try collectRefs(ctx, params_open, body_open + 1, body_close, name, go_keywords);
     _ = try emit(ctx, .{
         .name = name,
+        .bindings = try withGoReceiverBinding(ctx, body.bindings, receiver_name, receiver),
         .kind = if (is_method) .method else .function,
         .line = ctx.toks[name_i].line,
         .span_start = lineStartOffset(ctx, func_i),
@@ -3348,10 +3611,19 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         .exported = goExported(name),
         .parent_local = parent,
         .refs = body.refs,
-        .bindings = body.bindings,
         .receiver = receiver,
     });
     return body_close + 1;
+}
+
+/// `bindings` plus the Go method receiver as a typed local (`func (a *API)` ->
+/// `a -> API`). Appended last so a body local of the same name shadows it, and
+/// it is what lets `a.store.Get()` reach the receiver type's field table.
+fn withGoReceiverBinding(ctx: *Ctx, bindings: []Binding, name: []const u8, type_name: []const u8) ![]Binding {
+    if (name.len == 0 or type_name.len == 0) return bindings;
+    const grown = try ctx.arena.realloc(bindings, bindings.len + 1);
+    grown[grown.len - 1] = .{ .name = name, .type_name = type_name };
+    return grown;
 }
 
 /// A Go-modules major-version import segment: `v2`, `v10`, ….
@@ -3452,6 +3724,7 @@ fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
             .exported = goExported(name),
             .parent_local = parent,
             .refs = &.{},
+            .bindings = if (is_iface) &.{} else try collectGoFieldBindings(ctx, open, close),
         });
         if (is_iface) try parseGoInterfaceMethods(ctx, open + 1, close, my);
         return close + 1;
@@ -3471,6 +3744,42 @@ fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         .refs = &.{},
     });
     return tokenAfterOffset(ctx, end, hi);
+}
+
+/// Field `name Type` pairs from a Go struct body. A method of the struct can
+/// then resolve a member access through one of its fields by the field's
+/// declared type — `a.store.Get()` where `store store.Store` — instead of
+/// guessing by method name. The compact reference model keeps only `store` as
+/// the qualifier, so the field table is the only surviving type evidence.
+fn collectGoFieldBindings(ctx: *Ctx, open: u32, close: u32) ![]const Binding {
+    var list: std.ArrayList(Binding) = .empty;
+    defer list.deinit(ctx.gpa);
+    var i = open + 1;
+    while (i < close) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier or !isLineStart(ctx, i)) continue;
+        if (go_keywords.has(ctx.textOf(i))) continue;
+        const field_line = ctx.toks[i].line;
+        const name = ctx.textOf(i);
+        var j = i + 1;
+        // `*T`, `[]T`, `map[K]V` all put the element type after the decoration.
+        while (j < close and (ctx.isPunct(j, '*') or ctx.isPunct(j, '['))) {
+            if (ctx.isPunct(j, '[')) {
+                const c = ctx.close[j];
+                j = if (c == sentinel or c >= close) close else c + 1;
+                continue;
+            }
+            j += 1;
+        }
+        if (j >= close or ctx.toks[j].kind != .identifier) continue;
+        if (ctx.toks[j].line != field_line) continue;
+        var type_name = ctx.textOf(j);
+        while (j + 2 < close and ctx.isPunct(j + 1, '.') and ctx.toks[j + 2].kind == .identifier) {
+            j += 2;
+            type_name = ctx.textOf(j);
+        }
+        try list.append(ctx.gpa, .{ .name = name, .type_name = type_name });
+    }
+    return ctx.arena.dupe(Binding, list.items);
 }
 
 /// Emit a `method` for each `Name(params) ret` signature line in a Go interface

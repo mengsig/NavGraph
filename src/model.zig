@@ -148,6 +148,11 @@ pub const Reference = struct {
     /// Receiver identifier for a member access `recv.name`, else "" for a bare
     /// reference. Used to type-scope resolution (kills same-name false edges).
     qualifier: []const u8 = "",
+    /// Identifier heading the receiver chain when `qualifier` is itself a member
+    /// (`o.store.Get()` -> "o"); empty when `qualifier` heads the chain. Tells a
+    /// field access apart from a bare module/package qualifier, so the enclosing
+    /// type's field table can never answer for another object's field.
+    receiver_root: []const u8 = "",
     /// First line (1-based) where this name is referenced in the body.
     line: u32,
     kind: RefKind,

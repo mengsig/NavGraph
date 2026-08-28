@@ -278,10 +278,10 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .hierarchy, .name = "hierarchy", .aliases = &.{"hier"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .overrides }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .raises, .name = "raises", .aliases = &.{"throws"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .catches, .name = "catches", .aliases = &.{"handles"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .neighbors, .name = "neighbors", .aliases = &.{"near"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .neighbors, .name = "neighbors", .aliases = &.{"near"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .unused, .name = "unused", .aliases = &.{"dead"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .tests, .no_public, .follow_imports }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .imports, .name = "imports", .arguments = &optional_filter, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .importers, .name = "importers", .arguments = &file_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .imports, .name = "imports", .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .importers, .name = "importers", .arguments = &file_arg, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .path, .name = "path", .arguments = &path_args, .options = &.{ .root, .no_cache, .verbosity, .strict, .format, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .flow, .name = "flow", .aliases = &.{"dataflow"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .writers, .readers, .unread, .on_type, .to }, .conflicts = &flow_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .taint, .name = "taint", .aliases = &.{"security"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .strict, .format, .to }, .required_options = &.{.to}, .outputs = &text_json, .access = .read_only, .requires_index = true },
@@ -295,13 +295,13 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .collisions, .name = "collisions", .aliases = &.{"duplicates"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .kind, .tests, .visibility, .members }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .files, .name = "files", .aliases = &.{"manifest"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .sort, .no_recurse }, .option_value_overrides = &files_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .status, .name = "status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .after, .no_recurse }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = false, .cache_effect = .none },
+    .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .no_cache, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = false, .cache_effect = .none },
     .{ .command = .strings, .name = "strings", .aliases = &.{ "str", "literals" }, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .todos, .name = "todos", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .edits, .name = "edits", .aliases = &.{"edit-sites"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .rename, .name = "rename", .arguments = &rename_args, .options = &.{ .root, .no_cache, .format, .preview }, .outputs = &text_json, .access = .mutating, .requires_index = true, .server_available = false },
     .{ .command = .coverage, .name = "coverage", .aliases = &.{"cov"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
+    .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
     .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
     .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
     .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false, .cache_effect = .none },
@@ -328,6 +328,18 @@ pub fn parseOptionFlag(flag: []const u8) ?Option {
         for (desc.spellings) |spelling| if (std.mem.eql(u8, flag, spelling.flag)) return desc.option;
     }
     return null;
+}
+
+/// Options a client appends to every invocation as a matter of course
+/// (`-l 200 -j --no-cache`). A command that does not declare one must not turn
+/// a previously working call into a usage error: it is accepted, ignored, and
+/// reported on stderr. A *command-specific* flag on the wrong command stays a
+/// hard error, because it can only be a mistake.
+pub fn isGlobalClassOption(option: Option) bool {
+    return switch (option) {
+        .root, .no_cache, .verbosity, .depth, .limit, .format, .tests, .strict, .refs => true,
+        else => false,
+    };
 }
 
 pub fn hasOption(command: Command, option: Option) bool {

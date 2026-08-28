@@ -511,9 +511,13 @@ test "capability manifest publishes runnable option constraints and cache truth"
     const read = findNamedValue(root.get("commands").?.array.items, "read").?.object;
     try std.testing.expect(!read.get("requiresIndex").?.bool);
     try std.testing.expectEqualStrings("none", read.get("cacheEffect").?.string);
+    // `read` declares `no_cache` (clients append it to every argv) while its
+    // cache effect stays "none" — it never touches the cache either way.
+    var read_declares_no_cache = false;
     for (read.get("options").?.array.items) |option| {
-        try std.testing.expect(!std.mem.eql(u8, option.string, "no_cache"));
+        if (std.mem.eql(u8, option.string, "no_cache")) read_declares_no_cache = true;
     }
+    try std.testing.expect(read_declares_no_cache);
     const rename = findNamedValue(root.get("commands").?.array.items, "rename").?.object;
     try std.testing.expect(!rename.get("serverAvailable").?.bool);
 
