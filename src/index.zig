@@ -1163,8 +1163,13 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.resolution_reason = .typed_receiver;
             return;
         }
-        // Known receiver but no such member here (an inherited/mixin method, or
-        // an external type): fall through to the heuristic call match below.
+        // A receiver whose declared type names no project type at all is a
+        // builtin or third-party container (`List`, `Vec`, `std::vector`,
+        // `dict`): `items.add(...)` is that library's method, never a project
+        // one. Abstain — the global name match below would invent an edge.
+        if (idx.graph.files[from.file].language.isBuiltinContainer(type_name)) return;
+        // Known project type without that member (inherited or mixed in): fall
+        // through to the heuristic call match below.
     } else if (ref.write) {
         // Constructor keyword writes carry the constructed type as qualifier.
         // Resolve only against a member of that type; never global-name guess.
@@ -1233,6 +1238,23 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         // guessing a same-named local callable through the global fallback.
         return;
     }
+    // A bare qualifier naming a FIELD of the enclosing type resolves through
+    // that field's declared type: `products.add(...)` inside a class holding
+    // `Repository<Product> products`. Checked after every branch above, so a
+    // local, a type qualifier, an import binding and a package qualifier all
+    // shadow a field of the same name.
+    if (enclosingFieldType(idx, from, ref)) |type_name| {
+        const m = memberOfType(idx, from.file, type_name, ref.name);
+        if (m.id != invalid) {
+            ref.target = m.id;
+            ref.exact = m.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+            ref.resolution_reason = .typed_receiver;
+            return;
+        }
+        if (idx.graph.files[from.file].language.isBuiltinContainer(type_name)) return;
+    }
+
     // Heuristic fallback: a *call* whose receiver type we can't infer
     // (`svc.create_run()`, `self.planning_service.create_run()`, `Foo.bar()` on
     // an untracked value). Bind it by method name so instance/static dispatch is
@@ -1247,6 +1269,19 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
         }
     }
+}
+
+/// The declared type of a field named `ref.qualifier` on the type enclosing
+/// `from`. Answers only for a qualifier that heads its own chain and is not
+/// shadowed by a local: `o.store.Get()` reads `o`'s type, never the enclosing
+/// one, and a local `store` provably shadows a field `store`.
+fn enclosingFieldType(idx: *const Index, from: model.Symbol, ref: *const model.Reference) ?[]const u8 {
+    if (from.parent == invalid or ref.receiver_root.len != 0) return null;
+    if (isLocalBinding(from, ref.qualifier)) return null;
+    for (idx.graph.symbols[from.parent].bindings) |b| {
+        if (std.mem.eql(u8, b.name, ref.qualifier) and b.type_name.len > 0) return b.type_name;
+    }
+    return null;
 }
 
 /// A unique, top-level type/container named `name` in the reference's own file.
@@ -4225,6 +4260,81 @@ test "unknown receiver: a member call is a heuristic guess, a member read stays 
 
     // `obj.value` is a member *read*, so it must not inflate the field's fan-in.
     try testing.expectEqual(@as(usize, 0), idx.callersOf(value).len);
+}
+
+test "a field of the enclosing type gives a bare receiver its declared type (java)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Repo.java", .data =
+        \\package p;
+        \\public class Repo {
+        \\    public int add(String key) { return 1; }
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Svc.java", .data =
+        \\package p;
+        \\public class Svc {
+        \\    private final Repo<String> store;
+        \\    public int run() {
+        \\        return store.add("k");
+        \\    }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const add = qualifiedId(&idx, "Repo", "add").?;
+    const run = idx.graph.symbols[qualifiedId(&idx, "Svc", "run").?];
+    const ref = refByQual(run, "store", "add").?;
+    // `store` is a field of the enclosing class, so its declared type answers —
+    // an exact edge, not the global name guess this used to produce.
+    try testing.expectEqual(add, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+}
+
+test "a builtin-container receiver never binds to a same-named project method (java)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Repo.java", .data =
+        \\package p;
+        \\public class Repo {
+        \\    public void add(String key) {}
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Svc.java", .data =
+        \\package p;
+        \\public class Svc {
+        \\    public void run() {
+        \\        List<String> names = new ArrayList<>();
+        \\        names.add("x");
+        \\    }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const add = qualifiedId(&idx, "Repo", "add").?;
+    const run = idx.graph.symbols[qualifiedId(&idx, "Svc", "run").?];
+    const ref = refByQual(run, "names", "add").?;
+    // `names` is declared `List<…>`: a standard-library method, so the resolver
+    // abstains instead of manufacturing an edge to the project's `Repo.add`.
+    try testing.expectEqual(invalid, ref.target);
+    try testing.expectEqual(model.ResolutionStatus.unresolved, ref.resolution_status);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(add).len);
 }
 
 test "heuristic method target prefers a same-file method over a free function" {

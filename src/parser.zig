@@ -1068,7 +1068,7 @@ fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]Binding {
     var list: std.ArrayList(Binding) = .empty;
     defer list.deinit(ctx.gpa);
     if (params_open != sentinel) {
-        if (ctx.cfg.language.family() == .c)
+        if (ctx.cfg.language.declaresTypeBeforeName())
             try collectCParamBindings(ctx, params_open, &list)
         else
             try collectParamBindings(ctx, params_open, &list);
@@ -1132,6 +1132,12 @@ const c_decl_modifiers = KeywordSet.initComptime(.{
     .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
     .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
     .{"class"},  .{"auto"},     .{"typename"},
+    // Java/C# field and parameter modifiers. `public`/`private`/`protected`
+    // are also C++ access labels; a trailing `:` leaves the declarator nameless,
+    // so the label still yields no binding.
+    .{"public"}, .{"private"},  .{"protected"}, .{"final"},   .{"readonly"},
+    .{"internal"}, .{"abstract"}, .{"sealed"},  .{"override"}, .{"virtual"},
+    .{"partial"}, .{"synchronized"}, .{"transient"},
 });
 
 /// Words that open a statement rather than a declaration, so a run starting
@@ -1165,7 +1171,8 @@ fn endsCDeclarator(ctx: *const Ctx, i: u32, limit: u32) bool {
 /// project type, and its job is to shadow a same-named global. Anything without
 /// a name yields nothing, so an expression statement is not a declaration.
 fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
-    if (c_statement_keywords.has(ctx.textOf(start))) return null;
+    const head = ctx.textOf(start);
+    if (!c_decl_modifiers.has(head) and c_statement_keywords.has(head)) return null;
     var i = start;
     var scalar = false;
     while (i < limit and ctx.toks[i].kind == .identifier and
@@ -1180,9 +1187,7 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
         type_name = ctx.textOf(i);
         i += 1;
         if (i < limit and ctx.isPunct(i, '<')) {
-            const close = ctx.close[i];
-            if (close == sentinel or close >= limit) return null;
-            i = close + 1;
+            i = skipGenericArgs(ctx, i, limit) orelse return null;
         }
         if (i + 1 < limit and ctx.isPunct(i, ':') and ctx.isPunct(i + 1, ':')) {
             i += 2;
@@ -1211,6 +1216,29 @@ fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
     return if (endsCDeclarator(ctx, i, limit)) .{ .name = name, .type_name = "" } else null;
 }
 
+/// Index just past the `>` that closes the generic argument list opened at `i`.
+/// The bracket table matches only `()[]{}` — `<` is ambiguous with comparison —
+/// so this counts depth itself and gives up at a token that cannot appear
+/// inside a type argument list, leaving `a < b && c > d` unmatched.
+fn skipGenericArgs(ctx: *const Ctx, i: u32, limit: u32) ?u32 {
+    std.debug.assert(ctx.isPunct(i, '<'));
+    var depth: u32 = 0;
+    var j = i;
+    while (j < limit) : (j += 1) {
+        if (ctx.toks[j].kind != .punct) continue;
+        switch (ctx.ch(j)) {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if (depth == 0) return j + 1;
+            },
+            ';', '{', '}', '(', ')', '=' => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// Record `name -> Type` for each C/C++ parameter in `(...)`.
 fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Binding)) !void {
     const close = ctx.close[open];
@@ -1218,7 +1246,11 @@ fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Bindin
     var start = open + 1;
     var i = start;
     while (i < close) {
-        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '<')) {
+        if (ctx.isPunct(i, '<')) {
+            i = skipGenericArgs(ctx, i, close) orelse i + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
             const inner = ctx.close[i];
             i = if (inner == sentinel or inner >= close) i + 1 else inner + 1;
             continue;
@@ -1252,6 +1284,16 @@ fn goShortDeclName(ctx: *const Ctx, i: u32, hi: u32, lo: u32) bool {
     var j = i + 1;
     while (j + 1 < hi and ctx.isPunct(j, ',') and ctx.toks[j + 1].kind == .identifier) j += 2;
     return j + 1 < hi and ctx.isPunct(j, ':') and ctx.isPunct(j + 1, '=');
+}
+
+/// Whether `name: Type` at statement start declares a binding in this language.
+/// Excludes the languages whose object/table literals spell `key: value` the
+/// same way (JS/TS, Lua, Ruby), where it would invent bindings from data.
+fn annotatesTypeAfterName(lang: language.Language) bool {
+    return switch (lang) {
+        .rust, .python, .zig => true,
+        else => false,
+    };
 }
 
 fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
@@ -1299,6 +1341,28 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
         const single = ctx.isPunct(i + 1, ':');
         const ty = if (single) typeFromRhs(ctx, i + 3, hi) orelse "" else "";
         return .{ .name = ctx.textOf(i), .type_name = ty };
+    }
+    // Java/C# write `[modifiers] Type name` — the type precedes the name, so the
+    // assignment rules below never see the declared name. A plain assignment
+    // yields nothing here and still falls through to them.
+    if (ctx.cfg.language.declaresTypeBeforeName()) {
+        const at_declarator_start = i == lo or ctx.toks[i - 1].line != t.line or
+            ctx.isPunct(i - 1, '(') or ctx.isPunct(i - 1, ';') or
+            ctx.isPunct(i - 1, '{') or ctx.isPunct(i - 1, '}');
+        if (at_declarator_start) {
+            if (cDeclarator(ctx, i, hi)) |b| return b;
+        }
+    }
+    // Annotated declaration `name: Type` — a struct/class field or an annotated
+    // local. Restricted to languages with no `key: value` literal at statement
+    // level, and to a type written as an identifier right after the colon, so a
+    // mapping entry is never read as a declaration. A leading visibility word
+    // (`pub name: Type`) keeps the name off the line start.
+    if (annotatesTypeAfterName(ctx.cfg.language) and ctx.isPunct(i + 1, ':') and
+        i + 2 < hi and ctx.toks[i + 2].kind == .identifier and
+        (i == lo or ctx.toks[i - 1].line != t.line or ctx.identEql(i - 1, "pub")))
+    {
+        if (typeFromChain(ctx, i + 2, hi)) |ty| return .{ .name = ctx.textOf(i), .type_name = ty };
     }
     const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
     if (!first_on_line) return null;
@@ -2053,6 +2117,9 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         .exported = true,
         .parent_local = parent,
         .refs = &.{},
+        // Field types only: `self.field.m()` and a bare `field.m()` need the
+        // field's declared type to resolve.
+        .bindings = try collectMemberBindings(ctx, open + 1, close),
     });
     // C++ class/struct bodies hold methods; C# class/struct/interface bodies do
     // too. Parse them as members (enums do not hold methods).
@@ -2062,6 +2129,25 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
         try parseCppMembers(ctx, open + 1, close, my_idx);
     }
     return close + 1;
+}
+
+/// Field bindings declared directly in a class/struct body: `[modifiers] Type
+/// name;`. Every bracketed run is skipped, so a parameter list and a method
+/// body cannot leak a local into the type's field table.
+fn collectMemberBindings(ctx: *Ctx, lo: u32, hi: u32) ![]Binding {
+    var list: std.ArrayList(Binding) = .empty;
+    defer list.deinit(ctx.gpa);
+    var i = lo;
+    while (i < hi) {
+        if (ctx.isPunct(i, '{') or ctx.isPunct(i, '(') or ctx.isPunct(i, '[')) {
+            const next = skipBracket(ctx, i);
+            i = if (next > i) next else i + 1;
+            continue;
+        }
+        if (detectBinding(ctx, i, hi, lo)) |b| try list.append(ctx.gpa, b);
+        i += 1;
+    }
+    return ctx.arena.dupe(Binding, list.items);
 }
 
 /// Parse the members of a C++ class/struct body [lo, hi): method definitions and
@@ -4084,6 +4170,9 @@ fn parseRustRecord(ctx: *Ctx, doc_i: u32, kw_i: u32, hi: u32, parent: ?u32, expo
         .exported = exported,
         .parent_local = parent,
         .refs = &.{},
+        // Field types only: a record body declares no calls, and `self.f.m()`
+        // needs `f`'s declared type to resolve.
+        .bindings = try collectBindings(ctx, sentinel, open + 1, close),
     });
     // A trait body holds method signatures and default methods.
     if (kind == .interface) try parseRustScope(ctx, open + 1, close, my, true);
@@ -6851,6 +6940,43 @@ test "java: package, imports, class, methods, and body refs" {
     try testing.expect(tally.parent_local != null);
     try testing.expect(hasCallRef(tally, "add"));
     try testing.expectEqual(SymbolKind.method, findSym(out.items, "add").?.kind);
+}
+
+test "java: a parameter and a generic field bind name -> declared type" {
+    const src =
+        \\public class Svc {
+        \\    private final Repo<Product> store;
+        \\    private int count = 0;
+        \\    public void register(Product product, String key) {
+        \\        store.add(key, product);
+        \\    }
+        \\}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    // Java writes the type before the name, so the parameter binds
+    // `product -> Product` (it used to bind the *type* as the name).
+    const register = findSym(out.items, "register").?;
+    try testing.expectEqualStrings("Product", bindingType(register.bindings, "product").?);
+    try testing.expectEqualStrings("String", bindingType(register.bindings, "key").?);
+    // The class body carries its field types, generic arguments skipped.
+    const svc = findSym(out.items, "Svc").?;
+    try testing.expectEqualStrings("Repo", bindingType(svc.bindings, "store").?);
+    try testing.expectEqualStrings("int", bindingType(svc.bindings, "count").?);
+}
+
+test "rust: a record body carries its field types as bindings" {
+    const src =
+        \\pub struct Ledger {
+        \\    pub entries: Vec<Entry>,
+        \\    owner: Account,
+        \\}
+    ;
+    var out = try parseForTest(src, .rust);
+    defer freeRefs(&out);
+    const ledger = findSym(out.items, "Ledger").?;
+    try testing.expectEqualStrings("Vec", bindingType(ledger.bindings, "entries").?);
+    try testing.expectEqualStrings("Account", bindingType(ledger.bindings, "owner").?);
 }
 
 test "java: interface, enum, and record are their own kinds" {
