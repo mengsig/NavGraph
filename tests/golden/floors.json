@@ -10,7 +10,7 @@
     { "language": "python", "def_precision_bp": 9668, "def_recall_bp": 9114, "edge_precision_bp": 9076, "edge_recall_bp": 8550, "exact_agreement_bp": 7542, "site_recall_bp": 8581, "site_precision_bp": 10000 },
     { "language": "ruby", "def_precision_bp": 9746, "def_recall_bp": 9277, "edge_precision_bp": 10000, "edge_recall_bp": 7384, "exact_agreement_bp": 8125, "site_recall_bp": 7462, "site_precision_bp": 10000 },
     { "language": "rust", "def_precision_bp": 9864, "def_recall_bp": 8588, "edge_precision_bp": 8431, "edge_recall_bp": 5119, "exact_agreement_bp": 8372, "site_recall_bp": 4000, "site_precision_bp": 9795 },
-    { "language": "typescript", "def_precision_bp": 9178, "def_recall_bp": 5677, "edge_precision_bp": 10000, "edge_recall_bp": 4642, "exact_agreement_bp": 8461, "site_recall_bp": 4406, "site_precision_bp": 10000 },
+    { "language": "typescript", "def_precision_bp": 9220, "def_recall_bp": 5819, "edge_precision_bp": 10000, "edge_recall_bp": 4642, "exact_agreement_bp": 8461, "site_recall_bp": 4406, "site_precision_bp": 10000 },
     { "language": "zig", "def_precision_bp": 10000, "def_recall_bp": 7291, "edge_precision_bp": 10000, "edge_recall_bp": 6489, "exact_agreement_bp": 6721, "site_recall_bp": 5078, "site_precision_bp": 10000 }
   ]
 }

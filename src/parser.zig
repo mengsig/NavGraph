@@ -2844,6 +2844,31 @@ fn parseJsBinding(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exp
     return parseJsPlainDeclarators(ctx, start_i, name_i, semi_i, hi, parent, exported);
 }
 
+/// Index of the comma that ends the declarator starting at `from`, or
+/// `sentinel`. Skips bracketed runs like `findNext`, and additionally generic
+/// argument lists: `const cache: Map<string, number>` is ONE declarator, and
+/// reading its type argument's comma as a separator emitted `number` as a
+/// top-level variable. `skipGenericArgs` gives up on a token no type argument
+/// list may contain, so `a < b, c` still splits on its comma.
+fn findDeclaratorComma(ctx: *const Ctx, from: u32, hi: u32) u32 {
+    var i = from;
+    while (i < hi) {
+        if (ctx.isPunct(i, ',')) return i;
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '{') or ctx.isPunct(i, '[')) {
+            i = skipBracket(ctx, i);
+            continue;
+        }
+        if (ctx.isPunct(i, '<')) {
+            if (skipGenericArgs(ctx, i, hi)) |after| {
+                i = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    return sentinel;
+}
+
 /// Emit one `.variable` symbol per comma-separated declarator in a plain
 /// `const`/`let`/`var` statement (`const a = f, b = g;`), each scoped to just
 /// its own `NAME [= INIT]` clause. A shared span across declarators let
@@ -2853,7 +2878,7 @@ fn parseJsPlainDeclarators(ctx: *Ctx, start_i: u32, first_name_i: u32, semi_i: u
     var name_i = first_name_i;
     var first = true;
     while (true) {
-        const comma_i = findNext(ctx, name_i + 1, stmt_end, ',');
+        const comma_i = findDeclaratorComma(ctx, name_i + 1, stmt_end);
         // A middle declarator's span stops just before its comma; the last one
         // spans through the statement's `;`, matching a single-declarator span.
         const span_end = if (comma_i != sentinel)

@@ -2879,6 +2879,68 @@ test "js: a multi-declarator alias binds each name to its own initializer" {
     try testing.expect(call_b.exact);
 }
 
+test "ts: a generic type argument is not a declarator boundary" {
+    // Regression (merge-gate F2): the declarator split scanned for a comma with
+    // `findNext`, which skips `()[]{}` but not `<>`. Every type argument after
+    // a comma was emitted as a top-level `.variable` — six invented
+    // definitions in the seven lines below, one of them colliding with a real
+    // function and so a live candidate for the global-name fallback.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "n.ts", .data =
+        \\export function handler(): number { return 1; }
+        \\function first(): number { return 1; }
+        \\function second(): number { return 2; }
+        \\const cache: Map<string, number> = new Map();
+        \\const registry: Map<string, handler> = new Map();
+        \\const nested: Map<string, Map<number, boolean>> = new Map();
+        \\const table: Record<string, string[]> = {};
+        \\const svc = new Service<Req, Res>();
+        \\const a = first, b = second;
+        \\const cmp = 1 < 2, after = 4;
+        \\const withDefaults = (x = 1, y = 2) => x + y;
+        \\const [d1, d2] = [1, 2];
+        \\const { k1, k2 } = table;
+        \\class Service<A, B> {}
+        \\type Req = {};
+        \\type Res = {};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // No type argument became a definition, and the real type keeps its
+    // identity: `Res` is the `type` alias, never a shadowing variable.
+    for ([_][]const u8{ "number", "boolean", "string" }) |phantom| {
+        try testing.expectEqual(@as(usize, 0), idx.lookup(phantom).len);
+    }
+    try testing.expectEqual(@as(usize, 1), idx.lookup("Res").len);
+    try testing.expectEqual(@as(usize, 1), idx.lookup("handler").len);
+    try testing.expectEqual(model.SymbolKind.function, idx.graph.symbols[idx.lookup("handler")[0]].kind);
+    for ([_][]const u8{ "Map", "Record" }) |uninvented| {
+        try testing.expectEqual(@as(usize, 0), idx.lookup(uninvented).len);
+    }
+    // Commas the scan must also not split on: an arrow's default parameter
+    // values, and a destructuring pattern's element list.
+    for ([_][]const u8{ "y", "d2", "k2" }) |inside_brackets| {
+        try testing.expectEqual(@as(usize, 0), idx.lookup(inside_brackets).len);
+    }
+
+    // A real multi-declarator still splits, generics or no — including one
+    // whose `<` is a comparison, where the generic scan must give up.
+    for ([_][]const u8{ "a", "b", "cmp", "after", "cache", "registry", "nested", "table", "svc" }) |declared| {
+        try testing.expectEqual(@as(usize, 1), idx.lookup(declared).len);
+    }
+    const first_fn = idx.lookup("first")[0];
+    const second_fn = idx.lookup("second")[0];
+    try testing.expect(first_fn != second_fn);
+}
+
 test "an express sub-router mount keeps its router handler" {
     // Regression (F2): `app.use('/admin', adminRouter)` mounts a router held in
     // a `const`; deleting calls to values dropped the handler entirely.

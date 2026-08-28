@@ -185,3 +185,18 @@ export async function trickyRun(): Promise<number> {
     BaseLedger.created
   );
 }
+
+// Multi-argument generic annotations: the comma inside `<...>` separates type
+// arguments, not declarators. A declarator scan blind to `<>` reads it as a
+// separator and invents a top-level variable named after every type argument
+// after the comma. Declared `var` so these entries measure that shape alone
+// and not the separate const-reported-as-var kind gap.
+var roleIndex: Map<string, number> = new Map();
+var roleNames: Record<string, string[]> = {};
+var nestedIndex: Map<string, Map<number, boolean>> = new Map();
+
+/** Reads all three so none is dead; references no project symbol, so the
+ * block adds definitions to measure and no edges. */
+export function indexRoles(): number {
+  return roleIndex.size + Object.keys(roleNames).length + nestedIndex.size;
+}
