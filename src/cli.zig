@@ -1328,10 +1328,16 @@ test "usageCommand renders concise registry-derived argument and option help" {
     defer aw.deinit();
     try testing.expect(try usageCommand(&aw.writer, "read"));
     const out = aw.written();
+    try testing.expect(std.mem.startsWith(u8, out, "NavGraph command: read\nPrint a bounded, numbered range of source lines.\n\n"));
     try testing.expect(std.mem.indexOf(u8, out, "USAGE: navgraph read <source> [options]") != null);
     try testing.expect(std.mem.indexOf(u8, out, "-l, --limit <N>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--after <v1:N>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") == null);
+
+    const usage_at = std.mem.indexOf(u8, out, "USAGE: navgraph read").?;
+    const example_at = std.mem.indexOf(u8, out, "EXAMPLE: navgraph read src/parser.zig:1-40").?;
+    const aliases_at = std.mem.indexOf(u8, out, "ALIASES: cat").?;
+    try testing.expect(usage_at < example_at and example_at < aliases_at);
 
     const capabilities_start = aw.written().len;
     try testing.expect(try usageCommand(&aw.writer, "capabilities"));

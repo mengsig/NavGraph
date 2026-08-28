@@ -48,7 +48,7 @@ Find a symbol:
 ```
 $ navgraph search usageCommand
 fn usageCommand (w: *std.Io.Writer, name: []const u8) !bool  src/cli.zig:235-329
-test usageCommand renders concise registry-derived argument and option help  src/cli.zig:1323-1343
+test usageCommand renders concise registry-derived argument and option help  src/cli.zig:1323-1349
 ```
 
 See who calls it:
@@ -56,7 +56,7 @@ See who calls it:
 ```
 $ navgraph callers usageCommand
 fn usageCommand (w: *std.Io.Writer, name: []const u8) !bool  src/cli.zig:235-329
-  test usageCommand renders concise registry-derived argument and option help  src/cli.zig:1323-1343  ↳:1329,1337
+  test usageCommand renders concise registry-derived argument and option help  src/cli.zig:1323-1349  ↳:1329,1343
   fn main (init: std.process.Init) !void  src/main.zig:21-156  ↳:72
 ```
 
