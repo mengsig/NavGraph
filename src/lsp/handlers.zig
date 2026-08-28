@@ -1292,6 +1292,27 @@ test "an invalid tests scope is rejected, not silently ignored" {
     try testing.expect((try resultOf(ok)).object.get("summary") != null);
 }
 
+test "the released version agrees across serverInfo, navgraph/status, and the manifest (F4)" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+
+    var init_res = try ts.responseFor(1);
+    defer init_res.deinit();
+    const server_info = (try resultOf(init_res)).object.get("serverInfo").?.object;
+    try testing.expectEqualStrings(capabilities.product_version, server_info.get("version").?.string);
+
+    var status_res = try ts.request(2,
+        \\{"jsonrpc":"2.0","id":2,"method":"navgraph/status","params":{}}
+    );
+    defer status_res.deinit();
+    try testing.expectEqualStrings(capabilities.product_version, (try resultOf(status_res)).object.get("version").?.string);
+
+    // A release binary reporting this placeholder is the exact defect F4
+    // found: build.zig.zon's version was never bumped from its default, and
+    // the release workflow gates the tag on that same value.
+    try testing.expect(!std.mem.eql(u8, capabilities.product_version, "0.0.0"));
+}
+
 test "initialize defaults to utf-16 when the client offers no encoding" {
     const ts = try TestServer.init(testing.allocator, testing.io, &project);
     defer ts.deinit();

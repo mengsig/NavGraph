@@ -8,8 +8,33 @@ permissions:
   contents: write
 
 jobs:
+  # build.zig.zon's `.version` is the single source of truth for the version
+  # every surface reports (--version, navgraph/status, LSP serverInfo — see
+  # build.zig). A tag that drifts from it would publish a binary that
+  # misreports its own release (coldstart review F4).
+  verify-tag:
+    name: verify tag matches build.zig.zon version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ${{ github.ref_name }} == v<zon version>
+        run: |
+          set -euo pipefail
+          zon_version=$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [ -z "$zon_version" ]; then
+            echo "could not read .version from build.zig.zon" >&2
+            exit 1
+          fi
+          expected="v${zon_version}"
+          if [ "${{ github.ref_name }}" != "$expected" ]; then
+            echo "tag ${{ github.ref_name }} does not match build.zig.zon (expected $expected)" >&2
+            exit 1
+          fi
+
   build:
     name: build (${{ matrix.target }})
+    needs: verify-tag
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,6 +47,12 @@ jobs:
         with:
           version: 0.16.0
           cache-key: release-${{ matrix.target }}
+
+      # Native (host-target) tests, once per matrix leg: cheap, and it keeps
+      # each leg's binary provably built from a tree that passed (F5) without
+      # a separate gate job to fan the result back out to the matrix.
+      - name: Test
+        run: zig build test --summary all
 
       # Zig cross-compiles every target from one host — no macOS runner needed
       # (the binary is pure Zig/std, no Objective-C framework dependency).

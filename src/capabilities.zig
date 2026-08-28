@@ -12,7 +12,9 @@ const registry = @import("command_registry.zig");
 const language = @import("language.zig");
 const agent_api = @import("agent_api.zig");
 
-pub const product_version = "0.1.0";
+/// The release version, read from `build.zig.zon` at build time. Single source
+/// of truth: the release workflow gates the pushed tag on that same value.
+pub const product_version = build_options.version;
 pub const capability_schema = "navgraph.capabilities.v1";
 pub const capability_schema_version: u32 = 1;
 pub const agent_protocol_version = "1.0";

@@ -70,6 +70,9 @@ pub fn build(b: *std.Build) void {
     // build graph invoke git (which would be non-hermetic and fail in source
     // archives). The source fingerprint remains authoritative when omitted.
     build_opts.addOption([]const u8, "revision", b.option([]const u8, "revision", "source revision embedded in capability metadata") orelse "");
+    // Read the release version from the manifest so `capabilities`, `--version`
+    // and the LSP's serverInfo cannot drift from what the release tag gates on.
+    build_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
     const build_opts_mod = build_opts.createModule();
     mod.addImport("build_options", build_opts_mod);
 

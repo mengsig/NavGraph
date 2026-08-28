@@ -5,6 +5,8 @@ All notable changes to NavGraph are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-28
+
 ### Added
 
 - **`navgraph lsp`** — a resident editor server: a standard LSP subset
@@ -13,12 +15,15 @@ All notable changes to NavGraph are documented here. Format loosely follows
   (`status`, `symbolAt`, `blast`, `search`, `grep`, `callers`, `calls`,
   `rescan`, `neighbors`, `path`, `outline`, `hot`, `unused`, `diff`, `routes`,
   `events`, `imports`, `importers`, `graph`). The whole graph stays in memory;
-  an edit re-indexes in single-digit milliseconds and queries answer in well
-  under a millisecond. See [`docs/lsp.md`](docs/lsp.md) for the full protocol.
-- `navgraph --version` / `-V` / `version`, and the version now surfaces in
-  `navgraph/status` and the LSP `initialize` `serverInfo`.
+  an edit re-indexes in tens of milliseconds or less and queries answer in
+  single-digit milliseconds. See [`docs/lsp.md`](docs/lsp.md) for the protocol.
+- The release version now comes from `build.zig.zon` instead of a second
+  hardcoded copy, so `navgraph capabilities` (aliases `version`, `--version`),
+  `navgraph/status` and the LSP `initialize` `serverInfo` cannot disagree with
+  the tag the release workflow gates on.
 - A tagged (`v*`) push now cross-compiles and publishes `ReleaseFast`
-  binaries for x86_64/aarch64 Linux and macOS as GitHub release assets.
+  binaries for x86_64/aarch64 Linux and macOS as GitHub release assets, after
+  a tag-vs-version check and the full test suite both pass.
 
 ### Changed
 
