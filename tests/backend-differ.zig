@@ -1014,3 +1014,72 @@ test "reference attribution stays linear in one file's definition count" {
     const big_ms = try perfCorpusMs(gpa, perf_defs);
     try testing.expect(big_ms <= 5 * small_ms + 50);
 }
+
+// ---------------------------------------------------------------------------
+// Ownership
+// ---------------------------------------------------------------------------
+
+fn parentName(idx: *const index.Index, sym: model.Symbol) []const u8 {
+    return if (sym.parent == model.invalid_symbol) "" else idx.graph.symbols[sym.parent].name;
+}
+
+fn symbolNamed(idx: *const index.Index, name: []const u8) ?model.Symbol {
+    for (idx.graph.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, name)) return sym;
+    }
+    return null;
+}
+
+test "a container declared inside a function belongs to it; an inline object type owns nothing" {
+    // F5: `resolveParents` claimed to match the heuristic and did not — a class
+    // declared in a function came back parentless, so `hierarchy` and the `def`
+    // path rendered it as a top-level type.
+    // F11: the anonymous-inline-object-type exclusion in `dropUnowned` was
+    // correct but untested; a parentless member would let a bare name in some
+    // other body bind to it.
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\def free():
+        \\    class Local:
+        \\        def m(self):
+        \\            return 1
+        \\    return Local
+        \\
+        \\def outer():
+        \\    def inner():
+        \\        return 1
+        \\    return inner()
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.ts", .data =
+        \\export class Widget {
+        \\  render(props: { title: string; hidden: boolean }): void {}
+        \\}
+        \\
+        \\export type Shape = { side: number };
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var heuristic = try index.build(gpa, io, root, false, .heuristic);
+    defer heuristic.deinit();
+    var ts = try index.build(gpa, io, root, false, .tree_sitter);
+    defer ts.deinit();
+
+    // F5: the class takes the function as its parent, in both backends…
+    try testing.expectEqualStrings("free", parentName(&ts, symbolNamed(&ts, "Local").?));
+    try testing.expectEqualStrings("free", parentName(&heuristic, symbolNamed(&heuristic, "Local").?));
+    // …while a nested *function* stays parentless and keeps resolving by name.
+    try testing.expectEqualStrings("", parentName(&ts, symbolNamed(&ts, "inner").?));
+    try testing.expectEqualStrings("", parentName(&heuristic, symbolNamed(&heuristic, "inner").?));
+
+    // F11: members of an inline object type in a signature belong to no named
+    // type and are dropped; a named type alias's members are kept.
+    try testing.expectEqual(@as(?model.Symbol, null), symbolNamed(&ts, "title"));
+    try testing.expectEqual(@as(?model.Symbol, null), symbolNamed(&ts, "hidden"));
+    const side = symbolNamed(&ts, "side") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("Shape", parentName(&ts, side));
+}

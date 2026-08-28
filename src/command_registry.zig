@@ -314,7 +314,7 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .coverage, .name = "coverage", .aliases = &.{"cov"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
     .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
-    .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
+    .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache, .backend }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
     .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false, .cache_effect = .none },
 };
 

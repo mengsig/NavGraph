@@ -523,8 +523,16 @@ fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParsedFile
 /// file tokenized cleanly. Kept apart from the stderr sink so tests cover the
 /// message and its assertions without writing to the test binary's stderr.
 fn writeParseHealthWarning(w: *std.Io.Writer, rel_path: []const u8, health: model.ParseHealth) std.Io.Writer.Error!void {
-    const from = health.desync_from orelse return;
     std.debug.assert(rel_path.len > 0);
+    // A silent substitution means `--backend tree-sitter` quietly returned
+    // heuristic symbols for this file and the user cannot tell which.
+    if (health.tree_sitter_fallback) {
+        try w.print(
+            "navgraph: parse-health: {s}: the grammar could not parse this file cleanly — indexed with the heuristic scanner instead\n",
+            .{rel_path},
+        );
+    }
+    const from = health.desync_from orelse return;
     std.debug.assert(health.desync_to >= from);
     try w.print(
         "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
@@ -540,7 +548,7 @@ fn writeParseHealthWarning(w: *std.Io.Writer, rel_path: []const u8, health: mode
 /// `parse_health` JSON field.
 fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
     if (builtin.is_test) return;
-    if (health.desync_from == null) return;
+    if (health.desync_from == null and !health.tree_sitter_fallback) return;
     // Diagnostic only, and the authoritative data is on the index, so a path too
     // long for the buffer is printed truncated rather than dropped.
     var buf: [4096]u8 = undefined;
@@ -3498,6 +3506,17 @@ test "the parse-health warning names the file and the desynced line range" {
     var clean: std.Io.Writer = .fixed(&clean_buf);
     try writeParseHealthWarning(&clean, "src/ok.zig", .{});
     try testing.expectEqual(@as(usize, 0), clean.buffered().len);
+
+    // Regression (F13): a grammar that could not parse a file cleanly hands it
+    // to the heuristic scanner. Without a diagnostic, `--backend tree-sitter`
+    // silently returns heuristic symbols for some files and the user cannot
+    // tell which.
+    var fell_buf: [256]u8 = undefined;
+    var fell: std.Io.Writer = .fixed(&fell_buf);
+    try writeParseHealthWarning(&fell, "src/jsx.ts", .{ .backend = .heuristic, .tree_sitter_fallback = true });
+    const note = fell.buffered();
+    try testing.expect(std.mem.indexOf(u8, note, "src/jsx.ts") != null);
+    try testing.expect(std.mem.indexOf(u8, note, "heuristic scanner") != null);
 }
 
 test "the precomputed Java supertype table records declared bases only" {

@@ -107,6 +107,7 @@ extern fn ts_query_cursor_new() ?*TSQueryCursor;
 extern fn ts_query_cursor_delete(self: *TSQueryCursor) void;
 extern fn ts_query_cursor_exec(self: *TSQueryCursor, q: *const TSQuery, node: TSNode) void;
 extern fn ts_query_cursor_next_match(self: *TSQueryCursor, out: *TSQueryMatch) bool;
+extern fn ts_query_cursor_did_exceed_match_limit(self: *const TSQueryCursor) bool;
 extern fn ts_language_abi_version(self: *const TSLanguage) u32;
 
 // Generated grammars. Referenced only under a comptime-false-eliminable branch,
@@ -416,6 +417,10 @@ pub fn parse(
     var defs: std.ArrayList(Def) = .empty;
     defer defs.deinit(gpa);
     try collectDefs(c, cursor, gpa, source, lang, root, &defs);
+    // A cursor that hit its match limit dropped matches, which would present a
+    // silently short symbol set as a complete one — the same failure the
+    // ERROR-node rule exists to prevent, so it takes the same whole-file exit.
+    if (ts_query_cursor_did_exceed_match_limit(cursor)) return .error_node;
     sortDefs(defs.items);
 
     var by_node: std.AutoHashMapUnmanaged(usize, u32) = .empty;
@@ -447,7 +452,9 @@ pub fn parse(
         });
     }
     try attachRefs(c, cursor, gpa, arena, source, root, defs.items, out.items[base..]);
+    if (ts_query_cursor_did_exceed_match_limit(cursor)) return .error_node;
     try attachBindings(c, cursor, gpa, arena, source, root, defs.items, out.items[base..]);
+    if (ts_query_cursor_did_exceed_match_limit(cursor)) return .error_node;
     return .extracted;
 }
 
@@ -470,11 +477,12 @@ fn sortDefs(defs: []Def) void {
 /// Fill `nearest` (the innermost enclosing definition of any kind) and
 /// `parent_local`.
 ///
-/// `parent_local` deliberately matches the heuristic backend: a definition is
-/// owned by an enclosing *container* (class/struct/interface/enum), never by an
-/// enclosing function, so a nested helper stays parentless and keeps resolving
-/// by its bare name. A `self.x` field is the exception — it belongs to the class
-/// it is written on, not to the constructor that assigns it.
+/// `parent_local` matches the heuristic backend: a definition is owned by an
+/// enclosing *container* (class/struct/interface/enum), so a nested helper
+/// function stays parentless and keeps resolving by its bare name. Two
+/// exceptions, both the heuristic's too: a `self.x` field belongs to the class
+/// it is written on rather than the constructor that assigns it, and a
+/// container declared inside a function belongs to that function.
 fn resolveParents(by_node: *const std.AutoHashMapUnmanaged(usize, u32), defs: []Def) void {
     for (defs) |*d| d.nearest = nearestDef(by_node, d.node);
     for (defs) |*d| {
@@ -483,7 +491,8 @@ fn resolveParents(by_node: *const std.AutoHashMapUnmanaged(usize, u32), defs: []
             continue;
         }
         const near = d.nearest orelse continue;
-        d.parent_local = if (isContainerKind(defs[near].kind)) near else null;
+        d.parent_local = if (isContainerKind(defs[near].kind) or
+            (isContainerKind(d.kind) and isCallableKind(defs[near].kind))) near else null;
     }
 }
 
@@ -1297,4 +1306,43 @@ fn attachBindings(
 /// the callable that declares it.
 fn ownerOfSignature(defs: []const Def, offset: u32) ?u32 {
     return enclosingCallable(defs, offset, .with_signature);
+}
+
+extern fn ts_query_cursor_set_match_limit(self: *TSQueryCursor, limit: u32) void;
+
+test "a cursor that hit its match limit falls back instead of returning a short set" {
+    // F15. tree-sitter's default match limit is effectively unlimited, so the
+    // overflow has to be forced. A dropped match yields a silently INCOMPLETE
+    // symbol set, which is what the ERROR-node rule exists to prevent — so it
+    // takes the same whole-file exit.
+    if (!build_options.ts_python) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    // A decorated method wrapping a nested function keeps several patterns
+    // matching at once, which is what a small capture-list pool drops.
+    const source =
+        \\class A:
+        \\    @deco
+        \\    def m(self):
+        \\        def inner():
+        \\            return self.a.b.c.d()
+        \\        return inner()
+    ;
+
+    var out: std.ArrayList(ParsedSymbol) = .empty;
+    defer out.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var ok_reg = Registry.init(gpa);
+    defer ok_reg.deinit();
+    try std.testing.expectEqual(Outcome.extracted, try parse(&ok_reg, gpa, arena.allocator(), source, .python, &out));
+    try std.testing.expect(out.items.len > 0);
+
+    // The limit is set on a fresh registry: the pool only refuses a capture
+    // list it has not already grown to hold.
+    var tight = Registry.init(gpa);
+    defer tight.deinit();
+    ts_query_cursor_set_match_limit(try tight.queryCursor(), 1);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(Outcome.error_node, try parse(&tight, gpa, arena.allocator(), source, .python, &out));
 }
