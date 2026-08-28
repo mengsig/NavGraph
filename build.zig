@@ -332,10 +332,13 @@ fn selectGrammars(b: *std.Build) Grammars {
         } else if (std.mem.eql(u8, name, "tsx")) {
             sel.tsx = true;
         } else {
-            std.debug.panic(
-                "-Dtree-sitter: unknown grammar '{s}' (expected all, none, or a comma list of python,typescript,tsx)",
+            // A clean build error, not a panic: the operator mistyped a build
+            // option and does not need a Zig stack trace to learn that.
+            std.debug.print(
+                "build: -Dtree-sitter: unknown grammar '{s}' (expected all, none, or a comma list of python,typescript,tsx)\n",
                 .{name},
             );
+            std.process.exit(1);
         }
     }
     return sel;

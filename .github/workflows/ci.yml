@@ -1,9 +1,13 @@
-name: Backends
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# Read-only: nothing here writes to the repository or publishes anything.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -11,8 +15,9 @@ concurrency:
 
 jobs:
   test:
-    name: test (${{ matrix.os }}, tree-sitter=${{ matrix.tree-sitter }})
+    name: build + test (${{ matrix.os }}, tree-sitter=${{ matrix.tree-sitter }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -35,4 +40,11 @@ jobs:
         run: zig build test -Dtree-sitter=${{ matrix.tree-sitter }} --summary all
 
       - name: Backend differ
+        if: matrix.tree-sitter != 'none'
         run: zig build differ -Dtree-sitter=${{ matrix.tree-sitter }} --summary all
+
+      # Every differ case skips without a grammar. Run it anyway so the suite
+      # still has to compile in that configuration — it is not backend coverage.
+      - name: Backend differ compiles with no grammar linked
+        if: matrix.tree-sitter == 'none'
+        run: zig build differ -Dtree-sitter=none --summary all

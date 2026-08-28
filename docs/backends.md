@@ -42,6 +42,16 @@ change what `auto` extracts.
   links no grammar at all (`-Dtree-sitter=none`), rather than silently serving
   heuristic output under a tree-sitter flag.
 
+`serve` accepts it too, and the session reuses the choice across reloads.
+
+The on-disk cache is keyed on the backend that produced each entry, so
+`--backend` decides the same thing warm as it does with `--no-cache`. A cached
+entry answers only when the backend owning that file under the current
+`--backend` produced it; a file the grammar could not parse cleanly was
+heuristic-parsed *on purpose*, so its entry answers for `tree-sitter` and not
+for `heuristic`. Switching backends therefore costs one full re-parse and
+rewrites the cache (measured below).
+
 No LSP server exists on this branch yet. When one is added, the intended hook
 is an `initializationOptions.backend` field mirroring this same enum — `--backend`
 and the hook should share `Choice.fromName` rather than duplicating the parse.
@@ -61,6 +71,49 @@ ABI — propagate as errors rather than degrading into quietly different output;
 only an ERROR *node* (a parse that succeeded but is incomplete) triggers the
 heuristic fallback.
 
+The substitution is also reported: `navgraph: parse-health: <file>: the grammar
+could not parse this file cleanly — indexed with the heuristic scanner instead`.
+A user who asked for `--backend tree-sitter` can tell which files did not get
+it. A query cursor that exceeds its match limit takes the same whole-file exit —
+a dropped match would present a silently short symbol set as a complete one.
+
+### Build identity
+
+`capabilities -j` publishes the linked grammars (`build.grammars`), and the
+`--backend` enum omits `tree-sitter` on a build that links none — the manifest
+is the agent contract, so it must not advertise a value the binary refuses. The
+grammar selection is folded into the source fingerprint, so `-Dtree-sitter=none`
+and `-Dtree-sitter=all` have distinct `buildId`s and cannot share a cache.
+
+### Visibility and ownership
+
+The two backends agree on what is public API, which the differ asserts symbol
+for symbol. Python uses the leading-underscore rule; TypeScript uses the
+`export` keyword, and an `export` does not reach through a class, interface or
+enum body — `export class C { m() {} }` exports `C`, not `C.m`.
+
+A member named twice is one symbol: a field declared and then assigned on
+`this`/`self`, or an overload signature standing next to its implementation. A
+`get`/`set` pair is two real members and stays two. A container declared inside
+a function belongs to that function; a nested helper function stays parentless
+and keeps resolving by its bare name.
+
+### Reference chain heads
+
+`model.Reference.receiver_root` records the identifier heading a receiver chain
+(`o.store.Get()` -> `o`), which is how the resolver tells a field access from a
+bare module qualifier. The tree-sitter backend derives it from the tree rather
+than from a capture — a capture would need one pattern per chain depth — and
+the differ asserts it matches the heuristic scanner's for every shared
+reference.
+
+Owner attribution (which callable a reference site belongs to) is linear in
+nesting depth, not in the file's definition count: `defs` is sorted
+outer-before-inner and spans nest, so one binary search plus a walk up the
+enclosing chain finds the innermost callable. The per-site linear scan this
+replaced made a single large module quadratic — 12 000 definitions in one file
+cost 1.141 s, against 0.268 s now.
+
 ### Promoting a language
 
 Moving a language from heuristic-owned to tree-sitter-owned under `auto` is a
@@ -73,8 +126,10 @@ passing first:
    (`testenv/py_fastapi`, `testenv/ts_frontend`, `testenv/fullstack`,
    `testenv/parser_gaps`).
 2. The bench numbers below (or their equivalent for the language being
-   promoted) — a 7-17x cold-parse regression is accepted for python (measured
+   promoted) — a 10-13x cold-parse regression is accepted for python (measured
    below); re-measure before promoting a language with different grammar cost.
+3. The differ's `exported`, `receiver_root` and attribution-cost assertions,
+   which are what make "the resolver behaves the same" more than a claim.
 
 ## Offline builds
 
@@ -88,7 +143,7 @@ the network. `-Dtree-sitter=all|python|typescript|tsx` needs one of:
   fresh worktree on the same machine costs nothing).
 - No network — pre-populate the cache once with `zig build --fetch` on a
   machine that has network, then copy `$ZIG_GLOBAL_CACHE_DIR/p/` to the offline
-  machine (or vendor it into CI's cache action, see `.github/workflows/backends.yml`).
+  machine (or vendor it into CI's cache action, see `.github/workflows/ci.yml`).
 
 Pinned dependencies (`build.zig.zon`):
 
@@ -111,52 +166,63 @@ cost and none of it benefits from `ReleaseFast`.
 ## Measurements
 
 `zig build -Doptimize=ReleaseFast -Dtree-sitter=<cfg>`, binary stripped with
-`strip`. Index time is best-of-3 wall-clock via `outline -C <target> -j`
+`strip`. Index time is best-of-3 wall-clock via `outline -C <target> -j -l 1`
 (`--no-cache` for cold, a warm-cache run afterward for warm); peak RSS is
-`ru_maxrss` from `wait4` on the exact child process (no `bc`, no GNU `time` —
-neither is on the measuring box). Two targets: **repo** = this worktree
-(`src/` + `testenv/` + everything else, mostly `.zig` with a `.py`/`.ts` fixture
-mix), and **synth100k** = a synthetic 2,320-file / 99,905-line all-Python tree.
+`ru_maxrss` from `wait4` on the exact child process. Two targets: **repo** =
+this worktree (`src/` + `testenv/` + everything else, mostly `.zig` with a
+`.py`/`.ts` fixture mix), and **synth100k** = a synthetic 1,780-file /
+99,680-line all-Python tree of 6 documented classes per module, each with a
+constructor assigning two `self` fields and a method calling a module-level
+helper.
 
 | `-Dtree-sitter` | binary (raw) | binary (stripped) |
 | --- | --- | --- |
-| `none` | 14.06 MB | 2.70 MB |
-| `python` | 15.04 MB | 3.35 MB (+0.64 MB) |
-| `all` | 17.89 MB | 6.19 MB (+2.84 MB over `python` for typescript+tsx) |
+| `none` | 14.13 MB | 2.73 MB |
+| `python` | 15.35 MB | 3.42 MB (+0.69 MB) |
+| `all` | 18.20 MB | 6.26 MB (+2.84 MB over `python` for typescript+tsx) |
 
 | cfg | backend | target | cold | cold peak RSS | warm | warm peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| `none` | heuristic | repo | 0.134s | 13.5 MB | 0.051s | 19.5 MB |
-| `none` | heuristic | synth100k | 0.195s | 31.2 MB | 0.090s | 40.4 MB |
-| `python` | heuristic | repo | 0.138s | 15.0 MB | 0.022s | 20.1 MB |
-| `python` | heuristic | synth100k | 0.101s | 30.8 MB | 0.140s | 43.7 MB |
-| `python` | tree-sitter | repo | 0.137s | 14.4 MB | 0.051s | 20.4 MB |
-| `python` | tree-sitter | synth100k | 1.704s | 35.0 MB | 0.130s | 42.4 MB |
-| `all` | heuristic | repo | 0.079s | 14.8 MB | 0.068s | 20.7 MB |
-| `all` | heuristic | synth100k | 0.123s | 31.2 MB | 0.128s | 42.8 MB |
-| `all` | tree-sitter | repo | 0.138s | 15.2 MB | 0.052s | 21.6 MB |
-| `all` | tree-sitter | synth100k | 1.318s | 35.9 MB | 0.088s | 44.0 MB |
+| `none` | heuristic | repo | 0.145s | 15.4 MB | 0.052s | 20.7 MB |
+| `none` | heuristic | synth100k | 0.113s | 31.3 MB | 0.074s | 34.1 MB |
+| `python` | heuristic | repo | 0.137s | 15.6 MB | 0.053s | 22.8 MB |
+| `python` | heuristic | synth100k | 0.121s | 28.3 MB | 0.077s | 32.8 MB |
+| `python` | tree-sitter | repo | 0.146s | 15.8 MB | 0.043s | 22.8 MB |
+| `python` | tree-sitter | synth100k | 1.229s | 42.0 MB | 0.103s | 50.6 MB |
+| `all` | heuristic | repo | 0.138s | 15.3 MB | 0.053s | 23.3 MB |
+| `all` | heuristic | synth100k | 0.117s | 28.8 MB | 0.086s | 34.9 MB |
+| `all` | tree-sitter | repo | 0.138s | 15.3 MB | 0.060s | 23.0 MB |
+| `all` | tree-sitter | synth100k | 1.566s | 42.7 MB | 0.106s | 51.6 MB |
+
+Switching backends over an existing cache (`-Dtree-sitter=all`, synth100k):
+
+| run | time |
+| --- | --- |
+| cold heuristic, writes the cache | 0.133s |
+| warm heuristic, same backend | 0.060s |
+| first tree-sitter run over that cache | 1.538s |
+| warm tree-sitter, same backend | 0.108s |
+| first heuristic run again | 0.130s |
 
 Takeaways:
 
-- Warm-cache time is backend-independent (the cache stores extracted symbols,
-  not which backend produced them) — all warm numbers cluster in the same
-  22-140ms band regardless of backend, within run-to-run noise on this box.
-- The cold-parse cost is real and concentrated in tree-sitter: on the
-  synthetic 100k-line all-Python tree, tree-sitter cold is 11-17x the
-  heuristic's cold time (1.318-1.704s vs 0.101-0.123s), consistent with the
-  migration plan's accepted "7x slower cold parse" (this measurement runs
-  somewhat higher, on unloaded fixture content rather than the spike's
-  corpus — still the same order of magnitude, and warm-cache is what repeat
-  runs pay). On the repo target (mostly `.zig`, which has no grammar and stays
-  on the heuristic scanner either way) the two backends are indistinguishable,
-  as expected.
+- A warm run is only warm within one backend. The cache records which backend
+  produced each entry, so switching re-parses the tree and rewrites it — the
+  price of `--backend` meaning the same thing warm as cold. Repeat runs on one
+  backend cost 0.06-0.11s either way.
+- The cold-parse cost is real and concentrated in tree-sitter: on the synthetic
+  100k-line all-Python tree, tree-sitter cold is 10-13x the heuristic's cold
+  time (1.229-1.566s vs 0.117-0.121s), consistent with the migration plan's
+  accepted "7x slower cold parse" — same order of magnitude, and warm-cache is
+  what repeat runs pay. On the repo target (mostly `.zig`, which has no grammar
+  and stays on the heuristic scanner either way) the two backends are
+  indistinguishable, as expected.
 - Each linked grammar has a fixed binary-size cost independent of whether any
-  file in a given run actually uses it: `python` alone costs 0.64 MB stripped,
+  file in a given run actually uses it: `python` alone costs 0.69 MB stripped,
   `typescript`+`tsx` together cost another 2.84 MB.
 
-Raw data: `results.json` alongside this file's measurement run is not checked
-in (regenerate with the commands above); the table here is the record.
+The corpus is regenerated per measurement run rather than checked in; the
+table here is the record.
 
 ## Cross-compile matrix
 
