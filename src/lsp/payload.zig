@@ -68,6 +68,47 @@ fn writeEscaped(w: *Writer, c: u8) !void {
 // Symbol
 // ---------------------------------------------------------------------------
 
+/// A stable hash of a symbol's definition text (signature + body),
+/// whitespace-normalized (runs collapsed to one space, trimmed) so reformatting
+/// alone doesn't change it. Clients key per-site state (e.g. impact approvals)
+/// on `qualified@file` + this hash, so state invalidates when the code changes.
+/// Streamed straight into the hasher — no intermediate buffer, unbounded body size.
+pub fn contentHash(source: []const u8, sym: Symbol) u64 {
+    var hasher = std.hash.Wyhash.init(0x4e_47_43_4f_4e_54_45_4e); // "NGCONTEN"
+    var chunk: [64]u8 = undefined;
+    var n: usize = 0;
+    var pending_space = false;
+    var started = false;
+    for (sym.body(source)) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            if (started) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            chunk[n] = ' ';
+            n += 1;
+            if (n == chunk.len) {
+                hasher.update(chunk[0..n]);
+                n = 0;
+            }
+            pending_space = false;
+        }
+        chunk[n] = c;
+        n += 1;
+        started = true;
+        if (n == chunk.len) {
+            hasher.update(chunk[0..n]);
+            n = 0;
+        }
+    }
+    if (n != 0) hasher.update(chunk[0..n]);
+    return hasher.final();
+}
+
+pub fn writeContentHash(w: *Writer, source: []const u8, sym: Symbol) !void {
+    try w.print("\"{x:0>16}\"", .{contentHash(source, sym)});
+}
+
 /// `Parent.name` when the symbol is nested, else `name`. This is the form
 /// `query.resolveIds` accepts, so a `qualified` value round-trips as a `Target`.
 pub fn writeQualified(w: *Writer, ctx: Ctx, sym: Symbol) !void {
@@ -118,13 +159,15 @@ pub fn writeSymbol(w: *Writer, ctx: Ctx, sym: Symbol) !void {
         try w.writeAll(",\"doc\":");
         try writeString(w, doc);
     }
-    try w.print(",\"language\":\"{s}\",\"callers\":{d},\"callees\":{d},\"exported\":{},\"test\":{}}}", .{
+    try w.print(",\"language\":\"{s}\",\"callers\":{d},\"callees\":{d},\"exported\":{},\"test\":{},\"contentHash\":", .{
         file.language.tag(),
         idx.callersOf(sym.id).len,
         query.fanOut(sym),
         sym.exported,
         query.isTestSymbol(idx, sym),
     });
+    try writeContentHash(w, file.text, sym);
+    try w.writeByte('}');
 }
 
 pub fn writeSymbolId(w: *Writer, ctx: Ctx, id: SymbolId) !void {
@@ -169,6 +212,18 @@ pub fn writeNameRange(w: *Writer, text: []const u8, line_1based: u32, name: []co
     try w.print(
         "{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
         .{ line0, col, line0, col + width },
+    );
+}
+
+/// A 0-based LSP range spanning byte offsets `[start, end)` of `text`
+/// (`symbolAt.range`, `navgraph/where`'s callers) — unlike `writeNameRange`,
+/// this does not search for a name; the caller already has exact offsets.
+pub fn writeByteRange(w: *Writer, text: []const u8, start: usize, end: usize, enc: position.Encoding) !void {
+    const from = position.positionAt(text, start, enc);
+    const to = position.positionAt(text, end, enc);
+    try w.print(
+        "{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
+        .{ from.line, from.character, to.line, to.character },
     );
 }
 
@@ -238,6 +293,33 @@ test "writeCollapsed escapes quotes, backslashes and control bytes" {
     defer aw.deinit();
     try writeCollapsed(&aw.writer, "a\"b\\c\x01d");
     try testing.expectEqualStrings("\"a\\\"b\\\\c\\u0001d\"", aw.written());
+}
+
+test "contentHash is stable across whitespace reformatting and changes with the code" {
+    const src_a = "pub fn f(x: u32) void {\n    return;\n}\n";
+    const src_b = "pub fn f(x: u32) void {   return; }\n"; // same code, reformatted
+    const src_c = "pub fn f(x: u32) void {\n    return x;\n}\n"; // real change
+    const sym = Symbol{
+        .id = 0,
+        .file = 0,
+        .name = "f",
+        .kind = .function,
+        .line = 1,
+        .span_start = 0,
+        .span_end = src_a.len - 1,
+        .sig_end = 24,
+        .doc = "",
+        .parent = model.invalid_symbol,
+        .exported = true,
+        .refs = &.{},
+    };
+    var sym_b = sym;
+    sym_b.span_end = src_b.len - 1;
+    var sym_c = sym;
+    sym_c.span_end = src_c.len - 1;
+
+    try testing.expectEqual(contentHash(src_a, sym), contentHash(src_b, sym_b));
+    try testing.expect(contentHash(src_a, sym) != contentHash(src_c, sym_c));
 }
 
 test "writeLines and writeEdge render the contract's edge shape" {

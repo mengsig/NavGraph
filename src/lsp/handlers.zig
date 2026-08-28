@@ -28,6 +28,9 @@ const SymbolId = model.SymbolId;
 const invalid = model.invalid_symbol;
 
 pub const protocol_version = 1;
+/// `navgraph/status.protocolMinor`: the addendum level. Bump on every additive
+/// v1.x addendum; `protocol_version` itself stays 1 (breaking changes only).
+pub const protocol_minor = 1;
 /// Reported in `initialize`'s serverInfo and `navgraph/status`. One source of
 /// truth with `navgraph capabilities`.
 pub const version = capabilities.product_version;
@@ -804,8 +807,8 @@ fn writeStatus(w: *Writer, c: payload.Ctx) !void {
     const idx = c.index();
     try w.writeAll("{\"root\":");
     try payload.writeString(w, s.root_abs);
-    try w.print(",\"protocolVersion\":{d},\"version\":\"{s}\",\"files\":{d},\"symbols\":{d},\"edges\":{d},\"languages\":{{", .{
-        protocol_version, version, s.fileCount(), s.symbolCount(), s.edgeCount(),
+    try w.print(",\"protocolVersion\":{d},\"protocolMinor\":{d},\"version\":\"{s}\",\"files\":{d},\"symbols\":{d},\"edges\":{d},\"languages\":{{", .{
+        protocol_version, protocol_minor, version, s.fileCount(), s.symbolCount(), s.edgeCount(),
     });
     var counts: std.EnumArray(@import("../language.zig").Language, u32) = .initFill(0);
     for (idx.graph.files) |f| counts.set(f.language, counts.get(f.language) + 1);
@@ -817,7 +820,18 @@ fn writeStatus(w: *Writer, c: payload.Ctx) !void {
         first = false;
         try w.print("\"{s}\":{d}", .{ e.key.tag(), e.value.* });
     }
-    try w.print("}},\"overlays\":{d},\"indexedAt\":\"", .{s.overlays.count()});
+    try w.writeAll("},\"backend\":{\"default\":\"auto\",\"languages\":{");
+    // No tree-sitter backend ships in this repo (the seam lives behind
+    // `index.ReparseHint`, PR #9) — every present language is "heuristic".
+    first = true;
+    var bit = counts.iterator();
+    while (bit.next()) |e| {
+        if (e.value.* == 0) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.print("\"{s}\":\"heuristic\"", .{e.key.tag()});
+    }
+    try w.print("}}}},\"overlays\":{d},\"indexedAt\":\"", .{s.overlays.count()});
     try writeIso8601(w, s.indexed_at_unix_ms);
     try w.print("\",\"lastIndexMs\":{d},\"cache\":{}}}", .{ s.last_index_ms, s.used_cache });
 }
@@ -844,8 +858,10 @@ fn symbolAt(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w:
     const c = try self.ctx();
     const at = (try offsetOf(self, arena, Params.from(params))) orelse return error.InvalidParams;
     const located = (try queries.locate(arena, c, at.path, at.offset)) orelse {
-        return w.writeAll("{\"word\":\"\",\"symbol\":null,\"enclosing\":null,\"candidates\":[]}");
+        return w.writeAll("{\"word\":\"\",\"symbol\":null,\"enclosing\":null,\"candidates\":[],\"range\":null,\"breadcrumbs\":[]}");
     };
+    const file_id = queries.fileIdOf(c.index(), at.path).?; // `locate` already resolved this path.
+    const file = c.index().graph.files[file_id];
     try w.writeAll("{\"word\":");
     try payload.writeString(w, located.word);
     try w.writeAll(",\"symbol\":");
@@ -854,6 +870,10 @@ fn symbolAt(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w:
     try writeSymbolOrNull(w, c, located.enclosing);
     try w.writeAll(",\"candidates\":");
     try payload.writeSymbolArray(w, c, located.candidates);
+    try w.writeAll(",\"range\":");
+    try payload.writeByteRange(w, file.text, located.start, located.end, c.encoding);
+    try w.writeAll(",\"breadcrumbs\":");
+    try payload.writeSymbolArray(w, c, try queries.breadcrumbChain(c.index(), arena, located.enclosing));
     try w.writeByte('}');
 }
 
@@ -889,7 +909,11 @@ fn searchMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
     const p = Params.from(params);
     const q = p.str("query") orelse return error.InvalidParams;
     const scope = try scopeOf(self, p);
-    const filter = search.Filter{ .kinds = try kindsOf(arena, p), .tests = scope.tests };
+    const filter = search.Filter{
+        .kinds = try kindsOf(arena, p),
+        .tests = scope.tests,
+        .recent = try p.strings(arena, "recent"),
+    };
 
     var hits: std.ArrayList(search.Hit) = .empty;
     defer hits.deinit(arena);
@@ -914,7 +938,7 @@ fn searchMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
         }
         try w.writeByte('}');
     }
-    try w.print("],\"total\":{d}}}", .{hits.items.len});
+    try w.print("],\"total\":{d},\"truncated\":{}}}", .{ hits.items.len, shown.len < hits.items.len });
 }
 
 fn kindsOf(arena: std.mem.Allocator, p: Params) ![]const u8 {
@@ -2086,6 +2110,54 @@ test "navgraph/symbolAt names the word, its definition and its enclosing symbol"
     try testing.expectEqualStrings("util.zig", r.get("symbol").?.object.get("file").?.string);
     try testing.expectEqualStrings("mid", r.get("enclosing").?.object.get("name").?.string);
     try testing.expectEqual(@as(usize, 0), r.get("candidates").?.array.items.len);
+
+    // "    util.helper();" -> "helper" starts at column 9 and is 6 chars wide.
+    const range = r.get("range").?.object;
+    try testing.expectEqual(@as(i64, 8), range.get("start").?.object.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 9), range.get("start").?.object.get("character").?.integer);
+    try testing.expectEqual(@as(i64, 15), range.get("end").?.object.get("character").?.integer);
+
+    // `mid` is a top-level function: its own breadcrumb chain is just itself.
+    const breadcrumbs = r.get("breadcrumbs").?.array.items;
+    try testing.expectEqual(@as(usize, 1), breadcrumbs.len);
+    try testing.expectEqualStrings("mid", breadcrumbs[0].object.get("name").?.string);
+}
+
+test "navgraph/symbolAt breadcrumbs walk outermost to innermost" {
+    const ts = try startedPy(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "ports.py");
+
+    // `get`'s body (line 6, 1-based -> 0-based 5, "        return key" starts
+    // at column 8) sits inside `MemoryStore.get`.
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":72,"method":"navgraph/symbolAt","params":{{"uri":"{s}","position":{{"line":5,"character":8}}}}}}
+    , .{uri});
+    var res = try ts.request(72, body);
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    const breadcrumbs = r.get("breadcrumbs").?.array.items;
+    try testing.expectEqual(@as(usize, 2), breadcrumbs.len);
+    try testing.expectEqualStrings("MemoryStore", breadcrumbs[0].object.get("name").?.string);
+    try testing.expectEqualStrings("get", breadcrumbs[1].object.get("name").?.string);
+}
+
+test "navgraph/symbolAt off whitespace answers a null range and no breadcrumbs" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":73,"method":"navgraph/symbolAt","params":{{"uri":"{s}","position":{{"line":1,"character":0}}}}}}
+    , .{uri});
+    var res = try ts.request(73, body);
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expect(r.get("range").? == .null);
+    try testing.expectEqual(@as(usize, 0), r.get("breadcrumbs").?.array.items.len);
 }
 
 test "hover renders the signature, the location and the fan-in counts" {

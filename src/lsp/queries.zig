@@ -75,6 +75,9 @@ pub const Located = struct {
     enclosing: SymbolId,
     /// Same-name definitions other than `symbol`, in graph order.
     candidates: []const SymbolId,
+    /// Byte range of `word` in its file's text (`symbolAt.range`).
+    start: usize,
+    end: usize,
 };
 
 /// Resolve the identifier at `offset` in `path`.
@@ -116,7 +119,24 @@ pub fn locate(
         .symbol = chosen,
         .enclosing = enclosing_id,
         .candidates = try others.toOwnedSlice(gpa),
+        .start = ident.start,
+        .end = ident.end,
     };
+}
+
+/// The enclosing chain of `id`, outermost first, innermost (`id` itself)
+/// last — `symbolAt.breadcrumbs` / `navgraph/where.breadcrumbs`. Empty when
+/// `id` is `invalid_symbol`.
+pub fn breadcrumbChain(idx: *const Index, gpa: std.mem.Allocator, id: SymbolId) ![]const SymbolId {
+    var chain: std.ArrayList(SymbolId) = .empty;
+    errdefer chain.deinit(gpa);
+    var cur = id;
+    while (cur != invalid) {
+        try chain.append(gpa, cur);
+        cur = idx.graph.symbols[cur].parent;
+    }
+    std.mem.reverse(SymbolId, chain.items);
+    return chain.toOwnedSlice(gpa);
 }
 
 /// The already-resolved target of a reference to `name` from `from`'s body.
