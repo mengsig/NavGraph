@@ -326,6 +326,30 @@ graded as inferred, are now findings the next wave can see.
 | A member reached through an expression we cannot name is no longer recorded as a *bare* reference and handed to the global name match; a qualifier naming a standard-library type abstains; `Weights w({1.0})` types its local | cpp, rust | cpp edge P 36.6→39.0, rust site P 94.1→98.0 and edge P 78.2→84.3 |
 | One-letter names are references (the collector dropped every identifier shorter than two bytes, so `pub fn a() void { b(); }` produced no callee in any language) | all | no corpus defines a one-letter symbol, so nothing moved; covered by a new index test |
 
+**Fix round 2's own paired sweep.** Same isolation technique applied to fix
+round 2 alone (the reverse-mixin fix and the generic-aware declarator split):
+one fixed fixture tree per corpus, only the binary swapped between the
+pre-fix and post-fix commit. Two of the fourteen `testenv/` corpora move, and
+NavGraph's own `src/` does not move at all; every change traces to one of the
+two fixes and is corpus-improving:
+
+- `ruby_app`: two new edges, both bare `super` becoming a call —
+  `tricky_ruby.rb:size@133 -> tricky_ruby.rb:size@81` (`LoudLedger#size`) and
+  `tricky_ruby.rb:titles@121 -> tricky_ruby.rb:titles@103`
+  (`TaggedLedger#titles`).
+- `ts_frontend`: four phantom definitions gone (`number@194`, `string@195`,
+  `Map@196`, `boolean@196` — each a generic type argument the old
+  comma-splitter mistook for its own declarator), three declarator signatures
+  now recorded whole instead of truncated at that same comma (`roleIndex@194`,
+  `roleNames@195`, `nestedIndex@196`), and one reference retargeted: `number`
+  at `tricky_ts.ts:120` (inside `makeScaler`) no longer resolves `exact=true`
+  to the phantom `var number@194` — the phantom was stealing that reference,
+  exactly the failure mode the F2 fix exists to close.
+
+Ten changed entries across two corpora: two edges, four phantom definitions
+removed, three signatures corrected, one reference retargeted. Nothing else
+in `testenv/` or `src/` moves.
+
 **NavGraph's own `src/` as a second corpus.** Paired dumps from binaries built
 at the wave's base (`3451d51`) and its HEAD, run over one frozen copy of
 `src/` (the `3451d51` snapshot) so the diff isolates resolver behavior from
