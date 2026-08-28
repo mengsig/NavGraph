@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const capabilities = @import("../capabilities.zig");
+const impls = @import("../impls.zig");
 const model = @import("../model.zig");
 const query = @import("../query.zig");
 const overlay = @import("overlay.zig");
@@ -384,6 +385,9 @@ fn initialize(self: *Server, gpa: std.mem.Allocator, params: ?std.json.Value, w:
             "\"textDocumentSync\":{{\"openClose\":true,\"change\":1,\"save\":{{\"includeText\":false}}}}," ++
             "\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true," ++
             "\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true," ++
+            "\"callHierarchyProvider\":true,\"typeHierarchyProvider\":true," ++
+            "\"implementationProvider\":true,\"typeDefinitionProvider\":true," ++
+            "\"documentHighlightProvider\":true,\"codeLensProvider\":{{\"resolveProvider\":true}}," ++
             "\"experimental\":{{\"navgraph\":{{\"protocolVersion\":{d},\"methods\":[",
         .{ self.encoding.name(), protocol_version },
     );
@@ -675,6 +679,115 @@ fn workspaceSymbol(self: *Server, arena: std.mem.Allocator, params: ?std.json.Va
         try w.writeByte('}');
     }
     try w.writeByte(']');
+}
+
+// ---------------------------------------------------------------------------
+// Call hierarchy / type hierarchy
+// ---------------------------------------------------------------------------
+
+fn prepareCallHierarchy(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const at = (try offsetOf(self, arena, Params.from(params))) orelse return w.writeAll("[]");
+    const located = (try queries.locate(arena, c, at.path, at.offset)) orelse return w.writeAll("[]");
+    try queries.writePrepareHierarchy(w, c, located.symbol);
+}
+
+fn prepareTypeHierarchy(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const at = (try offsetOf(self, arena, Params.from(params))) orelse return w.writeAll("[]");
+    const located = (try queries.locate(arena, c, at.path, at.offset)) orelse return w.writeAll("[]");
+    // Only a container has supertypes/subtypes; a non-container resolves to
+    // nothing rather than an empty-but-misleading hierarchy item.
+    const id = located.symbol;
+    if (id == invalid or !impls.isContainer(c.index().graph.symbols[id])) return w.writeAll("[]");
+    try queries.writePrepareHierarchy(w, c, id);
+}
+
+/// The item `id` an `incomingCalls`/`outgoingCalls`/`supertypes`/`subtypes`
+/// request names via its `item.data` (re-resolved by `qualified`+`file`, not
+/// the possibly-stale `id` — see `queries.resolveHierarchyItemData`).
+fn hierarchyItemId(c: payload.Ctx, p: Params) Error!SymbolId {
+    const data = p.nested("item").nested("data");
+    const qualified = data.str("qualified") orelse return error.InvalidParams;
+    const file = data.str("file") orelse return error.InvalidParams;
+    return queries.resolveHierarchyItemData(c.index(), qualified, file) orelse error.SymbolNotFound;
+}
+
+fn incomingCalls(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const id = try hierarchyItemId(c, p);
+    try queries.writeIncomingCalls(w, arena, c, id, try scopeOf(self, p));
+}
+
+fn outgoingCalls(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const id = try hierarchyItemId(c, p);
+    try queries.writeOutgoingCalls(w, arena, c, id, try scopeOf(self, p));
+}
+
+fn typeSupertypes(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const id = try hierarchyItemId(c, p);
+    try queries.writeTypeRelatives(w, arena, c, id, true, try scopeOf(self, p));
+}
+
+fn typeSubtypes(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const id = try hierarchyItemId(c, p);
+    try queries.writeTypeRelatives(w, arena, c, id, false, try scopeOf(self, p));
+}
+
+// ---------------------------------------------------------------------------
+// implementation / typeDefinition / documentHighlight / codeLens
+// ---------------------------------------------------------------------------
+
+fn implementation(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const p = Params.from(params);
+    const at = (try offsetOf(self, arena, p)) orelse return w.writeAll("[]");
+    const located = (try queries.locate(arena, c, at.path, at.offset)) orelse return w.writeAll("[]");
+    if (located.symbol == invalid) return w.writeAll("[]");
+    try queries.writeImplementation(w, arena, c, located.symbol, try scopeOf(self, p));
+}
+
+fn typeDefinition(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const at = (try offsetOf(self, arena, Params.from(params))) orelse return w.writeAll("[]");
+    try queries.writeTypeDefinition(w, c, at.path, at.offset);
+}
+
+fn documentHighlight(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const at = (try offsetOf(self, arena, Params.from(params))) orelse return w.writeAll("[]");
+    try queries.writeDocumentHighlight(w, c, at.path, at.offset);
+}
+
+fn codeLens(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    try self.flushPending(arena, .change);
+    const c = try self.ctx();
+    const path = (try documentPath(self, arena, Params.from(params))) orelse return w.writeAll("[]");
+    const file_id = queries.fileIdOf(c.index(), path) orelse return w.writeAll("[]");
+    try queries.writeCodeLens(w, c, c.index().graph.files[file_id]);
+}
+
+/// A no-op: `codeLens` already populates `command` eagerly, so resolving a
+/// lens is the identity function. Exists only to satisfy `resolveProvider`.
+fn codeLensResolve(_: *Server, _: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
+    const value = params orelse return error.InvalidParams;
+    try std.json.Stringify.value(value, .{}, w);
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1100,17 @@ const requests = [_]Entry{
     .{ .name = "textDocument/hover", .run = hover },
     .{ .name = "textDocument/documentSymbol", .run = documentSymbol },
     .{ .name = "workspace/symbol", .run = workspaceSymbol },
+    .{ .name = "textDocument/prepareCallHierarchy", .run = prepareCallHierarchy },
+    .{ .name = "callHierarchy/incomingCalls", .run = incomingCalls },
+    .{ .name = "callHierarchy/outgoingCalls", .run = outgoingCalls },
+    .{ .name = "textDocument/prepareTypeHierarchy", .run = prepareTypeHierarchy },
+    .{ .name = "typeHierarchy/supertypes", .run = typeSupertypes },
+    .{ .name = "typeHierarchy/subtypes", .run = typeSubtypes },
+    .{ .name = "textDocument/implementation", .run = implementation },
+    .{ .name = "textDocument/typeDefinition", .run = typeDefinition },
+    .{ .name = "textDocument/documentHighlight", .run = documentHighlight },
+    .{ .name = "textDocument/codeLens", .run = codeLens },
+    .{ .name = "codeLens/resolve", .run = codeLensResolve },
     .{ .name = "navgraph/status", .run = status },
     .{ .name = "navgraph/symbolAt", .run = symbolAt },
     .{ .name = "navgraph/blast", .run = blast },
@@ -1555,6 +1679,147 @@ test "navgraph/callers and navgraph/calls mirror the CLI tree" {
     defer calls.deinit();
     const out = (try resultOf(calls)).object.get("root").?.object;
     try testing.expectEqualStrings("mid", out.get("children").?.array.items[0].object.get("symbol").?.object.get("name").?.string);
+}
+
+test "prepareCallHierarchy resolves the definition at the cursor" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":50,"method":"textDocument/prepareCallHierarchy","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":7,"character":3}}}}}}
+    , .{uri});
+    var res = try ts.request(50, body);
+    defer res.deinit();
+    const items = (try resultOf(res)).array.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualStrings("mid", items[0].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 12), items[0].object.get("kind").?.integer);
+    const data = items[0].object.get("data").?.object;
+    try testing.expectEqualStrings("mid", data.get("qualified").?.string);
+    try testing.expectEqualStrings("app.zig", data.get("file").?.string);
+    try testing.expect(data.get("exact") == null);
+}
+
+test "callHierarchy/incomingCalls and outgoingCalls mirror the call graph" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var incoming = try ts.request(51,
+        \\{"jsonrpc":"2.0","id":51,"method":"callHierarchy/incomingCalls","params":{"item":{"data":{"qualified":"mid","file":"app.zig"}}}}
+    );
+    defer incoming.deinit();
+    const in_items = (try resultOf(incoming)).array.items;
+    try testing.expectEqual(@as(usize, 1), in_items.len);
+    const from = in_items[0].object.get("from").?.object;
+    try testing.expectEqualStrings("run", from.get("name").?.string);
+    try testing.expect(from.get("data").?.object.get("exact").?.bool);
+    const from_ranges = in_items[0].object.get("fromRanges").?.array.items;
+    try testing.expectEqual(@as(usize, 1), from_ranges.len);
+    try testing.expectEqual(@as(i64, 4), from_ranges[0].object.get("start").?.object.get("line").?.integer);
+
+    var outgoing = try ts.request(52,
+        \\{"jsonrpc":"2.0","id":52,"method":"callHierarchy/outgoingCalls","params":{"item":{"data":{"qualified":"mid","file":"app.zig"}}}}
+    );
+    defer outgoing.deinit();
+    const out_items = (try resultOf(outgoing)).array.items;
+    try testing.expectEqual(@as(usize, 1), out_items.len);
+    const to = out_items[0].object.get("to").?.object;
+    try testing.expectEqualStrings("helper", to.get("name").?.string);
+    try testing.expectEqualStrings("util.zig", to.get("data").?.object.get("file").?.string);
+
+    // A stale/unknown item (a re-index renamed or removed it) is a routine
+    // "not found", the same as any other unresolved Target.
+    var missing = try ts.request(53,
+        \\{"jsonrpc":"2.0","id":53,"method":"callHierarchy/incomingCalls","params":{"item":{"data":{"qualified":"nope","file":"app.zig"}}}}
+    );
+    defer missing.deinit();
+    try testing.expectEqual(@as(i64, -32001), try errorCodeOf(missing));
+}
+
+const py_ports_project = [_][2][]const u8{
+    .{
+        "ports.py",
+        \\from typing import Protocol
+        \\class Store(Protocol):
+        \\    def get(self, key: str) -> str: ...
+        \\    def put(self, key: str, value: str) -> None: ...
+        \\class MemoryStore:
+        \\    def get(self, key: str) -> str: return key
+        \\    def put(self, key: str, value: str) -> None: pass
+        \\class Partial(Store):
+        \\    def get(self, key: str) -> str: return key
+        \\
+    },
+};
+
+fn startedPy(gpa: std.mem.Allocator) !*TestServer {
+    const ts = try TestServer.init(gpa, testing.io, &py_ports_project);
+    errdefer ts.deinit();
+    try ts.start();
+    return ts;
+}
+
+test "prepareTypeHierarchy, supertypes and subtypes walk the base/impl table" {
+    const ts = try startedPy(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "ports.py");
+
+    // `Store` sits on line 2 (1-based) -> 0-based line 1, "class " = 6 cols in.
+    const prep_body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":60,"method":"textDocument/prepareTypeHierarchy","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":1,"character":6}}}}}}
+    , .{uri});
+    var prep = try ts.request(60, prep_body);
+    defer prep.deinit();
+    const items = (try resultOf(prep)).array.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualStrings("Store", items[0].object.get("name").?.string);
+
+    var sub = try ts.request(61,
+        \\{"jsonrpc":"2.0","id":61,"method":"typeHierarchy/subtypes","params":{"item":{"data":{"qualified":"Store","file":"ports.py"}}}}
+    );
+    defer sub.deinit();
+    const subtypes = (try resultOf(sub)).array.items;
+    // Nominal (`class Partial(Store)`) is a keyword base edge; structural-only
+    // `MemoryStore` is not — that distinction lives in `textDocument/implementation`.
+    try testing.expectEqual(@as(usize, 1), subtypes.len);
+    try testing.expectEqualStrings("Partial", subtypes[0].object.get("name").?.string);
+    try testing.expect(subtypes[0].object.get("data").?.object.get("exact") == null);
+
+    var sup = try ts.request(62,
+        \\{"jsonrpc":"2.0","id":62,"method":"typeHierarchy/supertypes","params":{"item":{"data":{"qualified":"Partial","file":"ports.py"}}}}
+    );
+    defer sup.deinit();
+    const supertypes = (try resultOf(sup)).array.items;
+    try testing.expectEqual(@as(usize, 1), supertypes.len);
+    try testing.expectEqualStrings("Store", supertypes[0].object.get("name").?.string);
+}
+
+test "textDocument/implementation covers structural and nominal conformance" {
+    const ts = try startedPy(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "ports.py");
+
+    const type_body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":63,"method":"textDocument/implementation","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":1,"character":6}}}}}}
+    , .{uri});
+    var type_res = try ts.request(63, type_body);
+    defer type_res.deinit();
+    const type_locs = (try resultOf(type_res)).array.items;
+    try testing.expectEqual(@as(usize, 2), type_locs.len);
+
+    // The `get` method (line 3, 1-based -> 0-based 2, "    def " = 8 cols in).
+    const method_body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":64,"method":"textDocument/implementation","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":2,"character":8}}}}}}
+    , .{uri});
+    var method_res = try ts.request(64, method_body);
+    defer method_res.deinit();
+    const method_locs = (try resultOf(method_res)).array.items;
+    try testing.expectEqual(@as(usize, 2), method_locs.len);
 }
 
 test "navgraph/blast reports depth, via, byFile and the file target form" {

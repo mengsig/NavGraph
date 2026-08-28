@@ -119,23 +119,23 @@ fn appendDeclaredBases(gpa: std.mem.Allocator, idx: *const Index, sym: model.Sym
     try lexer.tokenize(gpa, sig, language.configFor(file.language), &toks);
     const name_i = findToken(toks.items, sig, sym.name) orelse return;
     switch (file.language.family()) {
-        .python => try appendPythonBases(idx, sym, toks.items, sig, name_i, edges),
-        .js, .java => try appendKeywordBases(idx, sym, toks.items, sig, name_i, edges),
-        .c, .csharp => try appendColonBases(idx, sym, toks.items, sig, name_i, edges),
-        .ruby => try appendRubyBase(idx, sym, toks.items, sig, name_i, edges),
+        .python => try appendPythonBases(gpa, idx, sym, toks.items, sig, name_i, edges),
+        .js, .java => try appendKeywordBases(gpa, idx, sym, toks.items, sig, name_i, edges),
+        .c, .csharp => try appendColonBases(gpa, idx, sym, toks.items, sig, name_i, edges),
+        .ruby => try appendRubyBase(gpa, idx, sym, toks.items, sig, name_i, edges),
         else => {},
     }
 }
 
-fn appendPythonBases(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendPythonBases(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(name_i < toks.len);
     std.debug.assert(std.mem.eql(u8, toks[name_i].text(src), sym.name));
     const open = findPunct(toks, src, name_i + 1, '(') orelse return;
     const close = matchingClose(toks, src, open, '(', ')') orelse return;
-    try appendSegments(idx, sym, toks, src, open + 1, close, edges);
+    try appendSegments(gpa, idx, sym, toks, src, open + 1, close, edges);
 }
 
-fn appendKeywordBases(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendKeywordBases(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(name_i < toks.len);
     std.debug.assert(isContainer(sym));
     var i = name_i + 1;
@@ -144,34 +144,34 @@ fn appendKeywordBases(idx: *const Index, sym: model.Symbol, toks: []const Token,
         const start = i + 1;
         var end = start;
         while (end < toks.len and toks[end].kind != .eof and !tokenEq(toks, src, end, "extends") and !tokenEq(toks, src, end, "implements")) : (end += 1) {}
-        try appendSegments(idx, sym, toks, src, start, end, edges);
+        try appendSegments(gpa, idx, sym, toks, src, start, end, edges);
         i = if (end > 0) end - 1 else end;
     }
 }
 
-fn appendColonBases(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendColonBases(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(name_i < toks.len);
     std.debug.assert(isContainer(sym));
     const colon = findPunct(toks, src, name_i + 1, ':') orelse return;
     var end = colon + 1;
     while (end < toks.len and toks[end].kind != .eof and !tokenEq(toks, src, end, "where")) : (end += 1) {}
-    try appendSegments(idx, sym, toks, src, colon + 1, end, edges);
+    try appendSegments(gpa, idx, sym, toks, src, colon + 1, end, edges);
 }
 
-fn appendRubyBase(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendRubyBase(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, name_i: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(name_i < toks.len);
     std.debug.assert(isContainer(sym));
     if (findPunct(toks, src, name_i + 1, '<')) |less| {
-        try appendSegment(idx, sym, toks, src, less + 1, toks.len, edges);
+        try appendSegment(gpa, idx, sym, toks, src, less + 1, toks.len, edges);
     }
-    try appendRubyMixins(idx, sym, edges);
+    try appendRubyMixins(gpa, idx, sym, edges);
 }
 
 /// Ruby `include M` / `prepend M` statements add M to the ancestor chain, but
 /// they live in the class body, not its signature. Scan the body (up to the
 /// first nested `def`/`class`/`module`, where top-level mixins conventionally
 /// sit) and append each module constant as a base edge.
-fn appendRubyMixins(idx: *const Index, sym: model.Symbol, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendRubyMixins(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, edges: *std.ArrayList(BaseEdge)) !void {
     if (sym.sig_end >= sym.span_end) return;
     const file = idx.graph.files[sym.file];
     const body = file.text[sym.sig_end..sym.span_end];
@@ -196,12 +196,12 @@ fn appendRubyMixins(idx: *const Index, sym: model.Symbol, edges: *std.ArrayList(
         while (j < items.len and items[j].line == line and (items[j].kind == .identifier or
             punctEq(items[j], body, ':') or punctEq(items[j], body, '.'))) : (j += 1)
         {}
-        try appendSegment(idx, sym, items, body, i + 1, j, edges);
+        try appendSegment(gpa, idx, sym, items, body, i + 1, j, edges);
         i = j - 1;
     }
 }
 
-fn appendSegments(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, lo: usize, hi: usize, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendSegments(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, lo: usize, hi: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(lo <= hi);
     std.debug.assert(hi <= toks.len);
     var start = lo;
@@ -210,14 +210,14 @@ fn appendSegments(idx: *const Index, sym: model.Symbol, toks: []const Token, src
     while (i < hi) : (i += 1) {
         depth += bracketDelta(toks[i], src);
         if (depth == 0 and punctEq(toks[i], src, ',')) {
-            try appendSegment(idx, sym, toks, src, start, i, edges);
+            try appendSegment(gpa, idx, sym, toks, src, start, i, edges);
             start = i + 1;
         }
     }
-    try appendSegment(idx, sym, toks, src, start, hi, edges);
+    try appendSegment(gpa, idx, sym, toks, src, start, hi, edges);
 }
 
-fn appendSegment(idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, lo: usize, hi: usize, edges: *std.ArrayList(BaseEdge)) !void {
+fn appendSegment(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symbol, toks: []const Token, src: []const u8, lo: usize, hi: usize, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(lo <= hi);
     std.debug.assert(hi <= toks.len);
     const lookup_name = segmentName(toks, src, lo, hi) orelse return;
@@ -225,7 +225,7 @@ fn appendSegment(idx: *const Index, sym: model.Symbol, toks: []const Token, src:
     const properties = segmentProperties(toks, src, lo, hi);
     if (!properties.qualified and std.mem.eql(u8, lookup_name, sym.name)) return;
     const target = if (properties.qualified) null else resolveContainer(idx, sym, lookup_name);
-    try appendEdge(edges, idx.gpa, .{
+    try appendEdge(edges, gpa, .{
         .subtype = sym.id,
         .supertype = target orelse invalid,
         .name = identity,
@@ -296,7 +296,7 @@ fn appendGoEmbeddings(gpa: std.mem.Allocator, idx: *const Index, sym: model.Symb
         var end = start + 1;
         while (end < toks.items.len and toks.items[end].line == line) : (end += 1) {}
         if (!lineHasPunct(toks.items, body, start, end, '('))
-            try appendSegment(idx, sym, toks.items, body, start, end, edges);
+            try appendSegment(gpa, idx, sym, toks.items, body, start, end, edges);
         start = end;
     }
 }
@@ -309,11 +309,11 @@ fn appendRustImpls(gpa: std.mem.Allocator, idx: *const Index, edges: *std.ArrayL
         var toks: std.ArrayList(Token) = .empty;
         defer toks.deinit(gpa);
         try lexer.tokenize(gpa, file.text, language.configFor(.rust), &toks);
-        try scanRustImpls(idx, file.id, toks.items, file.text, edges);
+        try scanRustImpls(gpa, idx, file.id, toks.items, file.text, edges);
     }
 }
 
-fn scanRustImpls(idx: *const Index, file_id: model.FileId, toks: []const Token, src: []const u8, edges: *std.ArrayList(BaseEdge)) !void {
+fn scanRustImpls(gpa: std.mem.Allocator, idx: *const Index, file_id: model.FileId, toks: []const Token, src: []const u8, edges: *std.ArrayList(BaseEdge)) !void {
     std.debug.assert(file_id < idx.graph.files.len);
     std.debug.assert(src.len <= std.math.maxInt(u32));
     for (toks, 0..) |tok, i| {
@@ -327,7 +327,7 @@ fn scanRustImpls(idx: *const Index, file_id: model.FileId, toks: []const Token, 
         const child = resolveRustImplType(idx, file_id, type_name) orelse continue;
         const child_sym = idx.graph.symbols[child];
         const target = resolveContainer(idx, child_sym, trait_name);
-        try appendEdge(edges, idx.gpa, .{ .subtype = child, .supertype = target orelse invalid, .name = trait_name, .exact = target != null });
+        try appendEdge(edges, gpa, .{ .subtype = child, .supertype = target orelse invalid, .name = trait_name, .exact = target != null });
     }
 }
 
@@ -1157,4 +1157,23 @@ test "hierarchy rejects duplicate direct bases" {
     defer graph.deinit();
     try testing.expectEqual(@as(usize, 2), graph.edges.len);
     try testing.expectError(error.DuplicateBase, graph.mro(&idx, idx.lookup("Broken")[0]));
+}
+
+test "build accepts an arena allocator distinct from idx.gpa without leaking" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data = "class Base:\n    pass\nclass Sub(Base):\n    pass\n" });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var graph = try build(gpa, &idx);
+    defer graph.deinit();
+    try testing.expectEqual(@as(usize, 1), graph.edges.len);
 }

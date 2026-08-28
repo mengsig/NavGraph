@@ -11,6 +11,8 @@ const query = @import("../query.zig");
 const render = @import("../render.zig");
 const gitdiff = @import("../gitdiff.zig");
 const viz = @import("../viz.zig");
+const hierarchy = @import("../hierarchy.zig");
+const impls = @import("../impls.zig");
 const fswrite = @import("fswrite.zig");
 const overlay = @import("overlay.zig");
 const payload = @import("payload.zig");
@@ -635,6 +637,303 @@ fn dataRead(idx: *const Index, from: SymbolId, to: SymbolId) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Call hierarchy / type hierarchy
+// ---------------------------------------------------------------------------
+
+/// `CallHierarchyItem` / `TypeHierarchyItem` — the two contract shapes are
+/// identical apart from `data.exact`, which only a call-hierarchy edge carries
+/// (a type-hierarchy edge has no separate confidence bit to report). `exact`
+/// null omits the field.
+fn writeHierarchyItem(w: *Writer, ctx: Ctx, sym: Symbol, exact: ?bool) !void {
+    const idx = ctx.index();
+    const file = idx.graph.files[sym.file];
+    try w.writeAll("{\"name\":");
+    try payload.writeString(w, sym.name);
+    try w.print(",\"kind\":{d},\"uri\":\"", .{lspSymbolKind(sym.kind)});
+    try overlay.writeUriIn(w, ctx.session.root_abs, file.path);
+    try w.writeAll("\",\"range\":");
+    try payload.writeDefRange(w, ctx, sym);
+    try w.writeAll(",\"selectionRange\":");
+    try payload.writeNameRange(w, file.text, sym.line, sym.name, ctx.encoding);
+    try w.print(",\"data\":{{\"id\":{d},\"qualified\":", .{sym.id});
+    try payload.writeQualified(w, ctx, sym);
+    try w.writeAll(",\"file\":");
+    try payload.writeString(w, file.path);
+    if (exact) |e| try w.print(",\"exact\":{}", .{e});
+    try w.writeAll("}}");
+}
+
+/// Re-resolve a hierarchy item's `data` (`{id, qualified, file}`) back to a
+/// symbol, by `qualified`+`file` rather than trusting `id` across a possible
+/// re-index (ids are only stable within one generation). `id` is carried for a
+/// client's own bookkeeping, not read here.
+pub fn resolveHierarchyItemData(idx: *const Index, qualified: []const u8, file: []const u8) ?SymbolId {
+    var buf: [64]SymbolId = undefined;
+    for (query.resolveIds(idx, qualified, &buf)) |id| {
+        if (std.mem.eql(u8, idx.graph.files[idx.graph.symbols[id].file].path, file)) return id;
+    }
+    return null;
+}
+
+/// `prepareCallHierarchy` / `prepareTypeHierarchy` — the single resolved item
+/// at a cursor, or an empty array when nothing resolves there.
+pub fn writePrepareHierarchy(w: *Writer, ctx: Ctx, id: SymbolId) !void {
+    if (id == invalid) return w.writeAll("[]");
+    try w.writeByte('[');
+    try writeHierarchyItem(w, ctx, ctx.index().graph.symbols[id], null);
+    try w.writeByte(']');
+}
+
+/// `callHierarchy/incomingCalls`: every distinct caller of `id`, with the
+/// lines in the CALLER's file where it references `id` (`fromRanges`).
+pub fn writeIncomingCalls(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, scope: Scope) !void {
+    const idx = ctx.index();
+    const target = idx.graph.symbols[id];
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
+    var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+    defer seen.deinit(gpa);
+
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+    for (idx.callersOf(id)) |cid| {
+        if ((try seen.getOrPut(gpa, cid)).found_existing) continue;
+        const csym = idx.graph.symbols[cid];
+        const exact = query.hasExactEdge(idx, cid, id);
+        if (scope.strict and !exact) continue;
+        if (!scope.admits(idx, csym)) continue;
+        try query.callSiteLines(idx, cid, id, &lines);
+        if (lines.items.len == 0) continue;
+        if (wrote != 0) try w.writeByte(',');
+        wrote += 1;
+        try w.writeAll("{\"from\":");
+        try writeHierarchyItem(w, ctx, csym, exact);
+        try w.writeAll(",\"fromRanges\":[");
+        const caller_text = idx.graph.files[csym.file].text;
+        for (lines.items, 0..) |line, i| {
+            if (i != 0) try w.writeByte(',');
+            try payload.writeNameRange(w, caller_text, line, target.name, ctx.encoding);
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeByte(']');
+}
+
+/// `callHierarchy/outgoingCalls`: every distinct callee `id` resolves to, with
+/// the lines in `id`'s OWN file where it references that callee.
+pub fn writeOutgoingCalls(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, scope: Scope) !void {
+    const idx = ctx.index();
+    const from_text = idx.graph.files[idx.graph.symbols[id].file].text;
+    var lines: std.ArrayList(u32) = .empty;
+    defer lines.deinit(idx.gpa);
+    var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+    defer seen.deinit(gpa);
+
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+    var it = Neighbours.init(idx, id, .callees, false);
+    while (it.next()) |n| {
+        if ((try seen.getOrPut(gpa, n.id)).found_existing) continue;
+        const tsym = idx.graph.symbols[n.id];
+        if (scope.strict and !n.exact) continue;
+        if (!scope.admits(idx, tsym)) continue;
+        try query.callSiteLines(idx, id, n.id, &lines);
+        if (lines.items.len == 0) continue;
+        if (wrote != 0) try w.writeByte(',');
+        wrote += 1;
+        try w.writeAll("{\"to\":");
+        try writeHierarchyItem(w, ctx, tsym, n.exact);
+        try w.writeAll(",\"fromRanges\":[");
+        for (lines.items, 0..) |line, i| {
+            if (i != 0) try w.writeByte(',');
+            try payload.writeNameRange(w, from_text, line, tsym.name, ctx.encoding);
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeByte(']');
+}
+
+/// `typeHierarchy/supertypes` / `subtypes`: one hop of the base/impl table
+/// (`hierarchy.zig`'s `extends`/`implements`/`includes`/`impl-for` edges),
+/// matching how an editor expands the tree one level per request.
+pub fn writeTypeRelatives(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, up: bool, scope: Scope) !void {
+    const idx = ctx.index();
+    var graph = try hierarchy.build(gpa, idx);
+    defer graph.deinit();
+    var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+    defer seen.deinit(gpa);
+
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+    for (graph.edges) |e| {
+        const other = if (up) e.supertype else e.subtype;
+        const anchor = if (up) e.subtype else e.supertype;
+        if (anchor != id or other == invalid) continue;
+        if ((try seen.getOrPut(gpa, other)).found_existing) continue;
+        const sym = idx.graph.symbols[other];
+        if (!scope.admits(idx, sym)) continue;
+        if (wrote != 0) try w.writeByte(',');
+        wrote += 1;
+        try writeHierarchyItem(w, ctx, sym, null);
+    }
+    try w.writeByte(']');
+}
+
+// ---------------------------------------------------------------------------
+// implementation / typeDefinition / documentHighlight / codeLens
+// ---------------------------------------------------------------------------
+
+/// `textDocument/implementation`: implementors of an interface/trait/protocol
+/// MEMBER (`impls.zig`'s method-level edges) or of a TYPE (`impls.zig`'s
+/// structural/nominal port relations, unioned with `hierarchy.zig`'s
+/// keyword-declared subtypes of an interface — duck-typed Python and
+/// keyword-typed Java/TS/C#/Go/Ruby both surface here).
+pub fn writeImplementation(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, scope: Scope) !void {
+    const idx = ctx.index();
+    const sym = idx.graph.symbols[id];
+    var seen: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+    defer seen.deinit(gpa);
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+
+    if (sym.kind == .method) {
+        var graph = try impls.build(gpa, idx);
+        defer graph.deinit();
+        for (graph.edges) |e| {
+            if (e.port_method != id) continue;
+            if ((try seen.getOrPut(gpa, e.implementation_method)).found_existing) continue;
+            const impl_sym = idx.graph.symbols[e.implementation_method];
+            if (!scope.admits(idx, impl_sym)) continue;
+            if (wrote != 0) try w.writeByte(',');
+            wrote += 1;
+            try payload.writeSymbolLocation(w, ctx, impl_sym);
+        }
+    } else if (impls.isContainer(sym)) {
+        var pgraph = try impls.build(gpa, idx);
+        defer pgraph.deinit();
+        for (pgraph.relations) |r| {
+            if (r.port != id) continue;
+            if ((try seen.getOrPut(gpa, r.implementation)).found_existing) continue;
+            const impl_sym = idx.graph.symbols[r.implementation];
+            if (!scope.admits(idx, impl_sym)) continue;
+            if (wrote != 0) try w.writeByte(',');
+            wrote += 1;
+            try payload.writeSymbolLocation(w, ctx, impl_sym);
+        }
+        if (sym.kind == .interface) {
+            var hgraph = try hierarchy.build(gpa, idx);
+            defer hgraph.deinit();
+            for (hgraph.edges) |e| {
+                if (e.supertype != id) continue;
+                if ((try seen.getOrPut(gpa, e.subtype)).found_existing) continue;
+                const sub_sym = idx.graph.symbols[e.subtype];
+                if (!scope.admits(idx, sub_sym)) continue;
+                if (wrote != 0) try w.writeByte(',');
+                wrote += 1;
+                try payload.writeSymbolLocation(w, ctx, sub_sym);
+            }
+        }
+    }
+    try w.writeByte(']');
+}
+
+/// `textDocument/typeDefinition`: the declared type of the identifier at
+/// `offset`, from the enclosing body's own `Binding` table (`name: TypeName`
+/// local/parameter declarations). Empty — never an error — when no binding is
+/// recorded for that name; a language/position this doesn't cover is a
+/// routine "not recorded", not a failure.
+pub fn writeTypeDefinition(w: *Writer, ctx: Ctx, path: []const u8, offset: usize) !void {
+    const idx = ctx.index();
+    const file_id = fileIdOf(idx, path) orelse return w.writeAll("[]");
+    const file = idx.graph.files[file_id];
+    const ident = position.identifierAt(file.text, offset) orelse return w.writeAll("[]");
+    const enclosing = enclosingSymbol(idx, file, ident.start);
+
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+    if (enclosing) |e| {
+        for (e.bindings) |b| {
+            if (!std.mem.eql(u8, b.name, ident.name)) continue;
+            var buf: [16]SymbolId = undefined;
+            const ids = query.resolveIds(idx, b.type_name, &buf);
+            if (ids.len != 0) {
+                try payload.writeSymbolLocation(w, ctx, idx.graph.symbols[ids[0]]);
+                wrote += 1;
+            }
+            break;
+        }
+    }
+    try w.writeByte(']');
+}
+
+/// `textDocument/documentHighlight`: every reference site of the symbol under
+/// `offset`, restricted to `path`'s own file — the declaration (kind `Text`)
+/// plus every resolved read/write use (kind `Read`/`Write`).
+pub fn writeDocumentHighlight(w: *Writer, ctx: Ctx, path: []const u8, offset: usize) !void {
+    const idx = ctx.index();
+    const file_id = fileIdOf(idx, path) orelse return w.writeAll("[]");
+    const file = idx.graph.files[file_id];
+    const located = (try locate(ctx.session.gpa, ctx, path, offset)) orelse return w.writeAll("[]");
+    if (located.symbol == invalid) return w.writeAll("[]");
+    const target = idx.graph.symbols[located.symbol];
+
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+    if (target.file == file_id) {
+        try w.writeAll("{\"range\":");
+        try payload.writeNameRange(w, file.text, target.line, target.name, ctx.encoding);
+        try w.writeAll(",\"kind\":1}");
+        wrote += 1;
+    }
+    var i = file.sym_start;
+    while (i < file.sym_end) : (i += 1) {
+        const owner = idx.graph.symbols[i];
+        for (owner.refs) |ref| {
+            if (ref.target != located.symbol) continue;
+            const site_lines: []const u32 = if (ref.lines.len != 0) ref.lines else &.{ref.line};
+            for (site_lines) |line| {
+                if (wrote != 0) try w.writeByte(',');
+                try w.writeAll("{\"range\":");
+                try payload.writeNameRange(w, file.text, line, target.name, ctx.encoding);
+                try w.print(",\"kind\":{d}}}", .{@as(u8, if (ref.write) 3 else 2)});
+                wrote += 1;
+            }
+        }
+    }
+    try w.writeByte(']');
+}
+
+/// `textDocument/codeLens`: one lens per definition with a call-graph
+/// presence, `"N callers · M callees"` driving `navgraph.blast` on that symbol.
+pub fn writeCodeLens(w: *Writer, ctx: Ctx, file: model.SourceFile) !void {
+    const idx = ctx.index();
+    try w.writeByte('[');
+    var wrote: u32 = 0;
+    var i = file.sym_start;
+    while (i < file.sym_end) : (i += 1) {
+        const sym = idx.graph.symbols[i];
+        if (!isLensTarget(sym.kind)) continue;
+        if (wrote != 0) try w.writeByte(',');
+        wrote += 1;
+        try w.writeAll("{\"range\":");
+        try payload.writeDefRange(w, ctx, sym);
+        try w.print(",\"command\":{{\"title\":\"{d} callers \xc2\xb7 {d} callees\",\"command\":\"navgraph.blast\",\"arguments\":[{{\"symbol\":\"", .{
+            idx.callersOf(sym.id).len, query.fanOut(sym),
+        });
+        try payload.writeQualifiedAtFileBody(w, ctx, sym);
+        try w.writeAll("\"}]}");
+    }
+    try w.writeByte(']');
+}
+
+fn isLensTarget(kind: model.SymbolKind) bool {
+    return switch (kind) {
+        .function, .method, .class, .@"struct", .@"enum", .interface, .type, .route, .test_case => true,
+        else => false,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Hover
 // ---------------------------------------------------------------------------
 
@@ -683,12 +982,7 @@ fn writeChildSymbols(w: *Writer, ctx: Ctx, file: model.SourceFile, parent: Symbo
         try w.writeAll(",\"detail\":");
         try payload.writeCollapsed(w, sym.signature(file.text));
         try w.print(",\"kind\":{d},\"range\":", .{lspSymbolKind(sym.kind)});
-        const end_line = sym.endLine(file.text) - 1;
-        const end_col = position.byteToColumn(position.lineSlice(file.text, end_line) orelse "", ctx.encoding);
-        try w.print(
-            "{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
-            .{ sym.line - 1, end_line, end_col },
-        );
+        try payload.writeDefRange(w, ctx, sym);
         try w.writeAll(",\"selectionRange\":");
         try payload.writeNameRange(w, file.text, sym.line, sym.name, ctx.encoding);
         try w.writeAll(",\"children\":");

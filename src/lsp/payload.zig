@@ -84,6 +84,21 @@ fn writeStringBody(w: *Writer, s: []const u8) !void {
     for (s) |c| try writeEscaped(w, c);
 }
 
+/// `Parent.name@file` (or `name@file` when unnested) with no surrounding
+/// quotes — the caller wraps it in its own JSON string. This is the
+/// `name@path` form every navgraph name argument accepts, so a
+/// `codeLens` command's `arguments` round-trips as a `Target.symbol`.
+pub fn writeQualifiedAtFileBody(w: *Writer, ctx: Ctx, sym: Symbol) !void {
+    const idx = ctx.index();
+    if (sym.parent != model.invalid_symbol) {
+        try writeStringBody(w, idx.graph.symbols[sym.parent].name);
+        try writeEscaped(w, '.');
+    }
+    try writeStringBody(w, sym.name);
+    try writeEscaped(w, '@');
+    try writeStringBody(w, idx.graph.files[sym.file].path);
+}
+
 /// The contract's `Symbol` object.
 pub fn writeSymbol(w: *Writer, ctx: Ctx, sym: Symbol) !void {
     const idx = ctx.index();
@@ -129,6 +144,20 @@ pub fn writeSymbolArray(w: *Writer, ctx: Ctx, ids: []const SymbolId) !void {
 // ---------------------------------------------------------------------------
 // LSP Location / Range
 // ---------------------------------------------------------------------------
+
+/// A 0-based LSP range spanning a definition's whole source span (`sym.line`
+/// through `sym.endLine`), for `CallHierarchyItem.range` / `DocumentSymbol.range`
+/// / `TypeHierarchyItem.range` — every shape the contract spans a definition
+/// with. `selectionRange`/`writeNameRange` covers just the name.
+pub fn writeDefRange(w: *Writer, ctx: Ctx, sym: Symbol) !void {
+    const file = ctx.index().graph.files[sym.file];
+    const end_line = sym.endLine(file.text) - 1;
+    const end_col = position.byteToColumn(position.lineSlice(file.text, end_line) orelse "", ctx.encoding);
+    try w.print(
+        "{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
+        .{ sym.line - 1, end_line, end_col },
+    );
+}
 
 /// A 0-based LSP range covering `name` on 1-based `line`. When the name is not
 /// found on that line the range collapses at column 0.
