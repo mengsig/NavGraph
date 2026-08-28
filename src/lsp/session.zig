@@ -47,8 +47,10 @@ pub const Reason = enum {
     }
 };
 
-/// What one (re)index produced. `changed` is owned by the session and stays
-/// valid until the next re-index.
+/// What one (re)index produced. `changed` names the files whose indexed content
+/// changed — the dirty set for an edit, the disk delta (created, deleted,
+/// re-read) for a rescan. It is owned by the session and stays valid until the
+/// next re-index.
 pub const Report = struct {
     reason: Reason,
     files: u32,
@@ -243,10 +245,10 @@ pub const Session = struct {
         const start = self.nowMs();
         var sources = try index_mod.collect(self.gpa, self.io, self.root_dir, null, null, !full);
 
-        // Reserve the retirement slots first: this is the last step that can
-        // fail while `sources` is still ours to free. After the move below the
-        // session is its only owner, so nothing may free it from here.
-        self.retired.ensureUnusedCapacity(self.gpa, self.slots.items.len + 1) catch |err| {
+        // Everything that can fail while `sources` is still ours to free runs
+        // here. After the move below the session is its only owner, so nothing
+        // may free it from that point on.
+        self.prepareRescan(sources.files) catch |err| {
             sources.deinit();
             return err;
         };
@@ -262,15 +264,42 @@ pub const Session = struct {
         self.used_cache = sources.cache.hits != 0;
         try self.adoptSources();
 
-        self.changed.clearRetainingCapacity();
-        for (self.overlays.docs.keys()) |path| {
-            try self.changed.append(self.gpa, path);
-            try self.reparse(path);
-        }
+        for (self.overlays.docs.keys()) |path| try self.reparse(path);
         try self.swapIndex(self.cacheWrite());
         self.dirty.clearRetainingCapacity();
         self.debounce_deadline_ms = null;
         return self.finishIndex(.rescan, start);
+    }
+
+    /// Record what this rescan will change and reserve the retirement slots.
+    /// Both allocate, so both run while the caller can still free `next`.
+    fn prepareRescan(self: *Session, next: []const index_mod.ParsedFile) !void {
+        try self.retired.ensureUnusedCapacity(self.gpa, self.slots.items.len + 1);
+        try self.recordDiskDelta(next);
+    }
+
+    /// Fill `changed` with the files this rescan adds, drops, or re-reads with
+    /// different content. An open document is excluded: the index holds its
+    /// buffer, not the disk copy, so a rescan does not change it.
+    fn recordDiskDelta(self: *Session, next: []const index_mod.ParsedFile) !void {
+        self.changed.clearRetainingCapacity();
+        var next_paths: std.StringHashMapUnmanaged(void) = .empty;
+        defer next_paths.deinit(self.gpa);
+        try next_paths.ensureTotalCapacity(self.gpa, @intCast(next.len));
+        for (next) |f| {
+            next_paths.putAssumeCapacity(f.path, {});
+            const i = self.by_path.get(f.path) orelse {
+                try self.changed.append(self.gpa, try self.intern(f.path));
+                continue;
+            };
+            const slot = self.slots.items[i];
+            if (slot.overlaid or sameStat(slot.file.stat, f.stat)) continue;
+            try self.changed.append(self.gpa, slot.file.path);
+        }
+        for (self.slots.items) |slot| {
+            if (next_paths.contains(slot.file.path)) continue;
+            try self.changed.append(self.gpa, slot.file.path);
+        }
     }
 
     /// Re-stat every non-overlaid file; queue the ones that changed on disk.
@@ -280,12 +309,12 @@ pub const Session = struct {
         for (self.slots.items) |slot| {
             if (slot.overlaid) continue;
             const path = slot.file.path;
-            const st = self.statOf(path);
-            const same = if (st) |s|
-                s.mtime_ns == slot.file.stat.mtime_ns and s.ctime_ns == slot.file.stat.ctime_ns and s.size == slot.file.stat.size
-            else
-                false;
-            if (same) continue;
+            const st = self.statOf(path) orelse {
+                try self.markDirty(path);
+                found += 1;
+                continue;
+            };
+            if (sameStat(slot.file.stat, st)) continue;
             try self.markDirty(path);
             found += 1;
         }
@@ -509,6 +538,11 @@ pub const Session = struct {
 /// Mirrors the indexer's own per-file read cap.
 const max_file_bytes: usize = 8 * 1024 * 1024;
 
+/// Whether two stats describe the same on-disk content.
+fn sameStat(a: cache.FileStat, b: cache.FileStat) bool {
+    return a.mtime_ns == b.mtime_ns and a.ctime_ns == b.ctime_ns and a.size == b.size;
+}
+
 fn destroyArena(gpa: std.mem.Allocator, arena: ?*Arena) void {
     const a = arena orelse return;
     a.deinit();
@@ -675,6 +709,40 @@ test "rescan picks up a file created on disk and keeps unsaved overlays" {
     try testing.expect(s.idx.lookup("added").len == 1);
     // The unsaved edit survived the rescan.
     try testing.expect(s.idx.lookup("unsaved").len == 1);
+}
+
+test "rescan reports the disk delta, not the open buffers" {
+    var fx = try Fixture.init(testing.allocator, testing.io, &sample);
+    defer fx.deinit(testing.allocator);
+    const s = &fx.session;
+
+    // app.zig stays open and untouched on disk; util.zig is rewritten, added.zig
+    // appears, and gone.zig is deleted.
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "gone.zig", .data = "pub fn gone() void {}\n" });
+    _ = try s.rescan(false);
+    try s.openDocument("app.zig", sample[0][1]);
+    _ = try s.reindex(.change);
+
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "util.zig", .data = "pub fn helper() void {}\npub fn extra() void {}\n" });
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "added.zig", .data = "pub fn added() void {}\n" });
+    try fx.tmp.dir.deleteFile(testing.io, "gone.zig");
+
+    const report = try s.rescan(false);
+    try testing.expectEqual(Reason.rescan, report.reason);
+    try testing.expectEqual(@as(usize, 3), report.changed.len);
+    try testing.expectEqual(@as(usize, 1), countPath(report.changed, "util.zig"));
+    try testing.expectEqual(@as(usize, 1), countPath(report.changed, "added.zig"));
+    try testing.expectEqual(@as(usize, 1), countPath(report.changed, "gone.zig"));
+    // The open, unchanged buffer is not a change.
+    try testing.expectEqual(@as(usize, 0), countPath(report.changed, "app.zig"));
+}
+
+fn countPath(paths: []const []const u8, want: []const u8) usize {
+    var n: usize = 0;
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, want)) n += 1;
+    }
+    return n;
 }
 
 test "scanForChanges queues a file edited on disk but ignores an open one" {
