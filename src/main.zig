@@ -15,6 +15,7 @@ const viz = @import("viz.zig");
 const capabilities = @import("capabilities.zig");
 const agent_api = @import("agent_api.zig");
 const workspace_path = @import("workspace_path.zig");
+const lsp = @import("lsp.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -88,6 +89,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The editor server owns stdout (it is the protocol channel) and builds its
+    // own resident index, so it runs before the one-shot index build below.
+    if (parsed.command == .lsp) return runLspServer(gpa, io, err_out, parsed);
+
     if (parsed.command == .serve) {
         var authority = RootAuthority.open(gpa, io, parsed.root) catch |err| {
             try out.print("navgraph: failed to bind server root '{s}': {s}\n", .{ parsed.root, @errorName(err) });
@@ -117,7 +122,6 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         return;
     }
-
     var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
@@ -141,6 +145,23 @@ pub fn main(init: std.process.Init) !void {
     // (the "(no …)" note), so scripts/agents can branch on $? instead of
     // re-parsing output. Usage errors exit 2, indexing failures propagate.
     if (!found) std.process.exit(1);
+}
+
+/// Run `navgraph lsp` and exit with the code the LSP session ended on.
+fn runLspServer(gpa: std.mem.Allocator, io: std.Io, err_out: *std.Io.Writer, parsed: cli.Parsed) !void {
+    const level = lsp.handlers.LogLevel.parse(parsed.log_level) orelse {
+        try err_out.print("navgraph: unknown --log-level '{s}' (expected error|info|debug)\n", .{parsed.log_level});
+        try err_out.flush();
+        std.process.exit(2);
+    };
+    const code = try lsp.run(gpa, io, .{
+        // An explicit `--root` pins the index root; otherwise the client's
+        // workspace root from `initialize` decides (falling back to cwd).
+        .root = if (parsed.root_given) parsed.root else "",
+        .log_path = parsed.log_path,
+        .log_level = level,
+    });
+    if (code != 0) std.process.exit(code);
 }
 
 /// Say on stderr how many graph nodes `-l` withheld.
@@ -253,7 +274,7 @@ fn dispatchWithAuthority(
                 try noteGraphTruncation(io, truncation, parsed.options.limit);
             break :blk true; // graph always emits a page/model
         },
-        .capabilities, .serve, .help => unreachable,
+        .capabilities, .serve, .lsp, .help => unreachable,
     };
 }
 

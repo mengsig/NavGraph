@@ -46,6 +46,7 @@ pub const Command = enum {
     graph,
     capabilities,
     serve,
+    lsp,
     help,
 };
 
@@ -102,6 +103,8 @@ pub const Option = enum {
     handler,
     no_public,
     follow_imports,
+    log,
+    log_level,
 };
 
 pub const ValueKind = enum { boolean, string, integer, enumeration, cursor };
@@ -178,6 +181,8 @@ pub const option_descriptors = [_]OptionDescriptor{
     .{ .option = .handler, .name = "handler", .spellings = &.{valueFlag("--handler")}, .value_kind = .string },
     .{ .option = .no_public, .name = "no_public", .spellings = &.{trueFlag("--no-public")}, .value_kind = .boolean },
     .{ .option = .follow_imports, .name = "follow_imports", .spellings = &.{trueFlag("--follow-imports")}, .value_kind = .boolean },
+    .{ .option = .log, .name = "log", .spellings = &.{valueFlag("--log")}, .value_kind = .string },
+    .{ .option = .log_level, .name = "log_level", .spellings = &.{valueFlag("--log-level")}, .value_kind = .enumeration, .values = &.{ "error", "info", "debug" } },
 };
 
 pub const CommandDescriptor = struct {
@@ -304,6 +309,7 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
     .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
     .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
+    .{ .command = .lsp, .name = "lsp", .arguments = &no_args, .options = &.{ .root, .no_cache, .log, .log_level }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
     .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false, .cache_effect = .none },
 };
 
