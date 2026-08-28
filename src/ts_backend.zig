@@ -950,17 +950,49 @@ fn applyDecorators(source: []const u8, decorated: TSNode, mods: *Mods) void {
 /// Index of the innermost callable definition owning byte `offset`, or null when
 /// the site sits at file scope (which the heuristic backend also drops).
 fn ownerOf(defs: []const Def, offset: u32) ?u32 {
-    var best: ?u32 = null;
-    var best_span: u32 = std.math.maxInt(u32);
-    for (defs, 0..) |d, i| {
-        if (d.kind != .function and d.kind != .method) continue;
-        if (offset < d.sig_end or offset >= d.span_end) continue;
-        const span = d.span_end - d.span_start;
-        if (span > best_span) continue;
-        best_span = span;
-        best = @intCast(i);
+    return enclosingCallable(defs, offset, .body_only);
+}
+
+/// Where a reference site must sit to belong to a callable: in its body, or
+/// anywhere in it including the signature (a parameter is declared there).
+const SiteScope = enum { body_only, with_signature };
+
+/// The innermost callable containing `offset`, found in time linear in nesting
+/// depth rather than in the file's definition count — the per-site linear scan
+/// this replaces made a single 12 000-definition module quadratic.
+///
+/// `defs` is sorted outer-before-inner by `span_start` (`sortDefs`) and spans
+/// nest, so every definition containing `offset` is an ancestor of the last
+/// definition opened at or before it, i.e. on that one's `nearest` chain.
+fn enclosingCallable(defs: []const Def, offset: u32, scope: SiteScope) ?u32 {
+    var cur = lastOpenedAt(defs, offset);
+    while (cur) |i| {
+        const d = defs[i];
+        if (d.kind == .function or d.kind == .method) {
+            const from = switch (scope) {
+                .body_only => d.sig_end,
+                .with_signature => d.span_start,
+            };
+            if (offset >= from and offset < d.span_end) return i;
+        }
+        const next = d.nearest orelse return null;
+        // Enclosing definitions sort earlier, so the walk strictly ascends and
+        // cannot loop.
+        std.debug.assert(next < i);
+        cur = next;
     }
-    return best;
+    return null;
+}
+
+/// Index of the last definition whose span starts at or before `offset`.
+fn lastOpenedAt(defs: []const Def, offset: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = defs.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (defs[mid].span_start <= offset) lo = mid + 1 else hi = mid;
+    }
+    return if (lo == 0) null else @intCast(lo - 1);
 }
 
 /// The `object`/`property` pair of a member access (`a.b`), whichever field
@@ -1261,16 +1293,8 @@ fn attachBindings(
 }
 
 /// Owner lookup for a site inside a definition's *signature* (a parameter).
+/// Like `ownerOf`, but a site in the signature counts: a parameter belongs to
+/// the callable that declares it.
 fn ownerOfSignature(defs: []const Def, offset: u32) ?u32 {
-    var best: ?u32 = null;
-    var best_span: u32 = std.math.maxInt(u32);
-    for (defs, 0..) |d, i| {
-        if (d.kind != .function and d.kind != .method) continue;
-        if (offset < d.span_start or offset >= d.span_end) continue;
-        const span = d.span_end - d.span_start;
-        if (span > best_span) continue;
-        best_span = span;
-        best = @intCast(i);
-    }
-    return best;
+    return enclosingCallable(defs, offset, .with_signature);
 }
