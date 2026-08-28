@@ -221,7 +221,7 @@ const testing = std.testing;
 fn vzBuild(tmp: *std.testing.TmpDir) !Index {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    return index_mod.build(testing.allocator, testing.io, root, false);
+    return index_mod.build(testing.allocator, testing.io, root, false, .auto);
 }
 
 fn vzRender(idx: *Index, filter: []const u8, opts: query.Options) ![]u8 {

@@ -981,7 +981,7 @@ test "taint graph does not bypass a constant-returning wrapper" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1003,7 +1003,7 @@ test "taint graph propagates a call result into a sink" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1026,7 +1026,7 @@ test "taint graph ignores later writes when reading an earlier binding" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1085,7 +1085,7 @@ test "taint graph handles route pseudo-symbol ordering" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1110,7 +1110,7 @@ test "taint graph keeps assignments inside brace-language bodies" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1135,7 +1135,7 @@ test "taint graph links a direct source through a local assignment to a sink" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1164,7 +1164,7 @@ test "taint graph maps a caller argument to a callee parameter" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();
@@ -1189,7 +1189,7 @@ test "taint graph downgrades nested call results in heuristic receiver calls" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx, Selector.parse("request.json").?, Selector.parse("subprocess.run").?);
     defer graph.deinit();

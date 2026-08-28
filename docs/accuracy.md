@@ -264,12 +264,12 @@ run:
 | java | 100.00 | 76.25 | 106/106/139 | 97.05 | 59.45 | 66/68/111 | 87.87 | 93.58 | 59.83 | 73/78/122 |
 | javascript | 85.05 | 77.08 | 74/87/96 | 97.95 | 73.84 | 48/49/65 | 81.25 | 100.00 | 74.62 | 50/50/67 |
 | lua | 90.90 | 66.66 | 50/55/75 | 84.90 | 84.90 | 45/53/53 | 93.33 | 100.00 | 86.20 | 50/50/58 |
-| python | 96.68 | 91.14 | 175/181/192 | 93.07 | 87.68 | 121/130/138 | 73.55 | 100.00 | 87.94 | 124/124/141 |
+| python | 96.87 | 96.87 | 186/192/192 | 98.40 | 89.13 | 123/125/138 | 80.48 | 100.00 | 89.36 | 126/126/141 |
 | ruby | 97.46 | 92.77 | 77/79/83 | 100.00 | 73.84 | 48/48/65 | 81.25 | 100.00 | 73.52 | 50/50/68 |
 | rust | 98.64 | 85.88 | 73/74/85 | 84.31 | 51.19 | 43/51/84 | 83.72 | 97.95 | 40.00 | 48/49/120 |
-| typescript | 92.20 | 58.19 | 71/77/122 | 100.00 | 46.42 | 26/26/56 | 84.61 | 100.00 | 44.06 | 26/26/59 |
+| typescript | 94.78 | 89.34 | 109/115/122 | 100.00 | 62.50 | 35/35/56 | 97.14 | 100.00 | 59.32 | 35/35/59 |
 | zig | 100.00 | 72.91 | 105/105/144 | 98.36 | 63.82 | 60/61/94 | 68.33 | 100.00 | 50.00 | 64/64/128 |
-| **all** | **93.45** | **74.06** | 1071/1146/1446 | **90.86** | **61.10** | 597/657/977 | **81.40** | **98.15** | **57.33** | 637/649/1111 |
+| **all** | **93.72** | **77.45** | 1120/1195/1446 | **91.98** | **62.23** | 608/661/977 | **83.55** | **98.18** | **58.32** | 648/660/1111 |
 <!-- /accuracy-table:after-wave-1 -->
 
 No measurement dropped in any language against that like-for-like base. The
@@ -453,6 +453,72 @@ symbols are named `Stats`. It selects by kind now.
 The open gap this exposes is Zig's, not the walk's: a field of the enclosing
 container (`self.stack`) does not type its receiver, so the call is a 1-in-2
 name guess rather than an exact bind.
+
+## Tree-sitter promotion: Python, TypeScript, TSX
+
+`--backend auto` routes Python, TypeScript and TSX through the tree-sitter
+backend (`src/backends.zig`'s owner table). Every other language stays on the
+heuristic scanner. The promotion was gated on this bench: no metric of a
+promoted language may fall, and the raised floors ship in the same commit.
+
+Measured before (the table above, heuristic everywhere) and after:
+
+| language | metric | before | after |
+|---|---|---|---|
+| python | def P | 96.68 | 96.87 |
+| python | def R | 91.14 | **96.87** |
+| python | edge P | 93.07 | **98.40** |
+| python | edge R | 87.68 | 89.13 |
+| python | exact agree | 73.55 | **80.48** |
+| python | site P | 100.00 | 100.00 |
+| python | site R | 87.94 | 89.36 |
+| typescript | def P | 92.20 | **94.78** |
+| typescript | def R | 58.19 | **89.34** |
+| typescript | edge P | 100.00 | 100.00 |
+| typescript | edge R | 46.42 | **62.50** |
+| typescript | exact agree | 84.61 | **97.14** |
+| typescript | site P | 100.00 | 100.00 |
+| typescript | site R | 44.06 | **59.32** |
+
+No other language moved a cell: the owner table is per-language, and the two
+resolver changes below only read a `declared_type` no heuristic-backed language
+records.
+
+What moved each number:
+
+- **Definition recall.** The grammar sees what a token scan cannot: Python
+  `self.x = …` instance fields, TypeScript interface members, class fields and
+  their declared types. TypeScript's 58.19 → 89.34 is almost entirely those.
+- **Edge precision and exactness.** A declared type is now resolution evidence.
+  `receiverType` reads the declared type of a *field* of the chain-root
+  container and of a *same-file top-level variable*, so `self.items.get(…)` on
+  `items: dict` abstains (`isBuiltinContainer`) instead of matching some
+  project `get`, and a module-level `cache = Store()` binds `cache.get(…)` to
+  `Store.get`. Python edge precision 93.07 → 98.40 is that abstention; the
+  TypeScript exactness jump is that binding.
+
+Three judgement calls, all made against the goldens rather than against what
+the backend happened to emit:
+
+- **Enum members and a type alias's object-type members are not definitions.**
+  The corpora exclude enum members in every language and count only interface
+  members, class fields and constructor parameter properties on the TypeScript
+  side. Indexing `type Event = { kind: … }`'s members cost 5 points of
+  TypeScript definition precision (94.78 → 89.34 measured), so the queries are
+  scoped to `interface_body`. This reverses one half of PR #9's F11 assertion,
+  which predated the golden corpus.
+- **Seven Python edges the heuristic drew are gone**, all `<dict>.get(…)` /
+  `<dict>.update(…)` landing on an unrelated service method by global-name
+  match. None is in `tests/golden/python.json`; they are recorded as
+  adjudicated losses in `tests/backend-differ.zig`.
+- **Twenty-nine newly exact edges** were read against the fixture source before
+  being accepted, and are listed with their reason in the same file. An exact
+  edge is a promise to `--strict`, so gaining one stays a reviewed act.
+
+Two backend bugs the promotion surfaced and this change fixes: the second
+declarator of `const a = 1, b = 2` was dropped (the definition is the
+declarator, not the statement), and references one character long were skipped
+on a rule the heuristic scanner had already abandoned.
 
 ## Failure classes, by what they cost
 

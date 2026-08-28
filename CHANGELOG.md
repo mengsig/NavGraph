@@ -5,6 +5,39 @@ All notable changes to NavGraph are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **A tree-sitter parser backend** (`-Dtree-sitter=<all|none|python,typescript,tsx>`,
+  default `all`), selected per run with `--backend <auto|heuristic|tree-sitter>`.
+  Python, TypeScript and TSX are now owned by it under the default `auto`;
+  every other language stays on the heuristic scanner. See
+  [`docs/backends.md`](docs/backends.md).
+- `zig build differ` diffs both backends over the fixture trees: no definition
+  or edge the scanner finds may disappear, and every newly exact edge is a
+  reviewed entry with a written reason.
+
+### Changed
+
+- Python and TypeScript accuracy against the golden corpora, measured by
+  `zig build bench`: definition recall 91.14 → 96.87 (python) and
+  58.19 → 89.34 (typescript), edge precision 93.07 → 98.40 (python), exact
+  agreement 73.55 → 80.48 (python) and 84.61 → 97.14 (typescript). No metric of
+  either language fell; the floors are raised to match.
+- A declared type is now resolution evidence: a field of the receiver chain's
+  head type, and a same-file top-level variable, type their receiver. A call on
+  a builtin container (`items: dict`) abstains instead of matching a
+  same-named project method.
+- Enum members and a type alias's object-type members are no longer indexed as
+  definitions, matching the golden corpora (interface members and class fields
+  still are).
+
+### Fixed
+
+- TypeScript: the second and later declarators of `const a = 1, b = 2` were
+  dropped by the tree-sitter backend.
+- References one character long (`b()`) were skipped by the tree-sitter
+  backend, on a rule the heuristic scanner no longer applies.
+
 ## [1.0.0] - 2026-08-28
 
 First tagged release.

@@ -10,6 +10,7 @@
 //! to stderr, or to `--log <file>`.
 
 const std = @import("std");
+const backends = @import("../backends.zig");
 const handlers = @import("handlers.zig");
 const rpc = @import("rpc.zig");
 const session_mod = @import("session.zig");
@@ -28,6 +29,8 @@ pub const Options = struct {
     /// `--log <file>`; empty means log to stderr.
     log_path: []const u8 = "",
     log_level: handlers.LogLevel = .err,
+    /// `--backend`; the session's grammars are compiled for it once.
+    backend: backends.Choice = .auto,
 };
 
 /// Serve until stdin ends or the client sends `exit`. Returns the process exit
@@ -44,7 +47,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !u8 {
     var server = handlers.Server.init(gpa, io, &out_file.interface, .{
         .writer = &log_writer.interface,
         .level = opts.log_level,
-    }, opts.root);
+    }, opts.root, opts.backend);
     defer server.deinit();
 
     var stream: Stream = .{};

@@ -565,6 +565,16 @@ model, the measured numbers and the current limitations — is in
 
 Everything for one run lives in a single arena that is freed on exit.
 
+## Backends
+
+Step 3 above (**Extract**) runs one of two backends: the heuristic scanner
+described here (no grammar required, always available), or an opt-in
+tree-sitter backend (`-Dtree-sitter=<all|none|comma list>` at build time,
+`--backend auto|heuristic|tree-sitter` at run time) that trades a slower cold
+parse for grammar-accurate extraction on the languages it covers. See
+`docs/backends.md` for the design, the offline-build story, and measured
+numbers.
+
 ## Limitations & roadmap
 
 - Resolution is **heuristic**, not compiler-grade. It is type-scoped (a member

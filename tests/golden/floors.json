@@ -7,10 +7,10 @@
     { "language": "java", "def_precision_bp": 10000, "def_recall_bp": 7625, "edge_precision_bp": 9705, "edge_recall_bp": 5945, "exact_agreement_bp": 8787, "site_recall_bp": 5983, "site_precision_bp": 9358 },
     { "language": "javascript", "def_precision_bp": 8505, "def_recall_bp": 7708, "edge_precision_bp": 9795, "edge_recall_bp": 7384, "exact_agreement_bp": 8125, "site_recall_bp": 7462, "site_precision_bp": 10000 },
     { "language": "lua", "def_precision_bp": 9090, "def_recall_bp": 6666, "edge_precision_bp": 8490, "edge_recall_bp": 8490, "exact_agreement_bp": 9333, "site_recall_bp": 8620, "site_precision_bp": 10000 },
-    { "language": "python", "def_precision_bp": 9668, "def_recall_bp": 9114, "edge_precision_bp": 9307, "edge_recall_bp": 8768, "exact_agreement_bp": 7355, "site_recall_bp": 8794, "site_precision_bp": 10000 },
+    { "language": "python", "def_precision_bp": 9687, "def_recall_bp": 9687, "edge_precision_bp": 9840, "edge_recall_bp": 8913, "exact_agreement_bp": 8048, "site_recall_bp": 8936, "site_precision_bp": 10000 },
     { "language": "ruby", "def_precision_bp": 9746, "def_recall_bp": 9277, "edge_precision_bp": 10000, "edge_recall_bp": 7384, "exact_agreement_bp": 8125, "site_recall_bp": 7352, "site_precision_bp": 10000 },
     { "language": "rust", "def_precision_bp": 9864, "def_recall_bp": 8588, "edge_precision_bp": 8431, "edge_recall_bp": 5119, "exact_agreement_bp": 8372, "site_recall_bp": 4000, "site_precision_bp": 9795 },
-    { "language": "typescript", "def_precision_bp": 9220, "def_recall_bp": 5819, "edge_precision_bp": 10000, "edge_recall_bp": 4642, "exact_agreement_bp": 8461, "site_recall_bp": 4406, "site_precision_bp": 10000 },
+    { "language": "typescript", "def_precision_bp": 9478, "def_recall_bp": 8934, "edge_precision_bp": 10000, "edge_recall_bp": 6250, "exact_agreement_bp": 9714, "site_recall_bp": 5932, "site_precision_bp": 10000 },
     { "language": "zig", "def_precision_bp": 10000, "def_recall_bp": 7291, "edge_precision_bp": 9836, "edge_recall_bp": 6382, "exact_agreement_bp": 6833, "site_recall_bp": 5000, "site_precision_bp": 10000 }
   ]
 }

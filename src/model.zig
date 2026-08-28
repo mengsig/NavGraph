@@ -228,6 +228,11 @@ pub const Symbol = struct {
     /// `os.path`). Empty for every other kind. `name` holds the binding it is
     /// imported as, so `import_path` + `name` gives `alias -> module`.
     import_path: []const u8 = "",
+    /// Declared or directly-inferred type of this symbol, when the source spells
+    /// one: a Python annotation or `self.x = Type()` constructor, a TS field or
+    /// property type. Empty when unknown. Only a grammar-backed parse fills it;
+    /// the heuristic scanner leaves it empty.
+    declared_type: []const u8 = "",
 
     /// The single-line signature slice (declaration up to sig_end), trimmed.
     pub fn signature(self: Symbol, source: []const u8) []const u8 {
@@ -270,14 +275,38 @@ pub const Symbol = struct {
     }
 };
 
+/// Which extraction backend produced a file's symbols. Serialized as one byte.
+pub const Backend = enum(u8) {
+    /// The lexer-driven scanner in `parser.zig` — the default and the fallback.
+    heuristic,
+    /// A real grammar via `ts_backend.zig`.
+    tree_sitter,
+};
+
 /// File-level parser reliability. A desync means an unterminated literal may
 /// have swallowed the reported line range, so missing symbols/edges are suspect.
 pub const ParseHealth = struct {
     desync_from: ?u32 = null,
     desync_to: u32 = 0,
+    /// Backend that actually produced the symbols (not the one requested).
+    backend: Backend = .heuristic,
+    /// Tree-sitter owned this language but its parse hit an ERROR node, so the
+    /// heuristic scanner produced these symbols instead. A partial tree-sitter
+    /// set is never presented as complete.
+    tree_sitter_fallback: bool = false,
 
     pub fn reliable(self: ParseHealth) bool {
         return self.desync_from == null;
+    }
+
+    /// Whether this file has anything worth surfacing on a diagnostic feed: a
+    /// tokenizer desync (missing symbols suspected) or a silent backend
+    /// substitution (the requested backend was not the one that ran).
+    /// Deliberately distinct from `reliable`, which means "no missing-symbol
+    /// risk" and must stay that narrow — a fallback file's heuristic parse is
+    /// no less complete than any other heuristic-language file.
+    pub fn hasDiagnostic(self: ParseHealth) bool {
+        return self.desync_from != null or self.tree_sitter_fallback;
     }
 };
 

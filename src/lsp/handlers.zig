@@ -19,6 +19,7 @@ const queries = @import("queries.zig");
 const regex = @import("regex.zig");
 const rpc = @import("rpc.zig");
 const search = @import("search.zig");
+const backends = @import("../backends.zig");
 const session_mod = @import("session.zig");
 
 const Writer = std.Io.Writer;
@@ -79,6 +80,8 @@ pub const Server = struct {
     cli_root: []const u8,
     /// The resolved index root, owned by the server.
     root: []u8,
+    /// `--backend`; the session compiles its grammars for this once.
+    backend: backends.Choice,
     cfg: session_mod.Config,
     encoding: position.Encoding,
     session: ?session_mod.Session,
@@ -92,7 +95,7 @@ pub const Server = struct {
     /// by the same request, so it never outlives the response it describes.
     err_detail: ?[]const u8,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, out: *Writer, log: Log, cli_root: []const u8) Server {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, out: *Writer, log: Log, cli_root: []const u8, backend: backends.Choice) Server {
         return .{
             .gpa = gpa,
             .io = io,
@@ -100,6 +103,7 @@ pub const Server = struct {
             .log = log,
             .cli_root = cli_root,
             .root = &.{},
+            .backend = backend,
             .cfg = .{},
             .encoding = .utf16,
             .session = null,
@@ -443,7 +447,7 @@ fn initialized(self: *Server, arena: std.mem.Allocator, _: ?std.json.Value) Erro
         try self.send(try progressCreate(arena, token));
         try self.notify(arena, "$/progress", try progressBegin(arena, token));
     }
-    self.session = session_mod.Session.init(self.gpa, self.io, self.root, self.cfg) catch |err| {
+    self.session = session_mod.Session.init(self.gpa, self.io, self.root, self.cfg, self.backend) catch |err| {
         self.log.print(.err, "indexing {s} failed: {s}", .{ self.root, @errorName(err) });
         if (self.client_progress) try self.notify(arena, "$/progress", try progressEnd(arena, token, "index failed"));
         try self.notify(arena, "window/logMessage", try logMessageParams(arena, 1, "navgraph: indexing failed"));
@@ -1110,7 +1114,7 @@ pub const TestServer = struct {
         self.server = Server.init(gpa, io, &self.out.writer, .{
             .writer = &self.logged.writer,
             .level = .err,
-        }, self.root);
+        }, self.root, .auto);
         return self;
     }
 
@@ -2596,7 +2600,7 @@ fn expectSameOrder(a: []const []const u8, b: []const []const u8) !void {
 }
 
 test "golden parity: outline/unused/hot/path/neighbors agree with the CLI's -j output (testenv/zig_vm)" {
-    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/zig_vm", false);
+    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/zig_vm", false, .auto);
     defer idx.deinit();
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/zig_vm");
     defer ts.deinit();
@@ -2722,7 +2726,7 @@ test "golden parity: outline/unused/hot/path/neighbors agree with the CLI's -j o
 }
 
 test "golden parity: routes/events/imports/importers agree with the CLI's -j output (testenv/fullstack)" {
-    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/fullstack", false);
+    var idx = try index_mod.build(testing.allocator, testing.io, "testenv/fullstack", false, .auto);
     defer idx.deinit();
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
     defer ts.deinit();

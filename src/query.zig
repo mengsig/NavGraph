@@ -575,7 +575,7 @@ fn collectStatus(idx: *const Index, io: std.Io, filter: []const u8, opts: Option
         if (!statusFileSelected(file, filter, opts)) continue;
         report.scope_files += 1;
         report.scope_symbols += file.sym_end - file.sym_start;
-        if (!file.parse_health.reliable()) report.parse_warnings += 1;
+        if (file.parse_health.hasDiagnostic()) report.parse_warnings += 1;
         const resolution = unresolvedInFile(idx, file);
         report.likely_local_refs += resolution.likely_local;
         report.external_or_unmodeled_refs += resolution.external_or_unmodeled;
@@ -784,8 +784,12 @@ fn renderStatusDiagnostics(w: *Writer, idx: *const Index, filter: []const u8, re
     try w.print("parse health: {d} warning{s}\n", .{ report.parse_warnings, if (report.parse_warnings == 1) "" else "s" });
     for (idx.graph.files) |file| {
         if (!statusFileSelected(file, filter, opts)) continue;
-        const from = file.parse_health.desync_from orelse continue;
-        try w.print("  {s}:{d}-{d} tokenizer_desync\n", .{ file.path, from, file.parse_health.desync_to });
+        if (file.parse_health.desync_from) |from| {
+            try w.print("  {s}:{d}-{d} tokenizer_desync\n", .{ file.path, from, file.parse_health.desync_to });
+        }
+        if (file.parse_health.tree_sitter_fallback) {
+            try w.print("  {s} tree_sitter_fallback\n", .{file.path});
+        }
     }
     try w.print("skipped: {d}\n", .{report.skipped});
     for (idx.skipped_dirs) |path| if (filter.len == 0 or matchesFilter(path, filter)) try w.print("  {s}\n", .{path});
@@ -4945,7 +4949,7 @@ test "shortest path and dead-code detection over a call chain" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // alpha -> beta -> gamma is the shortest path.
@@ -4989,7 +4993,7 @@ test "calls hides var/const data reads by default, shows them with --refs; graph
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Default `calls run`: the call to `helper` shows; the `LIMIT` const read is
@@ -5057,7 +5061,7 @@ test "call-site line annotation, usages search, and @path disambiguation" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // `callers helper` must annotate the caller with the call-site line (5), not
@@ -5122,7 +5126,7 @@ test "heuristic (ambiguous name-match) edges are marked with `?`; strict drops t
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Default `calls run` marks the ambiguous callee edge with `?`.
@@ -5155,22 +5159,22 @@ test "OO dispatch stays out of unused; hot reports its heuristic fan-in honestly
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     // `create_run` is dispatched via a chained, untyped receiver
-    // (`self.planning.create_run(...)`) — the OO pattern that made the repo-scale
-    // trials flag live methods as dead.
+    // (`self.planning.create_run(...)`, `planning` a bare parameter) — the OO
+    // pattern that made the repo-scale trials flag live methods as dead.
     try tmp.dir.writeFile(io, .{ .sub_path = "svc.py", .data =
         \\class PlanningService:
         \\    def create_run(self, x):
         \\        return x
         \\
         \\class Handler:
-        \\    def __init__(self):
-        \\        self.planning = PlanningService()
+        \\    def __init__(self, planning):
+        \\        self.planning = planning
         \\    def handle(self):
         \\        return self.planning.create_run(1)
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var idbuf: [8]SymbolId = undefined;
@@ -5239,7 +5243,7 @@ test "unused: a helper used only via a template literal or past JSX prose is not
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5272,7 +5276,7 @@ test "unused: a class never instantiated is dead; an instantiated one is live" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5302,7 +5306,7 @@ test "unused: a Java record's positional parameter is not read as an external ba
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5334,7 +5338,7 @@ test "unused: a dead symbol is flagged despite a used same-name twin in another 
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var refs = try buildReferencedNames(&idx);
@@ -5373,7 +5377,7 @@ test "unused --follow-imports flags a same-family dead twin the tally masks" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var abuf: [8]SymbolId = undefined;
@@ -5414,7 +5418,7 @@ test "unused: a multi-line decorator suppresses a framework-wired handler" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5447,7 +5451,7 @@ test "unused: a decorator function applied as @name is live, not dead" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5470,7 +5474,7 @@ test "unused: --no-public reports how many exported symbols it hid" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5503,7 +5507,7 @@ test "unused: a name only re-exported/imported is dead; called or aliased-and-us
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5544,7 +5548,7 @@ test "unused: used-only-from-tests is flagged and annotated; production use is n
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5584,7 +5588,7 @@ test "unused: default (--tests with) treats test usage as real; --tests-only fin
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Default `--tests with`: a symbol used by a test is NOT dead; only truly-dead.
@@ -5638,7 +5642,7 @@ test "unused: a Zig fn used only inside an inline test {} block is test-only, no
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5671,7 +5675,7 @@ test "callers shows call-site multiplicity (×N) when a caller invokes the targe
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5705,7 +5709,7 @@ test "callers lists every distinct call-site line when a caller hits the target 
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5738,7 +5742,7 @@ test "read: numbered lines, a range, and a non-indexed file via disk fallback" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // Indexed file, a line range: lines 2-3 numbered, line 1 excluded.
@@ -5776,7 +5780,7 @@ test "files lists indexed files with their symbol counts" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5808,7 +5812,7 @@ test "files --sort symbols ranks the file with more symbols first" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5854,7 +5858,7 @@ test "end line is correct despite a leading comment or template prefix" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // plain: name on line 2, closing brace on line 4.
@@ -5885,7 +5889,7 @@ test "events pairs a decorator handler with an emitter across files" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5918,7 +5922,7 @@ test "diff maps a changed hunk to its symbol and lists the blast radius" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // A synthetic hunk touching helper's body (line 2) — bypasses git so the test
@@ -5968,7 +5972,7 @@ test "diff includes untracked supported source and exact new-file patch" {
     // from HEAD. The unsupported note must not leak into the source diff.
     try tmp.dir.writeFile(io, .{ .sub_path = "fresh.zig", .data = "pub fn fresh() u32 { return 7; }\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "not source\n" });
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -5995,7 +5999,7 @@ test "events marks a key with only one side unpaired and honors the filter" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6024,7 +6028,7 @@ test "hot ranks the most-called function first" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const ranked = try collectHot(&idx, "", .with);
@@ -6063,7 +6067,7 @@ test "hot splits test callers from production callers" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const ranked = try collectHot(&idx, "", .with);
@@ -6094,7 +6098,7 @@ test "line range renders end line for a multi-line definition" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6127,7 +6131,7 @@ test "render surfaces accessor/async modifiers in the kind field" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // A getter reads as `get Store.value`, not a bare `method` (the false bug).
@@ -6169,7 +6173,7 @@ test "strings finds text inside string literals, never bare identifiers" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // The URL literal is found in both languages, with file:line.
@@ -6211,7 +6215,7 @@ test "search --refs lists every distinct use-site line of a name" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6243,7 +6247,7 @@ test "search --refs pins instance-attribute reads by receiver" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6284,7 +6288,7 @@ test "def -v full includes leading decorators and multi-line python literals" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // The handler's decorators are part of its `-v full` (a paste-ready target).
@@ -6325,7 +6329,7 @@ test "read: multiple comma-separated ranges with a gap marker" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6377,7 +6381,7 @@ test "read merges overlapping ranges and never emits duplicate lines" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6411,7 +6415,7 @@ test "read pages whole files and explicit selections with a selected-line cursor
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6484,7 +6488,7 @@ test "read whole-file default returns the first 300-line page" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6506,7 +6510,7 @@ test "read validation errors are typed in text and do not probe fake filenames" 
     try tmp.dir.writeFile(io, .{ .sub_path = "m.py", .data = "value = 1\n" });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6550,7 +6554,7 @@ test "unused: a prod fn used only from a tests/ directory is test-only (dir scop
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6707,7 +6711,7 @@ test "outline -k restricts to the requested kind, both sides of the branch" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // No filter: both the struct and the fn appear.
@@ -6754,7 +6758,7 @@ test "outline -v names drops the signature that the default sig view shows" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // Default sig view carries the parameter list.
@@ -6796,7 +6800,7 @@ test "outline truncates per-file and names the unexpanded overflow files under -
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // limit 1 across two files: first file expands one symbol, second is named-only.
@@ -6842,7 +6846,7 @@ test "outline path filter with no match reports an explicit empty result" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6866,7 +6870,7 @@ test "outline --format json is well-formed and carries path/lang/symbols" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6905,7 +6909,7 @@ test "listFiles: default order filters by path and reports an empty scope" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // Filter narrows to the matching file only.
@@ -6941,7 +6945,7 @@ test "read: out-of-range line noted; open-ended A- tail runs to EOF" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // A range whose start is past EOF is flagged, not silently empty.
@@ -7000,7 +7004,7 @@ test "showDef: unknown name is reported; @path selects one of several twins" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // Missing name → the explicit not-found sentence.
@@ -7049,7 +7053,7 @@ test "walk: unknown symbol reported; callees followed to depth 2" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // Unknown name → the (no symbol named …) note.
@@ -7095,7 +7099,7 @@ test "search: matches names, honors -k, and reports no match" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // A substring pattern matches both the struct and the fn by name.
@@ -7144,7 +7148,7 @@ test "neighbors: shows both callees and callers, and reports a missing symbol" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // mid sits between top (caller) and leaf (callee): both directions listed.
@@ -7193,7 +7197,7 @@ test "routes: a route renders with its handler callee and its client caller" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -7225,7 +7229,7 @@ test "phase 1 route views select clients, unhit routes, handlers, and orphan cal
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7260,7 +7264,7 @@ test "routes: a filter that matches no route reports an empty scope" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // The filter matches the one route by its name substring.
@@ -7303,7 +7307,7 @@ test "phase 1 protocol walks and conformance share inferred implementation edges
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -7350,7 +7354,7 @@ test "events filters DOM noise and links Kafka topic aliases" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7374,7 +7378,7 @@ test "phase 1 visibility filters outline and search consistently" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7405,7 +7409,7 @@ test "imports: listImports shows a local import with its binding; empty scope no
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // user.zig → dep.zig, bound as `dep`.
@@ -7445,7 +7449,7 @@ test "imports: listImporters lists reverse deps and reports none for a leaf" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // dep.zig is imported by user.zig.
@@ -7484,7 +7488,7 @@ test "shortestPath renders the chain, a same-node path, and a no-path note" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // A reachable target renders the full alpha→beta→gamma cascade.
@@ -7533,7 +7537,7 @@ test "shortestPath abstains on ambiguous endpoints and offers unique pins" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -7566,7 +7570,7 @@ test "hot: caps at -l with an overflow note, and scopes by file-path filter" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     { // -l 1 shows only the top-ranked function and notes the rest.
@@ -7614,7 +7618,7 @@ test "hot hints when test callers dominate the visible ranking" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7643,7 +7647,7 @@ test "phase 2 flow classifies constructor, member, and augmented accesses" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7679,7 +7683,7 @@ test "flow reports ambiguous definitions and counts module initializers as write
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7714,7 +7718,7 @@ test "flow --to starts at an initializer and follows readers to the sink" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
 
     const value_ids = idx.lookup("VALUE");
@@ -7736,7 +7740,7 @@ test "flow handles an empty index" {
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7766,7 +7770,7 @@ test "flow --to ignores writes to unrelated values" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
 
     const value_ids = idx.lookup("VALUE");
@@ -7788,7 +7792,7 @@ test "phase 2 span ranking is global and biggest first" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     const ranked = try collectRankedDefinitions(&idx, "", "", .{ .sort = .span, .kinds = "fn" }, true);
     defer testing.allocator.free(ranked);
@@ -7809,7 +7813,7 @@ test "phase 2 collisions groups duplicate top-level names deterministically" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, testing.io, root, false);
+    var idx = try index_mod.build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -7844,7 +7848,7 @@ test "test-awareness: Zig test block is a caller; --tests scope + coverage" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The `test` block is a first-class symbol and a caller of `used`.
@@ -7895,7 +7899,7 @@ test "unused: a JS object-literal key does not mask a dead function (tally scope
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var refs = try buildReferencedNames(&idx);
     defer refs.deinit();
@@ -7922,7 +7926,7 @@ test "unused: a dead @dataclass class is reported (decorated classes are not fra
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var refs = try buildReferencedNames(&idx);
     defer refs.deinit();
@@ -7949,7 +7953,7 @@ test "status exposes changed files, parse health, and unresolved diagnostics" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     try tmp.dir.writeFile(io, .{ .sub_path = "ok.js", .data = "function caller(localValue) { missingCall(); anotherMissing(); return localValue; }\n" });
 

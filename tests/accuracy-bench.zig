@@ -216,6 +216,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The floors and the doc table grade the shipped configuration, where
+    // python/typescript/tsx are tree-sitter-owned. A `-Dtree-sitter=none` build
+    // indexes them with the heuristic scanner — a different indexer, not a
+    // regression — so it is reported and left ungraded rather than failed.
+    const graded = opts.update_floors or opts.check_doc_table or !opts.render_doc_table;
+    if (graded and !navgraph.ts_backend.any_grammar) {
+        try out.print(
+            "accuracy-bench: not graded — this build links no grammar (-Dtree-sitter=none) " ++
+                "and tests/golden/floors.json records the default -Dtree-sitter=all build.\n",
+            .{},
+        );
+        try out.flush();
+        return;
+    }
+
     const results = try scoreAll(gpa, arena, io, repo, opts.repo_root);
 
     if (opts.render_doc_table) {
@@ -946,7 +961,7 @@ fn scoreOne(
     const root = try std.fs.path.join(arena, &.{ repo_root, g.root });
     // Never read or write `.navgraph/cache`: the benchmark must measure this
     // build's parser, and it must not mutate the checked-in fixture trees.
-    var idx = try index_mod.build(gpa, io, root, false);
+    var idx = try index_mod.build(gpa, io, root, false, .auto);
     defer idx.deinit();
     const got = try extract(gpa, arena, &idx);
 
@@ -1435,7 +1450,7 @@ fn propose(
     fixture_root: []const u8,
 ) !void {
     const root = try std.fs.path.join(arena, &.{ repo_root, fixture_root });
-    var idx = try index_mod.build(gpa, io, root, false);
+    var idx = try index_mod.build(gpa, io, root, false, .auto);
     defer idx.deinit();
     const got = try extract(gpa, arena, &idx);
 

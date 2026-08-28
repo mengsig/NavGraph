@@ -827,7 +827,7 @@ test "hierarchy builds a diamond MRO and maps nearest overrides" {
     });
     var path_buf: [256]u8 = undefined;
     const root_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root_path, false);
+    var idx = try index_mod.build(testing.allocator, io, root_path, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -878,7 +878,7 @@ test "hierarchy JSON shares one result limit across sections" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(testing.allocator);
@@ -903,7 +903,7 @@ test "hierarchy keeps qualified unresolved bases distinct" {
     try tmp.dir.writeFile(io, .{ .sub_path = "qualified.py", .data = "class Child(a.Base, b.Base): pass\n" });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -927,7 +927,7 @@ test "hierarchy reports MROs with unresolved ancestor bases as incomplete" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -968,7 +968,7 @@ test "C++ and C# name-only override matches are inexact and strict excludes them
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -997,7 +997,7 @@ test "hierarchy JSON reports inheritance cycles instead of inventing an MRO" {
     });
     var path_buf: [256]u8 = undefined;
     const root_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root_path, false);
+    var idx = try index_mod.build(testing.allocator, io, root_path, false, .auto);
     defer idx.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(testing.allocator);
@@ -1021,7 +1021,7 @@ test "hierarchy keeps an ambiguous external base honest" {
     try tmp.dir.writeFile(io, .{ .sub_path = "child.py", .data = "class Child(Base): pass\n" });
     var path_buf: [256]u8 = undefined;
     const root_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root_path, false);
+    var idx = try index_mod.build(testing.allocator, io, root_path, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -1048,7 +1048,7 @@ test "hierarchy resolves Rust trait impls with generic where clauses" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     try testing.expectEqual(@as(usize, 1), idx.lookup("Worker").len);
     try testing.expectEqual(@as(usize, 1), idx.lookup("Service").len);
@@ -1077,7 +1077,7 @@ test "hierarchy resolves embedded Go interfaces" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     try testing.expectEqual(@as(usize, 1), idx.lookup("ReadCloser").len);
     var graph = try build(testing.allocator, &idx);
@@ -1104,7 +1104,7 @@ test "hierarchy resolves C++ and C# nominal bases" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();
@@ -1132,7 +1132,7 @@ test "hierarchy rejects an inconsistent C3 linearization" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     try testing.expectEqual(@as(usize, 1), idx.lookup("Broken").len);
     var graph = try build(testing.allocator, &idx);
@@ -1151,7 +1151,7 @@ test "hierarchy rejects duplicate direct bases" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var graph = try build(testing.allocator, &idx);
     defer graph.deinit();

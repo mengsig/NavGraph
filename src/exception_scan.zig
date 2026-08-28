@@ -545,7 +545,7 @@ test "collects Python raises and typed/catch-all protected ranges" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -573,7 +573,7 @@ test "collects multiline Python except tuples" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -596,7 +596,7 @@ test "collects brace-language throws and catch-all handlers" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -619,7 +619,7 @@ test "collects qualified lowercase C++ exception types" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -645,7 +645,7 @@ test "collects method-level Ruby rescue and preserves the raised class" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -680,7 +680,7 @@ test "Ruby bare rescues mean StandardError and dynamic rescue expressions stay i
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -709,7 +709,7 @@ test "C# catch filters are conditional and therefore inexact" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -734,7 +734,7 @@ test "dynamic error values and C throw identifiers are not exact raises" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();
@@ -754,7 +754,7 @@ test "marks ordinary Zig error values heuristic but returned errors exact" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try index_mod.build(testing.allocator, io, root, false);
+    var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     var analysis = try collect(testing.allocator, &idx);
     defer analysis.deinit();

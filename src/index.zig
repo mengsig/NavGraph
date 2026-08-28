@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const model = @import("model.zig");
 const language = @import("language.zig");
 const parser = @import("parser.zig");
+const backends = @import("backends.zig");
 const workspace_path = @import("workspace_path.zig");
 const api = @import("api.zig");
 const cache = @import("cache.zig");
@@ -202,12 +203,23 @@ const Builder = struct {
     skipped: std.ArrayList([]const u8),
     /// Accumulated `.gitignore` rules, matched to skip git-ignored files/dirs.
     ignore: gitignore.Matcher,
+    /// Which backend each file goes through, and the grammars to run it with.
+    parsing: backends.Parsing,
 };
 
 /// Build an index rooted at `root_path` (relative to cwd or absolute). When
 /// `use_cache` is set, unchanged files are restored from `.navgraph/cache` and
-/// the refreshed cache is written back. The returned Index owns everything.
-pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cache: bool) !Index {
+/// the refreshed cache is written back. The returned Index owns everything,
+/// including the grammars it compiles: one build is one process's worth of
+/// parsing. A long-lived server owns its own `backends.Registry` and drives
+/// `collect`/`assemble` instead, so the grammars are compiled once per session.
+pub fn build(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    use_cache: bool,
+    backend: backends.Choice,
+) !Index {
     std.debug.assert(root_path.len > 0);
     // `-C <path>` normally names a directory. If it names a single file, index
     // just that file (rooted at its parent dir) instead of erroring with NotDir —
@@ -220,7 +232,12 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, use_cach
         break :dir try std.Io.Dir.cwd().openDir(io, dir_part, .{ .iterate = true });
     };
     defer root_dir.close(io);
-    return buildOpenDir(gpa, io, root_dir, root_path, single_file, null, use_cache);
+    var registry = backends.Registry.init(gpa);
+    defer registry.deinit();
+    return buildOpenDir(gpa, io, root_dir, root_path, single_file, null, use_cache, .{
+        .choice = backend,
+        .registry = &registry,
+    });
 }
 
 /// Build from an already-open authority directory. Long-lived servers use this
@@ -234,8 +251,9 @@ pub fn buildOpenDir(
     single_file: ?[]const u8,
     single_file_target: ?[]const u8,
     use_cache: bool,
+    parsing: backends.Parsing,
 ) !Index {
-    var sources = try collect(gpa, io, root_dir, single_file, single_file_target, use_cache);
+    var sources = try collect(gpa, io, root_dir, single_file, single_file_target, use_cache, parsing);
     var idx = assemble(gpa, .{
         .root_label = root_label,
         .files = sources.files,
@@ -262,6 +280,7 @@ pub fn collect(
     single_file: ?[]const u8,
     single_file_target: ?[]const u8,
     use_cache: bool,
+    parsing: backends.Parsing,
 ) !Sources {
     const arena_box = try gpa.create(std.heap.ArenaAllocator);
     arena_box.* = std.heap.ArenaAllocator.init(gpa);
@@ -284,6 +303,7 @@ pub fn collect(
         .cache_hits = 0,
         .skipped = .empty,
         .ignore = gitignore.Matcher.init(gpa),
+        .parsing = parsing,
     };
     defer b.files.deinit(gpa);
     defer b.skipped.deinit(gpa);
@@ -368,6 +388,7 @@ pub fn assemble(gpa: std.mem.Allocator, a: Assembly) !Index {
                 .receiver = p.receiver,
                 .impl_protocol = p.impl_protocol,
                 .import_path = p.import_path,
+                .declared_type = p.declared_type,
             };
             next += 1;
         }
@@ -668,7 +689,12 @@ fn addFile(
         .size = file_stat.size,
     };
 
-    if (b.store) |*s| {
+    if (b.store) |*s| usable: {
+        // The entry must have been produced by the backend that owns this file
+        // under the current `--backend`, or the flag selects nothing whenever a
+        // cache exists.
+        const health = s.parseHealthOf(rel_path) orelse break :usable;
+        if (!b.parsing.cacheEntryUsable(lang, health)) break :usable;
         if (s.restore(b.arena, rel_path, stat)) |hit| {
             std.debug.assert(hit.text.len == stat.size);
             try appendFile(b, rel_path, lang, hit.text, hit.symbols, hit.parse_health, stat);
@@ -725,25 +751,34 @@ pub fn parseOne(
     arena: std.mem.Allocator,
     text: []const u8,
     lang: language.Language,
+    parsing: backends.Parsing,
 ) !ParseOutput {
     std.debug.assert(text.len <= std.math.maxInt(u32));
     std.debug.assert(lang != .unknown);
     var parsed: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer parsed.deinit(gpa);
-    const health = try parser.parse(gpa, arena, text, lang, &parsed);
+    const health = try parsing.parse(gpa, arena, text, lang, &parsed);
     return .{ .symbols = try arena.dupe(parser.ParsedSymbol, parsed.items), .health = health };
 }
 
 fn parseFile(b: *Builder, text: []const u8, lang: language.Language) !ParseOutput {
-    return parseOne(b.gpa, b.arena, text, lang);
+    return parseOne(b.gpa, b.arena, text, lang, b.parsing);
 }
 
 /// Write the parse-health warning for `rel_path` into `w`, or nothing when the
 /// file tokenized cleanly. Kept apart from the stderr sink so tests cover the
 /// message and its assertions without writing to the test binary's stderr.
 fn writeParseHealthWarning(w: *std.Io.Writer, rel_path: []const u8, health: model.ParseHealth) std.Io.Writer.Error!void {
-    const from = health.desync_from orelse return;
     std.debug.assert(rel_path.len > 0);
+    // A silent substitution means `--backend tree-sitter` quietly returned
+    // heuristic symbols for this file and the user cannot tell which.
+    if (health.tree_sitter_fallback) {
+        try w.print(
+            "navgraph: parse-health: {s}: the grammar could not parse this file cleanly — indexed with the heuristic scanner instead\n",
+            .{rel_path},
+        );
+    }
+    const from = health.desync_from orelse return;
     std.debug.assert(health.desync_to >= from);
     try w.print(
         "navgraph: parse-health: {s}: tokenizer lost sync (likely an unterminated string) — symbols on lines {d}-{d} may be missing\n",
@@ -759,7 +794,7 @@ fn writeParseHealthWarning(w: *std.Io.Writer, rel_path: []const u8, health: mode
 /// `parse_health` JSON field.
 fn warnParseHealth(rel_path: []const u8, health: model.ParseHealth) void {
     if (builtin.is_test) return;
-    if (health.desync_from == null) return;
+    if (health.desync_from == null and !health.tree_sitter_fallback) return;
     // Diagnostic only, and the authoritative data is on the index, so a path too
     // long for the buffer is printed truncated rather than dropped.
     var buf: [4096]u8 = undefined;
@@ -2094,6 +2129,12 @@ fn receiverType(idx: *const Index, from: model.Symbol, ref: *const model.Referen
         if (!std.mem.eql(u8, b.name, ref.qualifier)) continue;
         return if (b.type_name.len > 0) b.type_name else null;
     }
+    // A module-level `cache = Store()` types `cache.get(…)` just as a local
+    // does. Only when the qualifier heads the chain: in `a.cache.x` the
+    // qualifier is a member of `a`, not this file's variable.
+    if (ref.receiver_root.len == 0 or std.mem.eql(u8, ref.receiver_root, ref.qualifier)) {
+        if (fileScopeType(idx, from.file, ref.qualifier)) |t| return t;
+    }
     // `a.store.Get()` keeps only `store` as the qualifier, so the field table of
     // the type at the head of the chain is the type evidence. It answers only
     // for a chain whose head has a known type — a bare `store.Get()` (a package
@@ -2102,6 +2143,34 @@ fn receiverType(idx: *const Index, from: model.Symbol, ref: *const model.Referen
     const owner = chainRootType(idx, from, ref.receiver_root) orelse return null;
     for (idx.graph.symbols[owner].bindings) |b| {
         if (std.mem.eql(u8, b.name, ref.qualifier) and b.type_name.len > 0) return b.type_name;
+    }
+    // That type's own field declaration is evidence too: `this.items.get(…)` on
+    // `items: dict` dispatches to the container's method, so the caller abstains
+    // rather than matching any project `get`.
+    return declaredFieldType(idx, owner, ref.qualifier);
+}
+
+/// The declared type of `owner`'s field named `name`, or null when `owner` has
+/// no such field or it carries no declared type.
+fn declaredFieldType(idx: *const Index, owner: SymbolId, name: []const u8) ?[]const u8 {
+    const field = memberOfParent(idx, owner, name);
+    if (field.id == invalid) return null;
+    const sym = idx.graph.symbols[field.id];
+    if (sym.kind != .field) return null;
+    return if (sym.declared_type.len > 0) sym.declared_type else null;
+}
+
+/// The declared type of a top-level variable of `file` named `name`. Only a
+/// file's own definitions answer: an unqualified name in one file never refers
+/// to another file's top-level variable without an import binding it.
+fn fileScopeType(idx: *const Index, file: FileId, name: []const u8) ?[]const u8 {
+    const candidates = idx.by_name.get(name) orelse return null;
+    for (candidates) |cid| {
+        const cand = idx.graph.symbols[cid];
+        if (cand.file != file or cand.parent != invalid) continue;
+        if (cand.kind != .variable and cand.kind != .constant) continue;
+        if (cand.declared_type.len == 0) continue;
+        return cand.declared_type;
     }
     return null;
 }
@@ -2165,11 +2234,16 @@ const MemberMatch = struct { id: SymbolId, unambiguous: bool };
 /// across files the first is returned but flagged ambiguous.
 fn memberOfType(idx: *const Index, from_file: FileId, type_name: []const u8, name: []const u8) MemberMatch {
     const candidates = idx.by_name.get(name) orelse return .{ .id = invalid, .unambiguous = false };
+    const from_lang = idx.graph.files[from_file].language.family();
     var any: SymbolId = invalid;
     var matches: u32 = 0;
     for (candidates) |cid| {
         const cand = idx.graph.symbols[cid];
         if (cand.parent == invalid) continue;
+        // A type name is not a cross-language namespace: a Python `Customer`
+        // and a TypeScript `Customer` share a spelling, not a type. The only
+        // intended cross-language edge is a route_call (`linkRoutes`).
+        if (idx.graph.files[cand.file].language.family() != from_lang) continue;
         if (!std.mem.eql(u8, idx.graph.symbols[cand.parent].name, type_name)) continue;
         if (cand.file == from_file) return .{ .id = cid, .unambiguous = true };
         matches += 1;
@@ -2259,7 +2333,7 @@ test "module-qualified calls resolve through imports" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const helper = idx.lookup("helper")[0];
@@ -2321,11 +2395,11 @@ test "outside-root imports never bind root-local files and survive a warm cache"
 
     // Seed the cache, then compare a warm restore with a clean parse. Import
     // outcomes are rebuilt from either source and must be byte-for-byte equal.
-    var cold = try build(testing.allocator, io, root, true);
+    var cold = try build(testing.allocator, io, root, true, .auto);
     cold.deinit();
-    var warm = try build(testing.allocator, io, root, true);
+    var warm = try build(testing.allocator, io, root, true, .auto);
     defer warm.deinit();
-    var clean = try build(testing.allocator, io, root, false);
+    var clean = try build(testing.allocator, io, root, false, .auto);
     defer clean.deinit();
     try testing.expect(warm.cache_snapshot.hits > 0);
     try expectEquivalentIndexes(&clean, &warm);
@@ -2392,7 +2466,7 @@ test "qualified call to a same-named function in another module resolves" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // `main.run` calls `util.run` — the shared name must not be dropped as a
@@ -2441,7 +2515,7 @@ test "src-layout package imports resolve by unique suffix, no cross-language edg
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The cross-package import binds to the real file despite the src-layout.
@@ -2481,7 +2555,7 @@ test "a build-output name under a source tree is indexed; at the root it is prun
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The nested source directory is indexed…
@@ -2517,7 +2591,7 @@ test "incremental cache: second build restores identical symbols from disk" {
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     // First build parses and writes `.navgraph/cache`.
-    var cold = try build(testing.allocator, io, root, true);
+    var cold = try build(testing.allocator, io, root, true, .auto);
     const cold_names = try dupeNames(testing.allocator, &cold);
     defer freeNames(testing.allocator, cold_names);
     const cold_alpha = cold.lookup("alpha")[0];
@@ -2525,7 +2599,7 @@ test "incremental cache: second build restores identical symbols from disk" {
     cold.deinit();
 
     // Second build restores from the cache; the resulting graph must match.
-    var warm = try build(testing.allocator, io, root, true);
+    var warm = try build(testing.allocator, io, root, true, .auto);
     defer warm.deinit();
     try testing.expectEqual(cold_names.len, warm.graph.symbols.len);
     for (cold_names, warm.graph.symbols) |name, sym| try testing.expectEqualStrings(name, sym.name);
@@ -2568,7 +2642,7 @@ test "links a frontend HTTP client call to a backend route across languages" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The route symbol exists and links to its handler.
@@ -2631,7 +2705,7 @@ test "include_router prefix is applied across files and links a prefixed client"
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The route's path carries the mount prefix.
@@ -2687,7 +2761,7 @@ test "aliased from-import mount stacks with an APIRouter prefix" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const route_id = routeByName(&idx, "GET /api/v1/aoi-library").?;
@@ -2719,7 +2793,7 @@ test "trailing conditional client path does not wildcard-match the first route" 
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     const client = idx.graph.symbols[idx.lookup("listLibraryAois")[0]];
     const route_ref = routeCallRef(client).?;
@@ -2755,7 +2829,7 @@ test "links a frontend call through a request() wrapper to a backend route" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const route_id = routeId(&idx).?;
@@ -2792,7 +2866,7 @@ test "member calls: typed receiver is exact; unknown receiver is a heuristic gue
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The typed `f.stop()` must resolve to Foo.stop (exact), never Bar.stop.
@@ -2823,7 +2897,7 @@ test "go: a member call through a struct field of declared type resolves by type
     // reference keeps only `store` as the qualifier, so the declaring struct's
     // field table is the receiver's only type evidence.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const store_get = qualifiedId(&idx, "Store", "Get").?;
@@ -2844,7 +2918,7 @@ test "go: a call never binds to a type that shares the package-qualified name" {
     // Regression (F-9): `a.store.Stats()` bound to `struct Stats` — the type,
     // not the method — and was not flagged, so `--strict` kept it.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     // Pick the struct by kind: `Stats` also names two methods, and which one
@@ -2917,7 +2991,7 @@ test "go: a shadowing local and another struct's field both beat the field table
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const store_get = qualifiedId(&idx, "Store", "Get").?;
@@ -2970,7 +3044,7 @@ test "cpp: a same-named field on another class never yields a wrong exact edge" 
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const cache_get = qualifiedId(&idx, "Cache", "get").?;
@@ -3015,7 +3089,7 @@ test "python: a same-named attribute on another object never yields a wrong exac
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const cache_get = qualifiedId(&idx, "Cache", "get").?;
@@ -3053,7 +3127,7 @@ test "a call through a function-valued const keeps its edge" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const alias = qualifiedId(&idx, "Holder", "alias").?;
@@ -3087,7 +3161,7 @@ test "js: a multi-declarator alias binds each name to its own initializer" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Both declarators are their own symbol, aliasing their own initializer.
@@ -3135,7 +3209,7 @@ test "js: following a function alias keeps the exactness of the hop that found i
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Still retargeted through the alias — the edge is useful, just not proven.
@@ -3184,7 +3258,7 @@ test "ts: a generic type argument is not a declarator boundary" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // No type argument became a definition, and the real type keeps its
@@ -3218,7 +3292,7 @@ test "an express sub-router mount keeps its router handler" {
     // Regression (F2): `app.use('/admin', adminRouter)` mounts a router held in
     // a `const`; deleting calls to values dropped the handler entirely.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/js_express", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/js_express", false, .auto);
     defer idx.deinit();
 
     var checked = false;
@@ -3261,7 +3335,7 @@ test "c: a modifier-only declarator still shadows a same-named global" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const probe = idx.graph.symbols[idx.lookup("probe")[0]];
@@ -3299,7 +3373,7 @@ test "cpp: an `auto` local shadows a same-named global" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const draw = idx.graph.symbols[idx.lookup("draw")[0]];
@@ -3314,7 +3388,7 @@ test "go: a composite-literal field key is not a reference to a same-named packa
     // Regression (F5): `return &API{store: s}` bound the field key `store` to
     // the imported package `store`.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const new_api = idx.graph.symbols[idx.lookup("NewAPI")[0]];
@@ -3328,7 +3402,7 @@ test "go: a package-qualified type conversion is a type use, never a call" {
     // re-opened the exact-call-to-a-type class the PR was blocked for. The edge
     // is kept, reclassified.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const widget_id = idx.lookup("WidgetID")[0];
@@ -3356,7 +3430,7 @@ test "a package/namespace clause is never an exact reference target" {
     // stand-in — real evidence, but not something `--strict` should follow.
     const testing = std.testing;
     for ([_][]const u8{ "testenv/go_service", "testenv/cpp_app" }) |root| {
-        var idx = try build(testing.allocator, testing.io, root, false);
+        var idx = try build(testing.allocator, testing.io, root, false, .auto);
         defer idx.deinit();
 
         var seen: u32 = 0;
@@ -3485,7 +3559,7 @@ test "go: a local shadowing a package wins, and no call binds to a type" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const Case = struct {
@@ -3564,7 +3638,7 @@ test "go: a local shadowing a package wins, and no call binds to a type" {
 test "cpp: a member call through a typed pointer resolves to that type's method" {
     // Regression (F-9): `for (const Shape* s : shapes) s->area()`.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/cpp_app", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/cpp_app", false, .auto);
     defer idx.deinit();
 
     const shape_area = qualifiedId(&idx, "Shape", "area").?;
@@ -3590,7 +3664,7 @@ test "lua: a colon method call records its receiver and keeps the edge" {
     // Regression (F-9): `world:step(dt)` lost its qualifier entirely, so the
     // member call fell into bare resolution and was dropped.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/lua_game", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/lua_game", false, .auto);
     defer idx.deinit();
 
     const step = qualifiedId(&idx, "Game", "step").?;
@@ -3641,7 +3715,7 @@ test "an unknown receiver still abstains when many same-named members exist" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const a_deinit = qualifiedId(&idx, "A", "deinit").?;
@@ -3682,7 +3756,7 @@ test "a bare identifier never binds to a same-named class member" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const field = qualifiedId(&idx, "Ctx", "name").?;
@@ -3751,7 +3825,7 @@ test "self-dispatch and a typed receiver stay in their own file's class" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const a_put = qualifiedIdInFile(&idx, "Store", "put", "pkg_a").?;
@@ -3809,7 +3883,7 @@ test "build index over a temp project resolves cross-file calls" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     try testing.expect(idx.graph.files.len == 2);
@@ -3856,7 +3930,7 @@ test "a POST fetch with a method option links to the POST route, not the GET rou
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const post_route = routeByName(&idx, "POST /orders").?;
@@ -3891,7 +3965,7 @@ test "an inline-arrow route gets no phantom handler; an identifier arg is linked
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // GET route → its identifier handler `listItems`.
@@ -3925,7 +3999,7 @@ test "FastAPI decorator kwargs (response_model) don't hijack the handler" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const route = idx.graph.symbols[routeByName(&idx, "GET /ops/dashboard").?];
@@ -3956,7 +4030,7 @@ test "python relative imports resolve to package files" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const routes_file = idx.graph.symbols[idx.lookup("get_user")[0]].file;
@@ -3983,7 +4057,7 @@ test "a bare read of a local variable is not bound to a same-named global" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // `use`'s local `candidates` must not create an edge to the global fn.
@@ -4008,7 +4082,7 @@ test "go: a call resolves across files within the Go family" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const save = idx.lookup("Save")[0];
@@ -4033,7 +4107,7 @@ test "rust: a call resolves by name across files within the Rust family" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const parse = idx.lookup("parse")[0];
@@ -4046,7 +4120,7 @@ test "rust: a call resolves by name across files within the Rust family" {
 
 test "checked-in Java corpus resolves lexical, static-import, and inherited members honestly" {
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/java_app", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/java_app", false, .auto);
     defer idx.deinit();
 
     const main_id = qualifiedId(&idx, "Program", "main").?;
@@ -4119,7 +4193,7 @@ fn javaInheritanceBuildMs(tmp: *std.testing.TmpDir, groups: usize, per_group: us
     var rep: usize = 0;
     while (rep < perf_reps) : (rep += 1) {
         const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        var idx = try build(testing.allocator, io, root, false);
+        var idx = try build(testing.allocator, io, root, false, .auto);
         defer idx.deinit();
         const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
         best_ms = @min(best_ms, @as(i64, @intCast(elapsed_ms)));
@@ -4187,6 +4261,17 @@ test "the parse-health warning names the file and the desynced line range" {
     var clean: std.Io.Writer = .fixed(&clean_buf);
     try writeParseHealthWarning(&clean, "src/ok.zig", .{});
     try testing.expectEqual(@as(usize, 0), clean.buffered().len);
+
+    // Regression (F13): a grammar that could not parse a file cleanly hands it
+    // to the heuristic scanner. Without a diagnostic, `--backend tree-sitter`
+    // silently returns heuristic symbols for some files and the user cannot
+    // tell which.
+    var fell_buf: [256]u8 = undefined;
+    var fell: std.Io.Writer = .fixed(&fell_buf);
+    try writeParseHealthWarning(&fell, "src/jsx.ts", .{ .backend = .heuristic, .tree_sitter_fallback = true });
+    const note = fell.buffered();
+    try testing.expect(std.mem.indexOf(u8, note, "src/jsx.ts") != null);
+    try testing.expect(std.mem.indexOf(u8, note, "heuristic scanner") != null);
 }
 
 test "the precomputed Java supertype table records declared bases only" {
@@ -4206,7 +4291,7 @@ test "the precomputed Java supertype table records declared bases only" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const sub = idx.lookup("Sub")[0];
@@ -4235,7 +4320,7 @@ test "Java overloads never make an arbitrary bare member edge exact" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, testing.io, root, false);
+    var idx = try build(testing.allocator, testing.io, root, false, .auto);
     defer idx.deinit();
 
     const run = idx.graph.symbols[qualifiedId(&idx, "Overloaded", "run").?];
@@ -4246,7 +4331,7 @@ test "Java overloads never make an arbitrary bare member edge exact" {
 
 test "checked-in Rust corpus parents a cross-file nominal impl on its type" {
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false, .auto);
     defer idx.deinit();
 
     const expr = idx.lookup("Expr")[0];
@@ -4265,7 +4350,7 @@ test "checked-in Rust corpus: `use` bindings keep their cross-file call edges" {
     // Regression: the non-local-import guard fired on Rust `use` bindings, which
     // the indexer does not model, deleting every Rust cross-file call edge.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false, .auto);
     defer idx.deinit();
 
     const run = idx.lookup("run")[0];
@@ -4296,7 +4381,7 @@ test "a JS import binding still blocks the global-name fallback" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const local_run = idx.lookup("run")[0];
@@ -4315,7 +4400,7 @@ test "Rust cross-file impl parenting survives a warm cache restore" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var clean = try build(testing.allocator, testing.io, root, true);
+    var clean = try build(testing.allocator, testing.io, root, true, .auto);
     defer clean.deinit();
     const clean_expr = clean.lookup("Expr")[0];
     var clean_attached = false;
@@ -4325,7 +4410,7 @@ test "Rust cross-file impl parenting survives a warm cache restore" {
     }
     try testing.expect(clean_attached);
 
-    var warm = try build(testing.allocator, testing.io, root, true);
+    var warm = try build(testing.allocator, testing.io, root, true, .auto);
     defer warm.deinit();
     try testing.expectEqual(@as(u32, 2), warm.cache_snapshot.hits);
     const warm_expr = warm.lookup("Expr")[0];
@@ -4357,7 +4442,7 @@ test "ruby: require_relative resolves and a cross-file call links within the Rub
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const helper = idx.lookup("helper")[0];
@@ -4387,7 +4472,7 @@ test "cross-language: a Go and a Python function sharing a name stay isolated" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Both `Process` definitions exist under one name.
@@ -4418,7 +4503,7 @@ test "cross-language: Rust and Go definitions with the same name do not cross-li
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const rs_helper = qualifiedFileSym(&idx, "lib.rs", "helper").?;
@@ -4462,7 +4547,7 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Four distinct `compute` definitions, each with exactly one caller from its
@@ -4479,6 +4564,65 @@ test "cross-language: a mixed Go/Rust/Ruby/Python repo resolves only within fami
         try testing.expectEqual(@as(usize, 1), callers.len);
         try testing.expectEqualStrings(c[1], idx.graph.symbols[callers[0]].name);
     }
+}
+
+test "cross-language: a typed receiver never resolves memberOfType across a language family" {
+    // F8 (round 2). memberOfType's family guard (a type name is not a
+    // cross-language namespace) was measured harmless but had no test of its
+    // own — this branch's only substantive src/index.zig change beyond
+    // backend plumbing. The call site is deliberately in a *third* file, not
+    // the one declaring either `Widget`, so `cand.file == from_file` cannot
+    // short-circuit the match before the family guard is reached — without
+    // the guard, the TypeScript candidate joins the Zig one in memberOfType's
+    // loop and the pick would be ambiguous, or bound to the wrong language's
+    // method outright.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub const Widget = struct {
+        \\    pub fn run(self: *Widget) void {}
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.ts", .data =
+        \\export class Widget {
+        \\  run(): void {}
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data =
+        \\const a = @import("a.zig");
+        \\pub fn use(f: *a.Widget) void {
+        \\    f.run();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false, .auto);
+    defer idx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), idx.lookup("run").len);
+    const zig_run = qualifiedIdInFile(&idx, "Widget", "run", "a.zig").?;
+    const ts_run = qualifiedIdInFile(&idx, "Widget", "run", "b.ts").?;
+    try testing.expect(zig_run != ts_run);
+
+    // `f.run()` is typed to the Zig Widget and must resolve exactly to it,
+    // never the TypeScript Widget's same-named method.
+    const use = idx.graph.symbols[idx.lookup("use")[0]];
+    var checked = false;
+    for (use.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "run")) continue;
+        try testing.expectEqual(zig_run, ref.target);
+        try testing.expect(ref.target != ts_run);
+        try testing.expect(ref.exact);
+        try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+        checked = true;
+    }
+    try testing.expect(checked);
+    // The TypeScript method has no caller at all.
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(ts_run).len);
 }
 
 // ===========================================================================
@@ -4559,7 +4703,7 @@ test "lua: require binds a module edge and a qualified cross-file call resolves"
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The Lua `require("lib.util")` binds `util` -> lib/util.lua as a module edge.
@@ -4597,7 +4741,7 @@ test "js: a CommonJS require binds a module and a qualified member call resolves
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const main_file = idx.graph.symbols[idx.lookup("run")[0]].file;
@@ -4632,7 +4776,7 @@ test "python from-import records a module edge whose binding is empty" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const main_file = idx.graph.symbols[idx.lookup("run")[0]].file;
@@ -4661,7 +4805,7 @@ test "a zig @import of the file's own path is ignored (no self-import edge)" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const file = idx.graph.symbols[idx.lookup("f")[0]].file;
@@ -4693,7 +4837,7 @@ test "chooseTarget: a bare call to a name defined in two files is a non-confiden
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     try testing.expectEqual(@as(usize, 2), idx.lookup("shared").len);
@@ -4734,7 +4878,7 @@ test "chooseTarget: a same-file definition wins and is exact over a same-named o
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const a_dup = qualifiedFileSym(&idx, "a.zig", "dup").?;
@@ -4768,7 +4912,7 @@ test "member call: a self receiver resolves exactly to a sibling method (zig)" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const first = qualifiedId(&idx, "T", "first").?;
@@ -4797,7 +4941,7 @@ test "a bare Zig sibling in the same container resolves as a lexical member" {
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const first = qualifiedId(&idx, "T", "first").?;
@@ -4829,7 +4973,7 @@ test "a direct same-file type qualifier resolves only its own member" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const wanted = qualifiedId(&idx, "ServerSession", "init").?;
@@ -4866,7 +5010,7 @@ test "an immediate type token inside an imported module chain resolves in that i
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const run = idx.graph.symbols[idx.lookup("run")[0]];
@@ -4893,7 +5037,7 @@ test "member call: a this receiver resolves exactly to a sibling method (js clas
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const first = qualifiedId(&idx, "Svc", "first").?;
@@ -4924,7 +5068,7 @@ test "unknown receiver: a member call is a heuristic guess, a member read stays 
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const value = qualifiedId(&idx, "Ctx", "value").?;
@@ -4968,7 +5112,7 @@ test "a field of the enclosing type gives a bare receiver its declared type (jav
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const add = qualifiedId(&idx, "Repo", "add").?;
@@ -5017,7 +5161,7 @@ test "cpp: a direct-initialized local types its receiver; an unnameable one abst
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // `Weights weights({...})` is a definition, not the most vexing parse, so
@@ -5076,7 +5220,7 @@ test "ruby: super never crosses a mixin's reverse includer edge" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const parent_size = qualifiedId(&idx, "Parent", "size").?;
@@ -5155,7 +5299,7 @@ test "ruby: two mixins declaring the same method resolve in MRO order" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const render = idx.graph.symbols[qualifiedId(&idx, "TwoMix", "render").?];
@@ -5206,7 +5350,7 @@ test "ruby: a module method still dispatches into the class that includes it" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Two includers both define `label`, so the module's own call is a real
@@ -5264,7 +5408,7 @@ test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // `attr_accessor :tag` defines both the reader and the writer.
@@ -5324,7 +5468,7 @@ test "ruby: an operator method is a definition, and its body's calls resolve" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     inline for (.{ "+", "[]", "<=>" }) |op| {
@@ -5370,7 +5514,7 @@ test "rust: a smart-pointer receiver derefs to its inner type, but not as a qual
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // `child: Box<Node>` derefs, so `self.child.label()` still reaches a method
@@ -5414,7 +5558,7 @@ test "cpp: unique_ptr/shared_ptr receivers deref to their inner type, but a raw 
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const engine_start = qualifiedId(&idx, "Engine", "start").?;
@@ -5462,7 +5606,7 @@ test "cpp: an optional receiver derefs like a smart pointer; the wrapper's own m
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const go_optional = idx.graph.symbols[qualifiedId(&idx, "Holder", "goOptional").?];
@@ -5514,7 +5658,7 @@ test "one-letter names resolve as call sites in every language family" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // The reference collector used to drop every name shorter than two bytes,
@@ -5555,7 +5699,7 @@ test "lua: a local typed by a factory call resolves its method exactly" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const new = qualifiedId(&idx, "Account", "new").?;
@@ -5598,7 +5742,7 @@ test "a builtin-container receiver never binds to a same-named project method (j
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const add = qualifiedId(&idx, "Repo", "add").?;
@@ -5635,7 +5779,7 @@ test "heuristic method target prefers a same-file method over a free function" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const method = qualifiedId(&idx, "T", "process").?;
@@ -5667,7 +5811,7 @@ test "a qualified call to a nonexistent member of an imported module stays unres
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const run = idx.graph.symbols[idx.lookup("run")[0]];
@@ -5702,7 +5846,7 @@ test "route linking: an unmatched client fetch stays external and the route has 
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const loader = idx.graph.symbols[idx.lookup("loadThing")[0]];
@@ -5753,7 +5897,7 @@ test "skipped_dirs: a pruned vendor tree is reported once; a build/dep dir is si
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Only the top-level real source is indexed; pruned trees are absent.
@@ -5781,7 +5925,7 @@ test "skipped_dirs is empty when nothing potentially-source is pruned" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     try testing.expectEqual(@as(usize, 1), idx.lookup("only").len);
@@ -5799,7 +5943,7 @@ test "a project with only unsupported files indexes nothing" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     try testing.expectEqual(@as(usize, 0), idx.graph.files.len);
@@ -5824,7 +5968,7 @@ test "incremental cache: a file grown between builds is re-parsed, not served st
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     // Cold build writes the cache.
-    var cold = try build(testing.allocator, io, root, true);
+    var cold = try build(testing.allocator, io, root, true, .auto);
     try testing.expectEqual(@as(usize, 1), cold.lookup("one").len);
     try testing.expectEqual(@as(usize, 0), cold.lookup("two").len);
     cold.deinit();
@@ -5840,7 +5984,7 @@ test "incremental cache: a file grown between builds is re-parsed, not served st
         \\}
     });
 
-    var warm = try build(testing.allocator, io, root, true);
+    var warm = try build(testing.allocator, io, root, true, .auto);
     defer warm.deinit();
     try testing.expectEqual(@as(usize, 1), warm.lookup("one").len);
     try testing.expectEqual(@as(usize, 1), warm.lookup("two").len); // freshly parsed
@@ -5867,19 +6011,19 @@ test "no-cache builds are deterministic and agree with a cached build" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var a = try build(testing.allocator, io, root, false);
+    var a = try build(testing.allocator, io, root, false, .auto);
     const names_a = try dupeNames(testing.allocator, &a);
     defer freeNames(testing.allocator, names_a);
     a.deinit();
 
     // A second no-cache build yields an identical symbol sequence.
-    var b = try build(testing.allocator, io, root, false);
+    var b = try build(testing.allocator, io, root, false, .auto);
     defer b.deinit();
     try testing.expectEqual(names_a.len, b.graph.symbols.len);
     for (names_a, b.graph.symbols) |name, sym| try testing.expectEqualStrings(name, sym.name);
 
     // And a cached build produces the same symbols too — the cache is transparent.
-    var c = try build(testing.allocator, io, root, true);
+    var c = try build(testing.allocator, io, root, true, .auto);
     defer c.deinit();
     try testing.expectEqual(names_a.len, c.graph.symbols.len);
     for (names_a, c.graph.symbols) |name, sym| try testing.expectEqualStrings(name, sym.name);
@@ -5906,7 +6050,7 @@ test "scope-blind refs: JS object key and param do not create false caller edges
     });
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
     // The dead global count() must have no callers: the `{ count: ... }` object
     // key and the `count` parameter are not references to it.
@@ -5923,7 +6067,7 @@ test "build indexes a single file when the root path names a file, not a directo
     try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "pub fn two() u32 { return 2; }" });
     var path_buf: [256]u8 = undefined;
     const file_root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, file_root, false);
+    var idx = try build(testing.allocator, io, file_root, false, .auto);
     defer idx.deinit();
     // Only a.zig is indexed; its symbol resolves, b.zig's does not.
     try testing.expectEqual(@as(usize, 1), idx.graph.files.len);
@@ -5944,12 +6088,12 @@ test "parse health and cache snapshot survive a warm cache restore" {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var cold = try build(testing.allocator, io, root, true);
+    var cold = try build(testing.allocator, io, root, true, .auto);
     try testing.expectEqual(@as(?u32, 2), cold.graph.files[0].parse_health.desync_from);
     try testing.expectEqual(CacheRewrite.written, cold.cache_snapshot.rewrite);
     cold.deinit();
 
-    var warm = try build(testing.allocator, io, root, true);
+    var warm = try build(testing.allocator, io, root, true, .auto);
     defer warm.deinit();
     try testing.expectEqual(@as(u32, 1), warm.cache_snapshot.hits);
     try testing.expectEqual(CacheRewrite.current, warm.cache_snapshot.rewrite);
@@ -6046,9 +6190,9 @@ fn expectCachedEqualsClean(io: std.Io, root: []const u8) !void {
     const testing = std.testing;
     std.debug.assert(root.len > 0);
     std.debug.assert(std.fs.path.isAbsolute(root) or std.mem.startsWith(u8, root, ".zig-cache/"));
-    var cached = try build(testing.allocator, io, root, true);
+    var cached = try build(testing.allocator, io, root, true, .auto);
     defer cached.deinit();
-    var clean = try build(testing.allocator, io, root, false);
+    var clean = try build(testing.allocator, io, root, false, .auto);
     defer clean.deinit();
     try expectEquivalentIndexes(&clean, &cached);
 }
@@ -6105,7 +6249,7 @@ test "edit-requery cache stays identical to no-cache across rename add delete an
     try writeVersionedFile(io, tmp.dir, "a.py", "def caller(): return twig(1)\nclass Store: pass\n", 5);
     try writeVersionedFile(io, tmp.dir, "b.py", "def twig(value): return value\n", 2);
     try expectCachedEqualsClean(io, root);
-    var final = try build(testing.allocator, io, root, true);
+    var final = try build(testing.allocator, io, root, true, .auto);
     defer final.deinit();
     try testing.expectEqual(@as(usize, 1), final.lookup("twig").len);
     try testing.expectEqual(@as(usize, 0), final.lookup("leaf").len);
@@ -6126,8 +6270,11 @@ test "assemble frees each allocation exactly once when one fails" {
 
     const app_src = "const util = @import(\"util.zig\");\npub fn run() void { util.helper(); }\n";
     const util_src = "pub fn helper() void {}\n";
-    const app = try parseOne(testing.allocator, a, app_src, .zig);
-    const util = try parseOne(testing.allocator, a, util_src, .zig);
+    var registry = backends.Registry.init(testing.allocator);
+    defer registry.deinit();
+    const parsing = backends.Parsing{ .choice = .auto, .registry = &registry };
+    const app = try parseOne(testing.allocator, a, app_src, .zig, parsing);
+    const util = try parseOne(testing.allocator, a, util_src, .zig, parsing);
     const files = [_]ParsedFile{
         .{
             .path = "app.zig",
@@ -6173,8 +6320,11 @@ test "an index generation is freed exactly once whether or not its replacement f
 
     const app_src = "const util = @import(\"util.zig\");\npub fn run() void { util.helper(); }\n";
     const util_src = "pub fn helper() void {}\n";
-    const app = try parseOne(testing.allocator, a, app_src, .zig);
-    const util = try parseOne(testing.allocator, a, util_src, .zig);
+    var registry = backends.Registry.init(testing.allocator);
+    defer registry.deinit();
+    const parsing = backends.Parsing{ .choice = .auto, .registry = &registry };
+    const app = try parseOne(testing.allocator, a, app_src, .zig, parsing);
+    const util = try parseOne(testing.allocator, a, util_src, .zig, parsing);
     const files = [_]ParsedFile{
         .{
             .path = "app.zig",
@@ -6217,7 +6367,7 @@ test "file discovery order is sorted, not the filesystem's" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     // Depth-first over byte-sorted entries: `a.zig` < `alpha` < `beta` < `c.zig`.

@@ -13,6 +13,7 @@
 //! place — `retired` holds them until then.
 
 const std = @import("std");
+const backends = @import("../backends.zig");
 const index_mod = @import("../index.zig");
 const language = @import("../language.zig");
 const model = @import("../model.zig");
@@ -79,6 +80,12 @@ pub const Session = struct {
     root_abs: [:0]u8,
     root_dir: std.Io.Dir,
     cfg: Config,
+    /// Compiled grammars, boxed so the pointer survives the session being moved
+    /// out of `init`. Built once here, not once per re-index: compiling a query
+    /// walks the whole grammar (~14 ms/language), and an edit re-indexes.
+    registry: *backends.Registry,
+    /// Backend this session indexes with; every re-parse must reuse it.
+    backend: backends.Choice,
 
     overlays: overlay.Store,
     sources: index_mod.Sources,
@@ -114,52 +121,72 @@ pub const Session = struct {
         io: std.Io,
         root_path: []const u8,
         cfg: Config,
+        backend: backends.Choice,
     ) !Session {
         const start_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
-        var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
-        errdefer root_dir.close(io);
-        const root_abs = try root_dir.realPathFileAlloc(io, ".", gpa);
-        errdefer gpa.free(root_abs);
+        // Everything the session will own is acquired inside this block, so its
+        // errdefers are discarded the moment the Session takes ownership. From
+        // there `self.deinit()` is the only path that frees them, and nothing is
+        // released twice.
+        var self = built: {
+            var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+            errdefer root_dir.close(io);
+            const root_abs = try root_dir.realPathFileAlloc(io, ".", gpa);
+            errdefer gpa.free(root_abs);
 
-        var sources = try index_mod.collect(gpa, io, root_dir, null, null, true);
-        errdefer sources.deinit();
+            // Session-lifetime, not per-index: compiling a grammar's queries
+            // walks the whole grammar (~14 ms), and every edit re-indexes.
+            const registry = try gpa.create(backends.Registry);
+            registry.* = backends.Registry.init(gpa);
+            errdefer {
+                registry.deinit();
+                gpa.destroy(registry);
+            }
 
-        // No document can be open yet, so the first walk is always safe to cache.
-        var idx = try index_mod.assemble(gpa, .{
-            .root_label = root_path,
-            .files = sources.files,
-            .skipped_dirs = sources.skipped_dirs,
-            .cache = sources.cache,
-            .cache_write = if (sources.cache.enabled and sources.cache_stale) .{ .io = io, .dir = root_dir } else null,
-        });
-        errdefer idx.deinit();
-        sources.cache_stale = idx.cache_snapshot.rewrite != .written;
+            var sources = try index_mod.collect(gpa, io, root_dir, null, null, true, .{
+                .choice = backend,
+                .registry = registry,
+            });
+            errdefer sources.deinit();
 
-        var self = Session{
-            .gpa = gpa,
-            .io = io,
-            .root_path = root_path,
-            .root_abs = root_abs,
-            .root_dir = root_dir,
-            .cfg = cfg,
-            .overlays = overlay.Store.init(gpa),
-            .sources = sources,
-            .slots = .empty,
-            .paths = Arena.init(gpa),
-            .interned = .empty,
-            .by_path = .empty,
-            .idx = idx,
-            .dirty = .empty,
-            .retired = .empty,
-            .changed = .empty,
-            .debounce_deadline_ms = null,
-            .watch_deadline_ms = null,
-            .edges = 0,
-            .last_index_ms = 0,
-            .indexed_at_unix_ms = 0,
-            .used_cache = sources.cache.hits != 0,
+            // No document can be open yet, so the first walk is always safe to cache.
+            const idx = try index_mod.assemble(gpa, .{
+                .root_label = root_path,
+                .files = sources.files,
+                .skipped_dirs = sources.skipped_dirs,
+                .cache = sources.cache,
+                .cache_write = if (sources.cache.enabled and sources.cache_stale) .{ .io = io, .dir = root_dir } else null,
+            });
+            sources.cache_stale = idx.cache_snapshot.rewrite != .written;
+
+            break :built Session{
+                .gpa = gpa,
+                .io = io,
+                .root_path = root_path,
+                .root_abs = root_abs,
+                .root_dir = root_dir,
+                .cfg = cfg,
+                .registry = registry,
+                .backend = backend,
+                .overlays = overlay.Store.init(gpa),
+                .sources = sources,
+                .slots = .empty,
+                .paths = Arena.init(gpa),
+                .interned = .empty,
+                .by_path = .empty,
+                .idx = idx,
+                .dirty = .empty,
+                .retired = .empty,
+                .changed = .empty,
+                .debounce_deadline_ms = null,
+                .watch_deadline_ms = null,
+                .edges = 0,
+                .last_index_ms = 0,
+                .indexed_at_unix_ms = 0,
+                .used_cache = sources.cache.hits != 0,
+            };
         };
-        errdefer self.deinitOwned();
+        errdefer self.deinit();
         try self.adoptSources();
         _ = self.finishIndex(.initial, start_ms);
         self.armWatch();
@@ -171,8 +198,12 @@ pub const Session = struct {
         self.deinitOwned();
     }
 
-    /// Everything the session owns apart from the index, so `init` can unwind
-    /// without a half-built session escaping.
+    /// This session's parse context: its backend plus its long-lived grammars.
+    fn parsing(self: *Session) backends.Parsing {
+        return .{ .choice = self.backend, .registry = self.registry };
+    }
+
+    /// Everything the session owns apart from the index.
     fn deinitOwned(self: *Session) void {
         for (self.slots.items) |s| destroyArena(self.gpa, s.arena);
         for (self.retired.items) |a| destroyArena(self.gpa, a);
@@ -185,6 +216,8 @@ pub const Session = struct {
         self.changed.deinit(self.gpa);
         self.overlays.deinit();
         self.sources.deinit();
+        self.registry.deinit();
+        self.gpa.destroy(self.registry);
         self.gpa.free(self.root_abs);
         self.root_dir.close(self.io);
     }
@@ -243,7 +276,7 @@ pub const Session = struct {
     /// changes made outside the editor. `full` ignores the on-disk parse cache.
     pub fn rescan(self: *Session, full: bool) !Report {
         const start = self.nowMs();
-        var sources = try index_mod.collect(self.gpa, self.io, self.root_dir, null, null, !full);
+        var sources = try index_mod.collect(self.gpa, self.io, self.root_dir, null, null, !full, self.parsing());
 
         // Everything that can fail while `sources` is still ours to free runs
         // here. After the move below the session is its only owner, so nothing
@@ -435,7 +468,7 @@ pub const Session = struct {
             };
         if (text.len > std.math.maxInt(u32)) return error.FileTooBig;
 
-        const parsed = try index_mod.parseOne(self.gpa, arena, text, lang);
+        const parsed = try index_mod.parseOne(self.gpa, arena, text, lang, self.parsing());
         try self.installSlot(.{
             .arena = arena_box,
             .file = .{
@@ -578,7 +611,7 @@ pub const Fixture = struct {
         for (files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
         const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         errdefer gpa.free(root);
-        const session = try Session.init(gpa, io, root, .{ .watch = false });
+        const session = try Session.init(gpa, io, root, .{ .watch = false }, .auto);
         return .{ .tmp = tmp, .root = root, .session = session };
     }
 

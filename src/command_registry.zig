@@ -6,6 +6,7 @@
 //! deliberately a smaller and safer first step than rewriting every handler.
 
 const std = @import("std");
+const backends = @import("backends.zig");
 
 pub const Command = enum {
     outline,
@@ -67,6 +68,7 @@ pub const Argument = struct {
 pub const Option = enum {
     root,
     no_cache,
+    backend,
     verbosity,
     depth,
     limit,
@@ -142,9 +144,18 @@ pub const OptionDescriptor = struct {
     minimum: ?u32 = null,
 };
 
+/// `--backend tree-sitter` is a hard error on a build that links no grammar, so
+/// the manifest must not advertise it: the manifest IS the agent contract, and
+/// an agent has no other way to discover what this binary can do.
+const backend_values: []const []const u8 = if (backends.any_grammar)
+    &.{ "auto", "heuristic", "tree-sitter" }
+else
+    &.{ "auto", "heuristic" };
+
 pub const option_descriptors = [_]OptionDescriptor{
     .{ .option = .root, .name = "root", .spellings = &.{ valueFlag("-C"), valueFlag("--root") }, .value_kind = .string },
     .{ .option = .no_cache, .name = "no_cache", .spellings = &.{trueFlag("--no-cache")}, .value_kind = .boolean },
+    .{ .option = .backend, .name = "backend", .spellings = &.{valueFlag("--backend")}, .value_kind = .enumeration, .values = backend_values },
     .{ .option = .verbosity, .name = "verbosity", .spellings = &.{ valueFlag("-v"), valueFlag("--verbosity") }, .value_kind = .enumeration, .values = &.{ "names", "sig", "doc", "full" } },
     .{ .option = .depth, .name = "depth", .spellings = &.{ valueFlag("-d"), valueFlag("--depth") }, .value_kind = .integer, .minimum = 0 },
     .{ .option = .limit, .name = "limit", .spellings = &.{ valueFlag("-l"), valueFlag("--limit") }, .value_kind = .integer, .minimum = 1 },
@@ -271,45 +282,45 @@ const route_conflicts = [_]OptionConflict{
 /// semantically effective applicability rather than every no-op combination the
 /// historical parser happened to accept.
 pub const command_descriptors = [_]CommandDescriptor{
-    .{ .command = .outline, .name = "outline", .aliases = &.{"o"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .format, .after, .kind, .sort, .tests, .no_recurse, .visibility }, .option_value_overrides = &outline_sort_values, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .def, .name = "def", .aliases = &.{"show"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .format, .visibility }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .docs, .name = "docs", .aliases = &.{"doc"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .calls, .name = "calls", .aliases = &.{"callees"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .callers, .name = "callers", .aliases = &.{"uses"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .tests, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .search, .name = "search", .aliases = &.{"grep"}, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .refs, .kind, .sort, .tests, .exact, .visibility, .writers, .readers, .unread, .on_type, .duplicates }, .option_value_overrides = &outline_sort_values, .dependencies = &search_dependencies, .conflicts = &search_conflicts, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .routes, .name = "routes", .aliases = &.{"api"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .clients, .unhit, .orphan_calls, .handler }, .conflicts = &route_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .events, .name = "events", .aliases = &.{ "dispatch", "bus" }, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .conforms, .name = "conforms", .aliases = &.{ "impls", "implements" }, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .hierarchy, .name = "hierarchy", .aliases = &.{"hier"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .overrides }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .raises, .name = "raises", .aliases = &.{"throws"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .catches, .name = "catches", .aliases = &.{"handles"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .neighbors, .name = "neighbors", .aliases = &.{"near"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .unused, .name = "unused", .aliases = &.{"dead"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .tests, .no_public, .follow_imports }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .imports, .name = "imports", .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .importers, .name = "importers", .arguments = &file_arg, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .path, .name = "path", .arguments = &path_args, .options = &.{ .root, .no_cache, .verbosity, .strict, .format, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .flow, .name = "flow", .aliases = &.{"dataflow"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .strict, .format, .writers, .readers, .unread, .on_type, .to }, .conflicts = &flow_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .taint, .name = "taint", .aliases = &.{"security"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .strict, .format, .to }, .required_options = &.{.to}, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .reaches, .name = "reaches", .aliases = &.{"reachable"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .tests, .impls, .from_tests }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .affected, .name = "affected", .aliases = &.{"impact"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .impls, .since }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .hot, .name = "hot", .aliases = &.{"central"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .sort, .tests }, .option_value_overrides = &hot_sort_values, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .diff, .name = "diff", .aliases = &.{"changed"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .verbosity, .limit, .budget, .format, .exact_source }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .history, .name = "history", .aliases = &.{"hist"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .last }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .blame, .name = "blame", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .verbosity, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .churn, .name = "churn", .arguments = &optional_path, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .sort, .since, .last }, .option_value_overrides = &churn_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .collisions, .name = "collisions", .aliases = &.{"duplicates"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .verbosity, .limit, .format, .kind, .tests, .visibility, .members }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .files, .name = "files", .aliases = &.{"manifest"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .sort, .no_recurse }, .option_value_overrides = &files_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .status, .name = "status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .limit, .format, .after, .no_recurse }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .outline, .name = "outline", .aliases = &.{"o"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .budget, .max_nodes, .summary, .format, .after, .kind, .sort, .tests, .no_recurse, .visibility }, .option_value_overrides = &outline_sort_values, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .def, .name = "def", .aliases = &.{"show"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .format, .visibility }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .docs, .name = "docs", .aliases = &.{"doc"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .calls, .name = "calls", .aliases = &.{"callees"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .callers, .name = "callers", .aliases = &.{"uses"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .tests, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .search, .name = "search", .aliases = &.{"grep"}, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .refs, .kind, .sort, .tests, .exact, .visibility, .writers, .readers, .unread, .on_type, .duplicates }, .option_value_overrides = &outline_sort_values, .dependencies = &search_dependencies, .conflicts = &search_conflicts, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .routes, .name = "routes", .aliases = &.{"api"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .clients, .unhit, .orphan_calls, .handler }, .conflicts = &route_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .events, .name = "events", .aliases = &.{ "dispatch", "bus" }, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .conforms, .name = "conforms", .aliases = &.{ "impls", "implements" }, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .hierarchy, .name = "hierarchy", .aliases = &.{"hier"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .strict, .format, .overrides }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .raises, .name = "raises", .aliases = &.{"throws"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .depth, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .catches, .name = "catches", .aliases = &.{"handles"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .limit, .strict, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .neighbors, .name = "neighbors", .aliases = &.{"near"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .depth, .limit, .budget, .max_nodes, .summary, .strict, .format, .refs, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .unused, .name = "unused", .aliases = &.{"dead"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .tests, .no_public, .follow_imports }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .imports, .name = "imports", .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .importers, .name = "importers", .arguments = &file_arg, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .path, .name = "path", .arguments = &path_args, .options = &.{ .root, .no_cache, .backend, .verbosity, .strict, .format, .impls }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .flow, .name = "flow", .aliases = &.{"dataflow"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .strict, .format, .writers, .readers, .unread, .on_type, .to }, .conflicts = &flow_conflicts, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .taint, .name = "taint", .aliases = &.{"security"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .limit, .strict, .format, .to }, .required_options = &.{.to}, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .reaches, .name = "reaches", .aliases = &.{"reachable"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .tests, .impls, .from_tests }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .affected, .name = "affected", .aliases = &.{"impact"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .impls, .since }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .hot, .name = "hot", .aliases = &.{"central"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .budget, .max_nodes, .summary, .strict, .format, .after, .sort, .tests }, .option_value_overrides = &hot_sort_values, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .diff, .name = "diff", .aliases = &.{"changed"}, .arguments = &optional_ref, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .budget, .format, .exact_source }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .history, .name = "history", .aliases = &.{"hist"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .last }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .blame, .name = "blame", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .churn, .name = "churn", .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .sort, .since, .last }, .option_value_overrides = &churn_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .collisions, .name = "collisions", .aliases = &.{"duplicates"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .verbosity, .limit, .format, .kind, .tests, .visibility, .members }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .files, .name = "files", .aliases = &.{"manifest"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format, .sort, .no_recurse }, .option_value_overrides = &files_sort_values, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .status, .name = "status", .aliases = &.{"snapshot"}, .arguments = &optional_filter, .options = &.{ .root, .no_cache, .backend, .limit, .format, .after, .no_recurse }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
     .{ .command = .read, .name = "read", .aliases = &.{"cat"}, .arguments = &source_arg, .options = &.{ .root, .no_cache, .limit, .budget, .format, .after }, .outputs = &text_json, .access = .read_only, .requires_index = false, .cache_effect = .none },
-    .{ .command = .strings, .name = "strings", .aliases = &.{ "str", "literals" }, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .todos, .name = "todos", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .edits, .name = "edits", .aliases = &.{"edit-sites"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
-    .{ .command = .rename, .name = "rename", .arguments = &rename_args, .options = &.{ .root, .no_cache, .format, .preview }, .outputs = &text_json, .access = .mutating, .requires_index = true, .server_available = false },
-    .{ .command = .coverage, .name = "coverage", .aliases = &.{"cov"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
-    .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .limit, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
+    .{ .command = .strings, .name = "strings", .aliases = &.{ "str", "literals" }, .arguments = &pattern_arg, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .todos, .name = "todos", .aliases = &.{"todo"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .edits, .name = "edits", .aliases = &.{"edit-sites"}, .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .backend, .limit, .format, .after }, .dependencies = &jsonl_after_dependency, .outputs = &text_json_jsonl, .access = .read_only, .requires_index = true },
+    .{ .command = .rename, .name = "rename", .arguments = &rename_args, .options = &.{ .root, .no_cache, .backend, .format, .preview }, .outputs = &text_json, .access = .mutating, .requires_index = true, .server_available = false },
+    .{ .command = .coverage, .name = "coverage", .aliases = &.{"cov"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
+    .{ .command = .graph, .name = "graph", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
     .{ .command = .capabilities, .name = "capabilities", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
-    .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
-    .{ .command = .lsp, .name = "lsp", .arguments = &no_args, .options = &.{ .root, .no_cache, .log, .log_level }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
+    .{ .command = .serve, .name = "serve", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache, .backend }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
+    .{ .command = .lsp, .name = "lsp", .arguments = &no_args, .options = &.{ .root, .no_cache, .backend, .log, .log_level }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
     .{ .command = .help, .name = "help", .aliases = &.{ "--help", "-h" }, .arguments = &help_args, .outputs = &text_only, .access = .metadata, .requires_index = false, .server_available = false, .cache_effect = .none },
 };
 
