@@ -3261,6 +3261,40 @@ test "navgraph/impact narrows to the named uri when several documents changed" {
     try testing.expect(std.mem.endsWith(u8, hunks[0].object.get("uri").?.string, "util.zig"));
 }
 
+test "navgraph/impact surfaces a disk-read failure instead of treating it as a new file (F13)" {
+    const impact_replaced_project = [_][2][]const u8{.{ "big.zig", "pub fn a() void {}\n" }};
+    const ts = try TestServer.init(testing.allocator, testing.io, &impact_replaced_project);
+    defer ts.deinit();
+    try ts.start();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const uri = try ts.uri(alloc, "big.zig");
+
+    // An overlay that differs from disk, so the impact path needs to read
+    // the disk copy for the common-prefix/suffix trim.
+    try ts.send(try std.fmt.allocPrint(alloc,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":
+        \\ {{"uri":"{s}","languageId":"zig","version":1,"text":"pub fn a() void {{}}\npub fn b() void {{}}\n"}}}}}}
+    , .{uri}));
+
+    // Replace the indexed file with a directory of the same name: the disk
+    // read now fails with something other than FileNotFound (the only case
+    // the fix is meant to swallow).
+    const root_dir = ts.server.session.?.root_dir;
+    const io = ts.server.io;
+    try root_dir.deleteFile(io, "big.zig");
+    try root_dir.createDir(io, "big.zig", .default_dir);
+
+    var res = try ts.request(90,
+        \\{"jsonrpc":"2.0","id":90,"method":"navgraph/impact","params":{}}
+    );
+    defer res.deinit();
+    // Pre-fix: the read error was swallowed and the whole overlay reported
+    // as one hunk, as if "big.zig" were a brand-new untracked file.
+    _ = try errorCodeOf(res);
+}
+
 test "navgraph/context reports the definition, callers, callees and a token estimate" {
     const ts = try started(testing.allocator);
     defer ts.deinit();

@@ -1866,7 +1866,14 @@ fn appendOverlayHunk(
     if (s.root_dir.readFileAlloc(s.io, path, gpa, .limited(8 * 1024 * 1024))) |bytes| {
         disk = bytes;
         owned = true;
-    } else |_| {}
+    } else |err| switch (err) {
+        // The intended, documented case: a new/untracked overlay-only file
+        // has no disk counterpart, so the whole overlay is one hunk.
+        error.FileNotFound => {},
+        // A permission error, an I/O error, or FileTooBig must not silently
+        // masquerade as "no such file" (coldstart F13) — surface it.
+        else => return err,
+    }
     defer if (owned) gpa.free(disk);
     const edit = index_mod.computeEdit(disk, overlay_text) orelse return;
     try hunks.append(gpa, .{ .file = fid, .lo = edit.start_point.row + 1, .hi = edit.new_end_point.row + 1 });
