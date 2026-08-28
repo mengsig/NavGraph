@@ -116,6 +116,8 @@ pub const Option = enum {
     log,
     log_level,
     include,
+    direction,
+    offset,
 };
 
 pub const ValueKind = enum { boolean, string, integer, enumeration, cursor };
@@ -207,6 +209,14 @@ pub const option_descriptors = [_]OptionDescriptor{
     // which validates one value) because it is a comma-separated *set* —
     // `parseIncludeCsv` validates each token against the same five names.
     .{ .option = .include, .name = "include", .spellings = &.{valueFlag("--include")}, .value_kind = .string },
+    // `hunks`: the blast-radius walk direction (m6) — mirrors
+    // `navgraph/impact`'s own `direction` param, exposed nowhere on the CLI
+    // before this round.
+    .{ .option = .direction, .name = "direction", .spellings = &.{valueFlag("--direction")}, .value_kind = .enumeration, .values = &.{ "callers", "callees" } },
+    // `hunks`/`context`: page offset into a capped list's priority order —
+    // B1's continuation for the CLI mirrors (`--after` is the unrelated
+    // JSONL row-stream cursor; this pages *within* one JSON response's list).
+    .{ .option = .offset, .name = "offset", .spellings = &.{valueFlag("--offset")}, .value_kind = .integer },
 };
 
 pub const CommandDescriptor = struct {
@@ -343,8 +353,8 @@ pub const command_descriptors = [_]CommandDescriptor{
     // one-shot Session (src/lsp/mirrors.zig) rather than running through this
     // file's *Index-based dispatch, so the legacy argv MCP tool cannot route
     // to it — `navgraph.hunks`/`.context`/`.where` are separate MCP tools.
-    .{ .command = .hunks, .name = "hunks", .summary = "Show the working change's blast radius, grouped by hunk.", .example = "navgraph hunks HEAD~1", .arguments = &optional_ref, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
-    .{ .command = .context, .name = "context", .summary = "Show a symbol's callers, callees, types, tests and definition, budget-trimmed.", .example = "navgraph context build@src/index.zig --budget 2000", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .budget, .include, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
+    .{ .command = .hunks, .name = "hunks", .summary = "Show the working change's blast radius, grouped by hunk.", .example = "navgraph hunks HEAD~1", .arguments = &optional_ref, .options = &.{ .root, .no_cache, .depth, .direction, .limit, .offset, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
+    .{ .command = .context, .name = "context", .summary = "Show a symbol's callers, callees, types, tests and definition, budget-trimmed.", .example = "navgraph context build@src/index.zig --budget 2000", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .budget, .include, .offset, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
     .{ .command = .where, .name = "where", .summary = "Find the symbol enclosing a file:line location.", .example = "navgraph where src/index.zig:120", .arguments = &file_line_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
     .{ .command = .capabilities, .name = "capabilities", .summary = "Print this binary's machine-readable feature manifest.", .example = "navgraph capabilities -j", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
     .{ .command = .serve, .name = "serve", .summary = "Run a long-lived MCP/JSON-RPC server over stdio.", .example = "navgraph serve -C .", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache, .backend }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },

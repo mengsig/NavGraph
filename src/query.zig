@@ -224,6 +224,14 @@ pub const Options = struct {
     /// distinguished by `Parsed.used_options.contains(.include)`, not by this
     /// string, since an explicit empty list is a real "include nothing".
     include: []const u8 = "",
+    /// `hunks`: which edge direction the blast radius walks (m6, mirrors
+    /// `navgraph/impact`'s own `direction`) — `.callers` unless `--direction
+    /// callees` is given.
+    hunks_direction: enum { callers, callees } = .callers,
+    /// `hunks`/`context`: page offset into a budget/limit-capped list's
+    /// priority order (B1) — `navgraph/impact`'s blast-radius page, or
+    /// `navgraph/context`'s `callers` page.
+    mirror_offset: u32 = 0,
 };
 
 /// Whether `sym` is test code: a Zig `test` block, a symbol in a test file/dir,

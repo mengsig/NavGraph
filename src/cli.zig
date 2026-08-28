@@ -116,10 +116,13 @@ const usage_text =
     \\  graph [path]       Interactive HTML visualization of the code graph
     \\                     (redirect stdout to a .html file; -j emits the raw JSON model)
     \\  hunks [ref]        Working change's hunks, blast radius and roots (navgraph/impact
-    \\                     mirror); default ref is HEAD, like affected/diff
+    \\                     mirror); default ref is HEAD, like affected/diff; --limit raises
+    \\                     the 500-node cap, --offset pages past it, --direction/--depth
+    \\                     control the walk
     \\  context <symbol>   One symbol's definition, callers/callees/types/tests in a single
     \\                     call, trimmed to --budget tokens (navgraph/context mirror);
-    \\                     --include restricts sections (callers,callees,types,tests,body)
+    \\                     --include restricts sections (callers,callees,types,tests,body);
+    \\                     --offset pages a budget-capped callers list
     \\  where <file:line>  Symbol enclosing a 1-based file:line, plus its breadcrumb chain
     \\                     (navgraph/where mirror; stack traces and diff hunks)
     \\  capabilities       Machine-readable protocol, build, language, command,
@@ -493,6 +496,23 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     if (std.mem.eql(u8, f.name, "--include")) {
         out.used_options.insert(.include);
         out.options.include = try f.value(args, i, f.name);
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--direction")) {
+        out.used_options.insert(.direction);
+        const val = try f.value(args, i, f.name);
+        if (std.mem.eql(u8, val, "callers")) {
+            out.options.hunks_direction = .callers;
+        } else if (std.mem.eql(u8, val, "callees")) {
+            out.options.hunks_direction = .callees;
+        } else {
+            return fail(error.BadValue, "invalid value '{s}' for --direction (expected callers|callees)", .{val});
+        }
+        return f.next(i);
+    }
+    if (std.mem.eql(u8, f.name, "--offset")) {
+        out.used_options.insert(.offset);
+        out.options.mirror_offset = try parseUint(try f.value(args, i, f.name), "--offset");
         return f.next(i);
     }
     if (std.mem.eql(u8, f.name, "--after")) {

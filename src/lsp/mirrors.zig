@@ -38,25 +38,37 @@ pub fn ctxOf(session: *session_mod.Session) payload.Ctx {
     return .{ .session = session, .encoding = .utf8 };
 }
 
+/// `depth`/`direction`/`limit`/`offset` for the CLI/MCP `hunks` mirror — m6:
+/// these were hard-coded (`cfg.depth`, `.callers`, `500`), so the wire
+/// method's own parameters had no CLI/MCP equivalent; `limit` in particular
+/// is the only way to raise B1's hard 500-node cap on these two surfaces.
+pub const HunksParams = struct {
+    depth: u32,
+    direction: queries.Direction = .callers,
+    limit: u32 = 500,
+    offset: u32 = 0,
+};
+
 /// `navgraph hunks [ref]`: `navgraph/impact`'s exact wire shape (roots, blast
 /// nodes/edges, hunks, changeId). CLI/MCP callers have no open-document
 /// overlays, so `ref` is always passed non-null — an empty string still means
 /// "HEAD", same as `navgraph diff`/`navgraph affected`'s own default-ref rule.
-pub fn hunks(w: *std.Io.Writer, gpa: std.mem.Allocator, ctx: payload.Ctx, ref: []const u8, detail: *?[]const u8) !void {
-    const cfg = ctx.session.cfg;
+pub fn hunks(w: *std.Io.Writer, gpa: std.mem.Allocator, ctx: payload.Ctx, ref: []const u8, params: HunksParams, detail: *?[]const u8) !void {
     try queries.writeImpact(w, gpa, ctx, ref, null, null, .{
-        .depth = cfg.depth,
-        .direction = .callers,
-        .limit = 500,
-        .scope = queries.Scope.fromConfig(cfg),
+        .depth = params.depth,
+        .direction = params.direction,
+        .limit = params.limit,
+        .offset = params.offset,
+        .scope = queries.Scope.fromConfig(ctx.session.cfg),
     }, detail);
 }
 
-/// `navgraph context <symbol> [--budget N] [--include LIST]`: resolve the
-/// name the same way every CLI symbol argument resolves (`query.resolveIds`,
-/// via `queries.resolveTarget`), then `navgraph/context`'s exact wire shape
-/// for the first match — same "first match wins" convention `contextMethod`
-/// uses for an ambiguous name.
+/// `navgraph context <symbol> [--budget N] [--include LIST] [--offset N]`:
+/// resolve the name the same way every CLI symbol argument resolves
+/// (`query.resolveIds`, via `queries.resolveTarget`), then
+/// `navgraph/context`'s exact wire shape for the first match — same "first
+/// match wins" convention `contextMethod` uses for an ambiguous name.
+/// `offset` pages through a `callers` list `budget` capped (B1/B2).
 pub fn context(
     w: *std.Io.Writer,
     gpa: std.mem.Allocator,
@@ -64,11 +76,12 @@ pub fn context(
     symbol: []const u8,
     budget: u32,
     include: queries.ContextInclude,
+    offset: u32,
 ) !void {
     var detail: ?[]const u8 = null;
     const roots = try queries.resolveTarget(gpa, ctx, .{ .symbol = symbol }, &detail);
     defer gpa.free(roots);
-    try queries.writeContext(w, gpa, ctx, roots[0], .{ .budget = budget, .include = include });
+    try queries.writeContext(w, gpa, ctx, roots[0], .{ .budget = budget, .include = include, .offset = offset });
 }
 
 /// `navgraph where <file>:<line>`.
@@ -206,7 +219,7 @@ test "hunks reports the working change against HEAD, grouped by hunk" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     var detail: ?[]const u8 = null;
-    try hunks(&aw.writer, testing.allocator, ctx, "", &detail);
+    try hunks(&aw.writer, testing.allocator, ctx, "", .{ .depth = ctx.session.cfg.depth }, &detail);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
@@ -224,7 +237,7 @@ test "hunks off a bad ref is GitFailed, with the git detail attached" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     var detail: ?[]const u8 = null;
-    try testing.expectError(error.GitFailed, hunks(&aw.writer, testing.allocator, ctx, "not-a-real-ref", &detail));
+    try testing.expectError(error.GitFailed, hunks(&aw.writer, testing.allocator, ctx, "not-a-real-ref", .{ .depth = ctx.session.cfg.depth }, &detail));
     try testing.expect(detail != null);
     if (detail) |d| testing.allocator.free(d);
 }
@@ -235,7 +248,7 @@ test "context returns the definition, trimmed to the given budget" {
     const ctx = ctxOf(&fx.session);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try context(&aw.writer, testing.allocator, ctx, "run", 2000, .{});
+    try context(&aw.writer, testing.allocator, ctx, "run", 2000, .{}, 0);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("run", parsed.value.object.get("symbol").?.object.get("name").?.string);
@@ -247,7 +260,7 @@ test "context on an unknown symbol is SymbolNotFound" {
     const ctx = ctxOf(&fx.session);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try testing.expectError(error.SymbolNotFound, context(&aw.writer, testing.allocator, ctx, "nope_xyz", 2000, .{}));
+    try testing.expectError(error.SymbolNotFound, context(&aw.writer, testing.allocator, ctx, "nope_xyz", 2000, .{}, 0));
 }
 
 test "context budget 0 does not error (silently reinterpreted, per the wire contract)" {
@@ -256,7 +269,7 @@ test "context budget 0 does not error (silently reinterpreted, per the wire cont
     const ctx = ctxOf(&fx.session);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try context(&aw.writer, testing.allocator, ctx, "run", 0, .{});
+    try context(&aw.writer, testing.allocator, ctx, "run", 0, .{}, 0);
     try testing.expect(aw.written().len != 0);
 }
 

@@ -210,7 +210,19 @@ fn runMirrorCommand(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator
     var detail: ?[]const u8 = null;
     const mirror_err: ?anyerror = switch (parsed.command) {
         .hunks => blk: {
-            lsp.mirrors.hunks(&aw.writer, arena, ctx, parsed.arg, &detail) catch |err| break :blk err;
+            const params = lsp.mirrors.HunksParams{
+                // Unset `-d/--depth` keeps hunks' own established default
+                // (the session's configured depth), not the CLI's generic
+                // depth-1 default meant for `calls`/`callers`.
+                .depth = if (parsed.used_options.contains(.depth)) parsed.options.depth else session.cfg.depth,
+                .direction = switch (parsed.options.hunks_direction) {
+                    .callers => .callers,
+                    .callees => .callees,
+                },
+                .limit = if (parsed.options.limit_set) parsed.options.limit else 500,
+                .offset = parsed.options.mirror_offset,
+            };
+            lsp.mirrors.hunks(&aw.writer, arena, ctx, parsed.arg, params, &detail) catch |err| break :blk err;
             break :blk null;
         },
         .context => blk: {
@@ -222,7 +234,7 @@ fn runMirrorCommand(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator
                 }
             else
                 lsp.queries.ContextInclude{};
-            lsp.mirrors.context(&aw.writer, arena, ctx, parsed.arg, budget, include) catch |err| {
+            lsp.mirrors.context(&aw.writer, arena, ctx, parsed.arg, budget, include, parsed.options.mirror_offset) catch |err| {
                 if (err == error.SymbolNotFound)
                     detail = std.fmt.allocPrint(arena, "no definition named '{s}'", .{parsed.arg}) catch null;
                 break :blk err;
@@ -334,7 +346,10 @@ fn writeContextText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
     try writeSymbolArray(out, "types", root.get("types").?);
     try writeSymbolArray(out, "tests", root.get("tests").?);
     const truncated = root.get("truncated").?.bool;
-    try out.print("truncated: {}  tokensEstimate: {d}\n", .{ truncated, jsonInt(root, "tokensEstimate") });
+    try out.print("truncated: {}  tokensEstimate: {d}  callersTotal: {d}\n", .{ truncated, jsonInt(root, "tokensEstimate"), jsonInt(root, "callersTotal") });
+    if (root.get("next")) |next| if (next != .null) {
+        try out.print("next: --offset {d} (more callers)\n", .{next.integer});
+    };
 }
 
 fn writeHunksText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
@@ -356,9 +371,12 @@ fn writeHunksText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
     try writeSymbolArray(out, "roots", root.get("roots").?);
     const summary = root.get("summary").?.object;
     try out.print(
-        "blast: {d} symbols, {d} files, {d} tests, maxDepth {d}, truncated {}\n",
-        .{ jsonInt(summary, "symbols"), jsonInt(summary, "files"), jsonInt(summary, "tests"), jsonInt(summary, "maxDepth"), summary.get("truncated").?.bool },
+        "blast: {d}/{d} symbols shown, {d} files, {d} tests, maxDepth {d}, truncated {}\n",
+        .{ jsonInt(summary, "symbols"), jsonInt(summary, "total"), jsonInt(summary, "files"), jsonInt(summary, "tests"), jsonInt(summary, "maxDepth"), summary.get("truncated").?.bool },
     );
+    if (root.get("next")) |next| if (next != .null) {
+        try out.print("next: --offset {d} (more nodes; raise --limit or page with --offset)\n", .{next.integer});
+    };
 }
 
 /// Say on stderr how many graph nodes `-l` withheld.
@@ -877,8 +895,8 @@ fn rpcTools(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     // than sharing this server's resident one (src/lsp/mirrors.zig's doc
     // comment explains why), so a call here costs a fresh walk, unlike
     // navgraph.query above.
-    try out.writeAll("{\"name\":\"navgraph.hunks\",\"description\":\"navgraph/impact mirror: the working change's hunks, blast radius and roots. Default ref is HEAD, like affected/diff.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"ref\":{\"type\":\"string\"}},\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
-    try out.writeAll("{\"name\":\"navgraph.context\",\"description\":\"navgraph/context mirror: one symbol's definition, callers/callees/types/tests in a single call, trimmed to a token budget (default 2000; 0 also means default).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"symbol\":{\"type\":\"string\"},\"budget\":{\"type\":\"integer\",\"minimum\":0},\"include\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\",\"types\",\"tests\",\"body\"]}}},\"required\":[\"symbol\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph.hunks\",\"description\":\"navgraph/impact mirror: the working change's hunks, blast radius and roots. Default ref is HEAD, like affected/diff. limit raises the 500-node page cap, offset pages past it, direction/depth control the walk.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"ref\":{\"type\":\"string\"},\"depth\":{\"type\":\"integer\",\"minimum\":0},\"direction\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\"]},\"limit\":{\"type\":\"integer\",\"minimum\":0},\"offset\":{\"type\":\"integer\",\"minimum\":0}},\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph.context\",\"description\":\"navgraph/context mirror: one symbol's definition, callers/callees/types/tests in a single call, trimmed to a token budget (default 2000; 0 also means default). offset pages a budget-capped callers list.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"symbol\":{\"type\":\"string\"},\"budget\":{\"type\":\"integer\",\"minimum\":0},\"include\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\",\"types\",\"tests\",\"body\"]}},\"offset\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"symbol\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
     try out.writeAll("{\"name\":\"navgraph.where\",\"description\":\"navgraph/where mirror: the symbol enclosing a 1-based file:line, plus its breadcrumb chain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\"},\"line\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"file\",\"line\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}}]}}\n");
     return true;
 }
@@ -1021,16 +1039,49 @@ fn writeMirrorResult(out: *std.Io.Writer, id: ?std.json.Value, json: []const u8)
 fn rpcHunksTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
     std.debug.assert(id != null);
     var ref: []const u8 = "";
+    var depth: ?u32 = null;
+    var direction: lsp.queries.Direction = .callers;
+    var limit: u32 = 500;
+    var offset: u32 = 0;
     for (arguments.object.keys(), arguments.object.values()) |key, value| {
-        if (!std.mem.eql(u8, key, "ref")) {
-            try rpcError(out, id, -32602, "unknown field for navgraph.hunks (expected: ref)");
+        if (std.mem.eql(u8, key, "ref")) {
+            if (value != .string) {
+                try rpcError(out, id, -32602, "ref must be a string");
+                return true;
+            }
+            ref = value.string;
+        } else if (std.mem.eql(u8, key, "depth")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "depth must be a non-negative integer");
+                return true;
+            }
+            depth = @intCast(value.integer);
+        } else if (std.mem.eql(u8, key, "direction")) {
+            if (value == .string and std.mem.eql(u8, value.string, "callers")) {
+                direction = .callers;
+            } else if (value == .string and std.mem.eql(u8, value.string, "callees")) {
+                direction = .callees;
+            } else {
+                try rpcError(out, id, -32602, "direction must be 'callers' or 'callees'");
+                return true;
+            }
+        } else if (std.mem.eql(u8, key, "limit")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "limit must be a non-negative integer");
+                return true;
+            }
+            // 0 is the wire contract's own "use the default" value.
+            if (value.integer != 0) limit = @intCast(value.integer);
+        } else if (std.mem.eql(u8, key, "offset")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "offset must be a non-negative integer");
+                return true;
+            }
+            offset = @intCast(value.integer);
+        } else {
+            try rpcError(out, id, -32602, "unknown field for navgraph.hunks (expected: ref, depth, direction, limit, offset)");
             return true;
         }
-        if (value != .string) {
-            try rpcError(out, id, -32602, "ref must be a string");
-            return true;
-        }
-        ref = value.string;
     }
 
     var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
@@ -1042,7 +1093,13 @@ fn rpcHunksTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Valu
     const arena = arena_state.allocator();
     var aw: std.Io.Writer.Allocating = .init(arena);
     var detail: ?[]const u8 = null;
-    lsp.mirrors.hunks(&aw.writer, arena, ctx, ref, &detail) catch |err| {
+    const params = lsp.mirrors.HunksParams{
+        .depth = depth orelse mirror_session.cfg.depth,
+        .direction = direction,
+        .limit = limit,
+        .offset = offset,
+    };
+    lsp.mirrors.hunks(&aw.writer, arena, ctx, ref, params, &detail) catch |err| {
         try rpcError(out, id, lsp.mirrors.errorCode(err), detail orelse lsp.mirrors.errorMessage(err));
         return true;
     };
@@ -1055,6 +1112,7 @@ fn rpcContextTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Va
     var symbol: ?[]const u8 = null;
     var budget: u32 = 2000;
     var include: lsp.queries.ContextInclude = .{};
+    var offset: u32 = 0;
     for (arguments.object.keys(), arguments.object.values()) |key, value| {
         if (std.mem.eql(u8, key, "symbol")) {
             if (value != .string or value.string.len == 0) {
@@ -1097,8 +1155,14 @@ fn rpcContextTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Va
                     return true;
                 }
             }
+        } else if (std.mem.eql(u8, key, "offset")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "offset must be a non-negative integer");
+                return true;
+            }
+            offset = @intCast(value.integer);
         } else {
-            try rpcError(out, id, -32602, "unknown field for navgraph.context (expected: symbol, budget, include)");
+            try rpcError(out, id, -32602, "unknown field for navgraph.context (expected: symbol, budget, include, offset)");
             return true;
         }
     }
@@ -1115,7 +1179,7 @@ fn rpcContextTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Va
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var aw: std.Io.Writer.Allocating = .init(arena);
-    lsp.mirrors.context(&aw.writer, arena, ctx, sym, budget, include) catch |err| {
+    lsp.mirrors.context(&aw.writer, arena, ctx, sym, budget, include, offset) catch |err| {
         const message = if (err == error.SymbolNotFound)
             std.fmt.allocPrint(arena, "no definition named '{s}'", .{sym}) catch lsp.mirrors.errorMessage(err)
         else
