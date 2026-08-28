@@ -73,11 +73,20 @@ pub const Index = struct {
     /// logging.go, …). Lets a package-qualified call (`caddy.Load(...)`) resolve
     /// to the package's top-level definitions. Arena-owned.
     go_packages: std.StringHashMapUnmanaged([]const FileId) = .empty,
-    /// Java type id → the ids of the supertypes its signature declares, in
-    /// ascending id order. Precomputed once so inherited-member lookup walks a
-    /// short adjacency list instead of rescanning every symbol per reference.
+    /// Type id → its declared ANCESTORS, in ascending id order: a Java type's
+    /// `extends`/`implements`, a Ruby class's superclass and the modules it
+    /// mixes in. Strictly one directional — every entry is a type the subject
+    /// inherits FROM, which is what makes it safe for `super` and inherited-
+    /// member walks. Precomputed once per build; a per-reference scan of the
+    /// symbol table was quadratic in project size. Arena-owned.
+    type_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
+    /// Ruby module id → the classes that mix it in, ascending. The REVERSE of
+    /// a mixin edge, deliberately NOT in `type_bases`: an ancestor walk that
+    /// crossed it would leave the subject's own hierarchy and reach a sibling
+    /// includer's members. Consulted only for implicit self inside a module's
+    /// own body, where a module method calls a method its includer defines.
     /// Arena-owned.
-    java_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
+    module_includers: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -236,7 +245,7 @@ pub fn buildOpenDir(
     attachCrossFileMethodParents(&idx);
     try buildImportTable(&idx);
     try buildGoPackageTable(&idx);
-    try buildJavaBaseTable(&idx);
+    try buildTypeBaseTable(&idx);
     resolveReferences(&idx);
     // Persist BEFORE applying router mounts: the mount pass rewrites route
     // symbol names in place (prepending the mount prefix), and those rewritten
@@ -282,19 +291,57 @@ const ignored_dirs = std.StaticStringMap(void).initComptime(.{
     .{".codeflow"},
 });
 
-fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
-    try loadGitignore(b, path_buf.items);
+/// A directory entry captured so the walk can order it. `name` is owned (the
+/// iterator's buffer is reused by the next `next`).
+const DirEntry = struct { name: []const u8, kind: std.Io.File.Kind };
+
+fn dirEntryLess(_: void, a: DirEntry, b: DirEntry) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+/// Read `dir`'s entries and sort them byte-wise by name.
+///
+/// `dir.iterate()` yields entries in filesystem order — ext4 hashes names with
+/// a per-filesystem seed, tmpfs keeps creation order — so the raw order differs
+/// between machines. File order decides symbol ids, and every resolver tie-break
+/// that falls back to id order rides on it, which made the same commit produce a
+/// different graph on a different filesystem. Sorting here is the single place
+/// that pins it.
+fn sortedEntries(b: *Builder, dir: std.Io.Dir) ![]DirEntry {
+    var entries: std.ArrayList(DirEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| b.gpa.free(e.name);
+        entries.deinit(b.gpa);
+    }
     var it = dir.iterate();
-    const base_len = path_buf.items.len;
     while (try it.next(b.io)) |entry| {
         if (entry.name.len == 0) continue;
+        if (entry.kind != .directory and entry.kind != .file) continue;
+        const name = try b.gpa.dupe(u8, entry.name);
+        errdefer b.gpa.free(name);
+        try entries.append(b.gpa, .{ .name = name, .kind = entry.kind });
+    }
+    const out = try entries.toOwnedSlice(b.gpa);
+    std.mem.sort(DirEntry, out, {}, dirEntryLess);
+    return out;
+}
+
+fn collectDir(b: *Builder, dir: std.Io.Dir, path_buf: *std.ArrayList(u8)) anyerror!void {
+    try loadGitignore(b, path_buf.items);
+    const entries = try sortedEntries(b, dir);
+    defer {
+        for (entries) |e| b.gpa.free(e.name);
+        b.gpa.free(entries);
+    }
+    const base_len = path_buf.items.len;
+    for (entries) |entry| {
         path_buf.shrinkRetainingCapacity(base_len);
         if (base_len != 0) try path_buf.append(b.gpa, '/');
         try path_buf.appendSlice(b.gpa, entry.name);
         switch (entry.kind) {
             .directory => try enterDir(b, dir, entry.name, path_buf),
             .file => try maybeAddFile(b, path_buf.items),
-            else => {},
+            else => unreachable,
         }
     }
     path_buf.shrinkRetainingCapacity(base_len);
@@ -823,9 +870,76 @@ fn resolveReferences(idx: *Index) void {
     for (idx.graph.symbols) |*sym| {
         for (sym.refs) |*ref| {
             resolveOne(idx, sym.*, ref);
+            followFunctionAlias(idx, ref);
             dropMisboundCall(idx, sym.*, ref);
         }
     }
+}
+
+/// A call through a constant/variable that holds nothing but a named function
+/// (`const doubler = doubleValue;`, `var Doubler Adjust = double`) reaches that
+/// function: the binding is an alias, not a definition of its own. Only an
+/// initializer that is exactly one identifier naming a unique project callable
+/// is followed, so a lambda literal or a factory call keeps its own edge.
+fn followFunctionAlias(idx: *const Index, ref: *model.Reference) void {
+    if (ref.kind != .call or ref.target == invalid) return;
+    const alias = idx.graph.symbols[ref.target];
+    if (alias.kind != .constant and alias.kind != .variable) return;
+    const name = aliasInitializerName(alias.signature(idx.graph.files[alias.file].text)) orelse return;
+    const candidates = idx.by_name.get(name) orelse return;
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
+    for (candidates) |cid| {
+        const cand = idx.graph.symbols[cid];
+        if (!isCallable(cand) or cand.file != alias.file) continue;
+        matches += 1;
+        if (found == invalid) found = cid;
+    }
+    if (matches != 1) return;
+    // The chain is only as strong as its weakest link. This hop (alias -> a
+    // unique same-file callable) is proven, but the hop that reached the alias
+    // may have been an unprovable global-name guess — two files each exporting
+    // `const doubler = ...` is a coin flip. Overwriting `exact` there put a
+    // guessed edge inside `--strict`, which is the one consumer that must be
+    // trustworthy. Only an already-proven chain re-derives its confidence.
+    ref.target = found;
+    if (ref.exact) {
+        ref.resolution_status = .exact;
+        ref.resolution_reason = .same_file_fallback;
+    }
+}
+
+/// The sole identifier a declaration is initialized to, or null when the
+/// initializer is anything else. `= double_value;` answers `double_value`;
+/// `= ->(n) { n * 2 }`, `= makeScaler(2)` and `= 3` answer nothing. Takes the
+/// FIRST top-level `=`: a multi-declarator statement's parser now scopes each
+/// symbol to its own clause, but a shared signature (an unanticipated form)
+/// must still bind the name in front of it, not a sibling's initializer.
+fn aliasInitializerName(decl: []const u8) ?[]const u8 {
+    var eq: ?usize = null;
+    var i: usize = 0;
+    while (i < decl.len) : (i += 1) {
+        if (decl[i] != '=') continue;
+        // Skip a comparison/arrow operator: `==`, `!=`, `<=`, `>=`, `=>`.
+        if (i + 1 < decl.len and decl[i + 1] == '=') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < decl.len and decl[i + 1] == '>') continue;
+        if (i > 0 and (decl[i - 1] == '!' or decl[i - 1] == '<' or decl[i - 1] == '>' or decl[i - 1] == '=')) continue;
+        eq = i;
+        break;
+    }
+    const start = (eq orelse return null) + 1;
+    // A comma before the initializer marks more than one declarator sharing
+    // this text (`a = f, b = g`) — refuse rather than guess whose name it is.
+    if (std.mem.indexOfScalar(u8, decl[0..start], ',') != null) return null;
+    var rhs = std.mem.trim(u8, decl[start..], " \t\r\n");
+    if (std.mem.endsWith(u8, rhs, ";")) rhs = std.mem.trim(u8, rhs[0 .. rhs.len - 1], " \t\r\n");
+    if (rhs.len == 0) return null;
+    for (rhs) |c| if (!isIdentByte(c)) return null;
+    if (std.ascii.isDigit(rhs[0])) return null;
+    return rhs;
 }
 
 /// Invariant: a call site never binds to a *type*, unless the language spells
@@ -876,6 +990,49 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
         }
     }
 
+    // Ruby's implicit self: an unqualified call inside a class or module names
+    // that type's own method first, then one reached through its ancestors
+    // (superclass, mixins) or — inside a module — through a class that mixes it
+    // in. `super` names the ancestor's method of the *enclosing* method's name.
+    if (idx.graph.files[from.file].language == .ruby and from.parent != invalid) {
+        const is_super = std.mem.eql(u8, ref.name, "super");
+        const wanted = if (is_super) from.name else ref.name;
+        if (!is_super) {
+            const own = memberOfParent(idx, from.parent, wanted);
+            if (own.id != invalid) {
+                ref.target = own.id;
+                ref.exact = own.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .lexical_member;
+                return;
+            }
+        }
+        ref.target = inheritedMember(idx, from, wanted);
+        if (ref.target != invalid) {
+            // A single declared ancestor declaring the member exactly once
+            // leaves nothing to guess — that is what `super` names.
+            const bases = idx.type_bases.get(from.parent) orelse &.{};
+            ref.exact = bases.len == 1 and memberOfParent(idx, bases[0], wanted).unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .inferred;
+            ref.resolution_reason = .inheritance;
+            return;
+        }
+        // Only now, and never for `super`: a module method may call a method
+        // its includer defines. `super` is a walk UP the ancestor chain — the
+        // includer sits below the module in the MRO, so it is not a candidate.
+        if (!is_super) {
+            const mixed_in = includerMember(idx, from.parent, wanted);
+            if (mixed_in.id != invalid) {
+                ref.target = mixed_in.id;
+                ref.exact = mixed_in.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .inheritance;
+                return;
+            }
+        }
+        if (is_super) return;
+    }
+
     if (idx.graph.files[from.file].language == .java) {
         // Java permits an unqualified member access inside the declaring class.
         // The concrete parent id makes a unique direct member a proven edge;
@@ -893,7 +1050,7 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
             // Inherited lookup is useful but intentionally inferred: this
             // dependency-free scanner does not build Java's complete classpath,
             // accessibility rules, overload set, or generic substitution.
-            ref.target = javaInheritedMember(idx, from, ref.name);
+            ref.target = inheritedMember(idx, from, ref.name);
             if (ref.target != invalid) {
                 ref.exact = false;
                 ref.resolution_status = .inferred;
@@ -938,9 +1095,14 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
         ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
     }
     // A chained Java call such as `line.item().sku()` can lose its receiver in
-    // the lightweight token model. Keep a small same-language method guess
-    // visible, but never exact, after every lexical/import path failed.
-    if (ref.target == invalid and idx.graph.files[from.file].language == .java and ref.kind == .call) {
+    // the lightweight token model, and a Ruby `&:sym` block names a method with
+    // no receiver at all. Keep a small same-language method guess visible, but
+    // never exact, after every lexical/import path failed.
+    const guesses_bare_method = switch (idx.graph.files[from.file].language) {
+        .java, .ruby => true,
+        else => false,
+    };
+    if (ref.target == invalid and guesses_bare_method and ref.kind == .call) {
         ref.target = heuristicMethodTarget(idx, from, ref.name);
         ref.exact = false;
         if (ref.target != invalid) {
@@ -989,13 +1151,13 @@ fn importedBareTarget(idx: *const Index, file: FileId, name: []const u8) MemberM
 /// Resolve an unqualified Java member through the enclosing type's declared
 /// superclass/interfaces. The selected edge is always marked non-exact by the
 /// caller; this pass only finds a useful local candidate and refuses cycles.
-fn javaInheritedMember(idx: *const Index, from: model.Symbol, name: []const u8) SymbolId {
+fn inheritedMember(idx: *const Index, from: model.Symbol, name: []const u8) SymbolId {
     if (from.parent == invalid) return invalid;
     var visited: [16]SymbolId = @splat(invalid);
-    return javaInheritedMemberFrom(idx, from.parent, name, &visited, 0);
+    return inheritedMemberFrom(idx, from.parent, name, &visited, 0);
 }
 
-fn javaInheritedMemberFrom(
+fn inheritedMemberFrom(
     idx: *const Index,
     type_id: SymbolId,
     name: []const u8,
@@ -1006,22 +1168,34 @@ fn javaInheritedMemberFrom(
     for (visited[0..depth]) |seen| if (seen == type_id) return invalid;
     visited[depth] = type_id;
 
-    for (idx.java_bases.get(type_id) orelse return invalid) |base_id| {
+    for (idx.type_bases.get(type_id) orelse return invalid) |base_id| {
+        // A declared cycle (`class A extends B` / `class B extends A`) would
+        // otherwise let the direct probe answer with the calling type's own
+        // member — the recursion guard below runs too late for that.
+        var on_path = false;
+        for (visited[0 .. depth + 1]) |seen| {
+            if (seen == base_id) {
+                on_path = true;
+                break;
+            }
+        }
+        if (on_path) continue;
         const direct = memberOfParent(idx, base_id, name);
         if (direct.id != invalid) return direct.id;
-        const inherited = javaInheritedMemberFrom(idx, base_id, name, visited, depth + 1);
+        const inherited = inheritedMemberFrom(idx, base_id, name, visited, depth + 1);
         if (inherited != invalid) return inherited;
     }
     return invalid;
 }
 
-/// Precompute every Java type's declared supertypes into `Index.java_bases`.
-/// The lookup this replaces scanned the whole symbol table per unresolved Java
-/// reference, recursed 16 deep — O(references x symbols x depth), which made
-/// index build super-linear in file count. The table itself is arena-owned and
-/// dies with the index; the scratch used to build it is not, and is released
-/// here.
-fn buildJavaBaseTable(idx: *Index) !void {
+/// Precompute every type's declared supertypes into `Index.type_bases` (Java
+/// `extends`/`implements`, Ruby `<` and `include`/`extend`/`prepend`), then the
+/// reverse mixin edge into the separate `Index.module_includers`. The lookup
+/// this replaces scanned the whole symbol table per unresolved reference,
+/// recursed 16 deep — O(references x symbols x depth), which made index build
+/// super-linear in file count. Both tables are arena-owned and die with the
+/// index; the scratch used to build them is not, and is released here.
+fn buildTypeBaseTable(idx: *Index) !void {
     const arena = idx.arena.allocator();
     const gpa = idx.gpa;
 
@@ -1032,7 +1206,7 @@ fn buildJavaBaseTable(idx: *Index) !void {
         by_name.deinit(gpa);
     }
     for (idx.graph.symbols) |sym| {
-        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        if (!hasBaseTable(idx, sym)) continue;
         const slot = try by_name.getOrPut(gpa, sym.name);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(gpa, sym.id);
@@ -1041,10 +1215,13 @@ fn buildJavaBaseTable(idx: *Index) !void {
     var bases: std.ArrayListUnmanaged(SymbolId) = .empty;
     defer bases.deinit(gpa);
     for (idx.graph.symbols) |sym| {
-        if (!isContainer(sym) or idx.graph.files[sym.file].language != .java) continue;
+        if (!hasBaseTable(idx, sym)) continue;
         bases.clearRetainingCapacity();
-        var it = JavaBaseIterator{ .signature = sym.signature(idx.graph.files[sym.file].text) };
-        while (it.next()) |base_name| {
+        const text = idx.graph.files[sym.file].text;
+        const ruby = idx.graph.files[sym.file].language == .ruby;
+        var java_it = JavaBaseIterator{ .signature = sym.signature(text) };
+        var ruby_it = RubyBaseIterator{ .signature = sym.signature(text), .body = sym.body(text) };
+        while (if (ruby) ruby_it.next() else java_it.next()) |base_name| {
             const candidates = by_name.get(base_name) orelse continue;
             // An explicit import of the base name disambiguates same-named
             // classes; otherwise any chosen base stays a non-exact hint.
@@ -1058,17 +1235,142 @@ fn buildJavaBaseTable(idx: *Index) !void {
             }
         }
         if (bases.items.len == 0) continue;
-        // Ascending, deduped: the scan this replaces visited candidate bases in
-        // symbol-id order and took the first that resolved the member.
-        std.mem.sort(SymbolId, bases.items, {}, std.sort.asc(SymbolId));
+        if (ruby) {
+            // Ruby's MRO searches the LAST `include` first, then earlier ones,
+            // then the superclass — the exact reverse of the order
+            // `RubyBaseIterator` yields, and determinable from the source.
+            // Sorting by symbol id instead made the first-declared module win.
+            std.mem.reverse(SymbolId, bases.items);
+        } else {
+            // Ascending: the scan this replaces visited candidate bases in
+            // symbol-id order and took the first that resolved the member.
+            std.mem.sort(SymbolId, bases.items, {}, std.sort.asc(SymbolId));
+        }
+        // Order-preserving dedup: a class may name the same base twice, and the
+        // ruby order above is not sorted, so an adjacent-only check would miss.
         var unique: usize = 0;
         for (bases.items) |id| {
-            if (unique != 0 and bases.items[unique - 1] == id) continue;
+            if (std.mem.indexOfScalar(SymbolId, bases.items[0..unique], id) != null) continue;
             bases.items[unique] = id;
             unique += 1;
         }
-        try idx.java_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
+        try idx.type_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
     }
+    try buildModuleIncluderTable(idx, arena);
+}
+
+/// Whether `sym` is a type whose declared bases we can read from its own text.
+fn hasBaseTable(idx: *const Index, sym: model.Symbol) bool {
+    if (!isContainer(sym) and sym.kind != .module) return false;
+    return switch (idx.graph.files[sym.file].language) {
+        .java => isContainer(sym),
+        .ruby => true,
+        else => false,
+    };
+}
+
+/// A Ruby mixin's methods dispatch into the class that mixes it in, so an
+/// unqualified member of a module may be defined by an includer. Record that
+/// reverse edge in its OWN table: merged into `type_bases` it reads as an
+/// ancestor, and a `super` walk crossing it lands in whatever unrelated class
+/// happens to include the same module.
+fn buildModuleIncluderTable(idx: *Index, arena: std.mem.Allocator) !void {
+    const gpa = idx.gpa;
+    var includers: std.AutoHashMapUnmanaged(SymbolId, std.ArrayListUnmanaged(SymbolId)) = .empty;
+    defer {
+        var vit = includers.valueIterator();
+        while (vit.next()) |list| list.deinit(gpa);
+        includers.deinit(gpa);
+    }
+    for (idx.graph.symbols) |sym| {
+        if (idx.graph.files[sym.file].language != .ruby or sym.kind != .class) continue;
+        for (idx.type_bases.get(sym.id) orelse continue) |base_id| {
+            if (idx.graph.symbols[base_id].kind != .module) continue;
+            const slot = try includers.getOrPut(gpa, base_id);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            try slot.value_ptr.append(gpa, sym.id);
+        }
+    }
+    var it = includers.iterator();
+    while (it.next()) |entry| {
+        const list = entry.value_ptr.items;
+        std.mem.sort(SymbolId, list, {}, std.sort.asc(SymbolId));
+        // A class that `include`s the same module twice lists it twice in its
+        // base table, so the reverse edge can repeat.
+        var unique: usize = 0;
+        for (list) |id| {
+            if (unique != 0 and list[unique - 1] == id) continue;
+            list[unique] = id;
+            unique += 1;
+        }
+        try idx.module_includers.put(arena, entry.key_ptr.*, try arena.dupe(SymbolId, list[0..unique]));
+    }
+}
+
+/// The member named `name` defined by a class that mixes in module `module_id`.
+/// This is the only consumer of the reverse mixin edge: implicit self inside a
+/// module body (`def identifier; tag(); end` where the includer defines `tag`).
+/// Unambiguous only when exactly one includer answers, exactly once — two
+/// includers with the same method is a real dispatch ambiguity, not a pick.
+fn includerMember(idx: *const Index, module_id: SymbolId, name: []const u8) MemberMatch {
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
+    for (idx.module_includers.get(module_id) orelse return .{ .id = invalid, .unambiguous = false }) |includer| {
+        const direct = memberOfParent(idx, includer, name);
+        if (direct.id == invalid) continue;
+        if (found == invalid) found = direct.id;
+        matches += if (direct.unambiguous) 1 else 2;
+    }
+    return .{ .id = found, .unambiguous = matches == 1 };
+}
+
+/// Iterates the type names a Ruby class/module inherits from: the superclass in
+/// `class Ebook < Book`, then every `include`/`extend`/`prepend` at the start of
+/// a line in its body. A `::`-qualified name yields its last segment, which is
+/// how the index names a nested type.
+const RubyBaseIterator = struct {
+    signature: []const u8,
+    body: []const u8,
+    superclass_done: bool = false,
+    i: usize = 0,
+
+    fn next(self: *RubyBaseIterator) ?[]const u8 {
+        if (!self.superclass_done) {
+            self.superclass_done = true;
+            if (std.mem.indexOfScalar(u8, self.signature, '<')) |lt| {
+                if (lastIdent(self.signature[lt + 1 ..])) |name| return name;
+            }
+        }
+        while (self.i < self.body.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.body, self.i, '\n') orelse self.body.len;
+            const line = std.mem.trim(u8, self.body[self.i..line_end], " \t\r");
+            self.i = line_end + 1;
+            for ([_][]const u8{ "include ", "extend ", "prepend " }) |kw| {
+                if (!std.mem.startsWith(u8, line, kw)) continue;
+                if (lastIdent(line[kw.len..])) |name| return name;
+            }
+        }
+        return null;
+    }
+};
+
+/// The last `::`-separated identifier at the start of `text` (`Catalog::Shelf`
+/// -> `Shelf`), or null when `text` does not begin with one.
+fn lastIdent(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+    var last: ?[]const u8 = null;
+    while (i < text.len and isIdentByte(text[i])) {
+        const start = i;
+        while (i < text.len and isIdentByte(text[i])) i += 1;
+        last = text[start..i];
+        if (i + 1 < text.len and text[i] == ':' and text[i + 1] == ':') {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    return last;
 }
 
 /// Iterates the type names a Java signature declares after `extends` /
@@ -1126,6 +1428,23 @@ fn isIdentByte(c: u8) bool {
 /// (self/this or a local binding), then by treating `recv` as an imported
 /// module bound to a file. If neither applies, leave it external.
 fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference) void {
+    // Ruby spells construction `Klass.new`, and the definition that call
+    // reaches is the class's `initialize`. Resolve under the name it is defined
+    // by; the reference keeps saying `new`.
+    if (idx.graph.files[from.file].language == .ruby and ref.kind == .call and
+        std.mem.eql(u8, ref.name, "new") and !isLocalBinding(from, ref.qualifier))
+    {
+        if (uniqueContainerNamed(idx, from.file, ref.qualifier)) |cls| {
+            const ctor = memberOfParent(idx, cls, "initialize");
+            if (ctor.id != invalid) {
+                ref.target = ctor.id;
+                ref.exact = ctor.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .type_qualifier;
+                return;
+            }
+        }
+    }
     // `self`/`this`: dispatch within the *exact* enclosing type (a concrete
     // parent symbol id), never another file's same-named class. Resolving by the
     // bare type name here let `self.put()` escape into a sibling package's class
@@ -1141,7 +1460,7 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
                 return;
             }
             if (idx.graph.files[from.file].language == .java) {
-                ref.target = javaInheritedMember(idx, from, ref.name);
+                ref.target = inheritedMember(idx, from, ref.name);
                 if (ref.target != invalid) {
                     ref.exact = false;
                     ref.resolution_status = .inferred;
@@ -1163,8 +1482,14 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.resolution_reason = .typed_receiver;
             return;
         }
-        // Known receiver but no such member here (an inherited/mixin method, or
-        // an external type): fall through to the heuristic call match below.
+        // A receiver whose declared type names no project type at all is a
+        // builtin or third-party container (`List`, `Vec`, `std::vector`,
+        // `dict`): `items.add(...)` is that library's method, never a project
+        // one. Abstain — the global name match below would invent an edge.
+        const lang = idx.graph.files[from.file].language;
+        if (lang.isBuiltinContainer(type_name) and !lang.derefsToInner(type_name)) return;
+        // Known project type without that member (inherited or mixed in): fall
+        // through to the heuristic call match below.
     } else if (ref.write) {
         // Constructor keyword writes carry the constructed type as qualifier.
         // Resolve only against a member of that type; never global-name guess.
@@ -1233,6 +1558,42 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         // guessing a same-named local callable through the global fallback.
         return;
     }
+    // A same-file top-level symbol that actually declares the member is exact
+    // evidence even when it is not a container kind: Lua and JS spell a type as
+    // a plain table/object (`local Account = {}`), and its methods are parented
+    // to it. Only a hit binds, so a miss still reaches the heuristic below.
+    if (sameFileOwnerMember(idx, from, ref.qualifier, ref.name)) |member| {
+        ref.target = member.id;
+        ref.exact = member.unambiguous;
+        ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        ref.resolution_reason = .type_qualifier;
+        return;
+    }
+
+    // A bare qualifier naming a FIELD of the enclosing type resolves through
+    // that field's declared type: `products.add(...)` inside a class holding
+    // `Repository<Product> products`. Checked after every branch above, so a
+    // local, a type qualifier, an import binding and a package qualifier all
+    // shadow a field of the same name.
+    if (enclosingFieldType(idx, from, ref)) |type_name| {
+        const m = memberOfType(idx, from.file, type_name, ref.name);
+        if (m.id != invalid) {
+            ref.target = m.id;
+            ref.exact = m.unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+            ref.resolution_reason = .typed_receiver;
+            return;
+        }
+        const lang = idx.graph.files[from.file].language;
+        if (lang.isBuiltinContainer(type_name) and !lang.derefsToInner(type_name)) return;
+    }
+
+    // A qualifier that names a standard-library type (`Vec::new`, `Array.from`,
+    // `std::vector<T>::size`) reaches that library's member, never a project
+    // one. Every same-file/imported/package branch above already declined, so
+    // no project type of that name is in scope here.
+    if (idx.graph.files[from.file].language.isBuiltinContainer(ref.qualifier)) return;
+
     // Heuristic fallback: a *call* whose receiver type we can't infer
     // (`svc.create_run()`, `self.planning_service.create_run()`, `Foo.bar()` on
     // an untracked value). Bind it by method name so instance/static dispatch is
@@ -1247,6 +1608,39 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
         }
     }
+}
+
+/// The member `name` declared on the sole same-file top-level symbol named
+/// `qualifier`, whatever its kind. Null when no such owner exists, several do,
+/// or the owner declares no such member — every one of those falls through to
+/// the heuristic rather than refusing the reference.
+fn sameFileOwnerMember(idx: *const Index, from: model.Symbol, qualifier: []const u8, name: []const u8) ?MemberMatch {
+    if (qualifier.len == 0 or isLocalBinding(from, qualifier)) return null;
+    const source = idx.graph.files[from.file];
+    var owner: SymbolId = invalid;
+    var id = source.sym_start;
+    while (id < source.sym_end) : (id += 1) {
+        const sym = idx.graph.symbols[id];
+        if (sym.parent != invalid or sym.kind == .import or !std.mem.eql(u8, sym.name, qualifier)) continue;
+        if (owner != invalid) return null;
+        owner = id;
+    }
+    if (owner == invalid) return null;
+    const member = memberOfParent(idx, owner, name);
+    return if (member.id == invalid) null else member;
+}
+
+/// The declared type of a field named `ref.qualifier` on the type enclosing
+/// `from`. Answers only for a qualifier that heads its own chain and is not
+/// shadowed by a local: `o.store.Get()` reads `o`'s type, never the enclosing
+/// one, and a local `store` provably shadows a field `store`.
+fn enclosingFieldType(idx: *const Index, from: model.Symbol, ref: *const model.Reference) ?[]const u8 {
+    if (from.parent == invalid or ref.receiver_root.len != 0) return null;
+    if (isLocalBinding(from, ref.qualifier)) return null;
+    for (idx.graph.symbols[from.parent].bindings) |b| {
+        if (std.mem.eql(u8, b.name, ref.qualifier) and b.type_name.len > 0) return b.type_name;
+    }
+    return null;
 }
 
 /// A unique, top-level type/container named `name` in the reference's own file.
@@ -2285,8 +2679,13 @@ test "go: a call never binds to a type that shares the package-qualified name" {
     var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
     defer idx.deinit();
 
-    const stats_struct = idx.lookup("Stats")[0];
-    try testing.expectEqual(model.SymbolKind.@"struct", idx.graph.symbols[stats_struct].kind);
+    // Pick the struct by kind: `Stats` also names two methods, and which one
+    // `lookup` lists first is file order, not something this test is about.
+    var stats_struct: SymbolId = invalid;
+    for (idx.lookup("Stats")) |cid| {
+        if (idx.graph.symbols[cid].kind == .@"struct") stats_struct = cid;
+    }
+    try testing.expect(stats_struct != invalid);
     const store_stats = qualifiedId(&idx, "Store", "Stats").?;
 
     const api_stats = idx.graph.symbols[qualifiedId(&idx, "API", "Stats").?];
@@ -2494,7 +2893,157 @@ test "a call through a function-valued const keeps its edge" {
     const use = idx.graph.symbols[qualifiedId(&idx, "Holder", "use").?];
     const ref = refByName(use, "alias").?;
     try testing.expectEqual(model.RefKind.call, ref.kind);
-    try testing.expectEqual(alias, ref.target);
+    // The edge survives, and now points past the alias at the function it
+    // holds: `alias` names no body of its own, so `exactOrGlob` is what the
+    // call reaches (see `followFunctionAlias`).
+    try testing.expectEqual(idx.lookup("exactOrGlob")[0], ref.target);
+}
+
+test "js: a multi-declarator alias binds each name to its own initializer" {
+    // Regression (F5): `aliasInitializerName` took the LAST `=` on the line, so
+    // `const a = first, b = second;` aliased `a` to `second` and marked the
+    // wrong edge `exact=true` — surviving `--strict`. Each declarator must now
+    // get its own scoped symbol and its own initializer.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.mjs", .data =
+        \\function first() { return 1; }
+        \\function second() { return 2; }
+        \\const a = first, b = second;
+        \\export function useA() { return a(1); }
+        \\export function useB() { return b(1); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Both declarators are their own symbol, aliasing their own initializer.
+    const first_fn = idx.lookup("first")[0];
+    const second_fn = idx.lookup("second")[0];
+    const use_a = idx.graph.symbols[idx.lookup("useA")[0]];
+    const use_b = idx.graph.symbols[idx.lookup("useB")[0]];
+    const call_a = refByName(use_a, "a").?;
+    const call_b = refByName(use_b, "b").?;
+
+    try testing.expectEqual(first_fn, call_a.target);
+    try testing.expect(call_a.exact);
+    try testing.expectEqual(second_fn, call_b.target);
+    try testing.expect(call_b.exact);
+}
+
+test "js: following a function alias keeps the exactness of the hop that found it" {
+    // Regression (merge-gate F3): `followFunctionAlias` set `exact = true`
+    // unconditionally. The alias -> implementation hop is proven, but the hop
+    // that reached the alias may not be: two files each export a different
+    // `doubler`, so the pick is a coin flip. Promoting it put a guessed edge
+    // inside `--strict`, the one consumer that must be trustworthy.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.mjs", .data =
+        \\function alphaImpl() { return 1; }
+        \\export const doubler = alphaImpl;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.mjs", .data =
+        \\function betaImpl() { return 2; }
+        \\export const doubler = betaImpl;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.mjs", .data =
+        \\export function run() { return doubler(3); }
+    });
+    // The provable shape, for contrast: one file, one `doubler`, no guess.
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.mjs", .data =
+        \\function soloImpl() { return 3; }
+        \\const solo = soloImpl;
+        \\export function runSolo() { return solo(4); }
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Still retargeted through the alias — the edge is useful, just not proven.
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const guessed = refByName(run, "doubler").?;
+    try testing.expectEqual(idx.lookup("alphaImpl")[0], guessed.target);
+    try testing.expect(!guessed.exact);
+    try testing.expect(guessed.resolution_status != .exact);
+
+    const run_solo = idx.graph.symbols[idx.lookup("runSolo")[0]];
+    const proven = refByName(run_solo, "solo").?;
+    try testing.expectEqual(idx.lookup("soloImpl")[0], proven.target);
+    try testing.expect(proven.exact);
+    try testing.expectEqual(model.ResolutionReason.same_file_fallback, proven.resolution_reason);
+}
+
+test "ts: a generic type argument is not a declarator boundary" {
+    // Regression (merge-gate F2): the declarator split scanned for a comma with
+    // `findNext`, which skips `()[]{}` but not `<>`. Every type argument after
+    // a comma was emitted as a top-level `.variable` — six invented
+    // definitions in the seven lines below, one of them colliding with a real
+    // function and so a live candidate for the global-name fallback.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "n.ts", .data =
+        \\export function handler(): number { return 1; }
+        \\function first(): number { return 1; }
+        \\function second(): number { return 2; }
+        \\const cache: Map<string, number> = new Map();
+        \\const registry: Map<string, handler> = new Map();
+        \\const nested: Map<string, Map<number, boolean>> = new Map();
+        \\const table: Record<string, string[]> = {};
+        \\const svc = new Service<Req, Res>();
+        \\const a = first, b = second;
+        \\const cmp = 1 < 2, after = 4;
+        \\const withDefaults = (x = 1, y = 2) => x + y;
+        \\const [d1, d2] = [1, 2];
+        \\const { k1, k2 } = table;
+        \\class Service<A, B> {}
+        \\type Req = {};
+        \\type Res = {};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // No type argument became a definition, and the real type keeps its
+    // identity: `Res` is the `type` alias, never a shadowing variable.
+    for ([_][]const u8{ "number", "boolean", "string" }) |phantom| {
+        try testing.expectEqual(@as(usize, 0), idx.lookup(phantom).len);
+    }
+    try testing.expectEqual(@as(usize, 1), idx.lookup("Res").len);
+    try testing.expectEqual(@as(usize, 1), idx.lookup("handler").len);
+    try testing.expectEqual(model.SymbolKind.function, idx.graph.symbols[idx.lookup("handler")[0]].kind);
+    for ([_][]const u8{ "Map", "Record" }) |uninvented| {
+        try testing.expectEqual(@as(usize, 0), idx.lookup(uninvented).len);
+    }
+    // Commas the scan must also not split on: an arrow's default parameter
+    // values, and a destructuring pattern's element list.
+    for ([_][]const u8{ "y", "d2", "k2" }) |inside_brackets| {
+        try testing.expectEqual(@as(usize, 0), idx.lookup(inside_brackets).len);
+    }
+
+    // A real multi-declarator still splits, generics or no — including one
+    // whose `<` is a comparison, where the generic scan must give up.
+    for ([_][]const u8{ "a", "b", "cmp", "after", "cache", "registry", "nested", "table", "svc" }) |declared| {
+        try testing.expectEqual(@as(usize, 1), idx.lookup(declared).len);
+    }
+    const first_fn = idx.lookup("first")[0];
+    const second_fn = idx.lookup("second")[0];
+    try testing.expect(first_fn != second_fn);
 }
 
 test "an express sub-router mount keeps its router handler" {
@@ -3493,7 +4042,7 @@ test "the precomputed Java supertype table records declared bases only" {
     defer idx.deinit();
 
     const sub = idx.lookup("Sub")[0];
-    const bases = idx.java_bases.get(sub).?;
+    const bases = idx.type_bases.get(sub).?;
     try testing.expectEqual(@as(usize, 2), bases.len);
     // Ascending symbol-id order, and `Boxed` (a generic argument) is not a base.
     var names: [2][]const u8 = undefined;
@@ -3502,7 +4051,7 @@ test "the precomputed Java supertype table records declared bases only" {
     try testing.expect(std.mem.eql(u8, names[0], "Mixin") or std.mem.eql(u8, names[1], "Mixin"));
     try testing.expect(bases[0] < bases[1]);
     // A type with no `extends`/`implements` has no entry at all.
-    try testing.expect(idx.java_bases.get(idx.lookup("Base")[0]) == null);
+    try testing.expect(idx.type_bases.get(idx.lookup("Base")[0]) == null);
 }
 
 test "Java overloads never make an arbitrary bare member edge exact" {
@@ -4227,6 +4776,673 @@ test "unknown receiver: a member call is a heuristic guess, a member read stays 
     try testing.expectEqual(@as(usize, 0), idx.callersOf(value).len);
 }
 
+test "a field of the enclosing type gives a bare receiver its declared type (java)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Repo.java", .data =
+        \\package p;
+        \\public class Repo {
+        \\    public int add(String key) { return 1; }
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Svc.java", .data =
+        \\package p;
+        \\public class Svc {
+        \\    private final Repo<String> store;
+        \\    public int run() {
+        \\        return store.add("k");
+        \\    }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const add = qualifiedId(&idx, "Repo", "add").?;
+    const run = idx.graph.symbols[qualifiedId(&idx, "Svc", "run").?];
+    const ref = refByQual(run, "store", "add").?;
+    // `store` is a field of the enclosing class, so its declared type answers —
+    // an exact edge, not the global name guess this used to produce.
+    try testing.expectEqual(add, ref.target);
+    try testing.expect(ref.exact);
+    try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
+    try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+}
+
+test "cpp: a direct-initialized local types its receiver; an unnameable one abstains" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "w.hpp", .data =
+        \\class Weights {
+        \\public:
+        \\    explicit Weights(std::vector<double> w) : w_(w) {}
+        \\    std::size_t size() const { return w_.size(); }
+        \\private:
+        \\    std::vector<double> w_;
+        \\};
+        \\class Bag {
+        \\public:
+        \\    std::size_t size() const { return 0; }
+        \\};
+        \\template <typename Derived>
+        \\class Counter {
+        \\public:
+        \\    int bump() { return static_cast<Derived*>(this)->step(); }
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "w.cpp", .data =
+        \\#include "w.hpp"
+        \\int step() { return 1; }
+        \\double run() {
+        \\    Weights weights({1.0, 2.0});
+        \\    return weights.size();
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `Weights weights({...})` is a definition, not the most vexing parse, so
+    // `weights.size()` reaches Weights and never the same-named Bag.size.
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    try testing.expectEqual(qualifiedId(&idx, "Weights", "size").?, refByQual(run, "weights", "size").?.target);
+
+    // The CRTP receiver `static_cast<Derived*>(this)` names no type, so the
+    // call abstains instead of landing on the free `step` by name alone.
+    const bump = idx.graph.symbols[qualifiedId(&idx, "Counter", "bump").?];
+    try testing.expect(refByName(bump, "step") == null);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(idx.lookup("step")[0]).len);
+}
+
+test "ruby: super never crosses a mixin's reverse includer edge" {
+    // Regression (merge-gate F1, root cause of coldstart F4): the reverse
+    // mixin edge (module -> its includers) used to live in `type_bases`
+    // alongside real ancestors, so an ancestor walk could not tell "my
+    // superclass" from "some other class that includes the same module".
+    // With one includer that produced a self-edge; with two, each sibling's
+    // `super` landed on the OTHER sibling's override and `Parent#size` was
+    // left with no callers at all. The edge now lives in `module_includers`,
+    // which no base-chain walk reads.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\module Quiet
+        \\  def volume
+        \\    0
+        \\  end
+        \\end
+        \\
+        \\class Parent
+        \\  def size
+        \\    7
+        \\  end
+        \\end
+        \\
+        \\class First < Parent
+        \\  include Quiet
+        \\  def size
+        \\    super + 1
+        \\  end
+        \\end
+        \\
+        \\class Second < Parent
+        \\  include Quiet
+        \\  def size
+        \\    super * 2
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const parent_size = qualifiedId(&idx, "Parent", "size").?;
+    const first_size = qualifiedId(&idx, "First", "size").?;
+    const second_size = qualifiedId(&idx, "Second", "size").?;
+
+    // Each sibling's `super` reaches the shared ancestor: not itself, and not
+    // the other includer of `Quiet`.
+    for ([_]SymbolId{ first_size, second_size }) |method_id| {
+        const super_ref = refByName(idx.graph.symbols[method_id], "super").?;
+        try testing.expectEqual(parent_size, super_ref.target);
+        // A bare `super` invokes the ancestor's method; a `read` would hide it
+        // from every call-graph consumer, the accuracy bench included.
+        try testing.expectEqual(model.RefKind.call, super_ref.kind);
+    }
+
+    // ... so the overridden method has both callers, which is the view
+    // `hierarchy` already had and the reference graph did not.
+    const callers = idx.callersOf(parent_size);
+    try testing.expectEqual(@as(usize, 2), callers.len);
+    try testing.expect(std.mem.indexOfScalar(SymbolId, callers, first_size) != null);
+    try testing.expect(std.mem.indexOfScalar(SymbolId, callers, second_size) != null);
+
+    // The reverse edge exists, but only in its own table. The forward edge
+    // (includer -> module) stays a real ancestor of each class.
+    const quiet = idx.lookup("Quiet")[0];
+    try testing.expect(idx.type_bases.get(quiet) == null);
+    try testing.expectEqual(@as(usize, 2), idx.module_includers.get(quiet).?.len);
+    const parent = idx.lookup("Parent")[0];
+    for ([_]SymbolId{ idx.lookup("First")[0], idx.lookup("Second")[0] }) |class_id| {
+        const bases = idx.type_bases.get(class_id).?;
+        try testing.expect(std.mem.indexOfScalar(SymbolId, bases, quiet) != null);
+        try testing.expect(std.mem.indexOfScalar(SymbolId, bases, parent) != null);
+        try testing.expect(idx.module_includers.get(class_id) == null);
+    }
+}
+
+test "ruby: two mixins declaring the same method resolve in MRO order" {
+    // Regression (merge-gate F8): base lists were sorted by symbol id, so the
+    // module declared FIRST won regardless of include order. Ruby searches the
+    // last `include` first, then earlier ones, then the superclass — and that
+    // order is right there in the source.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\module MixA
+        \\  def render
+        \\    "mixa"
+        \\  end
+        \\end
+        \\
+        \\module MixB
+        \\  def render
+        \\    "mixb"
+        \\  end
+        \\end
+        \\
+        \\class Parent
+        \\  def render
+        \\    "parent"
+        \\  end
+        \\end
+        \\
+        \\class TwoMix < Parent
+        \\  include MixA
+        \\  include MixB
+        \\
+        \\  def render
+        \\    super
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const render = idx.graph.symbols[qualifiedId(&idx, "TwoMix", "render").?];
+    try testing.expectEqual(qualifiedId(&idx, "MixB", "render").?, refByName(render, "super").?.target);
+
+    // MRO order end to end: MixB, MixA, then the superclass.
+    const bases = idx.type_bases.get(idx.lookup("TwoMix")[0]).?;
+    try testing.expectEqual(@as(usize, 3), bases.len);
+    try testing.expectEqual(idx.lookup("MixB")[0], bases[0]);
+    try testing.expectEqual(idx.lookup("MixA")[0], bases[1]);
+    try testing.expectEqual(idx.lookup("Parent")[0], bases[2]);
+}
+
+test "ruby: a module method still dispatches into the class that includes it" {
+    // The one legitimate use of the reverse edge, and the only one:
+    // `Mix#describe` calls `label`, which only the includer defines. Splitting
+    // the edge out of `type_bases` must not cost this — and it must not let a
+    // SIBLING includer answer for another (`Other#label` is never the target).
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\module Mix
+        \\  def describe
+        \\    label
+        \\  end
+        \\end
+        \\
+        \\class Only
+        \\  include Mix
+        \\  def label
+        \\    "only"
+        \\  end
+        \\end
+        \\
+        \\class Sibling
+        \\  include Mix
+        \\  def caption
+        \\    label
+        \\  end
+        \\  def label
+        \\    "sibling"
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Two includers both define `label`, so the module's own call is a real
+    // dispatch ambiguity: an edge, but never an exact one.
+    const describe = idx.graph.symbols[qualifiedId(&idx, "Mix", "describe").?];
+    const label_ref = refByName(describe, "label").?;
+    try testing.expect(label_ref.target == qualifiedId(&idx, "Only", "label").? or
+        label_ref.target == qualifiedId(&idx, "Sibling", "label").?);
+    try testing.expect(!label_ref.exact);
+
+    // A class's own implicit self is unaffected: it never leaves its class.
+    const caption = idx.graph.symbols[qualifiedId(&idx, "Sibling", "caption").?];
+    const own = refByName(caption, "label").?;
+    try testing.expectEqual(qualifiedId(&idx, "Sibling", "label").?, own.target);
+    try testing.expect(own.exact);
+}
+
+test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "shop.rb", .data =
+        \\module Identifiable
+        \\  def identifier
+        \\    tag()
+        \\  end
+        \\end
+        \\
+        \\class Item
+        \\  include Identifiable
+        \\
+        \\  attr_accessor :tag
+        \\
+        \\  def initialize(tag)
+        \\    @tag = tag
+        \\  end
+        \\
+        \\  def label
+        \\    identifier
+        \\  end
+        \\end
+        \\
+        \\class Boxed < Item
+        \\  def initialize(tag)
+        \\    super(tag)
+        \\  end
+        \\end
+        \\
+        \\def run
+        \\  Item.new("a").label
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `attr_accessor :tag` defines both the reader and the writer.
+    const reader = qualifiedId(&idx, "Item", "tag").?;
+    try testing.expect(qualifiedId(&idx, "Item", "tag=") != null);
+
+    // A module method's unqualified call reaches the including class's method.
+    const identifier = idx.graph.symbols[qualifiedId(&idx, "Identifiable", "identifier").?];
+    try testing.expectEqual(reader, refByName(identifier, "tag").?.target);
+
+    // Implicit self inside a class reaches a method mixed in by `include`.
+    const label = idx.graph.symbols[qualifiedId(&idx, "Item", "label").?];
+    try testing.expectEqual(identifier.id, refByName(label, "identifier").?.target);
+
+    // `super` names the ancestor's method of the enclosing method's own name.
+    const boxed_init = idx.graph.symbols[qualifiedId(&idx, "Boxed", "initialize").?];
+    const item_init = qualifiedId(&idx, "Item", "initialize").?;
+    try testing.expectEqual(item_init, refByName(boxed_init, "super").?.target);
+
+    // `Item.new` reaches the class's `initialize`, not a method literally
+    // named `new`.
+    const run = idx.graph.symbols[idx.lookup("run")[0]];
+    const ctor = refByQual(run, "Item", "new").?;
+    try testing.expectEqual(item_init, ctor.target);
+    try testing.expect(ctor.exact);
+}
+
+test "ruby: an operator method is a definition, and its body's calls resolve" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "ledger.rb", .data =
+        \\class Ledger
+        \\  def initialize(rows)
+        \\    @rows = rows
+        \\  end
+        \\
+        \\  def rows
+        \\    @rows
+        \\  end
+        \\
+        \\  def +(other)
+        \\    Ledger.new(rows + other.rows)
+        \\  end
+        \\
+        \\  def [](index)
+        \\    rows[index]
+        \\  end
+        \\
+        \\  def <=>(other)
+        \\    0
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    inline for (.{ "+", "[]", "<=>" }) |op| {
+        const id = qualifiedId(&idx, "Ledger", op) orelse return error.MissingOperatorMethod;
+        try testing.expectEqual(model.SymbolKind.method, idx.graph.symbols[id].kind);
+    }
+    // The operator's body is a body like any other: its calls resolve.
+    const plus = idx.graph.symbols[qualifiedId(&idx, "Ledger", "+").?];
+    try testing.expectEqual(qualifiedId(&idx, "Ledger", "rows").?, refByName(plus, "rows").?.target);
+    try testing.expectEqual(qualifiedId(&idx, "Ledger", "initialize").?, refByQual(plus, "Ledger", "new").?.target);
+}
+
+test "rust: a smart-pointer receiver derefs to its inner type, but not as a qualifier" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.rs", .data =
+        \\pub struct Node {
+        \\    child: Box<Node>,
+        \\}
+        \\pub struct Store {
+        \\    items: Vec<u32>,
+        \\}
+        \\impl Node {
+        \\    pub fn label(&self) -> usize {
+        \\        1
+        \\    }
+        \\    pub fn depth(&self) -> usize {
+        \\        self.child.label()
+        \\    }
+        \\}
+        \\impl Store {
+        \\    pub fn new() -> Store {
+        \\        Store { items: Vec::new() }
+        \\    }
+        \\    pub fn len(&self) -> usize {
+        \\        self.items.len()
+        \\    }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `child: Box<Node>` derefs, so `self.child.label()` still reaches a method
+    // — abstaining on the wrapper would delete the edge.
+    const depth = idx.graph.symbols[qualifiedId(&idx, "Node", "depth").?];
+    try testing.expectEqual(qualifiedId(&idx, "Node", "label").?, refByQual(depth, "child", "label").?.target);
+
+    // `items: Vec<u32>` does not: `self.items.len()` is the standard library's,
+    // never this project's `Store.len`. Nor does `Vec::new` reach `Store::new`.
+    const store_len = idx.graph.symbols[qualifiedId(&idx, "Store", "len").?];
+    try testing.expectEqual(invalid, refByQual(store_len, "items", "len").?.target);
+    const store_new = idx.graph.symbols[qualifiedId(&idx, "Store", "new").?];
+    try testing.expectEqual(invalid, refByQual(store_new, "Vec", "new").?.target);
+}
+
+test "cpp: unique_ptr/shared_ptr receivers deref to their inner type, but a raw container still abstains" {
+    // Regression (F2): derefsToInner was scoped to Rust only, so a C++
+    // unique_ptr/shared_ptr field's own isBuiltinContainer entry made the
+    // resolver abstain instead of falling through to the correct target —
+    // silently dropping edges the base commit produced.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.hpp", .data =
+        \\class Engine {
+        \\public:
+        \\    int start() { return 1; }
+        \\};
+        \\class Car {
+        \\    std::unique_ptr<Engine> engine_;
+        \\    std::shared_ptr<Engine> shared_;
+        \\    std::vector<Engine> pool_;
+        \\public:
+        \\    int goUnique() { return engine_->start(); }
+        \\    int goShared() { return shared_->start(); }
+        \\    int goPool() { return pool_.start(); }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const engine_start = qualifiedId(&idx, "Engine", "start").?;
+    const go_unique = idx.graph.symbols[qualifiedId(&idx, "Car", "goUnique").?];
+    const go_shared = idx.graph.symbols[qualifiedId(&idx, "Car", "goShared").?];
+    try testing.expectEqual(engine_start, refByQual(go_unique, "engine_", "start").?.target);
+    try testing.expectEqual(engine_start, refByQual(go_shared, "shared_", "start").?.target);
+
+    // `std::vector<Engine>` is not a smart pointer: still abstains rather than
+    // guessing a same-named project method.
+    const go_pool = idx.graph.symbols[qualifiedId(&idx, "Car", "goPool").?];
+    try testing.expectEqual(invalid, refByQual(go_pool, "pool_", "start").?.target);
+}
+
+test "cpp: an optional receiver derefs like a smart pointer; the wrapper's own members do not" {
+    // Regression (merge-gate F9): `optional` was left in `isBuiltinContainer`
+    // but out of `derefsToInner`, so `opt_->spin()` abstained where the wave's
+    // base bound it correctly. `operator->` on `std::optional` reaches the
+    // contained value exactly as `unique_ptr` does.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.hpp", .data =
+        \\class Derived {
+        \\public:
+        \\    int spin() { return 2; }
+        \\};
+        \\class Decoy {
+        \\public:
+        \\    int spin() { return 99; }
+        \\    int reset() { return 98; }
+        \\};
+        \\class Holder {
+        \\    std::optional<Derived> opt_;
+        \\    std::unique_ptr<Derived> u_;
+        \\    std::vector<Derived> pool_;
+        \\public:
+        \\    int goOptional() { return opt_->spin(); }
+        \\    int goVector() { return pool_.spin(); }
+        \\    int wrapperReset() { return u_.reset(); }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const go_optional = idx.graph.symbols[qualifiedId(&idx, "Holder", "goOptional").?];
+    try testing.expectEqual(
+        qualifiedId(&idx, "Derived", "spin").?,
+        refByQual(go_optional, "opt_", "spin").?.target,
+    );
+
+    // An opaque container still abstains rather than guessing `Decoy.spin`.
+    const go_vector = idx.graph.symbols[qualifiedId(&idx, "Holder", "goVector").?];
+    try testing.expectEqual(invalid, refByQual(go_vector, "pool_", "spin").?.target);
+
+    // The gap `derefsToInner`'s doc comment now records instead of denying: a
+    // call to the WRAPPER's own member is not guarded, so it still reaches a
+    // same-named project method by the global-name guess. Pinned so a future
+    // change to that behaviour is a decision, not a surprise.
+    const wrapper_reset = idx.graph.symbols[qualifiedId(&idx, "Holder", "wrapperReset").?];
+    const reset = refByQual(wrapper_reset, "u_", "reset").?;
+    try testing.expectEqual(qualifiedId(&idx, "Decoy", "reset").?, reset.target);
+    try testing.expect(!reset.exact);
+}
+
+test "one-letter names resolve as call sites in every language family" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn b() void {}
+        \\pub fn a() void {
+        \\    b();
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\def b():
+        \\    pass
+        \\def a():
+        \\    b()
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\def b
+        \\  1
+        \\end
+        \\def a
+        \\  b()
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The reference collector used to drop every name shorter than two bytes,
+    // so a one-letter callee had no edge at all.
+    inline for (.{ "a.zig", "a.py", "a.rb" }) |file| {
+        const callee = qualifiedFileSym(&idx, file, "b").?;
+        const callers = idx.callersOf(callee);
+        try testing.expectEqual(@as(usize, 1), callers.len);
+        try testing.expectEqualStrings("a", idx.graph.symbols[callers[0]].name);
+    }
+}
+
+test "lua: a local typed by a factory call resolves its method exactly" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.lua", .data =
+        \\local Account = {}
+        \\Account.__index = Account
+        \\
+        \\function Account.new(cents)
+        \\  return setmetatable({ cents = cents }, Account)
+        \\end
+        \\
+        \\function Account:deposit(amount)
+        \\  self.cents = self.cents + amount
+        \\end
+        \\
+        \\local M = {}
+        \\function M.run()
+        \\  local a = Account.new(1)
+        \\  a:deposit(2)
+        \\end
+        \\return M
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const new = qualifiedId(&idx, "Account", "new").?;
+    const deposit = qualifiedId(&idx, "Account", "deposit").?;
+    const run = idx.graph.symbols[qualifiedId(&idx, "M", "run").?];
+
+    // `Account` is a plain table, not a container kind, but it declares `new`:
+    // the same-file owner answers exactly.
+    const ctor = refByQual(run, "Account", "new").?;
+    try testing.expectEqual(new, ctor.target);
+    try testing.expect(ctor.exact);
+    // `local a = Account.new(1)` types `a`, so `a:deposit(2)` is exact too.
+    const call = refByQual(run, "a", "deposit").?;
+    try testing.expectEqual(deposit, call.target);
+    try testing.expect(call.exact);
+    try testing.expectEqual(model.ResolutionReason.typed_receiver, call.resolution_reason);
+}
+
+test "a builtin-container receiver never binds to a same-named project method (java)" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Repo.java", .data =
+        \\package p;
+        \\public class Repo {
+        \\    public void add(String key) {}
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Svc.java", .data =
+        \\package p;
+        \\public class Svc {
+        \\    public void run() {
+        \\        List<String> names = new ArrayList<>();
+        \\        names.add("x");
+        \\    }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const add = qualifiedId(&idx, "Repo", "add").?;
+    const run = idx.graph.symbols[qualifiedId(&idx, "Svc", "run").?];
+    const ref = refByQual(run, "names", "add").?;
+    // `names` is declared `List<…>`: a standard-library method, so the resolver
+    // abstains instead of manufacturing an edge to the project's `Repo.add`.
+    try testing.expectEqual(invalid, ref.target);
+    try testing.expectEqual(model.ResolutionStatus.unresolved, ref.resolution_status);
+    try testing.expectEqual(@as(usize, 0), idx.callersOf(add).len);
+}
+
 test "heuristic method target prefers a same-file method over a free function" {
     const testing = std.testing;
     const io = testing.io;
@@ -4727,4 +5943,37 @@ test "edit-requery cache stays identical to no-cache across rename add delete an
     try testing.expectEqual(@as(usize, 0), final.lookup("leaf").len);
     try testing.expectEqual(@as(usize, 0), final.lookup("save").len);
     try testing.expectEqual(final.lookup("caller")[0], final.callersOf(final.lookup("twig")[0])[0]);
+}
+
+test "file discovery order is sorted, not the filesystem's" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "alpha");
+    try tmp.dir.createDirPath(io, "beta");
+
+    // Written in an order that is neither sorted nor its reverse, so a walk that
+    // trusted the filesystem would have to be lucky to pass: ext4 hashes entry
+    // names with a per-filesystem seed, tmpfs returns creation order.
+    const created = [_][]const u8{
+        "m.zig", "beta/q.zig", "a.zig", "alpha/n.zig",
+        "z.zig", "beta/b.zig", "c.zig", "alpha/e.zig",
+    };
+    for (created) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "pub fn f() void {}\n" });
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Depth-first over byte-sorted entries: `a.zig` < `alpha` < `beta` < `c.zig`.
+    const expected = [_][]const u8{
+        "a.zig",      "alpha/e.zig", "alpha/n.zig", "beta/b.zig",
+        "beta/q.zig", "c.zig",       "m.zig",       "z.zig",
+    };
+    try testing.expectEqual(expected.len, idx.graph.files.len);
+    for (expected, idx.graph.files) |want, file| try testing.expectEqualStrings(want, file.path);
 }
