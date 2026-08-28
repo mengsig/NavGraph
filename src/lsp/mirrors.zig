@@ -195,6 +195,9 @@ test "hunks reports the working change against HEAD, grouped by hunk" {
     // Edit on disk *before* the session walks it, so the index and `git diff`
     // agree on the current content (a one-shot session always reflects
     // whatever is on disk when it is built — there is no live overlay here).
+    // A single contiguous edit to helper's own body, same trailing-newline
+    // convention as the committed original, so `git diff --unified=0` reports
+    // exactly one hunk.
     try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = "pub fn helper() void {\n    _ = 1;\n}\n" });
 
     var session = try session_mod.Session.init(testing.allocator, io, root, .{ .watch = false }, true);

@@ -17,6 +17,7 @@ const capabilities = @import("capabilities.zig");
 const agent_api = @import("agent_api.zig");
 const workspace_path = @import("workspace_path.zig");
 const lsp = @import("lsp.zig");
+const gitutil = @import("gitutil.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -130,6 +131,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The three 1.1 mirrors need a `Session`, not the `*Index` the generic
+    // one-shot dispatch below builds — see `lsp.mirrors`'s doc comment.
+    if (parsed.command == .hunks or parsed.command == .context or parsed.command == .where) {
+        const found = runMirrorCommand(gpa, io, arena, out, parsed) catch |err| switch (err) {
+            error.WriteFailed => std.process.exit(141),
+            else => return err,
+        };
+        out.flush() catch std.process.exit(141);
+        if (!found) std.process.exit(1);
+        return;
+    }
     var idx = index_mod.build(gpa, io, parsed.root, parsed.use_cache, parsed.backend) catch |err| {
         try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
         try out.flush();
@@ -171,6 +183,182 @@ fn runLspServer(gpa: std.mem.Allocator, io: std.Io, err_out: *std.Io.Writer, par
         .backend = parsed.backend,
     });
     if (code != 0) std.process.exit(code);
+}
+
+/// `navgraph hunks/context/where`: build a one-shot `Session` (see
+/// `lsp.mirrors`'s doc comment for why), run the requested mirror into an
+/// in-memory buffer, then render it — the buffer's bytes verbatim for `-j`,
+/// or `writeMirrorText`'s reformatting of the same JSON for text (the CLI's
+/// default). A malformed/unresolved input is reported the way `diff`/`read`
+/// already report theirs: a format-aware message on stdout
+/// (`query.emitError`) and `found = false` (the caller maps that to exit 1,
+/// same as every other one-shot command); only a real internal failure
+/// propagates as an error. An index-build failure is reported the same way
+/// `index_mod.build`'s own failure is on every other command (message + exit
+/// 1 right here) — that is a distinct, earlier failure class than "the query
+/// ran but found nothing".
+fn runMirrorCommand(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, out: *std.Io.Writer, parsed: cli.Parsed) !bool {
+    var session = lsp.session.Session.init(gpa, io, parsed.root, .{ .watch = false }, parsed.backend, parsed.use_cache) catch |err| {
+        try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
+        out.flush() catch std.process.exit(141);
+        std.process.exit(1);
+    };
+    defer session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&session);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var detail: ?[]const u8 = null;
+    const mirror_err: ?anyerror = switch (parsed.command) {
+        .hunks => blk: {
+            lsp.mirrors.hunks(&aw.writer, arena, ctx, parsed.arg, &detail) catch |err| break :blk err;
+            break :blk null;
+        },
+        .context => blk: {
+            const budget = if (parsed.options.context_budget != 0) parsed.options.context_budget else 2000;
+            const include = if (parsed.used_options.contains(.include))
+                lsp.mirrors.parseIncludeCsv(parsed.options.include) catch |err| {
+                    detail = "unknown --include value (expected callers, callees, types, tests, body)";
+                    break :blk err;
+                }
+            else
+                lsp.queries.ContextInclude{};
+            lsp.mirrors.context(&aw.writer, arena, ctx, parsed.arg, budget, include) catch |err| {
+                if (err == error.SymbolNotFound)
+                    detail = std.fmt.allocPrint(arena, "no definition named '{s}'", .{parsed.arg}) catch null;
+                break :blk err;
+            };
+            break :blk null;
+        },
+        .where => blk: {
+            const loc = lsp.mirrors.parseFileLine(parsed.arg) orelse {
+                detail = std.fmt.allocPrint(arena, "malformed location '{s}' (expected file:line, 1-based)", .{parsed.arg}) catch null;
+                break :blk error.InvalidParams;
+            };
+            lsp.mirrors.where(&aw.writer, arena, ctx, loc.path, loc.line) catch |err| break :blk err;
+            break :blk null;
+        },
+        else => unreachable,
+    };
+
+    if (mirror_err) |err| {
+        // Downstream closed the pipe mid-query (in-memory buffer, so this can
+        // only be an arena OOM) — a real failure, not "nothing found".
+        if (err == error.WriteFailed) return err;
+        const message = detail orelse lsp.mirrors.errorMessage(err);
+        try query.emitError(out, parsed.options.format, message);
+        return false;
+    }
+
+    switch (parsed.options.format) {
+        .json, .jsonl => {
+            try out.writeAll(aw.written());
+            try out.writeByte('\n');
+        },
+        .text => try writeMirrorText(out, arena, parsed.command, aw.written()),
+    }
+    return true;
+}
+
+/// Re-render one mirror's JSON (`runMirrorCommand`'s buffer — always the
+/// exact `lsp.queries.write*` output) as text. This is presentation only: the
+/// query itself already ran once, above: text mode never re-derives the
+/// answer, only reformats it, so the two output formats can never disagree.
+fn writeMirrorText(out: *std.Io.Writer, arena: std.mem.Allocator, command: cli.Command, json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    switch (command) {
+        .where => try writeWhereText(out, root),
+        .context => try writeContextText(out, root),
+        .hunks => try writeHunksText(out, root),
+        else => unreachable,
+    }
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = obj.get(key) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+fn jsonInt(obj: std.json.ObjectMap, key: []const u8) i64 {
+    const v = obj.get(key) orelse return 0;
+    return if (v == .integer) v.integer else 0;
+}
+
+/// One line for a `Symbol` object: `kind qualified — file:line`.
+fn writeSymbolLine(out: *std.Io.Writer, indent: []const u8, sym: std.json.Value) !void {
+    const o = sym.object;
+    try out.print("{s}{s} {s} — {s}:{d}\n", .{ indent, jsonStr(o, "kind"), jsonStr(o, "qualified"), jsonStr(o, "file"), jsonInt(o, "line") });
+}
+
+fn writeSymbolArray(out: *std.Io.Writer, label: []const u8, arr: std.json.Value) !void {
+    const items = arr.array.items;
+    try out.print("{s} ({d}):\n", .{ label, items.len });
+    if (items.len == 0) {
+        try out.writeAll("  (none)\n");
+        return;
+    }
+    for (items) |sym| try writeSymbolLine(out, "  ", sym);
+}
+
+fn writeWhereText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
+    const enclosing = root.get("enclosing") orelse .null;
+    if (enclosing == .null) {
+        try out.print("(no enclosing symbol in {s})\n", .{jsonStr(root, "file")});
+        return;
+    }
+    try out.writeAll("enclosing: ");
+    try writeSymbolLine(out, "", enclosing);
+    const chain = root.get("breadcrumbs").?.array.items;
+    try out.writeAll("breadcrumbs: ");
+    for (chain, 0..) |sym, i| {
+        if (i != 0) try out.writeAll(" > ");
+        try out.writeAll(jsonStr(sym.object, "qualified"));
+    }
+    try out.writeByte('\n');
+}
+
+fn writeContextText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
+    const sym = root.get("symbol").?.object;
+    try out.print("{s} {s} — {s}:{d}\n{s}\n", .{
+        jsonStr(sym, "kind"), jsonStr(sym, "qualified"), jsonStr(sym, "file"), jsonInt(sym, "line"), jsonStr(sym, "sig"),
+    });
+    const doc = jsonStr(sym, "doc");
+    if (doc.len != 0) try out.print("\n{s}\n", .{doc});
+    const def = root.get("definition").?.object;
+    const text = jsonStr(def, "text");
+    if (text.len != 0) try out.print("\ndefinition:\n{s}\n", .{text});
+    try out.writeByte('\n');
+    try writeSymbolArray(out, "callers", root.get("callers").?);
+    try writeSymbolArray(out, "callees", root.get("callees").?);
+    try writeSymbolArray(out, "types", root.get("types").?);
+    try writeSymbolArray(out, "tests", root.get("tests").?);
+    const truncated = root.get("truncated").?.bool;
+    try out.print("truncated: {}  tokensEstimate: {d}\n", .{ truncated, jsonInt(root, "tokensEstimate") });
+}
+
+fn writeHunksText(out: *std.Io.Writer, root: std.json.ObjectMap) !void {
+    const hunks_arr = root.get("hunks").?.array.items;
+    try out.print("changeId: {s}\nhunks ({d}):\n", .{ jsonStr(root, "changeId"), hunks_arr.len });
+    for (hunks_arr) |h| {
+        const ho = h.object;
+        const range = ho.get("range").?.object;
+        const start_line = range.get("start").?.object.get("line").?.integer + 1;
+        const end_line = range.get("end").?.object.get("line").?.integer + 1;
+        const roots = ho.get("roots").?.array.items;
+        // A hunk's own JSON carries a `file://` `uri` (no separate relative
+        // path); a root's `file` field is the repo-relative one the rest of
+        // this renderer already uses, so prefer it when the hunk has a root.
+        const path = if (roots.len != 0) jsonStr(roots[0].object, "file") else jsonStr(ho, "uri");
+        try out.print("  {s} lines {d}-{d}:\n", .{ path, start_line, end_line });
+        for (roots) |sym| try writeSymbolLine(out, "    ", sym);
+    }
+    try writeSymbolArray(out, "roots", root.get("roots").?);
+    const summary = root.get("summary").?.object;
+    try out.print(
+        "blast: {d} symbols, {d} files, {d} tests, maxDepth {d}, truncated {}\n",
+        .{ jsonInt(summary, "symbols"), jsonInt(summary, "files"), jsonInt(summary, "tests"), jsonInt(summary, "maxDepth"), summary.get("truncated").?.bool },
+    );
 }
 
 /// Say on stderr how many graph nodes `-l` withheld.
@@ -1463,6 +1651,198 @@ test "cli.parse rejects malformed invocations" {
     try std.testing.expectError(error.Usage, cli.parse(&.{ "path", "onlyone" }));
     // Unknown flag.
     try std.testing.expectError(error.UnknownFlag, cli.parse(&.{ "outline", "--bogus" }));
+}
+
+// ---------------------------------------------------------------------------
+// hunks/context/where: the 1.1 CLI mirrors (runMirrorCommand + cli.parse).
+// Session-based, so they need their own fixture (a root path, not an
+// already-built *Index — see lsp.mirrors's doc comment for why).
+// ---------------------------------------------------------------------------
+
+const MirrorFixture = struct {
+    tmp: std.testing.TmpDir,
+    root: []u8,
+
+    fn init(io: std.Io) !MirrorFixture {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        try writeSampleProject(io, tmp.dir);
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn deinit(self: *MirrorFixture) void {
+        std.testing.allocator.free(self.root);
+        self.tmp.cleanup();
+    }
+};
+
+/// Run `runMirrorCommand` for `parsed` (`parsed.root` is overwritten with
+/// `fx.root`) and return its rendered output plus `found`. Uses a real arena
+/// for the `arena` parameter, same as `main()` does: `runMirrorCommand`
+/// relies on bulk-free semantics there (an error `detail` is arena-allocated
+/// and never individually freed), so a plain leak-tracked allocator would
+/// flag it as a leak even though production never frees it either.
+fn runMirrorOwned(io: std.Io, fx: MirrorFixture, parsed_in: cli.Parsed) !struct { text: []u8, found: bool } {
+    const alloc = std.testing.allocator;
+    var parsed = parsed_in;
+    parsed.root = fx.root;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(alloc, &buf);
+    defer aw.deinit();
+    const found = try runMirrorCommand(alloc, io, arena_state.allocator(), &aw.writer, parsed);
+    return .{ .text = try alloc.dupe(u8, aw.written()), .found = found };
+}
+
+test "cli.parse maps hunks/context/where and their flags" {
+    const h = try cli.parse(&.{ "hunks", "HEAD~1", "-j" });
+    try std.testing.expectEqual(cli.Command.hunks, h.command);
+    try std.testing.expectEqualStrings("HEAD~1", h.arg);
+    try std.testing.expectEqual(query.OutputFormat.json, h.options.format);
+
+    const c = try cli.parse(&.{ "context", "run", "--budget", "0", "--include", "callers,types" });
+    try std.testing.expectEqual(cli.Command.context, c.command);
+    try std.testing.expectEqualStrings("run", c.arg);
+    try std.testing.expectEqual(@as(u32, 0), c.options.context_budget);
+    try std.testing.expectEqualStrings("callers,types", c.options.include);
+    try std.testing.expect(c.used_options.contains(.include));
+
+    const w = try cli.parse(&.{ "where", "app.zig:7" });
+    try std.testing.expectEqual(cli.Command.where, w.command);
+    try std.testing.expectEqualStrings("app.zig:7", w.arg);
+
+    // context's --budget is not the shared byte floor: 0 must not usage-error.
+    _ = try cli.parse(&.{ "context", "run", "--budget", "0" });
+    // ...but every other command's --budget still enforces the byte floor.
+    try std.testing.expectError(error.BadValue, cli.parse(&.{ "calls", "run", "--budget", "0" }));
+}
+
+test "dispatch where names the enclosing symbol and breadcrumbs" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .where, .arg = "app.zig:7", .options = .{ .format = .json } });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+    try std.testing.expect(has(r.text, "run"));
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.text, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("run", parsed.value.object.get("enclosing").?.object.get("name").?.string);
+}
+
+test "dispatch where off a malformed location reports the error and found=false, not a crash" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .where, .arg = "app.zig" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(!r.found);
+    try std.testing.expect(has(r.text, "malformed location"));
+}
+
+test "dispatch context includes the callee chain and honors --include" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    var opts = query.Options{};
+    opts.context_budget = 2000;
+    opts.format = .json;
+    const full = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "run", .options = opts });
+    defer std.testing.allocator.free(full.text);
+    try std.testing.expect(full.found);
+    try std.testing.expect(has(full.text, "mid"));
+
+    var include_opts = query.Options{};
+    include_opts.context_budget = 2000;
+    include_opts.format = .json;
+    var used = std.EnumSet(cli.registry.Option).initEmpty();
+    used.insert(.include);
+    const callers_only = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "run", .options = include_opts, .used_options = used });
+    defer std.testing.allocator.free(callers_only.text);
+    try std.testing.expect(callers_only.found);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, callers_only.text, .{});
+    defer parsed.deinit();
+    // `include` given but empty (`""`) is a strict "nothing" allow-list.
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("callees").?.array.items.len);
+}
+
+test "dispatch context on an unknown symbol reports not found, not a crash" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "nope_xyz" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(!r.found);
+    try std.testing.expect(has(r.text, "no definition named"));
+}
+
+test "dispatch context budget 0 does not error, per navgraph/context's own contract" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+
+    // context_budget defaults to 0, which runMirrorCommand maps to the wire
+    // default (2000) rather than passing 0 straight through.
+    const r = try runMirrorOwned(io, fx, .{ .command = .context, .arg = "run" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+}
+
+test "dispatch hunks off a bad ref reports the error, not a crash" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+    // A bare ref like "" would still resolve against *this worktree's own*
+    // enclosing git repo (`.zig-cache/tmp/...` sits inside it) — an
+    // unmistakably bad ref is what actually forces GitFailed deterministically,
+    // reported the same way `diff`'s own "unrunnable git root" case is
+    // (query.emitError, found=false), never a crash.
+    const r = try runMirrorOwned(io, fx, .{ .command = .hunks, .arg = "not-a-real-ref-xyz" });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(!r.found);
+    try std.testing.expect(has(r.text, "git diff"));
+}
+
+test "dispatch hunks reports the working change against HEAD, grouped by hunk" {
+    const io = std.testing.io;
+    var fx = try MirrorFixture.init(io);
+    defer fx.deinit();
+    const Git = struct {
+        fn ok(allocator: std.mem.Allocator, test_io: std.Io, cwd: []const u8, argv: []const []const u8) !void {
+            const result = try gitutil.run(allocator, test_io, cwd, argv);
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try std.testing.expect(result.term == .exited and result.term.exited == 0);
+        }
+    };
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "init", "--quiet" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "add", "--", "app.zig", "util.zig" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{
+        "git",     "-c",                   "user.name=NavGraph Test", "-c",                       "user.email=navgraph@example.invalid",
+        "-c",      "commit.gpgsign=false", "-c",                      "core.hooksPath=/dev/null", "commit",
+        "--quiet", "--no-verify",          "-m",                      "base",
+    });
+    // A single inserted line inside helper's own body: nothing else in the
+    // file moves (in particular, no trailing-newline change on the file's
+    // last line), so `git diff --unified=0` reports exactly one hunk.
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = "pub fn helper() void {\n    inner();\n    _ = 1;\n}\n\nfn inner() void {}" });
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .hunks, .options = .{ .format = .json } });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.text, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(obj.get("hunks").?.array.items.len == 1);
+    try std.testing.expectEqualStrings("helper", obj.get("roots").?.array.items[0].object.get("name").?.string);
 }
 
 test "phase 4 hierarchy exceptions and taint dispatch" {
