@@ -235,7 +235,7 @@ pub fn usage(w: *std.Io.Writer) !void {
 pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
     const command = registry.parseCommand(name) orelse return false;
     const desc = registry.descriptor(command);
-    try w.print("NavGraph command: {s}\n\nUSAGE: navgraph {s}", .{ desc.name, desc.name });
+    try w.print("NavGraph command: {s}\n{s}\n\nUSAGE: navgraph {s}", .{ desc.name, desc.summary, desc.name });
     for (desc.arguments) |argument| {
         if (argument.required) {
             try w.print(" <{s}>", .{argument.name});
@@ -244,7 +244,7 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
         }
     }
     if (desc.options.len != 0) try w.writeAll(" [options]");
-    try w.writeByte('\n');
+    try w.print("\nEXAMPLE: {s}\n", .{desc.example});
 
     if (desc.aliases.len != 0) {
         try w.writeAll("ALIASES: ");
@@ -1328,10 +1328,16 @@ test "usageCommand renders concise registry-derived argument and option help" {
     defer aw.deinit();
     try testing.expect(try usageCommand(&aw.writer, "read"));
     const out = aw.written();
+    try testing.expect(std.mem.startsWith(u8, out, "NavGraph command: read\nPrint a bounded, numbered range of source lines.\n\n"));
     try testing.expect(std.mem.indexOf(u8, out, "USAGE: navgraph read <source> [options]") != null);
     try testing.expect(std.mem.indexOf(u8, out, "-l, --limit <N>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--after <v1:N>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "COMMANDS:") == null);
+
+    const usage_at = std.mem.indexOf(u8, out, "USAGE: navgraph read").?;
+    const example_at = std.mem.indexOf(u8, out, "EXAMPLE: navgraph read src/parser.zig:1-40").?;
+    const aliases_at = std.mem.indexOf(u8, out, "ALIASES: cat").?;
+    try testing.expect(usage_at < example_at and example_at < aliases_at);
 
     const capabilities_start = aw.written().len;
     try testing.expect(try usageCommand(&aw.writer, "capabilities"));

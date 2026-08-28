@@ -1,0 +1,1 @@
+- **[convention]** CommandDescriptor in src/command_registry.zig now carries required .summary (plain-English one-liner) and .example (one runnable invocation) fields per command; navgraph help <cmd> prints both. Any new command must supply both or the descriptor literal fails to compile.  _(2026-08-28T13:03:23Z)_

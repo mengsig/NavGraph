@@ -1831,6 +1831,18 @@ test "README and agent prompt carry the generated language inventory marker" {
     try testing.expect(std.mem.indexOf(u8, prompt, "(`.java`)") != null);
 }
 
+test "README's command count claim matches command_descriptors.len" {
+    const testing = std.testing;
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const readme = try std.Io.Dir.cwd().readFileAlloc(io, "README.md", allocator, .limited(2 * 1024 * 1024));
+    defer allocator.free(readme);
+
+    var marker_buf: [32]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&marker_buf, "{d} commands", .{cli.registry.command_descriptors.len});
+    try testing.expect(std.mem.indexOf(u8, readme, marker) != null);
+}
+
 test "server reload atomically refreshes requests and notifications" {
     const testing = std.testing;
     const io = testing.io;
