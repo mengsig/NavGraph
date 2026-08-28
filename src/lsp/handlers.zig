@@ -264,11 +264,23 @@ const Params = struct {
         return if (v == .string) v.string else null;
     }
 
-    fn int(self: Params, key: []const u8, fallback: i64) i64 {
+    /// Absent or wrong-typed -> `fallback` (matches every existing caller's
+    /// "optional, defaulted" contract). Present as a number but hostile
+    /// (NaN, infinite, or outside `i64`) -> `InvalidParams`, never a crash and
+    /// never a silently-truncated/wrapped value (coldstart F1: `@intFromFloat`
+    /// on an out-of-range float is illegal behavior — UB in ReleaseFast,
+    /// SIGABRT in Debug).
+    fn int(self: Params, key: []const u8, fallback: i64) Error!i64 {
         const v = self.get(key) orelse return fallback;
         return switch (v) {
             .integer => |n| n,
-            .float => |f| @intFromFloat(f),
+            .float => |f| blk: {
+                if (!std.math.isFinite(f)) return error.InvalidParams;
+                // i64's exact range as f64: -2^63 is exact; 2^63 is the first
+                // power-of-two a truncated float could hit that no longer fits.
+                if (f < -9223372036854775808.0 or f >= 9223372036854775808.0) return error.InvalidParams;
+                break :blk @intFromFloat(f);
+            },
             else => fallback,
         };
     }
@@ -293,10 +305,16 @@ const Params = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    fn positive(self: Params, key: []const u8, fallback: u32) u32 {
-        const n = self.int(key, fallback);
+    /// A non-positive value (absent, `0`, or negative) means "use the
+    /// default" (established 1.0 convention, coldstart F8 documents the
+    /// tradeoff). A value too large for `u32` is hostile, not a sentinel for
+    /// "unbounded" -> `InvalidParams` rather than the silent-wraparound
+    /// `@intCast` this replaces (coldstart F1).
+    fn positive(self: Params, key: []const u8, fallback: u32) Error!u32 {
+        const n = try self.int(key, fallback);
         if (n <= 0) return fallback;
-        return @intCast(@min(n, std.math.maxInt(u32)));
+        if (n > std.math.maxInt(u32)) return error.InvalidParams;
+        return @intCast(n);
     }
 };
 
@@ -313,12 +331,28 @@ fn documentPath(self: *Server, gpa: std.mem.Allocator, p: Params) Error!?[]const
     return pathOf(self, gpa, uri);
 }
 
+/// `i64` -> `u32`, rejecting negative and out-of-range instead of the
+/// clamp-to-zero / trapping `@intCast` this replaces (coldstart F1: a hostile
+/// `position.line`/`range.*.line` of e.g. `5000000000` doesn't fit `u32` and
+/// used to abort the process).
+fn toU32(n: i64) Error!u32 {
+    if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidParams;
+    return @intCast(n);
+}
+
+/// 0-based `n` -> 1-based `u32`, checked so the `+ 1` itself cannot overflow
+/// (coldstart F1: `@max(n, 0) + 1` on `n == maxInt(i64)` trapped).
+fn oneBasedLine(n: i64) Error!u32 {
+    if (n < 0 or n >= std.math.maxInt(u32)) return error.InvalidParams;
+    return @as(u32, @intCast(n)) + 1;
+}
+
 fn positionOf(p: Params) Error!position.Position {
     const pos = p.nested("position");
     if (pos.obj == null) return error.InvalidParams;
     return .{
-        .line = @intCast(@max(pos.int("line", 0), 0)),
-        .character = @intCast(@max(pos.int("character", 0), 0)),
+        .line = try toU32(try pos.int("line", 0)),
+        .character = try toU32(try pos.int("character", 0)),
     };
 }
 
@@ -421,10 +455,10 @@ fn applyInitOptions(self: *Server, opts: Params) Error!void {
         self.cfg.tests = query.TestScope.parse(t) orelse return error.InvalidParams;
     }
     self.cfg.strict = opts.boolean("strict", self.cfg.strict);
-    self.cfg.debounce_ms = opts.positive("debounceMs", self.cfg.debounce_ms);
+    self.cfg.debounce_ms = try opts.positive("debounceMs", self.cfg.debounce_ms);
     self.cfg.watch = opts.boolean("watch", self.cfg.watch);
-    self.cfg.watch_interval_ms = opts.positive("watchIntervalMs", self.cfg.watch_interval_ms);
-    self.cfg.depth = @min(opts.positive("depth", self.cfg.depth), session_mod.Config.max_depth);
+    self.cfg.watch_interval_ms = try opts.positive("watchIntervalMs", self.cfg.watch_interval_ms);
+    self.cfg.depth = @min(try opts.positive("depth", self.cfg.depth), session_mod.Config.max_depth);
 }
 
 /// `--root` wins; then the client's workspace; then the current directory.
@@ -666,7 +700,7 @@ fn workspaceSymbol(self: *Server, arena: std.mem.Allocator, params: ?std.json.Va
     defer hits.deinit(arena);
     try search.searchSymbols(arena, c.index(), q, .{ .tests = self.cfg.tests }, &hits);
 
-    const limit = p.positive("limit", 200);
+    const limit = try p.positive("limit", 200);
     try w.writeByte('[');
     for (hits.items[0..@min(hits.items.len, limit)], 0..) |hit, i| {
         if (i != 0) try w.writeByte(',');
@@ -889,9 +923,9 @@ fn blast(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *W
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
     try queries.writeBlast(w, arena, c, roots, .{
-        .depth = @min(p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
+        .depth = @min(try p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
-        .limit = p.positive("limit", 500),
+        .limit = try p.positive("limit", 500),
         .scope = try scopeOf(self, p),
     });
 }
@@ -915,7 +949,7 @@ fn testsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value,
     _ = try scopeOf(self, p);
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
-    try queries.writeTestsFor(w, arena, c, roots[0], .{ .limit = p.positive("limit", 200) });
+    try queries.writeTestsFor(w, arena, c, roots[0], .{ .limit = try p.positive("limit", 200) });
 }
 
 /// `navgraph/types`: "who uses type T" — supertypes/subtypes/implementors
@@ -928,7 +962,7 @@ fn typesMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value,
     const scope = try scopeOf(self, p);
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
-    try queries.writeTypes(w, arena, c, roots[0], .{ .limit = p.positive("limit", 200), .scope = scope });
+    try queries.writeTypes(w, arena, c, roots[0], .{ .limit = try p.positive("limit", 200), .scope = scope });
 }
 
 /// `navgraph/impact`: the blast radius of the current working change
@@ -942,9 +976,9 @@ fn impactMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
     const p = Params.from(params);
     const scope = try scopeOf(self, p);
     const opts = queries.ImpactOptions{
-        .depth = @min(p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
+        .depth = @min(try p.positive("depth", self.cfg.depth), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
-        .limit = p.positive("limit", 500),
+        .limit = try p.positive("limit", 500),
         .scope = scope,
     };
     const ref = p.str("ref");
@@ -956,8 +990,8 @@ fn impactMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
     if (p.nested("range").obj != null) {
         const rg = p.nested("range");
         range = .{
-            .lo = @intCast(@max(rg.nested("start").int("line", 0), 0) + 1),
-            .hi = @intCast(@max(rg.nested("end").int("line", 0), 0) + 1),
+            .lo = try oneBasedLine(try rg.nested("start").int("line", 0)),
+            .hi = try oneBasedLine(try rg.nested("end").int("line", 0)),
         };
     }
     var detail: ?[]const u8 = null;
@@ -976,7 +1010,7 @@ fn contextMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Valu
     const p = Params.from(params);
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
-    try queries.writeContext(w, arena, c, roots[0], .{ .budget = p.positive("budget", 2000) });
+    try queries.writeContext(w, arena, c, roots[0], .{ .budget = try p.positive("budget", 2000) });
 }
 
 /// `navgraph/where`: the symbol enclosing `{uri, line}` and its breadcrumb
@@ -987,7 +1021,7 @@ fn whereMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value,
     const c = try self.ctx();
     const p = Params.from(params);
     const path = (try documentPath(self, arena, p)) orelse return error.InvalidParams;
-    const line = p.positive("line", 0);
+    const line = try p.positive("line", 0);
     if (line == 0) return error.InvalidParams;
     try queries.writeWhere(w, arena, c, path, line);
 }
@@ -1012,7 +1046,7 @@ fn searchMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
         try search.searchSymbols(arena, c.index(), q, filter, &hits);
     }
 
-    const limit = p.positive("limit", 50);
+    const limit = try p.positive("limit", 50);
     const shown = hits.items[0..@min(hits.items.len, limit)];
     try w.writeAll("{\"items\":[");
     for (shown, 0..) |hit, i| {
@@ -1052,7 +1086,7 @@ fn grep(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Wr
     defer pattern.deinit();
 
     try queries.writeGrep(w, c, &pattern, .{
-        .limit = p.positive("limit", 200),
+        .limit = try p.positive("limit", 200),
         .include = try p.strings(arena, "include"),
     });
 }
@@ -1079,7 +1113,7 @@ fn tree(
     const roots = try resolveTargetOrErr(self, arena, c, target);
     try w.writeAll("{\"root\":");
     try queries.writeTree(w, arena, c, roots[0], .{
-        .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
+        .depth = @min(try p.positive("depth", 1), session_mod.Config.max_depth),
         .direction = direction,
         .refs = p.boolean("refs", false),
         .scope = try scopeOf(self, p),
@@ -1118,7 +1152,7 @@ fn outlineMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Valu
     const p = Params.from(params);
     try queries.writeOutline(w, c, p.str("path") orelse "", .{
         .kinds = try kindsOf(arena, p),
-        .limit = p.positive("limit", 300),
+        .limit = try p.positive("limit", 300),
         .scope = try scopeOf(self, p),
     });
 }
@@ -1128,7 +1162,7 @@ fn hotMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w
     const c = try self.ctx();
     const p = Params.from(params);
     try queries.writeHot(w, c, p.str("path") orelse "", .{
-        .limit = p.positive("limit", 25),
+        .limit = try p.positive("limit", 25),
         .scope = try scopeOf(self, p),
     });
 }
@@ -1140,7 +1174,7 @@ fn unusedMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
     try queries.writeUnused(w, c, p.str("path") orelse "", .{
         .noPublic = p.boolean("noPublic", false),
         .followImports = p.boolean("followImports", false),
-        .limit = p.positive("limit", 300),
+        .limit = try p.positive("limit", 300),
         .scope = try scopeOf(self, p),
     });
 }
@@ -1151,9 +1185,9 @@ fn diffMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, 
     const p = Params.from(params);
     var detail: ?[]const u8 = null;
     queries.writeDiff(w, arena, c, p.str("ref") orelse "HEAD", .{
-        .depth = @min(p.positive("depth", 1), session_mod.Config.max_depth),
+        .depth = @min(try p.positive("depth", 1), session_mod.Config.max_depth),
         .direction = try directionOf(p, .callers),
-        .limit = p.positive("limit", 500),
+        .limit = try p.positive("limit", 500),
         .scope = try scopeOf(self, p),
     }, &detail) catch |err| {
         self.err_detail = detail;
@@ -1165,21 +1199,21 @@ fn routesMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value
     try self.flushPending(arena, .change);
     const c = try self.ctx();
     const p = Params.from(params);
-    try queries.writeRoutes(w, c, p.str("filter") orelse "", p.positive("limit", 300));
+    try queries.writeRoutes(w, c, p.str("filter") orelse "", try p.positive("limit", 300));
 }
 
 fn eventsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
     try self.flushPending(arena, .change);
     const c = try self.ctx();
     const p = Params.from(params);
-    try queries.writeEvents(w, c, p.str("filter") orelse "", p.positive("limit", 50));
+    try queries.writeEvents(w, c, p.str("filter") orelse "", try p.positive("limit", 50));
 }
 
 fn importsMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
     try self.flushPending(arena, .change);
     const c = try self.ctx();
     const p = Params.from(params);
-    try queries.writeImports(w, c, p.str("path") orelse "", p.positive("limit", 300));
+    try queries.writeImports(w, c, p.str("path") orelse "", try p.positive("limit", 300));
 }
 
 fn importersMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -1188,7 +1222,7 @@ fn importersMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Va
     const p = Params.from(params);
     const path = p.str("path") orelse return error.InvalidParams;
     if (path.len == 0) return error.InvalidParams;
-    try queries.writeImporters(w, c, path, p.positive("limit", 300));
+    try queries.writeImporters(w, c, path, try p.positive("limit", 300));
 }
 
 fn graphMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
