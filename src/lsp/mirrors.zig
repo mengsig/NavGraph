@@ -55,7 +55,10 @@ pub const HunksParams = struct {
 /// "HEAD", same as `navgraph diff`/`navgraph affected`'s own default-ref rule.
 pub fn hunks(w: *std.Io.Writer, gpa: std.mem.Allocator, ctx: payload.Ctx, ref: []const u8, params: HunksParams, detail: *?[]const u8) !void {
     try queries.writeImpact(w, gpa, ctx, ref, null, null, .{
-        .depth = params.depth,
+        // m4: every wire handler clamps `depth` to `max_depth` before it
+        // reaches `writeImpact`; clamp here too, once, so a CLI/MCP caller
+        // can't force an unbounded-depth walk the LSP surface refuses.
+        .depth = @min(params.depth, session_mod.Config.max_depth),
         .direction = params.direction,
         .limit = params.limit,
         .offset = params.offset,

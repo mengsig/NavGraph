@@ -2111,6 +2111,92 @@ test "dispatch hunks reports the working change against HEAD, grouped by hunk" {
     try std.testing.expectEqualStrings("helper", obj.get("roots").?.array.items[0].object.get("name").?.string);
 }
 
+// A callee chain 13 deep (f0 -> f1 -> ... -> f12): long enough that an
+// unclamped `--depth` and the session's max_depth (10) disagree — this
+// suite's usual project saturates well under depth 10, so the m4 clamp is
+// unobservable there (the independent review flagged exactly this: "could
+// not demonstrate").
+fn deepChainFixture(io: std.Io) !MirrorFixture {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    errdefer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data =
+        \\pub fn f0() void { f1(); }
+        \\pub fn f1() void { f2(); }
+        \\pub fn f2() void { f3(); }
+        \\pub fn f3() void { f4(); }
+        \\pub fn f4() void { f5(); }
+        \\pub fn f5() void { f6(); }
+        \\pub fn f6() void { f7(); }
+        \\pub fn f7() void { f8(); }
+        \\pub fn f8() void { f9(); }
+        \\pub fn f9() void { f10(); }
+        \\pub fn f10() void { f11(); }
+        \\pub fn f11() void { f12(); }
+        \\pub fn f12() void {}
+    });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    return .{ .tmp = tmp, .root = root };
+}
+
+// m4 regression: every wire handler clamps `depth` to `Config.max_depth`
+// (10) before it reaches the walk; the CLI/MCP `hunks` mirror passed
+// `depth` straight through, so a caller could force an unbounded-depth walk
+// the LSP surface refuses.
+test "dispatch hunks clamps --depth to the session's max depth (m4)" {
+    const io = std.testing.io;
+    var fx = try deepChainFixture(io);
+    defer fx.deinit();
+
+    const Git = struct {
+        fn ok(allocator: std.mem.Allocator, test_io: std.Io, cwd: []const u8, argv: []const []const u8) !void {
+            const result = try gitutil.run(allocator, test_io, cwd, argv);
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try std.testing.expect(result.term == .exited and result.term.exited == 0);
+        }
+    };
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "init", "--quiet" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{ "git", "add", "--", "app.zig" });
+    try Git.ok(std.testing.allocator, io, fx.root, &.{
+        "git",     "-c",                   "user.name=NavGraph Test", "-c",                       "user.email=navgraph@example.invalid",
+        "-c",      "commit.gpgsign=false", "-c",                      "core.hooksPath=/dev/null", "commit",
+        "--quiet", "--no-verify",          "-m",                      "base",
+    });
+    // One changed line inside f0's own body creates a hunk rooted at f0.
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "app.zig", .data =
+        \\pub fn f0() void { _ = 1; f1(); }
+        \\pub fn f1() void { f2(); }
+        \\pub fn f2() void { f3(); }
+        \\pub fn f3() void { f4(); }
+        \\pub fn f4() void { f5(); }
+        \\pub fn f5() void { f6(); }
+        \\pub fn f6() void { f7(); }
+        \\pub fn f7() void { f8(); }
+        \\pub fn f8() void { f9(); }
+        \\pub fn f9() void { f10(); }
+        \\pub fn f10() void { f11(); }
+        \\pub fn f11() void { f12(); }
+        \\pub fn f12() void {}
+    });
+
+    var used = std.EnumSet(cli.registry.Option).initEmpty();
+    used.insert(.depth);
+    var opts = query.Options{};
+    opts.format = .json;
+    opts.hunks_direction = .callees;
+    opts.depth = 999999;
+
+    const r = try runMirrorOwned(io, fx, .{ .command = .hunks, .options = opts, .used_options = used });
+    defer std.testing.allocator.free(r.text);
+    try std.testing.expect(r.found);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.text, .{});
+    defer parsed.deinit();
+    // Pre-fix: an unclamped depth walked the whole 13-node chain (f0..f12).
+    // Clamped to max_depth (10), the reachable set stops at f10 — 11 nodes
+    // (f0 through f10, depth 0..10).
+    try std.testing.expectEqual(@as(i64, 11), parsed.value.object.get("summary").?.object.get("total").?.integer);
+}
+
 test "phase 4 hierarchy exceptions and taint dispatch" {
     const testing = std.testing;
     const io = testing.io;
