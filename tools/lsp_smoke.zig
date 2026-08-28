@@ -111,7 +111,8 @@ fn buildSession(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     @memset(nested[0..20_000], '(');
     nested[20_000] = 'a';
     @memset(nested[20_001..], ')');
-    try frame(gpa, &out, try std.fmt.allocPrint(arena,
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
         "{{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"navgraph/grep\"," ++
             "\"params\":{{\"pattern\":\"{s}\",\"regex\":true,\"limit\":1}}}}",
         .{nested},
@@ -124,7 +125,8 @@ fn buildSession(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     const line = try arena.alloc(u8, 300_000);
     @memset(line, 'a');
     const uri = try std.fmt.allocPrint(arena, "file://{s}/min.js", .{root});
-    try frame(gpa, &out, try std.fmt.allocPrint(arena,
+    try frame(gpa, &out, try std.fmt.allocPrint(
+        arena,
         "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{{\"textDocument\":" ++
             "{{\"uri\":\"{s}\",\"languageId\":\"javascript\",\"version\":1,\"text\":\"{s}\"}}}}}}",
         .{ uri, line },

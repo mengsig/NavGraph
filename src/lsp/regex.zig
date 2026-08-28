@@ -62,8 +62,6 @@ pub const step_budget_per_byte: u32 = 32;
 pub const max_backtrack: usize = 16_384;
 pub const max_conts: usize = 16_384;
 
-
-
 const Class = struct {
     negate: bool,
     bits: [32]u8,
@@ -1077,4 +1075,3 @@ test "the iterative matcher agrees with the naive reference on random patterns" 
     try testing.expect(compared > 3000);
     try testing.expect(skipped < compared / 10);
 }
-

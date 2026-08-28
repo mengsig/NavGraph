@@ -5,9 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default: nothing here publishes, comments, or writes to the repo.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are cancelled; a run on main is the record of what
+  # landed and always finishes.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -18,12 +24,17 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: mlugg/setup-zig@v2
+      # Actions are pinned to a commit: a moving tag is someone else's write
+      # access to this workflow.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           cache-key: ${{ matrix.os }}
+
+      # Cheap and first: a formatting failure should not wait on a full build.
+      - name: Format
+        run: zig fmt --check .
 
       # ReleaseFast is what the editor server ships as, and it is the mode the
       # performance numbers in docs/lsp.md were measured in.

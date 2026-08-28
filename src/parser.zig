@@ -1129,21 +1129,21 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
 
 /// Leading words a C/C++ declarator may carry before its type.
 const c_decl_modifiers = KeywordSet.initComptime(.{
-    .{"const"},  .{"static"},   .{"volatile"}, .{"mutable"}, .{"register"},
-    .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
-    .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
-    .{"class"},  .{"auto"},     .{"typename"},
+    .{"const"},  .{"static"},    .{"volatile"}, .{"mutable"},  .{"register"},
+    .{"extern"}, .{"constexpr"}, .{"inline"},   .{"unsigned"}, .{"signed"},
+    .{"long"},   .{"short"},     .{"struct"},   .{"enum"},     .{"union"},
+    .{"class"},  .{"auto"},      .{"typename"},
 });
 
 /// Words that open a statement rather than a declaration, so a run starting
 /// with one is never `Type name`.
 const c_statement_keywords = KeywordSet.initComptime(.{
-    .{"if"},     .{"for"},       .{"while"},     .{"switch"}, .{"return"},
-    .{"else"},   .{"do"},        .{"case"},      .{"goto"},   .{"break"},
-    .{"continue"}, .{"sizeof"},  .{"new"},       .{"delete"}, .{"throw"},
-    .{"try"},    .{"catch"},     .{"using"},     .{"namespace"}, .{"typedef"},
-    .{"template"}, .{"public"},  .{"private"},   .{"protected"}, .{"friend"},
-    .{"virtual"}, .{"operator"}, .{"default"},
+    .{"if"},       .{"for"},      .{"while"},   .{"switch"},    .{"return"},
+    .{"else"},     .{"do"},       .{"case"},    .{"goto"},      .{"break"},
+    .{"continue"}, .{"sizeof"},   .{"new"},     .{"delete"},    .{"throw"},
+    .{"try"},      .{"catch"},    .{"using"},   .{"namespace"}, .{"typedef"},
+    .{"template"}, .{"public"},   .{"private"}, .{"protected"}, .{"friend"},
+    .{"virtual"},  .{"operator"}, .{"default"},
 });
 
 /// Modifiers that are a complete type on their own, so the declarator may carry
