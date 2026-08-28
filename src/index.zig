@@ -73,16 +73,20 @@ pub const Index = struct {
     /// logging.go, …). Lets a package-qualified call (`caddy.Load(...)`) resolve
     /// to the package's top-level definitions. Arena-owned.
     go_packages: std.StringHashMapUnmanaged([]const FileId) = .empty,
-    /// Java type id → the ids of the supertypes its signature declares, in
-    /// ascending id order. Precomputed once so inherited-member lookup walks a
-    /// short adjacency list instead of rescanning every symbol per reference.
-    /// Arena-owned.
-    /// Other types an unqualified member lookup may continue into: a Java
-    /// type's declared supertypes, a Ruby class's superclass and mixins, and —
-    /// for a Ruby module — the classes that mix it in, since a mixin's methods
-    /// dispatch into the includer. Precomputed once per build; a per-reference
-    /// scan of the symbol table was quadratic in project size.
+    /// Type id → its declared ANCESTORS, in ascending id order: a Java type's
+    /// `extends`/`implements`, a Ruby class's superclass and the modules it
+    /// mixes in. Strictly one directional — every entry is a type the subject
+    /// inherits FROM, which is what makes it safe for `super` and inherited-
+    /// member walks. Precomputed once per build; a per-reference scan of the
+    /// symbol table was quadratic in project size. Arena-owned.
     type_bases: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
+    /// Ruby module id → the classes that mix it in, ascending. The REVERSE of
+    /// a mixin edge, deliberately NOT in `type_bases`: an ancestor walk that
+    /// crossed it would leave the subject's own hierarchy and reach a sibling
+    /// includer's members. Consulted only for implicit self inside a module's
+    /// own body, where a module method calls a method its includer defines.
+    /// Arena-owned.
+    module_includers: std.AutoHashMapUnmanaged(SymbolId, []const SymbolId) = .empty,
 
     pub fn deinit(self: *Index) void {
         self.by_name.deinit(self.gpa);
@@ -949,8 +953,9 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
     // (superclass, mixins) or — inside a module — through a class that mixes it
     // in. `super` names the ancestor's method of the *enclosing* method's name.
     if (idx.graph.files[from.file].language == .ruby and from.parent != invalid) {
-        const wanted = if (std.mem.eql(u8, ref.name, "super")) from.name else ref.name;
-        if (!std.mem.eql(u8, ref.name, "super")) {
+        const is_super = std.mem.eql(u8, ref.name, "super");
+        const wanted = if (is_super) from.name else ref.name;
+        if (!is_super) {
             const own = memberOfParent(idx, from.parent, wanted);
             if (own.id != invalid) {
                 ref.target = own.id;
@@ -970,7 +975,20 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
             ref.resolution_reason = .inheritance;
             return;
         }
-        if (std.mem.eql(u8, ref.name, "super")) return;
+        // Only now, and never for `super`: a module method may call a method
+        // its includer defines. `super` is a walk UP the ancestor chain — the
+        // includer sits below the module in the MRO, so it is not a candidate.
+        if (!is_super) {
+            const mixed_in = includerMember(idx, from.parent, wanted);
+            if (mixed_in.id != invalid) {
+                ref.target = mixed_in.id;
+                ref.exact = mixed_in.unambiguous;
+                ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+                ref.resolution_reason = .inheritance;
+                return;
+            }
+        }
+        if (is_super) return;
     }
 
     if (idx.graph.files[from.file].language == .java) {
@@ -1109,10 +1127,9 @@ fn inheritedMemberFrom(
     visited[depth] = type_id;
 
     for (idx.type_bases.get(type_id) orelse return invalid) |base_id| {
-        // A Ruby mixin's reverse includer edge can close a cycle back onto a
-        // type already on this path (the includer itself, or an ancestor
-        // reached another way). Probing such a base's members directly found
-        // the *calling* method's own class, turning `super` into a self-edge.
+        // A declared cycle (`class A extends B` / `class B extends A`) would
+        // otherwise let the direct probe answer with the calling type's own
+        // member — the recursion guard below runs too late for that.
         var on_path = false;
         for (visited[0 .. depth + 1]) |seen| {
             if (seen == base_id) {
@@ -1130,12 +1147,12 @@ fn inheritedMemberFrom(
 }
 
 /// Precompute every type's declared supertypes into `Index.type_bases` (Java
-/// `extends`/`implements`, Ruby `<` and `include`/`extend`/`prepend`, plus the
-/// reverse mixin edge). The lookup this replaces scanned the whole symbol table
-/// per unresolved reference, recursed 16 deep — O(references x symbols x depth),
-/// which made index build super-linear in file count. The table itself is
-/// arena-owned and dies with the index; the scratch used to build it is not,
-/// and is released here.
+/// `extends`/`implements`, Ruby `<` and `include`/`extend`/`prepend`), then the
+/// reverse mixin edge into the separate `Index.module_includers`. The lookup
+/// this replaces scanned the whole symbol table per unresolved reference,
+/// recursed 16 deep — O(references x symbols x depth), which made index build
+/// super-linear in file count. Both tables are arena-owned and die with the
+/// index; the scratch used to build them is not, and is released here.
 fn buildTypeBaseTable(idx: *Index) !void {
     const arena = idx.arena.allocator();
     const gpa = idx.gpa;
@@ -1187,7 +1204,7 @@ fn buildTypeBaseTable(idx: *Index) !void {
         }
         try idx.type_bases.put(arena, sym.id, try arena.dupe(SymbolId, bases.items[0..unique]));
     }
-    try addRubyMixinIncluders(idx, arena);
+    try buildModuleIncluderTable(idx, arena);
 }
 
 /// Whether `sym` is a type whose declared bases we can read from its own text.
@@ -1202,8 +1219,10 @@ fn hasBaseTable(idx: *const Index, sym: model.Symbol) bool {
 
 /// A Ruby mixin's methods dispatch into the class that mixes it in, so an
 /// unqualified member of a module may be defined by an includer. Record that
-/// reverse edge, which the forward pass above only walks module-ward.
-fn addRubyMixinIncluders(idx: *Index, arena: std.mem.Allocator) !void {
+/// reverse edge in its OWN table: merged into `type_bases` it reads as an
+/// ancestor, and a `super` walk crossing it lands in whatever unrelated class
+/// happens to include the same module.
+fn buildModuleIncluderTable(idx: *Index, arena: std.mem.Allocator) !void {
     const gpa = idx.gpa;
     var includers: std.AutoHashMapUnmanaged(SymbolId, std.ArrayListUnmanaged(SymbolId)) = .empty;
     defer {
@@ -1222,14 +1241,35 @@ fn addRubyMixinIncluders(idx: *Index, arena: std.mem.Allocator) !void {
     }
     var it = includers.iterator();
     while (it.next()) |entry| {
-        const module_id = entry.key_ptr.*;
-        var merged: std.ArrayListUnmanaged(SymbolId) = .empty;
-        defer merged.deinit(gpa);
-        try merged.appendSlice(gpa, idx.type_bases.get(module_id) orelse &.{});
-        try merged.appendSlice(gpa, entry.value_ptr.items);
-        std.mem.sort(SymbolId, merged.items, {}, std.sort.asc(SymbolId));
-        try idx.type_bases.put(arena, module_id, try arena.dupe(SymbolId, merged.items));
+        const list = entry.value_ptr.items;
+        std.mem.sort(SymbolId, list, {}, std.sort.asc(SymbolId));
+        // A class that `include`s the same module twice lists it twice in its
+        // base table, so the reverse edge can repeat.
+        var unique: usize = 0;
+        for (list) |id| {
+            if (unique != 0 and list[unique - 1] == id) continue;
+            list[unique] = id;
+            unique += 1;
+        }
+        try idx.module_includers.put(arena, entry.key_ptr.*, try arena.dupe(SymbolId, list[0..unique]));
     }
+}
+
+/// The member named `name` defined by a class that mixes in module `module_id`.
+/// This is the only consumer of the reverse mixin edge: implicit self inside a
+/// module body (`def identifier; tag(); end` where the includer defines `tag`).
+/// Unambiguous only when exactly one includer answers, exactly once — two
+/// includers with the same method is a real dispatch ambiguity, not a pick.
+fn includerMember(idx: *const Index, module_id: SymbolId, name: []const u8) MemberMatch {
+    var found: SymbolId = invalid;
+    var matches: u32 = 0;
+    for (idx.module_includers.get(module_id) orelse return .{ .id = invalid, .unambiguous = false }) |includer| {
+        const direct = memberOfParent(idx, includer, name);
+        if (direct.id == invalid) continue;
+        if (found == invalid) found = direct.id;
+        matches += if (direct.unambiguous) 1 else 2;
+    }
+    return .{ .id = found, .unambiguous = matches == 1 };
 }
 
 /// Iterates the type names a Ruby class/module inherits from: the superclass in
@@ -4657,35 +4697,44 @@ test "cpp: a direct-initialized local types its receiver; an unnameable one abst
     try testing.expectEqual(@as(usize, 0), idx.callersOf(idx.lookup("step")[0]).len);
 }
 
-test "ruby: super in a class that includes a module terminates on the real ancestor, not itself" {
-    // Regression (F4): the reverse mixin edge (module -> includer) makes
-    // `type_bases` cyclic. `inheritedMemberFrom` only guarded against
-    // recursing back into a type already on the path — it never guarded the
-    // direct-member probe on each base, so `WithMixin`'s own `render` (the
-    // method calling `super`) was found through `Mix`'s reverse edge back to
-    // `WithMixin` before the walk ever reached `Parent`.
+test "ruby: super never crosses a mixin's reverse includer edge" {
+    // Regression (merge-gate F1, root cause of coldstart F4): the reverse
+    // mixin edge (module -> its includers) used to live in `type_bases`
+    // alongside real ancestors, so an ancestor walk could not tell "my
+    // superclass" from "some other class that includes the same module".
+    // With one includer that produced a self-edge; with two, each sibling's
+    // `super` landed on the OTHER sibling's override and `Parent#size` was
+    // left with no callers at all. The edge now lives in `module_includers`,
+    // which no base-chain walk reads.
     const testing = std.testing;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
-        \\module Mix
-        \\  def helper
-        \\    1
+        \\module Quiet
+        \\  def volume
+        \\    0
         \\  end
         \\end
         \\
         \\class Parent
-        \\  def render
-        \\    "parent"
+        \\  def size
+        \\    7
         \\  end
         \\end
         \\
-        \\class WithMixin < Parent
-        \\  include Mix
-        \\  def render
-        \\    super
+        \\class First < Parent
+        \\  include Quiet
+        \\  def size
+        \\    super + 1
+        \\  end
+        \\end
+        \\
+        \\class Second < Parent
+        \\  include Quiet
+        \\  def size
+        \\    super * 2
         \\  end
         \\end
     });
@@ -4695,15 +4744,94 @@ test "ruby: super in a class that includes a module terminates on the real ances
     var idx = try build(testing.allocator, io, root, false);
     defer idx.deinit();
 
-    const parent_render = qualifiedId(&idx, "Parent", "render").?;
-    const with_mixin_render_id = qualifiedId(&idx, "WithMixin", "render").?;
-    const with_mixin_render = idx.graph.symbols[with_mixin_render_id];
-    const super_ref = refByName(with_mixin_render, "super").?;
+    const parent_size = qualifiedId(&idx, "Parent", "size").?;
+    const first_size = qualifiedId(&idx, "First", "size").?;
+    const second_size = qualifiedId(&idx, "Second", "size").?;
 
-    // No self-recursive edge, and the real ancestor is found through Mix's
-    // dead end back to Parent.
-    try testing.expect(super_ref.target != with_mixin_render_id);
-    try testing.expectEqual(parent_render, super_ref.target);
+    // Each sibling's `super` reaches the shared ancestor: not itself, and not
+    // the other includer of `Quiet`.
+    for ([_]SymbolId{ first_size, second_size }) |method_id| {
+        const super_ref = refByName(idx.graph.symbols[method_id], "super").?;
+        try testing.expectEqual(parent_size, super_ref.target);
+        // A bare `super` invokes the ancestor's method; a `read` would hide it
+        // from every call-graph consumer, the accuracy bench included.
+        try testing.expectEqual(model.RefKind.call, super_ref.kind);
+    }
+
+    // ... so the overridden method has both callers, which is the view
+    // `hierarchy` already had and the reference graph did not.
+    const callers = idx.callersOf(parent_size);
+    try testing.expectEqual(@as(usize, 2), callers.len);
+    try testing.expect(std.mem.indexOfScalar(SymbolId, callers, first_size) != null);
+    try testing.expect(std.mem.indexOfScalar(SymbolId, callers, second_size) != null);
+
+    // The reverse edge exists, but only in its own table. The forward edge
+    // (includer -> module) stays a real ancestor of each class.
+    const quiet = idx.lookup("Quiet")[0];
+    try testing.expect(idx.type_bases.get(quiet) == null);
+    try testing.expectEqual(@as(usize, 2), idx.module_includers.get(quiet).?.len);
+    const parent = idx.lookup("Parent")[0];
+    for ([_]SymbolId{ idx.lookup("First")[0], idx.lookup("Second")[0] }) |class_id| {
+        const bases = idx.type_bases.get(class_id).?;
+        try testing.expect(std.mem.indexOfScalar(SymbolId, bases, quiet) != null);
+        try testing.expect(std.mem.indexOfScalar(SymbolId, bases, parent) != null);
+        try testing.expect(idx.module_includers.get(class_id) == null);
+    }
+}
+
+test "ruby: a module method still dispatches into the class that includes it" {
+    // The one legitimate use of the reverse edge, and the only one:
+    // `Mix#describe` calls `label`, which only the includer defines. Splitting
+    // the edge out of `type_bases` must not cost this — and it must not let a
+    // SIBLING includer answer for another (`Other#label` is never the target).
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\module Mix
+        \\  def describe
+        \\    label
+        \\  end
+        \\end
+        \\
+        \\class Only
+        \\  include Mix
+        \\  def label
+        \\    "only"
+        \\  end
+        \\end
+        \\
+        \\class Sibling
+        \\  include Mix
+        \\  def caption
+        \\    label
+        \\  end
+        \\  def label
+        \\    "sibling"
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // Two includers both define `label`, so the module's own call is a real
+    // dispatch ambiguity: an edge, but never an exact one.
+    const describe = idx.graph.symbols[qualifiedId(&idx, "Mix", "describe").?];
+    const label_ref = refByName(describe, "label").?;
+    try testing.expect(label_ref.target == qualifiedId(&idx, "Only", "label").? or
+        label_ref.target == qualifiedId(&idx, "Sibling", "label").?);
+    try testing.expect(!label_ref.exact);
+
+    // A class's own implicit self is unaffected: it never leaves its class.
+    const caption = idx.graph.symbols[qualifiedId(&idx, "Sibling", "caption").?];
+    const own = refByName(caption, "label").?;
+    try testing.expectEqual(qualifiedId(&idx, "Sibling", "label").?, own.target);
+    try testing.expect(own.exact);
 }
 
 test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {

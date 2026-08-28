@@ -617,10 +617,12 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (receiver.name.len == 0 and
             (isJsObjectKey(ctx, i, lo, hi) or isGoLiteralFieldKey(ctx, i, lo, hi))) continue;
         // Ruby has no public fields and needs no parentheses: `book.to_row` and
-        // `map(&:to_row)` are calls, not data reads.
+        // `map(&:to_row)` are calls, not data reads. A bare `super` invokes the
+        // ancestor's method exactly as `super()` does — it is never a read.
         const is_call = referenceCallOpen(ctx, last, hi) != null or
             (ctx.cfg.language == .ruby and !assignment.write and
-                (receiver.name.len != 0 or isRubySymbolBlock(ctx, i, lo)));
+                (receiver.name.len != 0 or isRubySymbolBlock(ctx, i, lo) or
+                    std.mem.eql(u8, name, "super")));
         if (assignment.read) {
             try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
         }
