@@ -97,13 +97,11 @@ pub const Language = enum {
                 "ICollection", "HashSet",    "Queue",       "Stack",    "Array",
                 "String",      "StringBuilder", "Task",     "Nullable", "Tuple",
             },
-            // Deliberately excludes the deref wrappers (`Box`, `Rc`, `Arc`,
-            // `RefCell`, `Cow`): a call through one lands on the *inner*
-            // type's method, so abstaining there drops a real edge.
             .rust => &.{
                 "Vec",    "VecDeque", "HashMap", "HashSet", "BTreeMap",
                 "BTreeSet", "String", "Option",  "Result",  "Iterator",
-                "str",
+                "str",    "Box",      "Rc",      "Arc",     "RefCell",
+                "Cell",   "Cow",      "Mutex",   "RwLock",
             },
             .python => &.{
                 "dict",  "list",  "set",   "tuple", "str",
@@ -123,6 +121,18 @@ pub const Language = enum {
             .go, .lua, .ruby, .other => &.{},
         };
         for (table) |t| if (std.mem.eql(u8, t, name)) return true;
+        return false;
+    }
+
+    /// Whether `name` is a smart pointer whose members are reached through the
+    /// type it wraps. A call on a value declared `Box<Expr>` dispatches to
+    /// `Expr`'s method, so a *receiver* of this type must not abstain the way an
+    /// opaque container does — but `Box::new` is still the wrapper's own.
+    pub fn derefsToInner(self: Language, name: []const u8) bool {
+        if (self.family() != .rust) return false;
+        for ([_][]const u8{ "Box", "Rc", "Arc", "RefCell", "Cell", "Cow", "Mutex", "RwLock" }) |t| {
+            if (std.mem.eql(u8, t, name)) return true;
+        }
         return false;
     }
 

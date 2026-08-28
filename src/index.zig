@@ -949,8 +949,11 @@ fn resolveOne(idx: *const Index, from: model.Symbol, ref: *model.Reference) void
         }
         ref.target = inheritedMember(idx, from, wanted);
         if (ref.target != invalid) {
-            ref.exact = false;
-            ref.resolution_status = .inferred;
+            // A single declared ancestor declaring the member exactly once
+            // leaves nothing to guess — that is what `super` names.
+            const bases = idx.type_bases.get(from.parent) orelse &.{};
+            ref.exact = bases.len == 1 and memberOfParent(idx, bases[0], wanted).unambiguous;
+            ref.resolution_status = if (ref.exact) .exact else .inferred;
             ref.resolution_reason = .inheritance;
             return;
         }
@@ -1366,7 +1369,8 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         // builtin or third-party container (`List`, `Vec`, `std::vector`,
         // `dict`): `items.add(...)` is that library's method, never a project
         // one. Abstain — the global name match below would invent an edge.
-        if (idx.graph.files[from.file].language.isBuiltinContainer(type_name)) return;
+        const lang = idx.graph.files[from.file].language;
+        if (lang.isBuiltinContainer(type_name) and !lang.derefsToInner(type_name)) return;
         // Known project type without that member (inherited or mixed in): fall
         // through to the heuristic call match below.
     } else if (ref.write) {
@@ -1463,7 +1467,8 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.resolution_reason = .typed_receiver;
             return;
         }
-        if (idx.graph.files[from.file].language.isBuiltinContainer(type_name)) return;
+        const lang = idx.graph.files[from.file].language;
+        if (lang.isBuiltinContainer(type_name) and !lang.derefsToInner(type_name)) return;
     }
 
     // A qualifier that names a standard-library type (`Vec::new`, `Array.from`,
@@ -1593,7 +1598,7 @@ fn heuristicMethodTarget(idx: *const Index, from: model.Symbol, name: []const u8
     return best;
 }
 
-/// Above this many same-named callable candidates, a receiver-unknown call is
+/// Above this many same-named callable candidates, a receiver-unknown call is/// Above this many same-named callable candidates, a receiver-unknown call is
 /// left unresolved instead of heuristically bound (see heuristicMethodTarget).
 const max_heuristic_candidates = 4;
 
@@ -4656,6 +4661,100 @@ test "ruby: attr readers, implicit self, mixins, super and Klass.new resolve" {
     const ctor = refByQual(run, "Item", "new").?;
     try testing.expectEqual(item_init, ctor.target);
     try testing.expect(ctor.exact);
+}
+
+test "ruby: an operator method is a definition, and its body's calls resolve" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "ledger.rb", .data =
+        \\class Ledger
+        \\  def initialize(rows)
+        \\    @rows = rows
+        \\  end
+        \\
+        \\  def rows
+        \\    @rows
+        \\  end
+        \\
+        \\  def +(other)
+        \\    Ledger.new(rows + other.rows)
+        \\  end
+        \\
+        \\  def [](index)
+        \\    rows[index]
+        \\  end
+        \\
+        \\  def <=>(other)
+        \\    0
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    inline for (.{ "+", "[]", "<=>" }) |op| {
+        const id = qualifiedId(&idx, "Ledger", op) orelse return error.MissingOperatorMethod;
+        try testing.expectEqual(model.SymbolKind.method, idx.graph.symbols[id].kind);
+    }
+    // The operator's body is a body like any other: its calls resolve.
+    const plus = idx.graph.symbols[qualifiedId(&idx, "Ledger", "+").?];
+    try testing.expectEqual(qualifiedId(&idx, "Ledger", "rows").?, refByName(plus, "rows").?.target);
+    try testing.expectEqual(qualifiedId(&idx, "Ledger", "initialize").?, refByQual(plus, "Ledger", "new").?.target);
+}
+
+test "rust: a smart-pointer receiver derefs to its inner type, but not as a qualifier" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.rs", .data =
+        \\pub struct Node {
+        \\    child: Box<Node>,
+        \\}
+        \\pub struct Store {
+        \\    items: Vec<u32>,
+        \\}
+        \\impl Node {
+        \\    pub fn label(&self) -> usize {
+        \\        1
+        \\    }
+        \\    pub fn depth(&self) -> usize {
+        \\        self.child.label()
+        \\    }
+        \\}
+        \\impl Store {
+        \\    pub fn new() -> Store {
+        \\        Store { items: Vec::new() }
+        \\    }
+        \\    pub fn len(&self) -> usize {
+        \\        self.items.len()
+        \\    }
+        \\}
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // `child: Box<Node>` derefs, so `self.child.label()` still reaches a method
+    // — abstaining on the wrapper would delete the edge.
+    const depth = idx.graph.symbols[qualifiedId(&idx, "Node", "depth").?];
+    try testing.expectEqual(qualifiedId(&idx, "Node", "label").?, refByQual(depth, "child", "label").?.target);
+
+    // `items: Vec<u32>` does not: `self.items.len()` is the standard library's,
+    // never this project's `Store.len`. Nor does `Vec::new` reach `Store::new`.
+    const store_len = idx.graph.symbols[qualifiedId(&idx, "Store", "len").?];
+    try testing.expectEqual(invalid, refByQual(store_len, "items", "len").?.target);
+    const store_new = idx.graph.symbols[qualifiedId(&idx, "Store", "new").?];
+    try testing.expectEqual(invalid, refByQual(store_new, "Vec", "new").?.target);
 }
 
 test "one-letter names resolve as call sites in every language family" {

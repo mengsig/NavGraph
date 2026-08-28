@@ -4652,6 +4652,14 @@ fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         is_singleton = true;
         j += 2;
     }
+    // `def +(other)`, `def <=>(other)`, `def [](i)`: an operator method's name is
+    // punctuation, not an identifier.
+    if (j < hi and ctx.toks[j].kind == .punct) {
+        if (rubyOperatorName(ctx, j, hi)) |op| {
+            return parseRubyDefBody(ctx, def_i, j, op.name, op.after, hi, parent, is_singleton);
+        }
+        return def_i;
+    }
     if (j >= hi or ctx.toks[j].kind != .identifier) return def_i;
     const name_i = j;
     var name = ctx.textOf(name_i);
@@ -4665,6 +4673,44 @@ fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         name = ctx.source[ctx.toks[name_i].start..ctx.toks[after].end];
         after += 1;
     }
+    return parseRubyDefBody(ctx, def_i, name_i, name, after, hi, parent, is_singleton);
+}
+
+/// The operator method name spelled by the adjacent punctuation run at `i`, and
+/// the token index just past it. Only Ruby's real operator method names match,
+/// so `def` followed by stray punctuation still parses as nothing.
+fn rubyOperatorName(ctx: *const Ctx, i: u32, hi: u32) ?struct { name: []const u8, after: u32 } {
+    const operators = [_][]const u8{
+        "<=>", "===", "[]=", "**", "==", "!=", "<=", ">=", "<<", ">>",
+        "[]",  "=~",  "+@",  "-@", "+",  "-",  "*",  "/",  "%",  "<",
+        ">",   "&",   "|",   "^",  "~",  "!",
+    };
+    var end = i;
+    while (end + 1 < hi and ctx.toks[end + 1].kind == .punct and
+        ctx.toks[end + 1].start == ctx.toks[end].end and end - i < 3) end += 1;
+    // Longest adjacent run first, so `<=>` wins over `<`.
+    var last = end;
+    while (true) {
+        const text = ctx.source[ctx.toks[i].start..ctx.toks[last].end];
+        for (operators) |op| {
+            if (std.mem.eql(u8, op, text)) return .{ .name = text, .after = last + 1 };
+        }
+        if (last == i) return null;
+        last -= 1;
+    }
+}
+
+fn parseRubyDefBody(
+    ctx: *Ctx,
+    def_i: u32,
+    name_i: u32,
+    name: []const u8,
+    params_i: u32,
+    hi: u32,
+    parent: ?u32,
+    is_singleton: bool,
+) AllocError!u32 {
+    var after = params_i;
     if (ctx.isPunct(after, '(')) {
         const pc = ctx.close[after];
         if (pc == sentinel) return def_i;
