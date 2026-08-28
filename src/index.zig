@@ -2284,7 +2284,7 @@ test "go: a member call through a struct field of declared type resolves by type
     // reference keeps only `store` as the qualifier, so the declaring struct's
     // field table is the receiver's only type evidence.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const store_get = qualifiedId(&idx, "Store", "Get").?;
@@ -2305,7 +2305,7 @@ test "go: a call never binds to a type that shares the package-qualified name" {
     // Regression (F-9): `a.store.Stats()` bound to `struct Stats` — the type,
     // not the method — and was not flagged, so `--strict` kept it.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const stats_struct = idx.lookup("Stats")[0];
@@ -2373,7 +2373,7 @@ test "go: a shadowing local and another struct's field both beat the field table
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const store_get = qualifiedId(&idx, "Store", "Get").?;
@@ -2426,7 +2426,7 @@ test "cpp: a same-named field on another class never yields a wrong exact edge" 
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const cache_get = qualifiedId(&idx, "Cache", "get").?;
@@ -2471,7 +2471,7 @@ test "python: a same-named attribute on another object never yields a wrong exac
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const cache_get = qualifiedId(&idx, "Cache", "get").?;
@@ -2509,7 +2509,7 @@ test "a call through a function-valued const keeps its edge" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const alias = qualifiedId(&idx, "Holder", "alias").?;
@@ -2524,7 +2524,7 @@ test "an express sub-router mount keeps its router handler" {
     // Regression (F2): `app.use('/admin', adminRouter)` mounts a router held in
     // a `const`; deleting calls to values dropped the handler entirely.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/js_express", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/js_express", false, .auto);
     defer idx.deinit();
 
     var checked = false;
@@ -2567,7 +2567,7 @@ test "c: a modifier-only declarator still shadows a same-named global" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const probe = idx.graph.symbols[idx.lookup("probe")[0]];
@@ -2605,7 +2605,7 @@ test "cpp: an `auto` local shadows a same-named global" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const draw = idx.graph.symbols[idx.lookup("draw")[0]];
@@ -2620,7 +2620,7 @@ test "go: a composite-literal field key is not a reference to a same-named packa
     // Regression (F5): `return &API{store: s}` bound the field key `store` to
     // the imported package `store`.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const new_api = idx.graph.symbols[idx.lookup("NewAPI")[0]];
@@ -2634,7 +2634,7 @@ test "go: a package-qualified type conversion is a type use, never a call" {
     // re-opened the exact-call-to-a-type class the PR was blocked for. The edge
     // is kept, reclassified.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/go_service", false, .auto);
     defer idx.deinit();
 
     const widget_id = idx.lookup("WidgetID")[0];
@@ -2662,7 +2662,7 @@ test "a package/namespace clause is never an exact reference target" {
     // stand-in — real evidence, but not something `--strict` should follow.
     const testing = std.testing;
     for ([_][]const u8{ "testenv/go_service", "testenv/cpp_app" }) |root| {
-        var idx = try build(testing.allocator, testing.io, root, false);
+        var idx = try build(testing.allocator, testing.io, root, false, .auto);
         defer idx.deinit();
 
         var seen: u32 = 0;
@@ -2791,7 +2791,7 @@ test "go: a local shadowing a package wins, and no call binds to a type" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const Case = struct {
@@ -2870,7 +2870,7 @@ test "go: a local shadowing a package wins, and no call binds to a type" {
 test "cpp: a member call through a typed pointer resolves to that type's method" {
     // Regression (F-9): `for (const Shape* s : shapes) s->area()`.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/cpp_app", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/cpp_app", false, .auto);
     defer idx.deinit();
 
     const shape_area = qualifiedId(&idx, "Shape", "area").?;
@@ -2896,7 +2896,7 @@ test "lua: a colon method call records its receiver and keeps the edge" {
     // Regression (F-9): `world:step(dt)` lost its qualifier entirely, so the
     // member call fell into bare resolution and was dropped.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/lua_game", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/lua_game", false, .auto);
     defer idx.deinit();
 
     const step = qualifiedId(&idx, "Game", "step").?;
@@ -2947,7 +2947,7 @@ test "an unknown receiver still abstains when many same-named members exist" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const a_deinit = qualifiedId(&idx, "A", "deinit").?;
@@ -3425,7 +3425,7 @@ fn javaInheritanceBuildMs(tmp: *std.testing.TmpDir, groups: usize, per_group: us
     var rep: usize = 0;
     while (rep < perf_reps) : (rep += 1) {
         const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        var idx = try build(testing.allocator, io, root, false);
+        var idx = try build(testing.allocator, io, root, false, .auto);
         defer idx.deinit();
         const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started, std.time.ns_per_ms);
         best_ms = @min(best_ms, @as(i64, @intCast(elapsed_ms)));
@@ -3512,7 +3512,7 @@ test "the precomputed Java supertype table records declared bases only" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const sub = idx.lookup("Sub")[0];
@@ -3571,7 +3571,7 @@ test "checked-in Rust corpus: `use` bindings keep their cross-file call edges" {
     // Regression: the non-local-import guard fired on Rust `use` bindings, which
     // the indexer does not model, deleting every Rust cross-file call edge.
     const testing = std.testing;
-    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false);
+    var idx = try build(testing.allocator, testing.io, "testenv/rust_cli", false, .auto);
     defer idx.deinit();
 
     const run = idx.lookup("run")[0];
@@ -3602,7 +3602,7 @@ test "a JS import binding still blocks the global-name fallback" {
 
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var idx = try build(testing.allocator, io, root, false);
+    var idx = try build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
 
     const local_run = idx.lookup("run")[0];
