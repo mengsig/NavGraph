@@ -3399,11 +3399,10 @@ test "navgraph/importers honors an explicit limit and reports truncated" {
     defer ts.deinit();
     try ts.start();
 
-    // Both `a.zig` and `b.zig` import `shared.zig`; only `shared.zig` (and
-    // trivially `a.zig`/`b.zig`, which import nothing) match the filter, but
-    // the *files listed* cap still applies across all 3.
+    // `path:".zig"` matches all 3 files; the *files listed* cap applies
+    // across all of them regardless of whether each one has an importer.
     var capped = try ts.request(88,
-        \\{"jsonrpc":"2.0","id":88,"method":"navgraph/importers","params":{"limit":1}}
+        \\{"jsonrpc":"2.0","id":88,"method":"navgraph/importers","params":{"path":".zig","limit":1}}
     );
     defer capped.deinit();
     const capped_r = (try resultOf(capped)).object;
@@ -3411,7 +3410,7 @@ test "navgraph/importers honors an explicit limit and reports truncated" {
     try testing.expect(capped_r.get("truncated").?.bool);
 
     var full = try ts.request(89,
-        \\{"jsonrpc":"2.0","id":89,"method":"navgraph/importers","params":{}}
+        \\{"jsonrpc":"2.0","id":89,"method":"navgraph/importers","params":{"path":".zig"}}
     );
     defer full.deinit();
     const full_r = (try resultOf(full)).object;
