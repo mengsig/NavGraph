@@ -1197,12 +1197,22 @@ fn buildTypeBaseTable(idx: *Index) !void {
             }
         }
         if (bases.items.len == 0) continue;
-        // Ascending, deduped: the scan this replaces visited candidate bases in
-        // symbol-id order and took the first that resolved the member.
-        std.mem.sort(SymbolId, bases.items, {}, std.sort.asc(SymbolId));
+        if (ruby) {
+            // Ruby's MRO searches the LAST `include` first, then earlier ones,
+            // then the superclass — the exact reverse of the order
+            // `RubyBaseIterator` yields, and determinable from the source.
+            // Sorting by symbol id instead made the first-declared module win.
+            std.mem.reverse(SymbolId, bases.items);
+        } else {
+            // Ascending: the scan this replaces visited candidate bases in
+            // symbol-id order and took the first that resolved the member.
+            std.mem.sort(SymbolId, bases.items, {}, std.sort.asc(SymbolId));
+        }
+        // Order-preserving dedup: a class may name the same base twice, and the
+        // ruby order above is not sorted, so an adjacent-only check would miss.
         var unique: usize = 0;
         for (bases.items) |id| {
-            if (unique != 0 and bases.items[unique - 1] == id) continue;
+            if (std.mem.indexOfScalar(SymbolId, bases.items[0..unique], id) != null) continue;
             bases.items[unique] = id;
             unique += 1;
         }
@@ -4893,6 +4903,61 @@ test "ruby: super never crosses a mixin's reverse includer edge" {
     }
 }
 
+test "ruby: two mixins declaring the same method resolve in MRO order" {
+    // Regression (merge-gate F8): base lists were sorted by symbol id, so the
+    // module declared FIRST won regardless of include order. Ruby searches the
+    // last `include` first, then earlier ones, then the superclass — and that
+    // order is right there in the source.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\module MixA
+        \\  def render
+        \\    "mixa"
+        \\  end
+        \\end
+        \\
+        \\module MixB
+        \\  def render
+        \\    "mixb"
+        \\  end
+        \\end
+        \\
+        \\class Parent
+        \\  def render
+        \\    "parent"
+        \\  end
+        \\end
+        \\
+        \\class TwoMix < Parent
+        \\  include MixA
+        \\  include MixB
+        \\
+        \\  def render
+        \\    super
+        \\  end
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const render = idx.graph.symbols[qualifiedId(&idx, "TwoMix", "render").?];
+    try testing.expectEqual(qualifiedId(&idx, "MixB", "render").?, refByName(render, "super").?.target);
+
+    // MRO order end to end: MixB, MixA, then the superclass.
+    const bases = idx.type_bases.get(idx.lookup("TwoMix")[0]).?;
+    try testing.expectEqual(@as(usize, 3), bases.len);
+    try testing.expectEqual(idx.lookup("MixB")[0], bases[0]);
+    try testing.expectEqual(idx.lookup("MixA")[0], bases[1]);
+    try testing.expectEqual(idx.lookup("Parent")[0], bases[2]);
+}
+
 test "ruby: a module method still dispatches into the class that includes it" {
     // The one legitimate use of the reverse edge, and the only one:
     // `Mix#describe` calls `label`, which only the includer defines. Splitting
@@ -5151,6 +5216,62 @@ test "cpp: unique_ptr/shared_ptr receivers deref to their inner type, but a raw 
     // guessing a same-named project method.
     const go_pool = idx.graph.symbols[qualifiedId(&idx, "Car", "goPool").?];
     try testing.expectEqual(invalid, refByQual(go_pool, "pool_", "start").?.target);
+}
+
+test "cpp: an optional receiver derefs like a smart pointer; the wrapper's own members do not" {
+    // Regression (merge-gate F9): `optional` was left in `isBuiltinContainer`
+    // but out of `derefsToInner`, so `opt_->spin()` abstained where the wave's
+    // base bound it correctly. `operator->` on `std::optional` reaches the
+    // contained value exactly as `unique_ptr` does.
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.hpp", .data =
+        \\class Derived {
+        \\public:
+        \\    int spin() { return 2; }
+        \\};
+        \\class Decoy {
+        \\public:
+        \\    int spin() { return 99; }
+        \\    int reset() { return 98; }
+        \\};
+        \\class Holder {
+        \\    std::optional<Derived> opt_;
+        \\    std::unique_ptr<Derived> u_;
+        \\    std::vector<Derived> pool_;
+        \\public:
+        \\    int goOptional() { return opt_->spin(); }
+        \\    int goVector() { return pool_.spin(); }
+        \\    int wrapperReset() { return u_.reset(); }
+        \\};
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const go_optional = idx.graph.symbols[qualifiedId(&idx, "Holder", "goOptional").?];
+    try testing.expectEqual(
+        qualifiedId(&idx, "Derived", "spin").?,
+        refByQual(go_optional, "opt_", "spin").?.target,
+    );
+
+    // An opaque container still abstains rather than guessing `Decoy.spin`.
+    const go_vector = idx.graph.symbols[qualifiedId(&idx, "Holder", "goVector").?];
+    try testing.expectEqual(invalid, refByQual(go_vector, "pool_", "spin").?.target);
+
+    // The gap `derefsToInner`'s doc comment now records instead of denying: a
+    // call to the WRAPPER's own member is not guarded, so it still reaches a
+    // same-named project method by the global-name guess. Pinned so a future
+    // change to that behaviour is a decision, not a surprise.
+    const wrapper_reset = idx.graph.symbols[qualifiedId(&idx, "Holder", "wrapperReset").?];
+    const reset = refByQual(wrapper_reset, "u_", "reset").?;
+    try testing.expectEqual(qualifiedId(&idx, "Decoy", "reset").?, reset.target);
+    try testing.expect(!reset.exact);
 }
 
 test "one-letter names resolve as call sites in every language family" {

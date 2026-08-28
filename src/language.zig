@@ -124,18 +124,23 @@ pub const Language = enum {
         return false;
     }
 
-    /// Whether `name` is a smart pointer whose members are reached through the
-    /// type it wraps. A call on a value declared `Box<Expr>` dispatches to
-    /// `Expr`'s method, so a *receiver* of this type must not abstain the way an
-    /// opaque container does — but `Box::new` is still the wrapper's own. C++
-    /// `unique_ptr`/`shared_ptr`/`weak_ptr` dispatch through their pointee the
-    /// same way; both stay in `isBuiltinContainer` too, so the wrapper's own
-    /// members (`reset`, `get`, `lock`, ...) still never bind to a same-named
-    /// project method unless a project method of that exact name exists.
+    /// Whether `name` is a wrapper whose members are reached through the type
+    /// it wraps. A call on a value declared `Box<Expr>` dispatches to `Expr`'s
+    /// method, so a *receiver* of this type must not abstain the way an opaque
+    /// container does — but `Box::new` is still the wrapper's own. C++
+    /// `unique_ptr`/`shared_ptr`/`weak_ptr` and `optional` reach their pointee
+    /// through `operator->` the same way.
+    ///
+    /// Known gap: these names stay in `isBuiltinContainer` for the qualifier
+    /// side, but the receiver-side abstain there is `isBuiltinContainer and
+    /// !derefsToInner`, so it never fires for them. A call to the WRAPPER's own
+    /// member (`u_.reset()`, `w_.lock()`) therefore still reaches a same-named
+    /// project method by the global-name guess, exactly as before this table
+    /// existed.
     pub fn derefsToInner(self: Language, name: []const u8) bool {
         const table: []const []const u8 = switch (self.family()) {
             .rust => &.{ "Box", "Rc", "Arc", "RefCell", "Cell", "Cow", "Mutex", "RwLock" },
-            .c => &.{ "unique_ptr", "shared_ptr", "weak_ptr" },
+            .c => &.{ "unique_ptr", "shared_ptr", "weak_ptr", "optional" },
             else => return false,
         };
         for (table) |t| if (std.mem.eql(u8, t, name)) return true;
