@@ -93,7 +93,7 @@ disappears again when the buffer is closed.
 | `-32700` | A frame body that is not JSON, or a frame the server could not parse. The server resyncs and keeps serving. |
 | `-32600` | Not a JSON-RPC request, or a request before `initialized`. |
 | `-32601` | Unknown method. |
-| `-32602` | Bad params: a missing/ill-typed field, an unknown `direction` or `tests` scope, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. |
+| `-32602` | Bad params: a missing required field, an ill-typed *required* field, an unknown `direction` or `tests` scope, a grep pattern that will not compile or is too long or too deeply nested, an unindexed file. An ill-typed *optional* field (e.g. `{"strict":"yes"}`) falls back to its default instead of erroring. |
 | `-32603` | Internal failure (allocation, IO). |
 | `-32001` | A `Target` that resolves to nothing — `{"code": -32001, "message": "…: symbol not found"}`. An error object never carries `data`. |
 | `-32002` | The request could not be completed: a grep regex that exhausts one of the bounds below, or a `navgraph/diff` / `{ref}` target whose `git diff` failed (bad ref, no git tree, git unavailable). |
