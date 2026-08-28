@@ -758,37 +758,129 @@ pub const ContextInclude = struct {
 };
 
 pub const ContextOptions = struct {
-    /// Rough token budget; sections drop in order (bodies, tests, types,
-    /// callees — callers never drop) until the estimate fits, or nothing is
-    /// left to drop.
+    /// Rough token budget: sections drop in order (body, tests, types,
+    /// callees), then `callers` itself is capped to fit whatever budget is
+    /// left — highest-value first (the definition/signature always survive;
+    /// an exact call edge outranks a heuristic one), never capped to zero
+    /// while any caller exists (B2).
     budget: u32 = 2000,
     include: ContextInclude = .{},
+    /// Page start within the (priority-ordered) `callers` list — pairs with
+    /// the response's `next` for continuation past a capped list (B1).
+    offset: u32 = 0,
 };
 
 /// A rough tokens-from-characters estimate (~4 chars/token), the same order
 /// of magnitude every major tokenizer lands near for source code. Exactness
 /// is not the point — it only has to shrink monotonically as sections drop.
-fn estimateTokens(chars: usize) u32 {
-    return @intCast((chars + 3) / 4);
+fn estimateTokens(chars: u64) u32 {
+    return @intCast(@min((chars + 3) / 4, std.math.maxInt(u32)));
 }
 
-fn sigCharsSum(idx: *const Index, ids: []const SymbolId) usize {
-    var total: usize = 0;
-    for (ids) |id| {
-        const sym = idx.graph.symbols[id];
-        total += sym.signature(idx.graph.files[sym.file].text).len;
+/// The fields `writeContext` shares between measuring a candidate response
+/// (into a `Writer.Discarding` sink) and writing the real one — one
+/// implementation, so the byte count driving `budget` can never drift from
+/// what actually goes on the wire (M3: the old estimate counted only
+/// signature characters, missing 87% of the emitted payload).
+const ContextFields = struct {
+    id: SymbolId,
+    sym: Symbol,
+    definition_text: []const u8,
+    sig: []const u8,
+    doc: []const u8,
+    callers: []const SymbolId,
+    callees: []const SymbolId,
+    types: []const SymbolId,
+    tests_list: []const SymbolId,
+};
+
+fn writeContextFields(w: *Writer, ctx: Ctx, f: ContextFields) !void {
+    try w.writeAll("{\"symbol\":");
+    try payload.writeSymbolId(w, ctx, f.id);
+    try w.writeAll(",\"definition\":{\"text\":");
+    try payload.writeString(w, f.definition_text);
+    try w.writeAll(",\"range\":");
+    try payload.writeDefRange(w, ctx, f.sym);
+    try w.writeAll("},\"signature\":");
+    try payload.writeCollapsed(w, f.sig);
+    if (f.doc.len != 0) {
+        try w.writeAll(",\"doc\":");
+        try payload.writeString(w, f.doc);
     }
-    return total;
+    try w.writeAll(",\"callers\":");
+    try payload.writeSymbolArray(w, ctx, f.callers);
+    try w.writeAll(",\"callees\":");
+    try payload.writeSymbolArray(w, ctx, f.callees);
+    try w.writeAll(",\"types\":");
+    try payload.writeSymbolArray(w, ctx, f.types);
+    try w.writeAll(",\"tests\":");
+    try payload.writeSymbolArray(w, ctx, f.tests_list);
+}
+
+/// The real, honest byte count of `f` as `writeContextFields` actually
+/// renders it (everything but the trailing `truncated`/`tokensEstimate`/
+/// `callersTotal`/`next`, whose own few bytes are immaterial next to the
+/// symbol payloads being budgeted).
+fn contextFieldBytes(ctx: Ctx, f: ContextFields) !u64 {
+    var buf: [256]u8 = undefined;
+    var discarding: Writer.Discarding = .init(&buf);
+    try writeContextFields(&discarding.writer, ctx, f);
+    return discarding.fullCount();
+}
+
+/// The real byte count of one `Symbol` as `payload.writeSymbolId` renders it.
+fn symbolBytes(ctx: Ctx, id: SymbolId) !u64 {
+    var buf: [256]u8 = undefined;
+    var discarding: Writer.Discarding = .init(&buf);
+    try payload.writeSymbolId(&discarding.writer, ctx, id);
+    return discarding.fullCount();
+}
+
+/// Caller priority for capping under budget: an exact call edge outranks a
+/// heuristic one ("closer" — the same exact-over-heuristic tie-break
+/// `locate`/`blast`'s neighbour walk already use). `std.mem.sort` is stable,
+/// so equal-priority callers keep `idx.callersOf`'s original relative order.
+const CallerPriority = struct {
+    idx: *const Index,
+    target: SymbolId,
+
+    fn lessThan(self: CallerPriority, a: SymbolId, b: SymbolId) bool {
+        const a_exact = query.hasExactEdge(self.idx, a, self.target);
+        const b_exact = query.hasExactEdge(self.idx, b, self.target);
+        return a_exact and !b_exact;
+    }
+};
+
+/// How many of `ordered[offset..]` fit within `remaining_bytes`, greedily in
+/// priority order. Never returns 0 when the page has at least one caller to
+/// offer, even over budget: `callers` is never dropped to nothing (B2), it is
+/// capped — a `budget:1` caller still learns who calls this symbol, just not
+/// all of them.
+fn fitCallers(ctx: Ctx, ordered: []const SymbolId, offset: u32, remaining_bytes: u64) !usize {
+    const page = ordered[@min(@as(usize, offset), ordered.len)..];
+    var shown: usize = 0;
+    var used: u64 = 0;
+    for (page) |id| {
+        const item_bytes = try symbolBytes(ctx, id) + (if (shown != 0) @as(u64, 1) else 0);
+        if (used + item_bytes > remaining_bytes and shown != 0) break;
+        used += item_bytes;
+        shown += 1;
+    }
+    return shown;
 }
 
 /// `navgraph/context`: everything an editing agent typically needs about one
 /// symbol in a single call — definition, callers/callees, related types, and
-/// covering tests — trimmed to `opts.budget` tokens by dropping, in order,
-/// the body (falling back to the signature alone), then tests, then types,
-/// then callees; callers are never dropped. `types` is best-effort: a
-/// container's declared supertypes, or (for a function/method) the resolved
-/// types of its own typed bindings — the same name-based binding scan
-/// `navgraph/types`'s `users` uses, so it shares that scan's limitations.
+/// covering tests — trimmed to `opts.budget` tokens. Sections drop in order:
+/// the body (falling back to the bare signature), then tests, then types,
+/// then callees; `callers` is never dropped as a section, but — unlike the
+/// others — it is count-capped to whatever budget remains once the rest is
+/// settled (B2), highest-priority callers first (`CallerPriority`), with a
+/// floor of one shown whenever any exist. `callersTotal`/`next` (B1) report
+/// the true count and a continuation past a capped list. `types` is
+/// best-effort: a container's declared supertypes, or (for a function/method)
+/// the resolved types of its own typed bindings — the same name-based binding
+/// scan `navgraph/types`'s `users` uses, so it shares that scan's limitations.
 pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, opts: ContextOptions) !void {
     const idx = ctx.index();
     const sym = idx.graph.symbols[id];
@@ -844,22 +936,29 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
         }
     }
 
-    // Level 0 keeps everything `include` allows; each higher level drops one
-    // more section, in the contract's stated order. A section `include`
-    // excludes stays dropped at every level (F5) — the mask applies before
-    // budget trimming. Stop at the first level that fits, or the last if none does.
+    // Level 0 keeps every section `include` allows, at full size (`callers`
+    // uncapped); each higher level drops one more, in the contract's stated
+    // order. A section `include` excludes stays dropped at every level (F5).
+    // Stop at the first level that fits, or the last if none does — measured
+    // in real emitted bytes (M3), not a signature-only approximation.
     var level: u32 = 0;
-    var chars: usize = 0;
+    var chars: u64 = 0;
     while (true) : (level += 1) {
         const with_body = level < 1 and opts.include.body;
         const with_tests = level < 2 and opts.include.tests;
         const with_types = level < 3 and opts.include.types;
         const with_callees = level < 4 and opts.include.callees;
-        chars = doc.len + (if (with_body) body_text.len else sig.len);
-        if (opts.include.callers) chars += sigCharsSum(idx, callers);
-        if (with_callees) chars += sigCharsSum(idx, callees.items);
-        if (with_types) chars += sigCharsSum(idx, types.items);
-        if (with_tests) chars += sigCharsSum(idx, tests_list.items);
+        chars = try contextFieldBytes(ctx, .{
+            .id = id,
+            .sym = sym,
+            .definition_text = if (with_body) body_text else sig,
+            .sig = sig,
+            .doc = doc,
+            .callers = callers,
+            .callees = if (with_callees) callees.items else &.{},
+            .types = if (with_types) types.items else &.{},
+            .tests_list = if (with_tests) tests_list.items else &.{},
+        });
         if (estimateTokens(chars) <= opts.budget or level >= 4) break;
     }
     const with_body = level < 1 and opts.include.body;
@@ -867,27 +966,62 @@ pub fn writeContext(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, id: SymbolId, 
     const with_types = level < 3 and opts.include.types;
     const with_callees = level < 4 and opts.include.callees;
 
-    try w.writeAll("{\"symbol\":");
-    try payload.writeSymbolId(w, ctx, id);
-    try w.writeAll(",\"definition\":{\"text\":");
-    try payload.writeString(w, if (with_body) body_text else sig);
-    try w.writeAll(",\"range\":");
-    try payload.writeDefRange(w, ctx, sym);
-    try w.writeAll("},\"signature\":");
-    try payload.writeCollapsed(w, sig);
-    if (doc.len != 0) {
-        try w.writeAll(",\"doc\":");
-        try payload.writeString(w, doc);
-    }
-    try w.writeAll(",\"callers\":");
-    try payload.writeSymbolArray(w, ctx, callers);
-    try w.writeAll(",\"callees\":");
-    try payload.writeSymbolArray(w, ctx, if (with_callees) callees.items else &.{});
-    try w.writeAll(",\"types\":");
-    try payload.writeSymbolArray(w, ctx, if (with_types) types.items else &.{});
-    try w.writeAll(",\"tests\":");
-    try payload.writeSymbolArray(w, ctx, if (with_tests) tests_list.items else &.{});
-    try w.print(",\"truncated\":{},\"tokensEstimate\":{d}}}", .{ level > 0, estimateTokens(chars) });
+    // `callers` is never dropped as a whole section, but at this point it may
+    // still be the sole reason the response overshoots `budget` (B2) — cap it
+    // to whatever room is left once every other section has settled.
+    const ordered_callers: []SymbolId = if (opts.include.callers) blk: {
+        const buf = try gpa.dupe(SymbolId, callers);
+        std.mem.sort(SymbolId, buf, CallerPriority{ .idx = idx, .target = id }, CallerPriority.lessThan);
+        break :blk buf;
+    } else &.{};
+    defer if (opts.include.callers) gpa.free(ordered_callers);
+
+    const base_bytes = try contextFieldBytes(ctx, .{
+        .id = id,
+        .sym = sym,
+        .definition_text = if (with_body) body_text else sig,
+        .sig = sig,
+        .doc = doc,
+        .callers = &.{},
+        .callees = if (with_callees) callees.items else &.{},
+        .types = if (with_types) types.items else &.{},
+        .tests_list = if (with_tests) tests_list.items else &.{},
+    });
+    const byte_budget = @as(u64, opts.budget) * 4;
+    const remaining: u64 = if (byte_budget > base_bytes) byte_budget - base_bytes else 0;
+    const shown_count = if (opts.include.callers) try fitCallers(ctx, ordered_callers, opts.offset, remaining) else 0;
+    const callers_start = @min(@as(usize, opts.offset), ordered_callers.len);
+    const callers_page = ordered_callers[callers_start .. callers_start + shown_count];
+    const callers_total = callers.len;
+    const shown_end = @as(usize, opts.offset) + shown_count;
+    const next: ?usize = if (opts.include.callers and shown_end < callers_total) shown_end else null;
+
+    const fields: ContextFields = .{
+        .id = id,
+        .sym = sym,
+        .definition_text = if (with_body) body_text else sig,
+        .sig = sig,
+        .doc = doc,
+        .callers = callers_page,
+        .callees = if (with_callees) callees.items else &.{},
+        .types = if (with_types) types.items else &.{},
+        .tests_list = if (with_tests) tests_list.items else &.{},
+    };
+    // M4: `truncated` fires only when something `include` actually asked for
+    // was actually dropped — a section cut by the ladder, or `callers`
+    // capped/paged past what this response shows. An `include` mask that
+    // never asked for a section is not truncation.
+    const truncated = (opts.include.body and !with_body) or
+        (opts.include.tests and !with_tests) or
+        (opts.include.types and !with_types) or
+        (opts.include.callees and !with_callees) or
+        (next != null);
+
+    try writeContextFields(w, ctx, fields);
+    try w.print(",\"callersTotal\":{d},\"next\":", .{callers_total});
+    if (next) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
+    const final_bytes = try contextFieldBytes(ctx, fields);
+    try w.print(",\"truncated\":{},\"tokensEstimate\":{d}}}", .{ truncated, estimateTokens(final_bytes) });
 }
 
 /// Iterate a symbol's graph neighbours in one direction, applying the same

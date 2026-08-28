@@ -1013,7 +1013,11 @@ fn contextMethod(self: *Server, arena: std.mem.Allocator, params: ?std.json.Valu
     const target = try targetOf(self, arena, p);
     const roots = try resolveTargetOrErr(self, arena, c, target);
     const include = try includeOf(p);
-    try queries.writeContext(w, arena, c, roots[0], .{ .budget = try p.positive("budget", 2000), .include = include });
+    try queries.writeContext(w, arena, c, roots[0], .{
+        .budget = try p.positive("budget", 2000),
+        .include = include,
+        .offset = try p.positive("offset", 0),
+    });
 }
 
 /// `include?:("callers"|"callees"|"types"|"tests"|"body")[]` — absent means
