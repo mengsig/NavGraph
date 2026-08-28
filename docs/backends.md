@@ -15,11 +15,18 @@ one of:
   used cleanly.
 - **`tree-sitter`** (`src/ts_backend.zig`) — hand-written `extern fn` bindings
   to the tree-sitter C runtime (no `@cImport`), one `Compiled` holder per
-  language (parser + compiled queries built once per process and reused across
-  files — compiling a query per file measured 37x slower). NavGraph-owned query
-  sets live under `src/queries/<lang>/{defs,refs,locals}.scm` and are embedded
-  with `@embedFile` (which cannot escape the module root, hence `src/queries/`
+  language (parser + compiled queries). NavGraph-owned query sets live under
+  `src/queries/<lang>/{defs,refs,locals}.scm` and are embedded with
+  `@embedFile` (which cannot escape the module root, hence `src/queries/`
   rather than a repo-root `queries/`).
+
+`backends.Registry` owns the compiled grammars and `backends.Parsing` pairs it
+with the `--backend` choice; the two travel together through `index.collect`
+and `index.parseOne`. The Registry's lifetime is the *process* (one CLI run) or
+the *session* (`navgraph lsp`, `serve`) — never one build and never one file.
+Compiling a query walks the whole grammar, so per-file compilation measured 37x
+slower, and per-build compilation would charge an editor session that cost on
+every keystroke's re-index (fixed costs measured below).
 
 Both backends fill the same `ParsedSymbol` shape, so `index.zig`, `query.zig`,
 `json_out.zig`, and the CLI never know which one ran.
@@ -27,9 +34,23 @@ Both backends fill the same `ParsedSymbol` shape, so `index.zig`, `query.zig`,
 ### Owner table
 
 `src/backends.zig`'s `owner_table` names, per `Language`, which backend `auto`
-mode uses. Every entry is `.heuristic` today: linking a grammar (`-Dtree-sitter`)
-makes tree-sitter *available* (`--backend tree-sitter`), it does not silently
-change what `auto` extracts.
+mode uses:
+
+| language | owner under `auto` |
+| --- | --- |
+| python, typescript, tsx | tree-sitter |
+| every other language | heuristic |
+
+Python, TypeScript and TSX are promoted because the grammar reads what a token
+scan cannot and `zig build bench` proves it: against the hand-verified golden
+corpora, definition recall went 91.14 → 96.87 (python) and 58.19 → 89.34
+(typescript), edge precision 93.07 → 98.40 (python), and exact agreement
+73.55 → 80.48 (python) and 84.61 → 97.14 (typescript), with no metric of either
+language falling. `docs/accuracy.md`'s "Tree-sitter promotion" section has the
+full table and what moved each number.
+
+For every other language, linking a grammar (`-Dtree-sitter`) makes tree-sitter
+*available* (`--backend tree-sitter`); it does not change what `auto` extracts.
 
 ### `--backend` flag
 
@@ -42,7 +63,8 @@ change what `auto` extracts.
   links no grammar at all (`-Dtree-sitter=none`), rather than silently serving
   heuristic output under a tree-sitter flag.
 
-`serve` accepts it too, and the session reuses the choice across reloads.
+`serve` and `lsp` accept it too, and each session reuses both the choice and
+its compiled grammars across every reload and re-index.
 
 The on-disk cache is keyed on the backend that produced each entry, so
 `--backend` decides the same thing warm as it does with `--no-cache`. A cached
@@ -52,9 +74,11 @@ heuristic-parsed *on purpose*, so its entry answers for `tree-sitter` and not
 for `heuristic`. Switching backends therefore costs one full re-parse and
 rewrites the cache (measured below).
 
-No LSP server exists on this branch yet. When one is added, the intended hook
-is an `initializationOptions.backend` field mirroring this same enum — `--backend`
-and the hook should share `Choice.fromName` rather than duplicating the parse.
+`navgraph lsp` takes `--backend` on the command line and builds one Registry
+per `session.Session`, so an edit-driven re-index reuses the grammars compiled
+at startup. An `initializationOptions.backend` field mirroring this same enum
+is the remaining hook; it should share `Choice.fromName` rather than
+duplicating the parse.
 
 ### Fallback rule and `ParseHealth`
 
@@ -129,10 +153,15 @@ passing first:
    introduces no unreviewed `exact=true` edge, over the fixture trees
    (`testenv/py_fastapi`, `testenv/ts_frontend`, `testenv/fullstack`,
    `testenv/parser_gaps`).
-2. The bench numbers below (or their equivalent for the language being
-   promoted) — a 10-13x cold-parse regression is accepted for python (measured
-   below); re-measure before promoting a language with different grammar cost.
-3. The differ's `exported`, `receiver_root` and attribution-cost assertions,
+2. `zig build bench` — every metric of the language being promoted rises or
+   holds against `tests/golden/floors.json`, and the raised floors ship in the
+   same commit (`--update-floors`, which never lowers one). A metric that drops
+   is the finding: either a real regression or a golden-vs-backend disagreement
+   to adjudicate against the corpus, in writing, in `docs/accuracy.md`.
+3. The cost numbers below — the per-process query-compile cost is paid by every
+   CLI invocation touching that language, so re-measure before promoting a
+   language with a different grammar cost.
+4. The differ's `exported`, `receiver_root` and attribution-cost assertions,
    which are what make "the resolver behaves the same" more than a claim.
 
 ## Offline builds
@@ -227,6 +256,26 @@ Takeaways:
 
 The corpus is regenerated per measurement run rather than checked in; the
 table here is the record.
+
+### What the promoted default costs
+
+With python/typescript/tsx owned by tree-sitter, `auto` pays one query-compile
+per language a run actually touches. It is a *fixed, per-process* cost, not
+per file: measured by indexing a single one-line file of each language,
+best-of-15 wall-clock, `-Doptimize=ReleaseFast -Dtree-sitter=all`.
+
+| single-file target | heuristic | auto (tree-sitter) | fixed cost |
+| --- | --- | --- | --- |
+| one `.py` | 1.4ms | 14.3ms | ~13ms |
+| one `.ts` | 0.9ms | 70.5ms | ~70ms |
+| one `.tsx` | 1.2ms | 63.7ms | ~63ms |
+
+The TypeScript and TSX query sets are far larger than Python's, and tsx is a
+separate generated grammar rather than a mode of typescript, so a run touching
+both `.ts` and `.tsx` pays both. This is the cost the Registry's lifetime
+exists to bound: a `navgraph lsp` session pays it once at startup, not on every
+re-index, and a warm-cache CLI run skips the parse entirely (`testenv` warm:
+7.6ms heuristic, 9.8ms auto).
 
 ## Cross-compile matrix
 

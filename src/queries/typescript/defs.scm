@@ -16,6 +16,8 @@
 (method_definition "static" @mod.static name: (property_identifier) @name) @def.method
 (method_definition "get" @mod.getter name: (property_identifier) @name) @def.method
 (method_definition "set" @mod.setter name: (property_identifier) @name) @def.method
+; An interface's method is a method, not a field: one pattern only, so the kind
+; never depends on which of two overlapping patterns the cursor reports first.
 (method_signature name: (property_identifier) @name) @def.method
 (abstract_method_signature name: (property_identifier) @name @mod.abstract) @def.method
 
@@ -48,36 +50,41 @@
   left: (member_expression object: (this) @recv property: (property_identifier) @name) @def.field
   right: (_) @init)
 
-; Interface members and type-literal members — zero of these reach the index
-; through the heuristic scanner.
+; Interface members — zero of these reach the index through the heuristic
+; scanner. Scoped to the interface body on purpose: the members of a type
+; alias's object type (`type Event = { kind: … } | …`) are structure, not
+; declarations a qualified name can address.
 (interface_declaration name: (type_identifier) @name) @def.interface
-(property_signature name: (property_identifier) @name) @def.field
-(property_signature
-  name: (property_identifier) @name
-  type: (type_annotation (_) @type)) @def.field
-(method_signature name: (property_identifier) @name) @def.field
+(interface_body (property_signature name: (property_identifier) @name) @def.field)
+(interface_body
+  (property_signature
+    name: (property_identifier) @name
+    type: (type_annotation (_) @type)) @def.field)
 
 (type_alias_declaration name: (type_identifier) @name) @def.type
 
+; Enum members are deliberately not definitions (they are values of the enum,
+; not addressable declarations) — the golden corpora exclude them in every
+; language, and the heuristic scanner indexes none of them.
 (enum_declaration name: (identifier) @name) @def.enum
-(enum_body (property_identifier) @name @def.field)
-(enum_body (enum_assignment name: (property_identifier) @name)) @def.field
 
 ; `const x = …` / `let x = …` / `var x = …`. All three are reported as variables,
 ; because the heuristic scanner does; a function-valued binding is refined to a
 ; function in Zig (refineFunctionValued).
-(lexical_declaration (variable_declarator name: (identifier) @name)) @def.variable
+; The declarator, not the statement, is the definition: `const a = 1, b = 2`
+; declares two, and one capture per statement merges them into the first.
+(lexical_declaration (variable_declarator name: (identifier) @name) @def.variable)
 (lexical_declaration
-  (variable_declarator name: (identifier) @name value: (_) @init)) @def.variable
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @name
-    value: (arrow_function "async" @mod.async))) @def.variable
+  (variable_declarator name: (identifier) @name value: (_) @init) @def.variable)
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
-    type: (type_annotation (_) @type))) @def.variable
-(variable_declaration (variable_declarator name: (identifier) @name)) @def.variable
+    value: (arrow_function "async" @mod.async)) @def.variable)
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    type: (type_annotation (_) @type)) @def.variable)
+(variable_declaration (variable_declarator name: (identifier) @name) @def.variable)
 
 ; `export` marks the symbol public regardless of its name.
 (export_statement declaration: (_) @exported)

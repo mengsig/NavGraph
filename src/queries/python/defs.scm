@@ -44,3 +44,5 @@
 ; `from mod import X` records the module edge only — it binds no module name.
 (import_from_statement module_name: (dotted_name) @from.path) @def.import
 (import_from_statement module_name: (relative_import) @from.path) @def.import
+; `from __future__ import x` is its own grammar rule with no module_name field.
+(future_import_statement "__future__" @from.path) @def.import

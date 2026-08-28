@@ -23,6 +23,12 @@ const language = navgraph.language;
 
 const testing = std.testing;
 
+/// A parse context over `reg` for one backend choice. Both always travel
+/// together; the tests vary the choice against one set of compiled grammars.
+fn parsingWith(reg: *backends.Registry, choice: backends.Choice) backends.Parsing {
+    return .{ .choice = choice, .registry = reg };
+}
+
 /// Fixture trees that contain python/typescript/tsx sources.
 const fixture_trees = [_][]const u8{
     "testenv/py_fastapi",
@@ -265,6 +271,10 @@ fn collectEdges(gpa: std.mem.Allocator, idx: *const index.Index, only_exact: boo
 /// deliberate, reviewed act.
 const AdjudicatedExact = struct {
     tree: []const u8,
+    /// File the calling end lives in. Names alone collide across a tree — two
+    /// different `get_item` call `get` — and a review verdict must name the one
+    /// site it was reached for.
+    file: []const u8,
     from: []const u8,
     to: []const u8,
     why: []const u8,
@@ -273,6 +283,7 @@ const AdjudicatedExact = struct {
 const adjudicated_exact = [_]AdjudicatedExact{
     .{
         .tree = "testenv/ts_frontend",
+        .file = "src/store/store.ts",
         .from = "debugDump",
         .to = "size",
         // `debugDump(store: Store<T>)` calls `store.size()`. Correct: the
@@ -282,13 +293,52 @@ const adjudicated_exact = [_]AdjudicatedExact{
     },
     .{
         .tree = "testenv/fullstack",
+        .file = "frontend/dashboard.ts",
         .from = "loadSnapshot",
         .to = "listOrders",
         .why = "heuristic span stops at the multi-line return type and never sees the body",
     },
-    .{ .tree = "testenv/fullstack", .from = "loadSnapshot", .to = "listCustomers", .why = "same multi-line return type" },
-    .{ .tree = "testenv/fullstack", .from = "loadSnapshot", .to = "listInventory", .why = "same multi-line return type" },
-    .{ .tree = "testenv/fullstack", .from = "loadSnapshot", .to = "checkHealth", .why = "same multi-line return type" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/dashboard.ts", .from = "loadSnapshot", .to = "listCustomers", .why = "same multi-line return type" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/dashboard.ts", .from = "loadSnapshot", .to = "listInventory", .why = "same multi-line return type" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/dashboard.ts", .from = "loadSnapshot", .to = "checkHealth", .why = "same multi-line return type" },
+    // The promotion's other half: the grammar records a declared type on a
+    // field, an annotated dataclass member and a module-level binding, and the
+    // resolver reads it (`receiverType`). Each was read against the source and
+    // each is in tests/golden/python.json.
+    .{ .tree = "testenv/py_fastapi", .file = "app/models.py", .from = "is_free", .to = "amount", .why = "self.price is a Money (annotated dataclass field)" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/models.py", .from = "subtotal", .to = "price", .why = "self.item is an Item" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/items.py", .from = "list_items", .to = "list_items", .why = "module-level _service = ItemService()" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/items.py", .from = "get_item", .to = "get", .why = "same _service" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/items.py", .from = "create_item", .to = "create", .why = "same _service" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/items.py", .from = "replace_item", .to = "update", .why = "same _service" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/items.py", .from = "patch_item", .to = "rename", .why = "same _service" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/items.py", .from = "delete_item", .to = "delete", .why = "same _service" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/orders.py", .from = "place_order", .to = "place", .why = "module-level _service = OrderService()" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/orders.py", .from = "read_order", .to = "get", .why = "same _service" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/services/order_service.py", .from = "_resolve_owner", .to = "fetch", .why = "self.users is a UserService" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/services/order_service.py", .from = "_append_line", .to = "get", .why = "self.items is an ItemService" },
+    // TypeScript, same cause: a class field or module-level `new X()` binding
+    // the grammar types. Each is an edge tests/golden/typescript.json records.
+    .{ .tree = "testenv/ts_frontend", .file = "src/api/posts.ts", .from = "list", .to = "get", .why = "this.http is an HttpClient" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/api/posts.ts", .from = "get", .to = "get", .why = "this.http is an HttpClient" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/api/posts.ts", .from = "create", .to = "post", .why = "this.http is an HttpClient" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/hooks/usePosts.ts", .from = "loadPosts", .to = "list", .why = "module-level client = new PostClient()" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/hooks/usePosts.ts", .from = "loadPost", .to = "get", .why = "client/cache are a PostClient and a Store" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/hooks/usePosts.ts", .from = "loadPost", .to = "set", .why = "module-level cache = new Store<Post>()" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/hooks/useUser.ts", .from = "loadUser", .to = "getUser", .why = "module-level client = new ApiClient()" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/hooks/useUser.ts", .from = "removeUser", .to = "deleteUser", .why = "same client" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/tricky_ts.ts", .from = "add", .to = "set", .why = "this.store is a Store" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/tricky_ts.ts", .from = "trickyRun", .to = "pages", .why = "for await over the async generator on line 173" },
+    // `BaseLedger.created += 1` / `… + BaseLedger.created`: a static field only
+    // the grammar indexes, so the qualified name now resolves to it (and to the
+    // class it names). Not in the golden edge list, which records call edges and
+    // type references, not static-member reads; both are real references.
+    .{ .tree = "testenv/ts_frontend", .file = "src/tricky_ts.ts", .from = "constructor", .to = "created", .why = "static field read, line 42" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/tricky_ts.ts", .from = "constructor", .to = "BaseLedger", .why = "the qualifier of that read" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/tricky_ts.ts", .from = "trickyRun", .to = "created", .why = "static field read, line 185" },
+    .{ .tree = "testenv/ts_frontend", .file = "src/tricky_ts.ts", .from = "trickyRun", .to = "BaseLedger", .why = "the qualifier of that read" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/bus.ts", .from = "placeOrder", .to = "emit", .why = "module-level const socket: Socket" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/bus.ts", .from = "subscribe", .to = "on", .why = "same socket" },
 };
 
 /// Edges only the heuristic backend draws, kept out of the "lost" count because
@@ -298,24 +348,38 @@ const adjudicated_exact = [_]AdjudicatedExact{
 /// `loadSnapshot`, whose return type spans several lines, and treats part of the
 /// return type as the body.
 const adjudicated_losses = [_]AdjudicatedExact{
-    .{ .tree = "testenv/fullstack", .from = "loadSnapshot", .to = "Order", .why = "signature type read, only seen through a mis-measured span" },
-    .{ .tree = "testenv/fullstack", .from = "loadSnapshot", .to = "Customer", .why = "same" },
-    .{ .tree = "testenv/fullstack", .from = "loadSnapshot", .to = "InventoryItem", .why = "same" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/dashboard.ts", .from = "loadSnapshot", .to = "Order", .why = "signature type read, only seen through a mis-measured span" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/dashboard.ts", .from = "loadSnapshot", .to = "Customer", .why = "same" },
+    .{ .tree = "testenv/fullstack", .file = "frontend/dashboard.ts", .from = "loadSnapshot", .to = "InventoryItem", .why = "same" },
+    // The rest are `<dict>.get(...)` / `<dict>.update(...)` on a module-level or
+    // instance dict. The heuristic sees no declared type, so it name-matches
+    // `get`/`update` project-wide and lands on a service method that has
+    // nothing to do with the call. The grammar records the `dict` annotation,
+    // so the resolver abstains (`isBuiltinContainer`) instead of inventing the
+    // edge. tests/golden/python.json records none of them.
+    .{ .tree = "testenv/py_fastapi", .file = "app/db.py", .from = "get_item", .to = "get", .why = "_ITEMS.get: dict, not ItemService" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/db.py", .from = "get_order", .to = "get", .why = "_ORDERS.get: dict, not ItemService" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/db.py", .from = "_reset", .to = "update", .why = "_SEQUENCE.update: dict, not ItemService" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/services/auth_service.py", .from = "whoami", .to = "get", .why = "self._issued.get: dict field, not ItemService" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/services/user_service.py", .from = "_query", .to = "get", .why = "_USERS.get: dict, not ItemService" },
+    // Both of these keep an edge; the typed receiver moves it to the right
+    // service, so the heuristic's same-file / project-wide pick is the loss.
+    .{ .tree = "testenv/py_fastapi", .file = "app/routes/orders.py", .from = "read_order", .to = "get", .why = "_service is an OrderService: edge moved off ItemService.get" },
+    .{ .tree = "testenv/py_fastapi", .file = "app/services/order_service.py", .from = "_append_line", .to = "get", .why = "self.items is an ItemService: edge moved off OrderService.get" },
 };
 
+fn matches(a: AdjudicatedExact, tree: []const u8, e: Edge) bool {
+    return std.mem.eql(u8, a.tree, tree) and std.mem.eql(u8, a.file, e.from.file) and
+        std.mem.eql(u8, a.from, e.from.name) and std.mem.eql(u8, a.to, e.to.name);
+}
+
 fn isAdjudicatedLoss(tree: []const u8, e: Edge) bool {
-    for (adjudicated_losses) |a| {
-        if (!std.mem.eql(u8, a.tree, tree)) continue;
-        if (std.mem.eql(u8, a.from, e.from.name) and std.mem.eql(u8, a.to, e.to.name)) return true;
-    }
+    for (adjudicated_losses) |a| if (matches(a, tree, e)) return true;
     return false;
 }
 
 fn isAdjudicated(tree: []const u8, e: Edge) bool {
-    for (adjudicated_exact) |a| {
-        if (!std.mem.eql(u8, a.tree, tree)) continue;
-        if (std.mem.eql(u8, a.from, e.from.name) and std.mem.eql(u8, a.to, e.to.name)) return true;
-    }
+    for (adjudicated_exact) |a| if (matches(a, tree, e)) return true;
     return false;
 }
 
@@ -444,15 +508,7 @@ test "hostile inputs never crash and an unparseable file falls back, recorded" {
         defer arena.deinit();
         var out: std.ArrayList(parser.ParsedSymbol) = .empty;
         defer out.deinit(gpa);
-        const health = try backends.parse(
-            &reg,
-            gpa,
-            arena.allocator(),
-            case.source,
-            case.lang,
-            .tree_sitter,
-            &out,
-        );
+        const health = try parsingWith(&reg, .tree_sitter).parse(gpa, arena.allocator(), case.source, case.lang, &out);
         // A fallback is always recorded against the heuristic backend, never
         // presented as a tree-sitter parse.
         if (health.tree_sitter_fallback) try testing.expectEqual(model.Backend.heuristic, health.backend);
@@ -475,15 +531,7 @@ test "JSX in a .ts file falls back to the heuristic scanner, recorded in ParseHe
     var out: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer out.deinit(gpa);
 
-    const health = try backends.parse(
-        &reg,
-        gpa,
-        arena.allocator(),
-        "export const X = () => <div>hi</div>;\n",
-        .typescript,
-        .tree_sitter,
-        &out,
-    );
+    const health = try parsingWith(&reg, .tree_sitter).parse(gpa, arena.allocator(), "export const X = () => <div>hi</div>;\n", .typescript, &out);
     try testing.expect(health.tree_sitter_fallback);
     try testing.expectEqual(model.Backend.heuristic, health.backend);
     try testing.expect(out.items.len > 0);
@@ -546,15 +594,7 @@ test "a clean parse is recorded as the tree-sitter backend" {
     var out: std.ArrayList(parser.ParsedSymbol) = .empty;
     defer out.deinit(gpa);
 
-    const health = try backends.parse(
-        &reg,
-        gpa,
-        arena.allocator(),
-        "class C:\n    def __init__(self):\n        self.x = C()\n",
-        .python,
-        .tree_sitter,
-        &out,
-    );
+    const health = try parsingWith(&reg, .tree_sitter).parse(gpa, arena.allocator(), "class C:\n    def __init__(self):\n        self.x = C()\n", .python, &out);
     try testing.expectEqual(model.Backend.tree_sitter, health.backend);
     try testing.expect(!health.tree_sitter_fallback);
 
@@ -569,26 +609,28 @@ test "a clean parse is recorded as the tree-sitter backend" {
     try testing.expect(found);
 }
 
-test "auto keeps every language on the heuristic backend" {
+test "auto routes a promoted language to tree-sitter and leaves the rest alone" {
     const gpa = testing.allocator;
     var reg = backends.Registry.init(gpa);
     defer reg.deinit();
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var out: std.ArrayList(parser.ParsedSymbol) = .empty;
-    defer out.deinit(gpa);
+    const auto = parsingWith(&reg, .auto);
 
-    const health = try backends.parse(
-        &reg,
-        gpa,
-        arena.allocator(),
-        "def f():\n    return 1\n",
-        .python,
-        .auto,
-        &out,
-    );
-    try testing.expectEqual(model.Backend.heuristic, health.backend);
-    try testing.expect(!health.tree_sitter_fallback);
+    // Python, TypeScript and TSX are promoted; every other language stays on
+    // the heuristic scanner whether or not a grammar is linked in.
+    const cases = [_]struct { lang: language.Language, source: []const u8, want: model.Backend }{
+        .{ .lang = .python, .source = "def f():\n    return 1\n", .want = if (ts_backend.supports(.python)) .tree_sitter else .heuristic },
+        .{ .lang = .typescript, .source = "export function f(): number { return 1; }\n", .want = if (ts_backend.supports(.typescript)) .tree_sitter else .heuristic },
+        .{ .lang = .go, .source = "func f() int { return 1 }\n", .want = .heuristic },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var out: std.ArrayList(parser.ParsedSymbol) = .empty;
+        defer out.deinit(gpa);
+        const health = try auto.parse(gpa, arena.allocator(), case.source, case.lang, &out);
+        try testing.expectEqual(case.want, health.backend);
+        try testing.expect(!health.tree_sitter_fallback);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -617,24 +659,29 @@ const ChainCase = struct {
     caller: []const u8,
     /// `receiver_root` the reference must carry: "self" is spelled per language.
     root: []const u8,
+    /// Class whose `fetch` the reference binds to once the chain head's field
+    /// table is readable, or "" when nothing types the receiver and the
+    /// reference must stay unresolved in both backends.
+    typed_target: []const u8,
 };
 
 const chain_cases = [_]ChainCase{
     // `self.store` / `this.store`: the enclosing instance heads the chain, so
-    // the resolver may read Api's own field table.
-    .{ .caller = "direct", .root = "self" },
-    // Another object heads the chain. Losing this root is the mis-resolution
-    // PR #7 landed to kill: Api's field table would answer for Holder's field.
-    .{ .caller = "cross", .root = "o" },
+    // the resolver reads Api's own field table — `store: Cache`.
+    .{ .caller = "direct", .root = "self", .typed_target = "Cache" },
+    // Another object heads the chain. Reading Api's field table here is the
+    // mis-resolution PR #7 landed to kill: the answer is Holder's `store: Store`.
+    .{ .caller = "cross", .root = "o", .typed_target = "Store" },
     // A bare qualifier heads its own chain, so no field table may answer.
-    .{ .caller = "bare", .root = "" },
+    .{ .caller = "bare", .root = "", .typed_target = "" },
 };
 
 /// Assert the three chain shapes carry the chain head the resolver reads, and
-/// that none of them is confidently resolved. Container field tables are Go-only
-/// today (`collectGoFieldBindings`), so a TS/Python chain cannot yet produce an
-/// exact edge — the roots are what must be right when it can.
-fn expectChainCases(idx: *const index.Index, file: []const u8, self_word: []const u8) !void {
+/// that each resolves to the class the head's field table names. `typed` is
+/// whether this index records those field types at all: only the tree-sitter
+/// backend does for Python and TypeScript, so the heuristic index must leave
+/// every one of them unresolved rather than guess.
+fn expectChainCases(idx: *const index.Index, file: []const u8, self_word: []const u8, typed: bool) !void {
     for (chain_cases) |case| {
         const caller = memberSymbolIn(idx, file, "Api", case.caller) orelse {
             std.debug.print("navgraph differ: no Api.{s} in {s}\n", .{ case.caller, file });
@@ -649,7 +696,12 @@ fn expectChainCases(idx: *const index.Index, file: []const u8, self_word: []cons
             std.debug.print("navgraph differ: {s} Api.{s} chain head\n", .{ file, case.caller });
             return err;
         };
-        try testing.expect(!ref.exact);
+        if (!typed or case.typed_target.len == 0) {
+            try testing.expect(!ref.exact);
+            continue;
+        }
+        try testing.expect(ref.exact);
+        try testing.expectEqualStrings(case.typed_target, parentName(idx, idx.graph.symbols[ref.target]));
     }
 }
 
@@ -725,10 +777,10 @@ test "the tree-sitter backend records the receiver chain head the resolver needs
     defer ts_idx.deinit();
     var heuristic = try index.build(testing.allocator, io, root, false, .heuristic);
     defer heuristic.deinit();
-    for ([_]*const index.Index{ &ts_idx, &heuristic }) |idx| {
-        try expectChainCases(idx, "app.py", "self");
-        try expectChainCases(idx, "app.ts", "this");
-    }
+    try expectChainCases(&ts_idx, "app.py", "self", true);
+    try expectChainCases(&ts_idx, "app.ts", "this", true);
+    try expectChainCases(&heuristic, "app.py", "self", false);
+    try expectChainCases(&heuristic, "app.ts", "this", false);
 }
 
 test "no reference loses its chain head on the fixture trees" {
@@ -847,18 +899,23 @@ test "a cache entry may only answer for the backend that produced it" {
     // purpose: that entry is right for tree-sitter and wrong for heuristic.
     const fell_back: model.ParseHealth = .{ .backend = .heuristic, .tree_sitter_fallback = true };
 
-    try testing.expect(backends.cacheEntryUsable(.python, .heuristic, heur));
-    try testing.expect(!backends.cacheEntryUsable(.python, .heuristic, ts));
-    try testing.expect(!backends.cacheEntryUsable(.python, .heuristic, fell_back));
+    var reg = backends.Registry.init(testing.allocator);
+    defer reg.deinit();
+    const heuristic = parsingWith(&reg, .heuristic);
+    const tree_sitter = parsingWith(&reg, .tree_sitter);
+
+    try testing.expect(heuristic.cacheEntryUsable(.python, heur));
+    try testing.expect(!heuristic.cacheEntryUsable(.python, ts));
+    try testing.expect(!heuristic.cacheEntryUsable(.python, fell_back));
 
     if (!ts_backend.any_grammar) return;
-    try testing.expect(backends.cacheEntryUsable(.python, .tree_sitter, ts));
-    try testing.expect(backends.cacheEntryUsable(.python, .tree_sitter, fell_back));
-    try testing.expect(!backends.cacheEntryUsable(.python, .tree_sitter, heur));
+    try testing.expect(tree_sitter.cacheEntryUsable(.python, ts));
+    try testing.expect(tree_sitter.cacheEntryUsable(.python, fell_back));
+    try testing.expect(!tree_sitter.cacheEntryUsable(.python, heur));
     // A language no grammar covers stays on the heuristic scanner under every
     // choice, so its heuristic entry is the only usable one.
-    try testing.expect(backends.cacheEntryUsable(.go, .tree_sitter, heur));
-    try testing.expect(!backends.cacheEntryUsable(.go, .tree_sitter, ts));
+    try testing.expect(tree_sitter.cacheEntryUsable(.go, heur));
+    try testing.expect(!tree_sitter.cacheEntryUsable(.go, ts));
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,8 +1131,6 @@ test "export does not reach through an interface or object-literal body either" 
         .{ .parent = "handlers", .name = "load" },
         .{ .parent = "IFace", .name = "a" },
         .{ .parent = "IFace", .name = "m" },
-        .{ .parent = "TAlias", .name = "c" },
-        .{ .parent = "E", .name = "X" },
         .{ .parent = "C", .name = "d" },
         .{ .parent = "C", .name = "p" },
     };
@@ -1090,6 +1145,11 @@ test "export does not reach through an interface or object-literal body either" 
     // anywhere on the ancestor chain).
     try testing.expect(!(symbolIn(&ts, "Priv", "b") orelse return error.TestUnexpectedResult).exported);
     try testing.expect(!(symbolIn(&ts, "Priv", "n") orelse return error.TestUnexpectedResult).exported);
+    // A type alias's object-type members and an enum's members are not
+    // definitions at all (see the F11 case below and tests/golden), so the
+    // export walk has nothing to reach in those two bodies.
+    try testing.expectEqual(@as(?model.Symbol, null), symbolIn(&ts, "TAlias", "c"));
+    try testing.expectEqual(@as(?model.Symbol, null), symbolIn(&ts, "E", "X"));
     // The containers themselves still export normally.
     try testing.expect((symbolIn(&ts, "", "IFace") orelse return error.TestUnexpectedResult).exported);
     try testing.expect((symbolIn(&ts, "", "TAlias") orelse return error.TestUnexpectedResult).exported);
@@ -1246,10 +1306,15 @@ test "a container declared inside a function belongs to it; an inline object typ
     try testing.expectEqualStrings("", parentName(&ts, symbolNamed(&ts, "inner").?));
     try testing.expectEqualStrings("", parentName(&heuristic, symbolNamed(&heuristic, "inner").?));
 
-    // F11: members of an inline object type in a signature belong to no named
-    // type and are dropped; a named type alias's members are kept.
+    // F11: members of an object type are not definitions, named alias or not.
+    // A type alias's members are structure, not declarations a qualified name
+    // addresses, and tests/golden/typescript.json (verified with
+    // typescript-language-server) counts only interface members, class fields
+    // and constructor parameter properties. Indexing them cost 5 points of
+    // definition precision against the corpus.
     try testing.expectEqual(@as(?model.Symbol, null), symbolNamed(&ts, "title"));
     try testing.expectEqual(@as(?model.Symbol, null), symbolNamed(&ts, "hidden"));
-    const side = symbolNamed(&ts, "side") orelse return error.TestExpectedEqual;
-    try testing.expectEqualStrings("Shape", parentName(&ts, side));
+    try testing.expectEqual(@as(?model.Symbol, null), symbolNamed(&ts, "side"));
+    // The alias itself is still a definition.
+    try testing.expect(symbolNamed(&ts, "Shape") != null);
 }

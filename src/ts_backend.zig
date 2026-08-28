@@ -633,7 +633,7 @@ fn collectDefs(
             }
             continue;
         }
-        const span_start = lineStart(source, ts_node_start_byte(def));
+        const span_start = spanStart(source, ts_node_start_byte(def));
         const span_end = ts_node_end_byte(def);
         var sig_end = if (fieldChild(def, "body")) |body| ts_node_start_byte(body) else span_end;
         sig_end = std.math.clamp(sig_end, span_start, span_end);
@@ -733,6 +733,7 @@ fn refineFunctionValued(source: []const u8, defs: []Def) void {
 
 /// The initializer of a single-declarator `const`/`let`/`var` statement.
 fn declaratorValue(decl: TSNode) ?TSNode {
+    if (nodeTypeIs(decl, "variable_declarator")) return fieldChild(decl, "value");
     const n = ts_node_named_child_count(decl);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
@@ -915,6 +916,15 @@ fn stripQuotes(text: []const u8) []const u8 {
 }
 
 /// Byte offset of the start of the line containing `offset`.
+/// Where a definition's span begins: the start of its line, so the span carries
+/// the indentation the heuristic scanner also includes. A definition that is not
+/// the first thing on its line (`const a = 1, b = 2`) starts at its own first
+/// byte instead — otherwise its span would swallow its earlier sibling's.
+fn spanStart(source: []const u8, start: u32) u32 {
+    const line = lineStart(source, start);
+    return if (std.mem.indexOfNone(u8, source[line..start], " \t") == null) line else start;
+}
+
 fn lineStart(source: []const u8, offset: u32) u32 {
     if (offset == 0) return 0;
     const nl = std.mem.lastIndexOfScalar(u8, source[0..offset], '\n') orelse return 0;
@@ -1117,7 +1127,6 @@ fn attachRefs(
         }
         const node = target orelse continue;
         const name = nodeText(source, node);
-        if (name.len < 2) continue; // the heuristic backend also skips 1-char names
         const gop = try sites.getOrPut(gpa, ts_node_start_byte(node));
         if (!gop.found_existing) {
             gop.value_ptr.* = .{
@@ -1325,13 +1334,32 @@ fn attachBindings(
             else
                 typeHead(nodeText(source, t));
         } else "";
-        try per_owner[owner].append(gpa, .{ .name = nodeText(source, n), .type_name = type_name });
+        try addBinding(gpa, &per_owner[owner], nodeText(source, n), type_name);
     }
 
     for (symbols, per_owner) |*sym, list| {
         if (list.items.len == 0) continue;
         sym.bindings = try arena.dupe(Binding, list.items);
     }
+}
+
+/// Record `name` as a local of one owner, keeping one binding per name.
+/// Patterns overlap here as they do for definitions — an assignment matches the
+/// untyped pattern and the typed one — so a repeat only fills in a type the
+/// earlier match had no expression for. A name with no type still masks a
+/// same-named global; a name that ever binds a type keeps it.
+fn addBinding(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(Binding),
+    name: []const u8,
+    type_name: []const u8,
+) Error!void {
+    for (list.items) |*b| {
+        if (!std.mem.eql(u8, b.name, name)) continue;
+        if (b.type_name.len == 0) b.type_name = type_name;
+        return;
+    }
+    try list.append(gpa, .{ .name = name, .type_name = type_name });
 }
 
 /// Owner lookup for a site inside a definition's *signature* (a parameter).

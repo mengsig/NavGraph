@@ -18,6 +18,9 @@ pub const Parsed = struct {
     /// Second positional (only `path <A> <B>` uses it). Empty otherwise.
     arg2: []const u8 = "",
     root: []const u8 = ".",
+    /// Whether `-C`/`--root` was given. `lsp` distinguishes an explicit root
+    /// (which wins) from the default (which defers to the editor's workspace).
+    root_given: bool = false,
     options: query.Options = .{},
     /// Public options explicitly selected by argv. This lets descriptor-driven
     /// applicability reject historical no-op flag combinations without trying
@@ -33,6 +36,10 @@ pub const Parsed = struct {
     /// Parser backend (`--backend`). `auto` follows the per-language table in
     /// `backends.zig`; `tree-sitter` forces a grammar wherever one is linked in.
     backend: backends.Choice = .auto,
+    /// `lsp` only: where to write diagnostics (stderr when empty) and how
+    /// much. stdout is the protocol channel and never carries logging.
+    log_path: []const u8 = "",
+    log_level: []const u8 = "error",
 };
 
 pub const ParseError = error{ Usage, UnknownFlag, MissingValue, BadValue };
@@ -111,6 +118,9 @@ const usage_text =
     \\  capabilities       Machine-readable protocol, build, language, command,
     \\                     option, output, safety, and trust metadata (alias: version)
     \\  serve             Long-lived JSON-RPC/MCP server over stdin/stdout
+    \\  lsp                Resident editor server (LSP over stdio): keeps the graph
+    \\                     in memory and answers blast/search/call queries in
+    \\                     milliseconds. See docs/lsp.md
     \\  help [command]     Full catalogue or concise help for one command
     \\
     \\FLAGS (command-scoped; run `navgraph help <command>` for the exact set):
@@ -165,6 +175,8 @@ const usage_text =
     \\  --follow-imports                       unused: disambiguate same-name symbols by
     \\                                         import reachability (finds unused code masked
     \\                                         by a used same-name twin; needs import resolution)
+    \\  --log <file>                           lsp: write diagnostics to <file> (default: stderr)
+    \\  --log-level <error|info|debug>         lsp: diagnostic verbosity (default: error)
     \\
     \\  Locations are `path:line-endLine`; call trees annotate each edge with its
     \\  call-site line as `↳:N`, `⇒impl` marks a protocol implementation edge,
@@ -209,6 +221,7 @@ const usage_text =
     \\  navgraph rename Store.get fetch --preview
     \\  navgraph todos src
     \\  navgraph search parse --jsonl --limit 50
+    \\  navgraph lsp -C .                       # editor server (Neovim, VS Code)
     \\
 ;
 
@@ -470,6 +483,7 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
     if (eqAny(f.name, &.{ "-C", "--root" })) {
         out.used_options.insert(.root);
         out.root = try f.value(args, i, f.name);
+        out.root_given = true;
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-k", "--kind" })) {
@@ -503,6 +517,16 @@ fn parseFlag(args: []const [:0]const u8, i: usize, out: *Parsed) ParseError!usiz
         out.used_options.insert(if (std.mem.eql(u8, f.name, "--on-type")) .on_type else .to);
         const val = try f.value(args, i, f.name);
         if (std.mem.eql(u8, f.name, "--on-type")) out.options.on_type = val else out.options.flow_to = val;
+        return f.next(i);
+    }
+    if (eqAny(f.name, &.{"--log"})) {
+        out.used_options.insert(.log);
+        out.log_path = try f.value(args, i, f.name);
+        return f.next(i);
+    }
+    if (eqAny(f.name, &.{"--log-level"})) {
+        out.used_options.insert(.log_level);
+        out.log_level = try f.value(args, i, f.name);
         return f.next(i);
     }
     if (eqAny(f.name, &.{ "-t", "--tests" })) {
@@ -1095,6 +1119,7 @@ test "parseCommand: every primary command name maps correctly" {
     try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
     try std.testing.expectEqual(Command.serve, parseCommand("serve").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
+    try std.testing.expectEqual(Command.capabilities, parseCommand("capabilities").?);
 }
 
 test "parseCommand: every alias maps to its command" {
@@ -1136,6 +1161,9 @@ test "parseCommand: every alias maps to its command" {
     // help aliases
     try std.testing.expectEqual(Command.help, parseCommand("--help").?);
     try std.testing.expectEqual(Command.help, parseCommand("-h").?);
+    // capabilities doubles as the version verb
+    try std.testing.expectEqual(Command.capabilities, parseCommand("version").?);
+    try std.testing.expectEqual(Command.capabilities, parseCommand("--version").?);
 }
 
 test "phase 1 commands and scoped flags parse" {

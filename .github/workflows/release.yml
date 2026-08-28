@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # build.zig.zon's `.version` is the single source of truth for the version
+  # every surface reports (--version, navgraph/status, LSP serverInfo — see
+  # build.zig). A tag that drifts from it would publish a binary that
+  # misreports its own release (coldstart review F4).
+  verify-tag:
+    name: verify tag matches build.zig.zon version
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a commit; a moving major tag is write access to
+      # a workflow that holds `contents: write`.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check ${{ github.ref_name }} == v<zon version>
+        run: |
+          set -euo pipefail
+          zon_version=$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [ -z "$zon_version" ]; then
+            echo "could not read .version from build.zig.zon" >&2
+            exit 1
+          fi
+          expected="v${zon_version}"
+          if [ "${{ github.ref_name }}" != "$expected" ]; then
+            echo "tag ${{ github.ref_name }} does not match build.zig.zon (expected $expected)" >&2
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          cache-key: release-${{ matrix.target }}
+
+      # Native (host-target) tests, once per matrix leg: cheap, and it keeps
+      # each leg's binary provably built from a tree that passed (F5) without
+      # a separate gate job to fan the result back out to the matrix.
+      - name: Test
+        run: zig build test --summary all
+
+      # Zig cross-compiles every target from one host — no macOS runner needed
+      # (the binary is pure Zig/std, no Objective-C framework dependency).
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="navgraph-${{ matrix.target }}"
+          mkdir "$staging"
+          cp zig-out/bin/navgraph "$staging/"
+          cp README.md CHANGELOG.md "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: navgraph-${{ matrix.target }}
+          path: navgraph-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only this job writes (it publishes the release); verify-tag and build
+    # inherit the workflow-level contents: read (merge-gate review F10).
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum navgraph-*.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/navgraph-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

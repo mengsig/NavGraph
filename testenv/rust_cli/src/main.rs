@@ -3,6 +3,7 @@
 mod eval;
 mod lexer;
 mod parser;
+mod tricky_rust;
 mod value;
 
 use eval::Evaluate;

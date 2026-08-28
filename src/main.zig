@@ -16,6 +16,7 @@ const viz = @import("viz.zig");
 const capabilities = @import("capabilities.zig");
 const agent_api = @import("agent_api.zig");
 const workspace_path = @import("workspace_path.zig");
+const lsp = @import("lsp.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -89,6 +90,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The editor server owns stdout (it is the protocol channel) and builds its
+    // own resident index, so it runs before the one-shot index build below.
+    if (parsed.command == .lsp) return runLspServer(gpa, io, err_out, parsed);
+
     if (parsed.command == .serve) {
         var authority = RootAuthority.open(gpa, io, parsed.root) catch |err| {
             try out.print("navgraph: failed to bind server root '{s}': {s}\n", .{ parsed.root, @errorName(err) });
@@ -97,6 +102,11 @@ pub fn main(init: std.process.Init) !void {
         };
         var authority_owned = true;
         errdefer if (authority_owned) authority.deinit();
+        // Session-lifetime, not per-build: `reload` re-indexes the whole tree
+        // and must not recompile every grammar to do it.
+        var registry = backends.Registry.init(gpa);
+        defer registry.deinit();
+        const parsing = backends.Parsing{ .choice = parsed.backend, .registry = &registry };
         var idx = index_mod.buildOpenDir(
             gpa,
             io,
@@ -105,14 +115,14 @@ pub fn main(init: std.process.Init) !void {
             authority.single_file,
             authority.single_file_target,
             parsed.use_cache,
-            parsed.backend,
+            parsing,
         ) catch |err| {
             try out.print("navgraph: failed to index '{s}': {s}\n", .{ parsed.root, @errorName(err) });
             try out.flush();
             std.process.exit(1);
         };
         defer idx.deinit();
-        var session = try ServerSession.initBound(gpa, io, &idx, parsed.root, parsed.use_cache, parsed.backend, authority);
+        var session = try ServerSession.initBound(gpa, io, &idx, parsed.root, parsed.use_cache, parsing, authority);
         authority_owned = false;
         defer session.deinit();
         try serve(out, &session);
@@ -143,6 +153,24 @@ pub fn main(init: std.process.Init) !void {
     // (the "(no …)" note), so scripts/agents can branch on $? instead of
     // re-parsing output. Usage errors exit 2, indexing failures propagate.
     if (!found) std.process.exit(1);
+}
+
+/// Run `navgraph lsp` and exit with the code the LSP session ended on.
+fn runLspServer(gpa: std.mem.Allocator, io: std.Io, err_out: *std.Io.Writer, parsed: cli.Parsed) !void {
+    const level = lsp.handlers.LogLevel.parse(parsed.log_level) orelse {
+        try err_out.print("navgraph: unknown --log-level '{s}' (expected error|info|debug)\n", .{parsed.log_level});
+        try err_out.flush();
+        std.process.exit(2);
+    };
+    const code = try lsp.run(gpa, io, .{
+        // An explicit `--root` pins the index root; otherwise the client's
+        // workspace root from `initialize` decides (falling back to cwd).
+        .root = if (parsed.root_given) parsed.root else "",
+        .log_path = parsed.log_path,
+        .log_level = level,
+        .backend = parsed.backend,
+    });
+    if (code != 0) std.process.exit(code);
 }
 
 /// Say on stderr how many graph nodes `-l` withheld.
@@ -255,7 +283,7 @@ fn dispatchWithAuthority(
                 try noteGraphTruncation(io, truncation, parsed.options.limit);
             break :blk true; // graph always emits a page/model
         },
-        .capabilities, .serve, .help => unreachable,
+        .capabilities, .serve, .lsp, .help => unreachable,
     };
 }
 
@@ -450,8 +478,9 @@ const ServerSession = struct {
     root: []u8,
     authority: RootAuthority,
     use_cache: bool,
-    /// Parser backend this session was started with; reloads must reuse it.
-    backend: backends.Choice,
+    /// Parse context this session was started with — the backend and the
+    /// grammars compiled for it. Reloads reuse both.
+    parsing: backends.Parsing,
     snapshot_id: u64,
 
     fn init(
@@ -460,11 +489,11 @@ const ServerSession = struct {
         idx: *index_mod.Index,
         root: []const u8,
         use_cache: bool,
-        backend: backends.Choice,
+        parsing: backends.Parsing,
     ) !ServerSession {
         var authority = try RootAuthority.open(gpa, io, root);
         errdefer authority.deinit();
-        return initBound(gpa, io, idx, root, use_cache, backend, authority);
+        return initBound(gpa, io, idx, root, use_cache, parsing, authority);
     }
 
     fn initBound(
@@ -473,7 +502,7 @@ const ServerSession = struct {
         idx: *index_mod.Index,
         root: []const u8,
         use_cache: bool,
-        backend: backends.Choice,
+        parsing: backends.Parsing,
         authority_value: RootAuthority,
     ) !ServerSession {
         std.debug.assert(root.len > 0);
@@ -488,7 +517,7 @@ const ServerSession = struct {
             // this function returns an error.
             .authority = authority_value,
             .use_cache = use_cache,
-            .backend = backend,
+            .parsing = parsing,
             .snapshot_id = agent_api.snapshotFingerprint(idx),
         };
     }
@@ -510,7 +539,7 @@ const ServerSession = struct {
             self.authority.single_file,
             self.authority.single_file_target,
             use_cache,
-            self.backend,
+            self.parsing,
         );
         const fresh_snapshot_id = agent_api.snapshotFingerprint(&fresh);
         const old = self.idx.*;
@@ -958,8 +987,16 @@ fn writeSampleProject(io: std.Io, dir: std.Io.Dir) !void {
 const SampleFixture = struct {
     tmp: std.testing.TmpDir,
     idx: index_mod.Index,
+    registry: backends.Registry,
+
+    /// Borrowed by any session the test starts, so it must outlive it — which
+    /// it does: the fixture is the test frame's, torn down last.
+    fn parsing(self: *SampleFixture) backends.Parsing {
+        return .{ .choice = .auto, .registry = &self.registry };
+    }
 
     fn deinit(self: *SampleFixture) void {
+        self.registry.deinit();
         self.idx.deinit();
         self.tmp.cleanup();
     }
@@ -974,7 +1011,7 @@ fn sampleFixture(io: std.Io) !SampleFixture {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const idx = try index_mod.build(std.testing.allocator, io, root, false, .auto);
-    return .{ .tmp = tmp, .idx = idx };
+    return .{ .tmp = tmp, .idx = idx, .registry = backends.Registry.init(std.testing.allocator) };
 }
 
 fn ambiguousFixture(io: std.Io) !SampleFixture {
@@ -1003,7 +1040,7 @@ fn ambiguousFixture(io: std.Io) !SampleFixture {
     var path_buf: [256]u8 = undefined;
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const idx = try index_mod.build(std.testing.allocator, io, root, false, .auto);
-    return .{ .tmp = tmp, .idx = idx };
+    return .{ .tmp = tmp, .idx = idx, .registry = backends.Registry.init(std.testing.allocator) };
 }
 
 /// Run dispatch() for `parsed` and return the rendered output (caller frees).
@@ -1569,7 +1606,7 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1601,7 +1638,7 @@ test "typed MCP facade covers six read-only surfaces with a stable bounded envel
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1661,7 +1698,7 @@ test "typed MCP relations abstain before ambiguous calls and path traversal" {
     const io = testing.io;
     var fx = try ambiguousFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1714,7 +1751,7 @@ test "MCP identity and capability surfaces share the live manifest contract" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1799,7 +1836,7 @@ test "server reload atomically refreshes requests and notifications" {
     const io = testing.io;
     var fx = try sampleFixture(io);
     defer fx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, .auto);
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false, fx.parsing());
     defer session.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1846,7 +1883,9 @@ test "failed server reload preserves the previous index" {
     const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/only.zig", .{tmp.sub_path});
     var idx = try index_mod.build(testing.allocator, io, root, false, .auto);
     defer idx.deinit();
-    var session = try ServerSession.init(testing.allocator, io, &idx, root, false, .auto);
+    var registry = backends.Registry.init(testing.allocator);
+    defer registry.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &idx, root, false, .{ .choice = .auto, .registry = &registry });
     defer session.deinit();
     try testing.expectEqual(@as(usize, 1), idx.lookup("stillIndexed").len);
     try tmp.dir.deleteFile(io, "only.zig");

@@ -5,17 +5,19 @@ on:
     branches: [main]
   pull_request:
 
-# Read-only: nothing here writes to the repository or publishes anything.
+# Read-only by default: nothing here publishes, comments, or writes to the repo.
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are cancelled; a run on main is the record of what
+  # landed and always finishes.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
-    name: build + test (${{ matrix.os }}, tree-sitter=${{ matrix.tree-sitter }})
+    name: test (${{ matrix.os }}, tree-sitter=${{ matrix.tree-sitter }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -24,30 +26,39 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         tree-sitter: [all, none]
     steps:
-      # F7 (round 2): third-party actions pinned by commit SHA, not a mutable
-      # tag — this workflow runs with the job token, so a compromised tag
-      # would run as CI. Comment names the tag the SHA resolves to.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      # Actions are pinned to a commit: a moving tag is someone else's write
+      # access to this workflow.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           cache-key: ${{ matrix.os }}-${{ matrix.tree-sitter }}
 
+      # Cheap and first: a formatting failure should not wait on a full build.
+      - name: Format
+        run: zig fmt --check .
+
+      # ReleaseFast is what the editor server ships as, and it is the mode the
+      # performance numbers in docs/lsp.md were measured in.
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtree-sitter=${{ matrix.tree-sitter }}
 
-      # `test` already depends on the differ step (see build.zig); run differ by
-      # name too so its result is visible as its own step, not folded into test.
       - name: Test
         run: zig build test -Dtree-sitter=${{ matrix.tree-sitter }} --summary all
 
+      # `test` already depends on the differ step (see build.zig); run differ by
+      # name too so its result is visible as its own step, not folded into test.
+      # Every differ case skips without a grammar, so the no-grammar run is a
+      # compile check for that configuration, not backend coverage.
       - name: Backend differ
-        if: matrix.tree-sitter != 'none'
         run: zig build differ -Dtree-sitter=${{ matrix.tree-sitter }} --summary all
 
-      # Every differ case skips without a grammar. Run it anyway so the suite
-      # still has to compile in that configuration — it is not backend coverage.
-      - name: Backend differ compiles with no grammar linked
-        if: matrix.tree-sitter == 'none'
-        run: zig build differ -Dtree-sitter=none --summary all
+      # The server owns stdout: anything else printed there corrupts the
+      # protocol stream. The driver replays a hostile session into the shipped
+      # ReleaseFast binary — a 20k-deep regex, an ordinary pattern over a 300k
+      # character line, a malformed header with a body — and then checks that
+      # stdout is an exact frame stream ending at EOF, that the requests behind
+      # each of those were answered, that navgraph/blast returned its own
+      # result shape, and that the process exited 0.
+      - name: Editor server speaks the protocol
+        run: zig build smoke -Doptimize=ReleaseFast -Dtree-sitter=${{ matrix.tree-sitter }}
