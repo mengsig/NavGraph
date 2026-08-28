@@ -25,8 +25,11 @@ Download the latest release (swap `x86_64-linux` for `aarch64-linux`,
 ```sh
 curl -LO https://github.com/mengsig/NavGraph/releases/latest/download/navgraph-x86_64-linux.tar.gz
 tar xzf navgraph-x86_64-linux.tar.gz
-install navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
+install -D navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
 ```
+
+The release also attaches a `SHA256SUMS` file (one entry per archive) if you
+want to verify the download.
 
 Now point it at a repo. There's no separate "build the index" step — the
 first command does it and caches the result:
@@ -35,9 +38,9 @@ first command does it and caches the result:
 $ navgraph status
 index root: .
 snapshot: 50 files, 3911 symbols
-cache: loaded=true, entries=50, hits=50/50, rewrite=current
+cache: loaded=false, entries=0, hits=0/50, rewrite=written
 freshness: current
-...
+... (plus a parse/resolution health dump)
 ```
 
 Find a symbol:
@@ -61,18 +64,17 @@ Ask what a change would break — every test that transitively reaches
 anything changed since a git ref (`affected`, alias `impact`):
 
 ```
-$ navgraph affected --since HEAD~1
+$ navgraph affected --since HEAD~2
 test typed agent decoder constructs canonical read-only requests  src/agent_api.zig:1122-1130
-test typed list envelope applies cursor before byte truncation and emits runnable next call  src/agent_api.zig:1152-1188
-test edit site review gaps lower envelope exactness and remain visible as a warning  src/agent_api.zig:1190-1222
+test capability manifest is valid, self-identifying JSON  src/capabilities.zig:471-500
+test schema fingerprint is the exact canonical emitted contract  src/capabilities.zig:502-514
 ...
-… 477 nodes elided (limit; 300 shown)
+… 106 nodes elided (limit; 300 shown)
 ```
 
 That's the loop: index once (automatic), then `search` / `def` / `calls` /
-`callers` / `affected` and the rest of the ~35 commands in [Usage](#usage)
-below — `navgraph help <command>` prints one-line usage plus an example for
-any of them.
+`callers` / `affected` and the rest of the 40 commands in [Usage](#usage)
+below — `navgraph help <command>` prints full usage for any of them.
 
 ## Use it from Neovim
 
@@ -88,8 +90,16 @@ same way; see [Editor integration](#editor-integration) below for the raw
 stdio: an agent gets one compact, typed `navgraph.query` tool instead of
 shelling out per command, with a `max_bytes` budget on every result so an
 answer never blows a context window. `navgraph lsp` gives an editor the same
-resident graph over LSP. Both re-index incrementally as files change instead
-of rebuilding from scratch.
+resident graph over LSP, re-indexing incrementally as you type. `serve`
+holds a snapshot for the session instead — call the `navgraph.reload` tool
+(or the `workspace/reload` JSON-RPC method) after external edits; see
+[Limitations & roadmap](#limitations--roadmap). Point your agent's MCP
+client config at `navgraph mcp` run over stdio, the same invocation shown
+under [Examples](#examples):
+
+```sh
+navgraph serve -C .
+```
 
 ## Doc map
 
