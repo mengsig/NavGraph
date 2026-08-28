@@ -51,6 +51,18 @@ pub fn main(init: std.process.Init) !void {
         try err_out.flush();
         std.process.exit(2);
     };
+    // A global-class flag the command does not use is accepted so a client's
+    // standard argv keeps working, but never silently: name it on stderr.
+    {
+        var it = parsed.ignored_options.iterator();
+        while (it.next()) |option| {
+            try err_out.print("navgraph: option '{s}' does not apply to {s}; ignored\n", .{
+                cli.registry.optionDescriptor(option).name,
+                @tagName(parsed.command),
+            });
+        }
+        try err_out.flush();
+    }
     if (parsed.command == .help) {
         if (parsed.arg.len == 0) {
             cli.usage(out) catch std.process.exit(141);
@@ -129,6 +141,16 @@ pub fn main(init: std.process.Init) !void {
     // (the "(no …)" note), so scripts/agents can branch on $? instead of
     // re-parsing output. Usage errors exit 2, indexing failures propagate.
     if (!found) std.process.exit(1);
+}
+
+/// Say on stderr how many graph nodes `-l` withheld.
+fn noteGraphTruncation(io: std.Io, truncation: viz.Truncation, limit: u32) !void {
+    var buf: [128]u8 = undefined;
+    var file: std.Io.File.Writer = .init(.stderr(), io, &buf);
+    try file.interface.print("navgraph: graph truncated to {d} of {d} nodes (-l {d})\n", .{
+        truncation.shown, truncation.total, limit,
+    });
+    try file.interface.flush();
 }
 
 /// Run the parsed command; true when at least one real result row was printed
@@ -223,7 +245,12 @@ fn dispatchWithAuthority(
         .rename => try workflow.rename(out, io, idx, parsed.root, parsed.arg, parsed.arg2, parsed.options),
         .coverage => try query.coverage(out, idx, parsed.arg, parsed.options),
         .graph => blk: {
-            try viz.graph(out, idx, parsed.arg, parsed.options);
+            const truncation = try viz.graph(out, idx, parsed.arg, parsed.options);
+            // The JSON model carries `truncated`/`nodes_total`; the HTML page has
+            // nowhere to put it and stdout must stay a valid page, so say it on
+            // stderr instead of passing a capped subgraph off as the graph.
+            if (truncation.any() and parsed.options.format != .json)
+                try noteGraphTruncation(io, truncation, parsed.options.limit);
             break :blk true; // graph always emits a page/model
         },
         .capabilities, .serve, .help => unreachable,
@@ -273,6 +300,7 @@ fn dispatchHardBudgetWithAuthority(
     if (compact.options.max_nodes != 0) cap = @min(cap, compact.options.max_nodes);
     cap = @min(cap, @max(@as(u32, 1), hard_limit / 96));
 
+    compact.options.limit_set = true;
     while (true) {
         compact.options.limit = cap;
         compact.options.max_nodes = cap;
