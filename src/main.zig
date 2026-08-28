@@ -871,7 +871,15 @@ fn rpcTools(out: *std.Io.Writer, id: ?std.json.Value) !bool {
     try out.writeAll(",\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
     try out.writeAll("{\"name\":\"navgraph\",\"description\":\"Legacy read-only argv compatibility tool. Prefer navgraph.query. Mutating commands, including rename and rename --preview, are rejected.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"args\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}},\"required\":[\"args\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false}},");
     try out.writeAll("{\"name\":\"navgraph.capabilities\",\"description\":\"Return NavGraph's machine-readable protocol, build identity, language, command, option, output, access, and trust contract without rebuilding the index.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},");
-    try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}}]}}\n");
+    try out.writeAll("{\"name\":\"navgraph.reload\",\"description\":\"Atomically rebuild and replace the server's in-memory index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"noCache\":{\"type\":\"boolean\"}},\"additionalProperties\":false}},");
+    // 1.1 mirrors of navgraph/impact, navgraph/context and navgraph/where
+    // (docs/lsp.md "1.1"): each builds its own one-shot index per call rather
+    // than sharing this server's resident one (src/lsp/mirrors.zig's doc
+    // comment explains why), so a call here costs a fresh walk, unlike
+    // navgraph.query above.
+    try out.writeAll("{\"name\":\"navgraph.hunks\",\"description\":\"navgraph/impact mirror: the working change's hunks, blast radius and roots. Default ref is HEAD, like affected/diff.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"ref\":{\"type\":\"string\"}},\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph.context\",\"description\":\"navgraph/context mirror: one symbol's definition, callers/callees/types/tests in a single call, trimmed to a token budget (default 2000; 0 also means default).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"symbol\":{\"type\":\"string\"},\"budget\":{\"type\":\"integer\",\"minimum\":0},\"include\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\",\"types\",\"tests\",\"body\"]}}},\"required\":[\"symbol\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}},");
+    try out.writeAll("{\"name\":\"navgraph.where\",\"description\":\"navgraph/where mirror: the symbol enclosing a 1-based file:line, plus its breadcrumb chain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\"},\"line\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"file\",\"line\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true}}]}}\n");
     return true;
 }
 
@@ -968,7 +976,198 @@ fn rpcToolCall(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value
         return rpcCapabilitiesTool(out, session.gpa, id, arguments);
     if (std.mem.eql(u8, name.string, "navgraph.reload"))
         return rpcReloadTool(out, session, id, arguments);
+    if (std.mem.eql(u8, name.string, "navgraph.hunks"))
+        return rpcHunksTool(out, session, id, arguments);
+    if (std.mem.eql(u8, name.string, "navgraph.context"))
+        return rpcContextTool(out, session, id, arguments);
+    if (std.mem.eql(u8, name.string, "navgraph.where"))
+        return rpcWhereTool(out, session, id, arguments);
     try rpcError(out, id, -32602, "unknown tool");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// navgraph.hunks / navgraph.context / navgraph.where: the 1.1 mirror tools.
+// Each opens its own one-shot Session over `session.root` (lsp.mirrors' doc
+// comment explains why this doesn't reuse `session.idx`) and runs the exact
+// same lsp.mirrors call the CLI verb runs, so the query logic is one
+// implementation shared by the LSP server, the CLI and this MCP surface.
+// ---------------------------------------------------------------------------
+
+/// Open a one-shot mirror session over `session.root`, or report an
+/// index-build failure as a tool error (matching the CLI's equivalent
+/// failure, but as a JSON-RPC error here since there is no stdout to print
+/// a diagnostic to).
+fn openMirrorSession(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value) !?lsp.session.Session {
+    return lsp.session.Session.init(session.gpa, session.io, session.root, .{ .watch = false }, session.use_cache) catch |err| {
+        var buf: [192]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "failed to index '{s}': {s}", .{ session.root, @errorName(err) }) catch "failed to index";
+        try rpcError(out, id, -32603, message);
+        return null;
+    };
+}
+
+/// Write one mirror's structured result: `writeAgentResult`'s envelope shape
+/// (a `structuredContent` object an MCP client reads directly, plus a
+/// placeholder `content` message), reusing that convention rather than
+/// inventing a second one for these three tools.
+fn writeMirrorResult(out: *std.Io.Writer, id: ?std.json.Value, json: []const u8) !void {
+    try rpcResultPrefix(out, id);
+    try out.writeAll("{\"content\":[{\"type\":\"text\",\"text\":\"NavGraph structured result\"}],\"structuredContent\":");
+    try out.writeAll(json);
+    try out.writeAll(",\"isError\":false}}\n");
+}
+
+fn rpcHunksTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
+    std.debug.assert(id != null);
+    var ref: []const u8 = "";
+    for (arguments.object.keys(), arguments.object.values()) |key, value| {
+        if (!std.mem.eql(u8, key, "ref")) {
+            try rpcError(out, id, -32602, "unknown field for navgraph.hunks (expected: ref)");
+            return true;
+        }
+        if (value != .string) {
+            try rpcError(out, id, -32602, "ref must be a string");
+            return true;
+        }
+        ref = value.string;
+    }
+
+    var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
+    defer mirror_session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&mirror_session);
+
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var detail: ?[]const u8 = null;
+    lsp.mirrors.hunks(&aw.writer, arena, ctx, ref, &detail) catch |err| {
+        try rpcError(out, id, lsp.mirrors.errorCode(err), detail orelse lsp.mirrors.errorMessage(err));
+        return true;
+    };
+    try writeMirrorResult(out, id, aw.written());
+    return true;
+}
+
+fn rpcContextTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
+    std.debug.assert(id != null);
+    var symbol: ?[]const u8 = null;
+    var budget: u32 = 2000;
+    var include: lsp.queries.ContextInclude = .{};
+    for (arguments.object.keys(), arguments.object.values()) |key, value| {
+        if (std.mem.eql(u8, key, "symbol")) {
+            if (value != .string or value.string.len == 0) {
+                try rpcError(out, id, -32602, "symbol must be a non-empty string");
+                return true;
+            }
+            symbol = value.string;
+        } else if (std.mem.eql(u8, key, "budget")) {
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "budget must be a non-negative integer");
+                return true;
+            }
+            // 0 is the wire contract's own "use the default" value, same as
+            // an absent budget — not a special case to reject or zero out.
+            if (value.integer != 0) budget = @intCast(value.integer);
+        } else if (std.mem.eql(u8, key, "include")) {
+            if (value != .array) {
+                try rpcError(out, id, -32602, "include must be an array of strings");
+                return true;
+            }
+            include = lsp.queries.ContextInclude.none;
+            for (value.array.items) |item| {
+                if (item != .string) {
+                    try rpcError(out, id, -32602, "include items must be strings");
+                    return true;
+                }
+                const s = item.string;
+                if (std.mem.eql(u8, s, "callers")) {
+                    include.callers = true;
+                } else if (std.mem.eql(u8, s, "callees")) {
+                    include.callees = true;
+                } else if (std.mem.eql(u8, s, "types")) {
+                    include.types = true;
+                } else if (std.mem.eql(u8, s, "tests")) {
+                    include.tests = true;
+                } else if (std.mem.eql(u8, s, "body")) {
+                    include.body = true;
+                } else {
+                    try rpcError(out, id, -32602, "include values must be one of: callers, callees, types, tests, body");
+                    return true;
+                }
+            }
+        } else {
+            try rpcError(out, id, -32602, "unknown field for navgraph.context (expected: symbol, budget, include)");
+            return true;
+        }
+    }
+    const sym = symbol orelse {
+        try rpcError(out, id, -32602, "symbol is required");
+        return true;
+    };
+
+    var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
+    defer mirror_session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&mirror_session);
+
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    lsp.mirrors.context(&aw.writer, arena, ctx, sym, budget, include) catch |err| {
+        const message = if (err == error.SymbolNotFound)
+            std.fmt.allocPrint(arena, "no definition named '{s}'", .{sym}) catch lsp.mirrors.errorMessage(err)
+        else
+            lsp.mirrors.errorMessage(err);
+        try rpcError(out, id, lsp.mirrors.errorCode(err), message);
+        return true;
+    };
+    try writeMirrorResult(out, id, aw.written());
+    return true;
+}
+
+fn rpcWhereTool(out: *std.Io.Writer, session: *ServerSession, id: ?std.json.Value, arguments: std.json.Value) !bool {
+    std.debug.assert(id != null);
+    var file: ?[]const u8 = null;
+    var line: ?u32 = null;
+    for (arguments.object.keys(), arguments.object.values()) |key, value| {
+        if (std.mem.eql(u8, key, "file")) {
+            if (value != .string or value.string.len == 0) {
+                try rpcError(out, id, -32602, "file must be a non-empty string");
+                return true;
+            }
+            file = value.string;
+        } else if (std.mem.eql(u8, key, "line")) {
+            if (value != .integer or value.integer < 1 or value.integer > std.math.maxInt(u32)) {
+                try rpcError(out, id, -32602, "line must be a positive integer (1-based)");
+                return true;
+            }
+            line = @intCast(value.integer);
+        } else {
+            try rpcError(out, id, -32602, "unknown field for navgraph.where (expected: file, line)");
+            return true;
+        }
+    }
+    const f = file orelse {
+        try rpcError(out, id, -32602, "file is required");
+        return true;
+    };
+    const l = line orelse {
+        try rpcError(out, id, -32602, "line is required");
+        return true;
+    };
+
+    var mirror_session = (try openMirrorSession(out, session, id)) orelse return true;
+    defer mirror_session.deinit();
+    const ctx = lsp.mirrors.ctxOf(&mirror_session);
+
+    var arena_state = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try lsp.mirrors.where(&aw.writer, arena, ctx, f, l);
+    try writeMirrorResult(out, id, aw.written());
     return true;
 }
 
@@ -2016,6 +2215,58 @@ test "serve handles MCP initialize and a tool call on the in-memory index" {
     try testing.expect(has(aw.written(), "\"error\":{\"code\":-32600"));
 }
 
+test "MCP navgraph.where/context/hunks round-trip and reject hostile input" {
+    const testing = std.testing;
+    const io = testing.io;
+    var fx = try sampleFixture(io);
+    defer fx.deinit();
+    var session = try ServerSession.init(testing.allocator, io, &fx.idx, fx.idx.root, false);
+    defer session.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    defer aw.deinit();
+
+    // app.zig line 7 is `mid();` inside `run`.
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"navgraph.where","arguments":{"file":"app.zig","line":7}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navgraph.context","arguments":{"symbol":"run","budget":0}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"navgraph.context","arguments":{"symbol":"nope_xyz"}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"navgraph.where","arguments":{"file":"app.zig"}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"navgraph.context","arguments":{"include":["bogus"],"symbol":"run"}}}
+    ));
+    try testing.expect(try handleServerRequest(&aw.writer, &session,
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"navgraph.hunks","arguments":{"ref":"not-a-real-ref-xyz"}}}
+    ));
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, aw.written(), "\n"), '\n');
+    var responses: [6]std.json.Parsed(std.json.Value) = undefined;
+    var count: usize = 0;
+    while (lines.next()) |line| : (count += 1) responses[count] = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+    defer for (responses[0..count]) |*r| r.deinit();
+    try testing.expectEqual(@as(usize, 6), count);
+
+    const where_result = responses[0].value.object.get("result").?.object;
+    try testing.expectEqualStrings("run", where_result.get("structuredContent").?.object.get("enclosing").?.object.get("name").?.string);
+
+    // budget:0 does not error (silently reinterpreted as the 2000 default).
+    const context_result = responses[1].value.object.get("result").?.object;
+    try testing.expectEqualStrings("run", context_result.get("structuredContent").?.object.get("symbol").?.object.get("name").?.string);
+
+    try testing.expectEqual(@as(i64, -32001), responses[2].value.object.get("error").?.object.get("code").?.integer);
+    try testing.expectEqual(@as(i64, -32602), responses[3].value.object.get("error").?.object.get("code").?.integer); // missing `line`
+    try testing.expectEqual(@as(i64, -32602), responses[4].value.object.get("error").?.object.get("code").?.integer); // unknown include value
+    try testing.expectEqual(@as(i64, -32002), responses[5].value.object.get("error").?.object.get("code").?.integer); // bad git ref
+}
+
 test "typed MCP facade covers six read-only surfaces with a stable bounded envelope" {
     const testing = std.testing;
     const io = testing.io;
@@ -2165,9 +2416,14 @@ test "MCP identity and capability surfaces share the live manifest contract" {
     try testing.expectEqualStrings(capabilities.capability_schema, init_navgraph.get("capabilitySchema").?.string);
 
     const tools = responses[1].value.object.get("result").?.object;
-    try testing.expectEqual(@as(usize, 4), tools.get("tools").?.array.items.len);
+    // navgraph.query, navgraph (legacy), navgraph.capabilities, navgraph.reload,
+    // navgraph.hunks, navgraph.context, navgraph.where.
+    try testing.expectEqual(@as(usize, 7), tools.get("tools").?.array.items.len);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.capabilities") != null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.query") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.hunks") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.context") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "navgraph.where") != null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "phase3") == null);
     try testing.expectEqualStrings(agent_api.tool_name, init_navgraph.get("queryTool").?.string);
     try testing.expectEqualStrings(agent_api.query_schema, init_navgraph.get("querySchema").?.string);
