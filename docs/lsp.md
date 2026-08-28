@@ -717,12 +717,13 @@ any test block, then an exact call edge over a heuristic one, then proximity
 to the target (same file, then same directory), with a floor of one shown
 whenever the symbol has any caller at all, so an extreme budget still answers
 "who calls this" rather than going empty. `callersTotal` is the true caller
-count regardless of the cap; `offset` pages through that priority order and
-`next` is the offset for the following page, or `null` once nothing remains
-(B1). `truncated` is set when a section `include` asked for was actually
-dropped by the ladder, or `callers` is capped/paged past what this response
-shows — never merely because `include` never asked for a section. An
-unresolved `Target` is `-32001`.
+count regardless of the *cap* — it is `0` when `include` excludes `callers`
+outright, same as the section itself. `offset` pages through that priority
+order and `next` is the offset for the following page, or `null` once
+nothing remains (B1). `truncated` is set when a section `include` asked for
+was actually dropped by the ladder, or `callers` is capped/paged past what
+this response shows — never merely because `include` never asked for a
+section. An unresolved `Target` is `-32001`.
 
 ### `navgraph/where`
 
