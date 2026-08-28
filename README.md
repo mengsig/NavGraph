@@ -226,7 +226,7 @@ navgraph <command> [arg] [flags]
 | `churn [path]`     | Rank current symbols by historical commits or added plus removed/replaced hunk lines (`--sort commits|lines`, `--last`, `--since`). |
 | `hot [path]`       | Rank functions by fan-in/out (`←N callers →M callees`) — the load-bearing symbols; test-dominated results hint at `--no-tests`. Returns the top 25 unless `-l N` asks for more. |
 | `files [filter]`   | Indexed files + symbol counts; `--sort symbols` ranks biggest-first. |
-| `status [filter]`  | Bounded summary: project/language/backend counts, cache state, and headline freshness/parse/resolution counts. `--full` adds the file-level dump (changed files, skipped paths, per-warning/reference detail). |
+| `status [filter]`  | Bounded summary: project counts plus scope-relative language/backend breakdown, cache state, and headline freshness/parse/resolution counts. `--full` adds the file-level dump (changed files, skipped paths, per-warning/reference detail). |
 | `read <file[:A-B]>`| Paged numbered source; ranges are validated/merged, `-l` and hard `--budget` bound pages, and `--after <next>` resumes. |
 | `strings <pattern>`| Search inside string literals (URLs, log/error text, regexes). |
 | `todos [path]`     | Find `TODO`/`FIXME`/`HACK` markers in real comment tokens. |

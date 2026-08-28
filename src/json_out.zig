@@ -1345,9 +1345,10 @@ pub fn status(
     try w.print(",\"snapshot\":{{\"files\":{},\"symbols\":{}}}", .{ idx.graph.files.len, idx.graph.symbols.len });
     try w.writeAll(",\"scope\":{\"filter\":");
     try writeString(w, filter);
-    try w.print(",\"files\":{},\"symbols\":{}}}", .{ report.scope_files, report.scope_symbols });
+    try w.print(",\"files\":{},\"symbols\":{}", .{ report.scope_files, report.scope_symbols });
     try writeLanguageBreakdown(w, idx, filter, opts);
     try writeBackendBreakdown(w, idx, filter, opts);
+    try w.writeByte('}');
     try writeCacheSnapshot(w, idx);
     try writeFreshness(w, idx, report);
     try writeSkippedStatus(w, idx, filter, report);
@@ -1371,9 +1372,10 @@ fn statusCompact(
     try w.print(",\"snapshot\":{{\"files\":{},\"symbols\":{}}}", .{ idx.graph.files.len, idx.graph.symbols.len });
     try w.writeAll(",\"scope\":{\"filter\":");
     try writeString(w, filter);
-    try w.print(",\"files\":{},\"symbols\":{}}}", .{ report.scope_files, report.scope_symbols });
+    try w.print(",\"files\":{},\"symbols\":{}", .{ report.scope_files, report.scope_symbols });
     try writeLanguageBreakdown(w, idx, filter, opts);
     try writeBackendBreakdown(w, idx, filter, opts);
+    try w.writeByte('}');
     try writeCacheSnapshot(w, idx);
     const freshness_current = report.root_error.len == 0 and report.changes.len == 0;
     try w.print(",\"freshness\":{{\"current\":{},\"changed_files\":{}", .{ freshness_current, report.changes.len });

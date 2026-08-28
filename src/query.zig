@@ -8137,8 +8137,10 @@ test "status default is a bounded summary; --full restores the item-level dump (
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_writer.written(), .{});
     defer parsed.deinit();
     const compact_obj = parsed.value.object;
-    try testing.expect(compact_obj.get("languages") != null);
-    try testing.expect(compact_obj.get("backend") != null);
+    // languages/backend are scope-relative counts, nested under scope.
+    const compact_scope = compact_obj.get("scope").?.object;
+    try testing.expect(compact_scope.get("languages") != null);
+    try testing.expect(compact_scope.get("backend") != null);
     try testing.expect(compact_obj.get("unresolved_references").?.object.get("items") == null);
     try testing.expect(compact_obj.get("parse_health").?.object.get("items") == null);
     try testing.expect(compact_obj.get("skipped").?.object.get("paths") == null);
