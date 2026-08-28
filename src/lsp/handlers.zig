@@ -3155,7 +3155,14 @@ test "navgraph/impact reports an empty change as all zeros, not an error" {
     try testing.expectEqual(@as(usize, 0), r.get("nodes").?.array.items.len);
     try testing.expectEqual(@as(usize, 0), r.get("edges").?.array.items.len);
     try testing.expectEqual(@as(usize, 0), r.get("hunks").?.array.items.len);
-    try testing.expectEqual(@as(i64, 0), r.get("summary").?.object.get("symbols").?.integer);
+    const summary = r.get("summary").?.object;
+    try testing.expectEqual(@as(i64, 0), summary.get("symbols").?.integer);
+    // docs/lsp.md's literal empty-change example (coldstart F4): byDepth is
+    // [], not the one-element [0] a naive `alloc(max_depth + 1)` produces.
+    try testing.expectEqual(@as(usize, 0), summary.get("byDepth").?.array.items.len);
+    // ...and changeId is the documented all-zero sentinel, not a nonzero
+    // Wyhash-of-nothing constant.
+    try testing.expectEqualStrings("0000000000000000", r.get("changeId").?.string);
 }
 
 test "navgraph/impact groups the working change into a hunk and blasts from its roots" {

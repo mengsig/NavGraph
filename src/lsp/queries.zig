@@ -546,7 +546,9 @@ fn writeBlastSummary(
         if (query.isTestSymbol(idx, idx.graph.symbols[n.id])) tests += 1;
     }
 
-    const by_depth = try gpa.alloc(u32, max_depth + 1);
+    // No nodes -> no depths, not a one-element `[0]` (coldstart F4: the
+    // documented empty-change/empty-blast result has `byDepth:[]`).
+    const by_depth = try gpa.alloc(u32, if (nodes.len == 0) 0 else max_depth + 1);
     defer gpa.free(by_depth);
     @memset(by_depth, 0);
 
@@ -1857,6 +1859,9 @@ fn appendOverlayHunk(
 /// one. Deliberately keyed on shape (file, range), not deep content bytes —
 /// per-symbol staleness is `Symbol.contentHash`'s job, not this one's.
 fn changeId(idx: *const Index, hunks: []const ImpactHunk) u64 {
+    // The documented empty-change sentinel (all-zero) needs an explicit
+    // case: Wyhash over zero bytes is a nonzero constant, not 0 (coldstart F4).
+    if (hunks.len == 0) return 0;
     var hasher = std.hash.Wyhash.init(0x4e_47_43_48_41_4e_47_45); // "NGCHANGE"
     for (hunks) |h| {
         hasher.update(idx.graph.files[h.file].path);
