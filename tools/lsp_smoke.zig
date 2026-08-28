@@ -32,22 +32,39 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(session);
     const in_path = try std.fs.path.join(arena, &.{ root, "session.lsp" });
     const out_path = try std.fs.path.join(arena, &.{ root, "session.out" });
+    const err_path = try std.fs.path.join(arena, &.{ root, "session.err" });
     try cwd.writeFile(io, .{ .sub_path = in_path, .data = session });
 
-    const term = try runServer(io, cwd, exe, root, in_path, out_path);
+    const term = try runServer(io, cwd, exe, root, in_path, out_path, err_path);
     if (term != .exited or term.exited != 0) {
-        fail("server did not exit cleanly: {any} (session bytes in {s})", .{ term, in_path });
+        // The hostile session is *supposed* to provoke a "malformed frame,
+        // resyncing" diagnostic; only surface the server's stderr on an
+        // actual failure, so a green run's build output stays frame-only.
+        // `fail` never returns, so the read result is never freed -- fine,
+        // since `std.process.exit` tears the whole process down right after.
+        const captured = cwd.readFileAlloc(io, err_path, gpa, .limited(1 << 20)) catch "";
+        fail("server did not exit cleanly: {any} (session bytes in {s})\n--- server stderr ---\n{s}", .{ term, in_path, captured });
     }
 
     const out = try cwd.readFileAlloc(io, out_path, gpa, .limited(16 * 1024 * 1024));
     defer gpa.free(out);
     try checkReplies(gpa, out);
-    std.debug.print("lsp-smoke: ok ({d} bytes of frames)\n", .{out.len});
+    try printOk(io, out.len);
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print("lsp-smoke: " ++ fmt ++ "\n", args);
     std.process.exit(1);
+}
+
+/// Success goes to stdout, not stderr: a green `zig build smoke`/`zig build
+/// test` must produce no stderr output the build runner could mistake for a
+/// failure hint (merge-gate review F5).
+fn printOk(io: std.Io, frame_bytes: usize) !void {
+    var buf: [128]u8 = undefined;
+    var out: std.Io.File.Writer = .initStreaming(.stdout(), io, &buf);
+    try out.interface.print("lsp-smoke: ok ({d} bytes of frames)\n", .{frame_bytes});
+    try out.interface.flush();
 }
 
 fn writeFixture(cwd: std.Io.Dir, io: std.Io, arena: std.mem.Allocator, root: []const u8) !void {
@@ -76,6 +93,7 @@ fn runServer(
     root: []const u8,
     in_path: []const u8,
     out_path: []const u8,
+    err_path: []const u8,
 ) !std.process.Child.Term {
     // stdin and stdout are files, not pipes: a pipe could deadlock on the
     // 300 KB session, and this is exactly how an editor's stream is replayed.
@@ -83,12 +101,17 @@ fn runServer(
     defer stdin.close(io);
     const stdout = try cwd.createFile(io, out_path, .{});
     defer stdout.close(io);
+    // Captured, not inherited: the hostile session provokes a real
+    // "malformed frame, resyncing" diagnostic on the server's stderr, which
+    // must not leak into the build runner's own stderr on a passing run.
+    const stderr = try cwd.createFile(io, err_path, .{});
+    defer stderr.close(io);
 
     var child = try std.process.spawn(io, .{
         .argv = &.{ exe, "lsp", "--root", root },
         .stdin = .{ .file = stdin },
         .stdout = .{ .file = stdout },
-        .stderr = .inherit,
+        .stderr = .{ .file = stderr },
     });
     return child.wait(io);
 }
