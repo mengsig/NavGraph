@@ -793,6 +793,61 @@ whole-graph re-resolution, not parsing, is the actual cost driver; see
   ambiguous base: Name ?`, but the LSP surface currently cannot distinguish
   "no supertype" from "supertype outside the index".
 
+### CLI and MCP mirrors
+
+`navgraph/impact`, `navgraph/context` and `navgraph/where` are also available
+outside the LSP: `navgraph hunks`/`context`/`where` on the command line, and
+`navgraph.hunks`/`navgraph.context`/`navgraph.where` as tools on `navgraph
+serve`/`mcp`'s MCP surface (alongside `navgraph.query`). All three share their
+implementation with the LSP server verbatim (`src/lsp/mirrors.zig` calls
+`queries.writeImpact`/`writeContext`/`writeWhere` directly) — the query logic
+lives in exactly one place; only how a caller reaches it differs.
+
+- `navgraph hunks [ref] [-j]` — the working change's hunks, blast radius and
+  roots (`navgraph/impact`'s wire shape exactly, `roots`/`nodes`/`edges`/
+  `summary`/`hunks`/`changeId` included). Named `hunks`, not `impact`, because
+  `navgraph impact` was already taken (an alias of the pre-1.1 `navgraph
+  affected` command, an unrelated git-diff query). The CLI and MCP tool never
+  have an open-document overlay, so — unlike the wire method, which treats an
+  absent `ref` as "compare open buffers to disk" — a missing `ref` here always
+  means "compare disk to HEAD", the same default `navgraph diff`/`navgraph
+  affected` already use.
+- `navgraph context <symbol> [--budget N] [--include a,b,…] [-j]` —
+  `navgraph/context`'s wire shape exactly: definition, signature, doc,
+  callers/callees/types/tests, trimmed to `--budget` tokens (default 2000; `0`
+  is silently reinterpreted as the default, per the wire contract — never a
+  usage error). `--include` is the same allow-list the wire `include` array
+  validates (`callers`, `callees`, `types`, `tests`, `body`); absent means
+  every section, present-but-empty means none. `--budget` here is *not* the
+  CLI's shared hard-byte-output `--budget` (a different unit and a different
+  default entirely) — `context` is the one command where that flag means
+  tokens, matching the wire param it mirrors.
+- `navgraph where <file>:<line> [-j]` — the symbol enclosing a 1-based
+  `file:line` and its breadcrumb chain, `navgraph/where`'s wire shape exactly.
+  A file outside the index answers `{"enclosing":null,...}` (never an error,
+  per the wire contract); a malformed `file:line` (no colon, a non-numeric or
+  zero line) is reported as a usage message and exit 1, not a crash.
+
+All three default to human-readable text; `-j` emits the identical JSON the
+wire methods return (the same `Symbol` shape — `qualified`, `uri`,
+`contentHash`, 0-based `range`s — not the CLI's own differently-shaped `-j`
+output; text mode is a plain reformatting of that same JSON, computed once).
+
+Design note: the CLI's other commands dispatch over a plain, already-loaded
+`Index`; the MCP surface's `navgraph.query`/legacy `navgraph` tools dispatch
+the same way over a resident one. Neither fits `queries.writeImpact`/
+`writeContext`/`writeWhere`, which need a `Session` (for git/overlay access,
+URI construction, and the position-encoding convention `Ctx` carries). Rather
+than thread a `Session` through the CLI's `Index`-based dispatch, or grow
+`agent_api`'s typed operation envelope with three more Session-shaped
+operations, `src/lsp/mirrors.zig` builds a throwaway one-shot `Session` per
+call — the same walk `Session.init` already does, and the same one-shot cost
+model every other `navgraph` CLI invocation already pays. The MCP tools pay
+that cost on every call (unlike `navgraph.query`, which reuses the server's
+resident index) since `Session` always builds its own index rather than
+adopting an existing one; not worth carrying two synchronized indices unless
+these mirrors turn out to be called often enough for it to matter.
+
 ## Neovim
 
 ```lua
@@ -825,6 +880,7 @@ vim.api.nvim_create_autocmd("FileType", {
 | --- | --- |
 | `loop.zig` | The stdio run loop, the read deadline, logging. |
 | `handlers.zig` | The method table, `initialize` negotiation, error mapping. |
+| `mirrors.zig` | One-shot CLI/MCP callers of `queries.write*` (`navgraph hunks`/`context`/`where` and their MCP tools) — no resident session. |
 | `queries.zig` | Target resolution, blast, call trees, hover, document symbols, grep, and every other `navgraph/*` adapter. |
 | `search.zig` | Fuzzy ranking, include globs, grep patterns. |
 | `payload.zig` | The JSON shapes above — one writer each. |

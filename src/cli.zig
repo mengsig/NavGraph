@@ -306,6 +306,14 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
                 try w.writeAll("-p, --vis <all|public|private>; --public; --private; --no-private\n");
                 continue;
             }
+            // `context`'s `--budget` is a token count (0 means "use the
+            // 2000-token default"), not the shared descriptor's hard *byte*
+            // floor of 64 — the generic "(min 64)" annotation below would be
+            // actively wrong here.
+            if (option == .budget and desc.command == .context) {
+                try w.writeAll("--budget <N>  (tokens; default 2000, 0 also means default)\n");
+                continue;
+            }
             for (option_desc.spellings, 0..) |spelling, i| {
                 if (i != 0) try w.writeAll(", ");
                 try w.writeAll(spelling.flag);
