@@ -1307,7 +1307,12 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
             ctx.toks[i - 1].line == t.line) return null;
         return cDeclarator(ctx, i, hi);
     }
-    const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
+    // Lua declares locals with `local x = …`, exactly where `const`/`let` sit in
+    // the other languages. `local function f()` declares a function, not a
+    // variable, so it is not a binding.
+    const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let") or
+        (ctx.cfg.language == .lua and ctx.identEql(i, "local") and
+            i + 1 < hi and !ctx.identEql(i + 1, "function"));
     if (is_decl) {
         if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
         // Capture the name even when no type can be inferred: an untyped local
@@ -1748,6 +1753,8 @@ fn emitZigContainer(ctx: *Ctx, a: EmitContainer) !u32 {
         .exported = a.exported,
         .parent_local = a.parent,
         .refs = &.{},
+        // Field types only, so `self.field.m()` has a receiver type.
+        .bindings = try collectMemberBindings(ctx, a.open + 1, close),
     });
     try parseZigScope(ctx, a.open + 1, close, my_idx);
     return close + 1;

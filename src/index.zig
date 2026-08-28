@@ -1238,6 +1238,18 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
         // guessing a same-named local callable through the global fallback.
         return;
     }
+    // A same-file top-level symbol that actually declares the member is exact
+    // evidence even when it is not a container kind: Lua and JS spell a type as
+    // a plain table/object (`local Account = {}`), and its methods are parented
+    // to it. Only a hit binds, so a miss still reaches the heuristic below.
+    if (sameFileOwnerMember(idx, from, ref.qualifier, ref.name)) |member| {
+        ref.target = member.id;
+        ref.exact = member.unambiguous;
+        ref.resolution_status = if (ref.exact) .exact else .ambiguous;
+        ref.resolution_reason = .type_qualifier;
+        return;
+    }
+
     // A bare qualifier naming a FIELD of the enclosing type resolves through
     // that field's declared type: `products.add(...)` inside a class holding
     // `Repository<Product> products`. Checked after every branch above, so a
@@ -1269,6 +1281,26 @@ fn resolveQualified(idx: *const Index, from: model.Symbol, ref: *model.Reference
             ref.resolution_reason = if (idx.graph.symbols[ref.target].file == from.file) .same_file_fallback else .global_fallback;
         }
     }
+}
+
+/// The member `name` declared on the sole same-file top-level symbol named
+/// `qualifier`, whatever its kind. Null when no such owner exists, several do,
+/// or the owner declares no such member — every one of those falls through to
+/// the heuristic rather than refusing the reference.
+fn sameFileOwnerMember(idx: *const Index, from: model.Symbol, qualifier: []const u8, name: []const u8) ?MemberMatch {
+    if (qualifier.len == 0 or isLocalBinding(from, qualifier)) return null;
+    const source = idx.graph.files[from.file];
+    var owner: SymbolId = invalid;
+    var id = source.sym_start;
+    while (id < source.sym_end) : (id += 1) {
+        const sym = idx.graph.symbols[id];
+        if (sym.parent != invalid or sym.kind == .import or !std.mem.eql(u8, sym.name, qualifier)) continue;
+        if (owner != invalid) return null;
+        owner = id;
+    }
+    if (owner == invalid) return null;
+    const member = memberOfParent(idx, owner, name);
+    return if (member.id == invalid) null else member;
 }
 
 /// The declared type of a field named `ref.qualifier` on the type enclosing
@@ -4298,6 +4330,53 @@ test "a field of the enclosing type gives a bare receiver its declared type (jav
     try testing.expect(ref.exact);
     try testing.expectEqual(model.ResolutionStatus.exact, ref.resolution_status);
     try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
+}
+
+test "lua: a local typed by a factory call resolves its method exactly" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.lua", .data =
+        \\local Account = {}
+        \\Account.__index = Account
+        \\
+        \\function Account.new(cents)
+        \\  return setmetatable({ cents = cents }, Account)
+        \\end
+        \\
+        \\function Account:deposit(amount)
+        \\  self.cents = self.cents + amount
+        \\end
+        \\
+        \\local M = {}
+        \\function M.run()
+        \\  local a = Account.new(1)
+        \\  a:deposit(2)
+        \\end
+        \\return M
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const new = qualifiedId(&idx, "Account", "new").?;
+    const deposit = qualifiedId(&idx, "Account", "deposit").?;
+    const run = idx.graph.symbols[qualifiedId(&idx, "M", "run").?];
+
+    // `Account` is a plain table, not a container kind, but it declares `new`:
+    // the same-file owner answers exactly.
+    const ctor = refByQual(run, "Account", "new").?;
+    try testing.expectEqual(new, ctor.target);
+    try testing.expect(ctor.exact);
+    // `local a = Account.new(1)` types `a`, so `a:deposit(2)` is exact too.
+    const call = refByQual(run, "a", "deposit").?;
+    try testing.expectEqual(deposit, call.target);
+    try testing.expect(call.exact);
+    try testing.expectEqual(model.ResolutionReason.typed_receiver, call.resolution_reason);
 }
 
 test "a builtin-container receiver never binds to a same-named project method (java)" {
