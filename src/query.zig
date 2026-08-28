@@ -808,14 +808,17 @@ fn renderStatusSummary(w: *Writer, idx: *const Index, filter: []const u8, opts: 
     try w.writeByte('\n');
     try w.writeAll("languages:");
     const lang_counts = statusLanguageCounts(idx, filter, opts);
-    inline for (@typeInfo(language.Language).@"enum".fields, 0..) |f, i| {
-        if (lang_counts[i] != 0) try w.print(" {s} {d}", .{ (@as(language.Language, @enumFromInt(f.value))).tag(), lang_counts[i] });
+    // Index by f.value (the enum's actual tag), not declaration ordinal —
+    // the counts arrays are filled via @intFromEnum and the two diverge if a
+    // tag is pinned.
+    inline for (@typeInfo(language.Language).@"enum".fields) |f| {
+        if (lang_counts[f.value] != 0) try w.print(" {s} {d}", .{ (@as(language.Language, @enumFromInt(f.value))).tag(), lang_counts[f.value] });
     }
     try w.writeByte('\n');
     try w.writeAll("backend:");
     const backend_counts = statusBackendCounts(idx, filter, opts);
-    inline for (@typeInfo(model.Backend).@"enum".fields, 0..) |f, i| {
-        if (backend_counts[i] != 0) try w.print(" {s} {d}", .{ f.name, backend_counts[i] });
+    inline for (@typeInfo(model.Backend).@"enum".fields) |f| {
+        if (backend_counts[f.value] != 0) try w.print(" {s} {d}", .{ f.name, backend_counts[f.value] });
     }
     try w.writeByte('\n');
     const state = idx.cache_snapshot;

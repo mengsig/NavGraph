@@ -1395,11 +1395,13 @@ fn writeLanguageBreakdown(w: *Writer, idx: *const Index, filter: []const u8, opt
     const counts = query.statusLanguageCounts(idx, filter, opts);
     try w.writeAll(",\"languages\":{");
     var first = true;
-    inline for (@typeInfo(language.Language).@"enum".fields, 0..) |f, i| {
-        if (counts[i] != 0) {
+    // Index by f.value (the enum's actual tag), not declaration ordinal —
+    // counts is filled via @intFromEnum and the two diverge if a tag is pinned.
+    inline for (@typeInfo(language.Language).@"enum".fields) |f| {
+        if (counts[f.value] != 0) {
             if (!first) try w.writeByte(',');
             first = false;
-            try w.print("\"{s}\":{d}", .{ (@as(language.Language, @enumFromInt(f.value))).tag(), counts[i] });
+            try w.print("\"{s}\":{d}", .{ (@as(language.Language, @enumFromInt(f.value))).tag(), counts[f.value] });
         }
     }
     try w.writeByte('}');
@@ -1409,11 +1411,11 @@ fn writeBackendBreakdown(w: *Writer, idx: *const Index, filter: []const u8, opts
     const counts = query.statusBackendCounts(idx, filter, opts);
     try w.writeAll(",\"backend\":{");
     var first = true;
-    inline for (@typeInfo(model.Backend).@"enum".fields, 0..) |f, i| {
-        if (counts[i] != 0) {
+    inline for (@typeInfo(model.Backend).@"enum".fields) |f| {
+        if (counts[f.value] != 0) {
             if (!first) try w.writeByte(',');
             first = false;
-            try w.print("\"{s}\":{d}", .{ f.name, counts[i] });
+            try w.print("\"{s}\":{d}", .{ f.name, counts[f.value] });
         }
     }
     try w.writeByte('}');
