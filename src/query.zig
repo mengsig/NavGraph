@@ -213,6 +213,17 @@ pub const Options = struct {
     routes_unhit: bool = false,
     routes_orphan_calls: bool = false,
     routes_handler: []const u8 = "",
+    /// `context`: token budget for `navgraph/context`'s trimming (0 means the
+    /// wire contract's own default, 2000) — a distinct field from `budget`
+    /// above, which is a hard *byte* ceiling on serialized stdout; the two
+    /// share a flag spelling but never a unit or a floor (cli.zig's
+    /// `--budget` handling special-cases `context`).
+    context_budget: u32 = 0,
+    /// `context`: comma-separated `include` allow-list
+    /// (`callers,callees,types,tests,body`); empty and unset are
+    /// distinguished by `Parsed.used_options.contains(.include)`, not by this
+    /// string, since an explicit empty list is a real "include nothing".
+    include: []const u8 = "",
 };
 
 /// Whether `sym` is test code: a Zig `test` block, a symbol in a test file/dir,

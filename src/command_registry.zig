@@ -45,6 +45,14 @@ pub const Command = enum {
     rename,
     coverage,
     graph,
+    // 1.1 CLI mirrors of the navgraph/impact, navgraph/context and
+    // navgraph/where LSP methods (docs/lsp.md's "1.1" section) — each shares
+    // its query logic with the LSP server via src/lsp/mirrors.zig instead of
+    // this file's *Index-based dispatch, so none is `server_available`
+    // (below): the legacy argv MCP tool only knows how to run that dispatch.
+    hunks,
+    context,
+    where,
     capabilities,
     serve,
     lsp,
@@ -53,7 +61,7 @@ pub const Command = enum {
 
 pub const Access = enum { read_only, mutating, metadata, server };
 pub const OutputMode = enum { text, json, jsonl, html, json_rpc };
-pub const ArgumentKind = enum { path_filter, symbol, pattern, filter, git_ref, source_range, new_name, command_name };
+pub const ArgumentKind = enum { path_filter, symbol, pattern, filter, git_ref, source_range, new_name, command_name, file_line };
 
 pub const Argument = struct {
     name: []const u8,
@@ -107,6 +115,7 @@ pub const Option = enum {
     follow_imports,
     log,
     log_level,
+    include,
 };
 
 pub const ValueKind = enum { boolean, string, integer, enumeration, cursor };
@@ -194,6 +203,10 @@ pub const option_descriptors = [_]OptionDescriptor{
     .{ .option = .follow_imports, .name = "follow_imports", .spellings = &.{trueFlag("--follow-imports")}, .value_kind = .boolean },
     .{ .option = .log, .name = "log", .spellings = &.{valueFlag("--log")}, .value_kind = .string },
     .{ .option = .log_level, .name = "log_level", .spellings = &.{valueFlag("--log-level")}, .value_kind = .enumeration, .values = &.{ "error", "info", "debug" } },
+    // `context`'s section allow-list; free-form here (not `.enumeration`,
+    // which validates one value) because it is a comma-separated *set* —
+    // `parseIncludeCsv` validates each token against the same five names.
+    .{ .option = .include, .name = "include", .spellings = &.{valueFlag("--include")}, .value_kind = .string },
 };
 
 pub const CommandDescriptor = struct {
@@ -246,6 +259,7 @@ const symbol_arg = [_]Argument{.{ .name = "symbol", .kind = .symbol, .required =
 const pattern_arg = [_]Argument{.{ .name = "pattern", .kind = .pattern, .required = true }};
 const file_arg = [_]Argument{.{ .name = "file", .kind = .path_filter, .required = true }};
 const source_arg = [_]Argument{.{ .name = "source", .kind = .source_range, .required = true }};
+const file_line_arg = [_]Argument{.{ .name = "location", .kind = .file_line, .required = true }};
 const path_args = [_]Argument{
     .{ .name = "from", .kind = .symbol, .required = true },
     .{ .name = "to", .kind = .symbol, .required = true },
@@ -324,6 +338,14 @@ pub const command_descriptors = [_]CommandDescriptor{
     .{ .command = .rename, .name = "rename", .summary = "Rename a symbol everywhere it resolves exactly.", .example = "navgraph rename Store.get fetch --preview", .arguments = &rename_args, .options = &.{ .root, .no_cache, .backend, .format, .preview }, .outputs = &text_json, .access = .mutating, .requires_index = true, .server_available = false },
     .{ .command = .coverage, .name = "coverage", .summary = "Estimate test coverage from the call graph (no instrumentation).", .example = "navgraph coverage src", .aliases = &.{"cov"}, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true },
     .{ .command = .graph, .name = "graph", .summary = "Render the code graph as an interactive HTML page.", .example = "navgraph graph src --no-tests > graph.html", .aliases = &.{ "viz", "visualize", "html" }, .arguments = &optional_path, .options = &.{ .root, .no_cache, .backend, .limit, .format, .tests }, .outputs = &html_json, .access = .read_only, .requires_index = true },
+    // Mirrors of navgraph/impact, navgraph/context and navgraph/where
+    // (docs/lsp.md "1.1"). `server_available = false`: each builds its own
+    // one-shot Session (src/lsp/mirrors.zig) rather than running through this
+    // file's *Index-based dispatch, so the legacy argv MCP tool cannot route
+    // to it — `navgraph.hunks`/`.context`/`.where` are separate MCP tools.
+    .{ .command = .hunks, .name = "hunks", .summary = "Show the working change's blast radius, grouped by hunk.", .example = "navgraph hunks HEAD~1", .arguments = &optional_ref, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
+    .{ .command = .context, .name = "context", .summary = "Show a symbol's callers, callees, types, tests and definition, budget-trimmed.", .example = "navgraph context build@src/index.zig --budget 2000", .arguments = &symbol_arg, .options = &.{ .root, .no_cache, .budget, .include, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
+    .{ .command = .where, .name = "where", .summary = "Find the symbol enclosing a file:line location.", .example = "navgraph where src/index.zig:120", .arguments = &file_line_arg, .options = &.{ .root, .no_cache, .format }, .outputs = &text_json, .access = .read_only, .requires_index = true, .server_available = false },
     .{ .command = .capabilities, .name = "capabilities", .summary = "Print this binary's machine-readable feature manifest.", .example = "navgraph capabilities -j", .aliases = &.{ "version", "--version" }, .arguments = &no_args, .options = &.{.format}, .outputs = &json_only, .access = .metadata, .requires_index = false, .cache_effect = .none },
     .{ .command = .serve, .name = "serve", .summary = "Run a long-lived MCP/JSON-RPC server over stdio.", .example = "navgraph serve -C .", .aliases = &.{"mcp"}, .arguments = &no_args, .options = &.{ .root, .no_cache, .backend }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },
     .{ .command = .lsp, .name = "lsp", .summary = "Run a resident editor server (LSP) that stays in memory.", .example = "navgraph lsp -C .", .arguments = &no_args, .options = &.{ .root, .no_cache, .backend, .log, .log_level }, .outputs = &rpc_only, .access = .server, .requires_index = true, .server_available = false },

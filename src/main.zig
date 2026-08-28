@@ -283,7 +283,10 @@ fn dispatchWithAuthority(
                 try noteGraphTruncation(io, truncation, parsed.options.limit);
             break :blk true; // graph always emits a page/model
         },
-        .capabilities, .serve, .lsp, .help => unreachable,
+        // `.hunks`/`.context`/`.where` are intercepted in `main()`, before
+        // `dispatchWithAuthority` is ever reached (`runMirrorCommand`): they
+        // need a `Session`, not the `*Index` this function dispatches over.
+        .capabilities, .serve, .lsp, .help, .hunks, .context, .where => unreachable,
     };
 }
 
