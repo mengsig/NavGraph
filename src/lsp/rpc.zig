@@ -173,7 +173,9 @@ pub const Reader = struct {
 ///
 /// Tolerates `\n` as well as `\r\n` line endings (some clients and every hand-
 /// written test script use bare `\n`), ignores headers other than
-/// `Content-Length`, and matches the header name case-insensitively.
+/// `Content-Length`, and matches the header name case-insensitively. A repeated
+/// `Content-Length` takes the last value — the one adjacent to the body, so the
+/// frame boundary stays where the sender put it.
 ///
 /// Every failure resynchronizes to the next plausible frame boundary rather
 /// than to the offending header line: a malformed frame's body must never be

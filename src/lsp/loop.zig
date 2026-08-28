@@ -361,6 +361,45 @@ test "a malformed frame with a body never desyncs the connection" {
     try expectServesBehind("x" ** (rpc.max_header_bytes + 16), 1024);
 }
 
+/// A frame that is well-formed but unusable must cost a reply at most, never
+/// the connection: the request behind it is still answered, and no extra frame
+/// goes out. `replies` says whether the bad frame itself is answered.
+fn expectServedAfter(prefix: []const u8, replies: bool, chunk: usize) !void {
+    const gpa = testing.allocator;
+    const ts = try handlers.TestServer.init(gpa, testing.io, &project);
+    defer ts.deinit();
+    try ts.start();
+    var stream: Stream = .{};
+    defer stream.deinit(gpa);
+
+    const good = try framed(gpa, &.{
+        \\{"jsonrpc":"2.0","id":55,"method":"navgraph/status","params":{}}
+    });
+    defer gpa.free(good);
+    const bytes = try std.mem.concat(gpa, u8, &.{ prefix, good });
+    defer gpa.free(bytes);
+
+    const before = ts.out.written().len;
+    try feed(gpa, &ts.server, &stream, bytes, chunk);
+    var res = try ts.responseFor(55);
+    defer res.deinit();
+    try testing.expect(res.value.object.get("result") != null);
+    const sent = std.mem.count(u8, ts.out.written()[before..], "Content-Length:");
+    try testing.expectEqual(@as(usize, if (replies) 2 else 1), sent);
+}
+
+test "a well-formed but unusable frame never costs the connection" {
+    // An empty body is not JSON, so it is answered with a parse error, id null.
+    try expectServedAfter("Content-Length: 0\r\n\r\n", true, 1);
+    // LSP has no batching, and a body with no id gets no reply.
+    try expectServedAfter("Content-Length: 2\r\n\r\n[]", false, 3);
+    // A repeated Content-Length: the last one wins, so the body is `{}` and the
+    // good frame behind it stays intact. Taking the first (9) would eat into it.
+    try expectServedAfter("Content-Length: 9\r\nContent-Length: 2\r\n\r\n{}", false, 5);
+    // Bare \n line endings, which hand-written clients and scripts send.
+    try expectServedAfter("Content-Length: 2\n\n{}", false, 7);
+}
+
 test "a run of garbage is answered once, not once per read" {
     const gpa = testing.allocator;
     const ts = try handlers.TestServer.init(gpa, testing.io, &project);
