@@ -4332,6 +4332,48 @@ test "a field of the enclosing type gives a bare receiver its declared type (jav
     try testing.expectEqual(model.ResolutionReason.typed_receiver, ref.resolution_reason);
 }
 
+test "one-letter names resolve as call sites in every language family" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data =
+        \\pub fn b() void {}
+        \\pub fn a() void {
+        \\    b();
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data =
+        \\def b():
+        \\    pass
+        \\def a():
+        \\    b()
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.rb", .data =
+        \\def b
+        \\  1
+        \\end
+        \\def a
+        \\  b()
+        \\end
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    // The reference collector used to drop every name shorter than two bytes,
+    // so a one-letter callee had no edge at all.
+    inline for (.{ "a.zig", "a.py", "a.rb" }) |file| {
+        const callee = qualifiedFileSym(&idx, file, "b").?;
+        const callers = idx.callersOf(callee);
+        try testing.expectEqual(@as(usize, 1), callers.len);
+        try testing.expectEqualStrings("a", idx.graph.symbols[callers[0]].name);
+    }
+}
+
 test "lua: a local typed by a factory call resolves its method exactly" {
     const testing = std.testing;
     const io = testing.io;

@@ -568,7 +568,10 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         const t = ctx.toks[i];
         if (t.kind != .identifier) continue;
         const name = t.text(ctx.source);
-        if (name.len < 2 or kw.has(name)) continue;
+        // A one-letter name is a real definition (`pub fn a()`) and a real call
+        // site: length is not evidence. Locals and parameters are already
+        // filtered by their bindings during resolution.
+        if (kw.has(name)) continue;
         const receiver = memberQualifier(ctx, i, lo);
         // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
         // `.{ .value = x }`) are labels, not references to a same-named symbol.
