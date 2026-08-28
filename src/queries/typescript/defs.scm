@@ -29,6 +29,25 @@
   name: (property_identifier) @name
   value: (_) @init) @def.field
 
+; `#private` fields: the name node is a private_property_identifier, so none of
+; the patterns above match them.
+(public_field_definition name: (private_property_identifier) @name) @def.field
+(public_field_definition
+  name: (private_property_identifier) @name
+  type: (type_annotation (_) @type)) @def.field
+(public_field_definition
+  name: (private_property_identifier) @name
+  value: (_) @init) @def.field
+
+; `this.x = …` instance fields, assigned in a constructor or method — the same
+; shape queries/python/defs.scm captures for `self.x`. The span is the `this.x`
+; node, so it ends at the `=` and never swallows the initializer.
+(assignment_expression
+  left: (member_expression object: (this) @recv property: (property_identifier) @name) @def.field)
+(assignment_expression
+  left: (member_expression object: (this) @recv property: (property_identifier) @name) @def.field
+  right: (_) @init)
+
 ; Interface members and type-literal members — zero of these reach the index
 ; through the heuristic scanner.
 (interface_declaration name: (type_identifier) @name) @def.interface
@@ -44,8 +63,9 @@
 (enum_body (property_identifier) @name @def.field)
 (enum_body (enum_assignment name: (property_identifier) @name)) @def.field
 
-; `const x = …` / `let x = …`. The kind (constant vs variable) follows the
-; declaration keyword, which lexical_declaration spells; `var` is a variable.
+; `const x = …` / `let x = …` / `var x = …`. All three are reported as variables,
+; because the heuristic scanner does; a function-valued binding is refined to a
+; function in Zig (refineFunctionValued).
 (lexical_declaration (variable_declarator name: (identifier) @name)) @def.variable
 (lexical_declaration
   (variable_declarator name: (identifier) @name value: (_) @init)) @def.variable

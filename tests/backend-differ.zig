@@ -819,3 +819,128 @@ test "exportedness agrees with the heuristic backend for every shared symbol" {
     try testing.expectEqual(@as(u32, 0), mismatched);
     try testing.expect(compared > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Member identity
+// ---------------------------------------------------------------------------
+
+fn countMembers(idx: *const index.Index, parent: []const u8, name: []const u8) u32 {
+    var n: u32 = 0;
+    for (idx.graph.symbols) |sym| {
+        if (!std.mem.eql(u8, sym.name, name)) continue;
+        if (parent.len == 0) {
+            if (sym.parent == model.invalid_symbol) n += 1;
+            continue;
+        }
+        if (sym.parent == model.invalid_symbol) continue;
+        if (std.mem.eql(u8, idx.graph.symbols[sym.parent].name, parent)) n += 1;
+    }
+    return n;
+}
+
+fn kindOf(idx: *const index.Index, name: []const u8) ?model.SymbolKind {
+    for (idx.graph.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, name)) return sym.kind;
+    }
+    return null;
+}
+
+test "one symbol per member, and no definition lost on shapes the fixtures lack" {
+    // F3/F4/F6/F7. The fixture trees contain none of these shapes, so the
+    // "no definition lost" test above passes over them vacuously.
+    if (!ts_backend.any_grammar) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.ts", .data =
+        \\export class Store {
+        \\  #secret = 1;
+        \\  private cache: Map<string, number>;
+        \\  total = 0;
+        \\
+        \\  constructor(seed: number) {
+        \\    this.cache = new Map();
+        \\    this.total = seed;
+        \\    this.extra = seed * 2;
+        \\  }
+        \\
+        \\  get size(): number {
+        \\    return this.total;
+        \\  }
+        \\
+        \\  set size(v: number) {
+        \\    this.total = v;
+        \\  }
+        \\}
+        \\
+        \\export function overload(a: string): string;
+        \\export function overload(a: number): number;
+        \\export function overload(a: any): any {
+        \\  return a;
+        \\}
+        \\
+        \\export const arrowFn = (a: number) => a + 1;
+        \\export const exprFn = function (a: number) { return a; };
+        \\export const genHelper = function* () { yield 1; };
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.py", .data =
+        \\class Repo:
+        \\    def __init__(self, url):
+        \\        self.url = url
+        \\
+        \\    @property
+        \\    def host(self):
+        \\        return self.url
+        \\
+        \\    @host.setter
+        \\    def host(self, value):
+        \\        self.url = value
+    });
+
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var heuristic = try index.build(gpa, io, root, false, .heuristic);
+    defer heuristic.deinit();
+    var ts = try index.build(gpa, io, root, false, .tree_sitter);
+    defer ts.deinit();
+
+    // The differ's core guarantee, on shapes the fixture trees do not contain.
+    var h_defs: KeySet = .empty;
+    defer h_defs.deinit(gpa);
+    try collectDefs(gpa, &heuristic, &h_defs);
+    var t_defs: KeySet = .empty;
+    defer t_defs.deinit(gpa);
+    try collectDefs(gpa, &ts, &t_defs);
+    var lost: u32 = 0;
+    var it = h_defs.keyIterator();
+    while (it.next()) |k| {
+        if (t_defs.contains(k.*)) continue;
+        lost += 1;
+        var buf: [280]u8 = undefined;
+        std.debug.print("navgraph differ: lost {s}\n", .{k.format(&buf)});
+    }
+    try testing.expectEqual(@as(u32, 0), lost);
+
+    // F3/F7: fields the heuristic indexes for neither language.
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "Store", "extra"));
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "Store", "#secret"));
+
+    // F4: a member declared and then assigned on `this`/`self` is one field, and
+    // an overload signature is not a second function.
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "Store", "cache"));
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "Store", "total"));
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "Repo", "url"));
+    try testing.expectEqual(@as(u32, 1), countMembers(&ts, "", "overload"));
+    // A get/set pair is two real members; both backends keep both.
+    try testing.expectEqual(@as(u32, 2), countMembers(&ts, "Store", "size"));
+    try testing.expectEqual(countMembers(&heuristic, "Store", "size"), countMembers(&ts, "Store", "size"));
+    try testing.expectEqual(@as(u32, 2), countMembers(&ts, "Repo", "host"));
+
+    // F6: a function-valued binding keeps the kind the heuristic gives it.
+    for ([_][]const u8{ "arrowFn", "exprFn", "genHelper" }) |name| {
+        try testing.expectEqual(kindOf(&heuristic, name), kindOf(&ts, name));
+    }
+    try testing.expectEqual(model.SymbolKind.function, kindOf(&ts, "arrowFn").?);
+    try testing.expectEqual(model.SymbolKind.variable, kindOf(&ts, "genHelper").?);
+}

@@ -425,6 +425,7 @@ pub fn parse(
     resolveParents(&by_node, defs.items);
     refineKinds(defs.items);
     try dropUnowned(&defs, gpa, &by_node);
+    try mergeDuplicates(&defs, gpa, &by_node);
 
     const base: u32 = @intCast(out.items.len);
     try out.ensureUnusedCapacity(gpa, defs.items.len);
@@ -679,11 +680,11 @@ fn refineFunctionValued(source: []const u8, defs: []Def) void {
         if (d.kind != .variable and d.kind != .constant) continue;
         const value = declaratorValue(d.node) orelse continue;
         const ty = std.mem.span(ts_node_type(value));
-        const function_like = std.mem.eql(u8, ty, "arrow_function") or
-            std.mem.eql(u8, ty, "function_expression") or
-            std.mem.eql(u8, ty, "function") or
-            std.mem.eql(u8, ty, "generator_function");
-        if (!function_like) continue;
+        // Arrow functions only, deliberately: the heuristic scanner reports
+        // `const f = function () {}` and `function* () {}` as variables, and a
+        // kind that disagrees between backends is a definition lost to the one
+        // that renamed it.
+        if (!std.mem.eql(u8, ty, "arrow_function")) continue;
         d.kind = .function;
         d.declared_type = "";
         if (fieldChild(value, "body")) |body|
@@ -752,10 +753,107 @@ fn dropUnowned(
     }
     if (kept == defs.items.len) return;
     defs.shrinkRetainingCapacity(kept);
-    // Local indices moved; rebuild the node index and re-resolve every parent.
+    try reindex(defs.items, gpa, by_node);
+}
+
+/// Local indices moved: rebuild the node index and re-resolve every parent.
+fn reindex(
+    defs: []Def,
+    gpa: std.mem.Allocator,
+    by_node: *std.AutoHashMapUnmanaged(usize, u32),
+) Error!void {
     by_node.clearRetainingCapacity();
-    for (defs.items, 0..) |d, i| try by_node.put(gpa, nodeKey(d.node), @intCast(i));
-    resolveParents(by_node, defs.items);
+    for (defs, 0..) |d, i| try by_node.put(gpa, nodeKey(d.node), @intCast(i));
+    resolveParents(by_node, defs);
+}
+
+/// Collapse definitions that name the same member twice:
+///   * a field written on `self`/`this` in several places (`__init__` and a
+///     setter) is one field, not one per assignment;
+///   * an overload signature is not a second function — a bodyless declaration
+///     yields to the implementation that shares its name.
+/// Both make `def A.b` ambiguous and `collisions` report a duplicate that is
+/// not one; the heuristic scanner reports one symbol for each shape. Two
+/// definitions that both have bodies (a `get`/`set` pair) are left alone —
+/// those are two real members and the heuristic keeps both.
+fn mergeDuplicates(
+    defs: *std.ArrayList(Def),
+    gpa: std.mem.Allocator,
+    by_node: *std.AutoHashMapUnmanaged(usize, u32),
+) Error!void {
+    if (defs.items.len < 2) return;
+    const order = try gpa.alloc(u32, defs.items.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    const items = defs.items;
+    std.mem.sort(u32, order, items, struct {
+        fn lt(d: []const Def, a: u32, b: u32) bool {
+            const x = d[a];
+            const y = d[b];
+            const xp = x.parent_local orelse std.math.maxInt(u32);
+            const yp = y.parent_local orelse std.math.maxInt(u32);
+            if (xp != yp) return xp < yp;
+            if (x.kind != y.kind) return @intFromEnum(x.kind) < @intFromEnum(y.kind);
+            const c = std.mem.order(u8, x.name, y.name);
+            if (c != .eq) return c == .lt;
+            return a < b;
+        }
+    }.lt);
+
+    const drop = try gpa.alloc(bool, items.len);
+    defer gpa.free(drop);
+    @memset(drop, false);
+
+    var run_start: usize = 0;
+    while (run_start < order.len) {
+        var run_end = run_start + 1;
+        while (run_end < order.len and sameMember(items[order[run_start]], items[order[run_end]])) run_end += 1;
+        mergeRun(items, order[run_start..run_end], drop);
+        run_start = run_end;
+    }
+
+    var kept: usize = 0;
+    for (items, 0..) |d, i| {
+        if (drop[i]) continue;
+        items[kept] = d;
+        kept += 1;
+    }
+    if (kept == items.len) return;
+    defs.shrinkRetainingCapacity(kept);
+    try reindex(defs.items, gpa, by_node);
+}
+
+fn sameMember(a: Def, b: Def) bool {
+    const ap = a.parent_local orelse std.math.maxInt(u32);
+    const bp = b.parent_local orelse std.math.maxInt(u32);
+    return ap == bp and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
+}
+
+/// `run` holds the indices of definitions naming one member, in source order.
+fn mergeRun(defs: []Def, run: []const u32, drop: []bool) void {
+    if (run.len < 2) return;
+    if (defs[run[0]].kind == .field) {
+        const keep = &defs[run[0]];
+        for (run[1..]) |i| {
+            const other = defs[i];
+            if (keep.declared_type.len == 0) keep.declared_type = other.declared_type;
+            if (keep.doc.len == 0) keep.doc = other.doc;
+            keep.modifiers = @bitCast(@as(u8, @bitCast(keep.modifiers)) | @as(u8, @bitCast(other.modifiers)));
+            drop[i] = true;
+        }
+        return;
+    }
+    if (!isCallableKind(defs[run[0]].kind)) return;
+    var has_implementation = false;
+    for (run) |i| has_implementation = has_implementation or hasBody(defs[i]);
+    if (!has_implementation) return; // interface overloads: all declarations, keep them
+    for (run) |i| {
+        if (!hasBody(defs[i])) drop[i] = true;
+    }
+}
+
+fn hasBody(d: Def) bool {
+    return fieldChild(d.node, "body") != null;
 }
 
 fn isCallableKind(kind: SymbolKind) bool {
