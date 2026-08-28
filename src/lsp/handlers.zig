@@ -2373,9 +2373,14 @@ test "navgraph/blast truncates at the limit and honors the callees direction" {
         \\{"jsonrpc":"2.0","id":22,"method":"navgraph/blast","params":{"symbol":"helper","depth":3,"limit":2}}
     );
     defer capped.deinit();
-    const summary = (try resultOf(capped)).object.get("summary").?.object;
+    const capped_r = try resultOf(capped);
+    const summary = capped_r.object.get("summary").?.object;
     try testing.expectEqual(@as(i64, 2), summary.get("symbols").?.integer);
     try testing.expect(summary.get("truncated").?.bool);
+    // B1: the true total (3: helper, mid, run) survives the cap, and `next`
+    // is a working continuation to the rest.
+    try testing.expectEqual(@as(i64, 3), summary.get("total").?.integer);
+    try testing.expectEqual(@as(i64, 2), capped_r.object.get("next").?.integer);
 
     var down = try ts.request(23,
         \\{"jsonrpc":"2.0","id":23,"method":"navgraph/blast","params":{"symbol":"run","direction":"callees","depth":3}}
@@ -2383,6 +2388,68 @@ test "navgraph/blast truncates at the limit and honors the callees direction" {
     defer down.deinit();
     const nodes = (try resultOf(down)).object.get("nodes").?.array.items;
     try testing.expectEqual(@as(usize, 3), nodes.len); // run -> mid -> helper
+}
+
+/// B1 regression: a blast radius past `limit` must report the true total and
+/// a working `offset` continuation, not a dead end (queries.zig:574-576,
+/// mirrors.zig:50, main.zig:865 — the independent evaluation's finding #4,
+/// reproduced on the 1.1 surface). 250 direct callers of `target`, one file.
+fn manyCallersFixture(gpa: std.mem.Allocator, comptime count: u32) !Writer.Allocating {
+    var src: Writer.Allocating = .init(gpa);
+    errdefer src.deinit();
+    try src.writer.writeAll("pub fn target() void {}\n");
+    var i: u32 = 0;
+    while (i < count) : (i += 1) try src.writer.print("pub fn caller{d}() void {{ target(); }}\n", .{i});
+    return src;
+}
+
+test "navgraph/blast reports the true total and offset pages through a blast radius larger than the limit" {
+    const gpa = testing.allocator;
+    const caller_count = 250;
+    var src = try manyCallersFixture(gpa, caller_count);
+    defer src.deinit();
+    const files = [_][2][]const u8{.{ "app.zig", src.written() }};
+
+    const ts = try TestServer.init(gpa, testing.io, &files);
+    defer ts.deinit();
+    try ts.start();
+
+    var page1 = try ts.request(320,
+        \\{"jsonrpc":"2.0","id":320,"method":"navgraph/blast","params":{"symbol":"target","direction":"callers","depth":1,"limit":50}}
+    );
+    defer page1.deinit();
+    const p1 = (try resultOf(page1)).object;
+    const nodes1 = p1.get("nodes").?.array.items;
+    try testing.expectEqual(@as(usize, 50), nodes1.len);
+    const summary1 = p1.get("summary").?.object;
+    // `target` itself is a node too (depth 0), so the true total is 251.
+    try testing.expectEqual(@as(i64, caller_count + 1), summary1.get("total").?.integer);
+    try testing.expectEqual(@as(i64, 50), summary1.get("symbols").?.integer);
+    try testing.expect(summary1.get("truncated").?.bool);
+    try testing.expectEqual(@as(i64, 50), p1.get("next").?.integer);
+
+    var page2 = try ts.request(321,
+        \\{"jsonrpc":"2.0","id":321,"method":"navgraph/blast","params":{"symbol":"target","direction":"callers","depth":1,"limit":50,"offset":50}}
+    );
+    defer page2.deinit();
+    const nodes2 = (try resultOf(page2)).object.get("nodes").?.array.items;
+    try testing.expectEqual(@as(usize, 50), nodes2.len);
+
+    // The two pages are disjoint — real progress, not the same 50 nodes twice.
+    var page1_ids = std.AutoHashMap(i64, void).init(gpa);
+    defer page1_ids.deinit();
+    for (nodes1) |n| try page1_ids.put(n.object.get("symbol").?.object.get("id").?.integer, {});
+    for (nodes2) |n| try testing.expect(!page1_ids.contains(n.object.get("symbol").?.object.get("id").?.integer));
+
+    // A limit generous enough to cover the whole radius shows it all, untruncated.
+    var full = try ts.request(322,
+        \\{"jsonrpc":"2.0","id":322,"method":"navgraph/blast","params":{"symbol":"target","direction":"callers","depth":1,"limit":1000}}
+    );
+    defer full.deinit();
+    const pf = (try resultOf(full)).object;
+    try testing.expectEqual(@as(usize, caller_count + 1), pf.get("nodes").?.array.items.len);
+    try testing.expect(!pf.get("summary").?.object.get("truncated").?.bool);
+    try testing.expect(pf.get("next").? == .null);
 }
 
 test "blast over a file target unions that file's definitions" {
@@ -3356,6 +3423,11 @@ test "navgraph/context honors include as a strict section allow-list (F5)" {
     try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
     try testing.expectEqual(@as(usize, 0), r.get("types").?.array.items.len);
     try testing.expectEqual(@as(usize, 0), r.get("tests").?.array.items.len);
+    // M4: `include` alone excluding a section is not truncation — nothing
+    // was actually dropped (the sole caller fits, whole and unpaged).
+    try testing.expect(!r.get("truncated").?.bool);
+    try testing.expectEqual(@as(i64, 1), r.get("callersTotal").?.integer);
+    try testing.expect(r.get("next").? == .null);
 }
 
 test "navgraph/context with an empty include drops every optional section, not the full bundle" {
@@ -3390,6 +3462,75 @@ test "navgraph/context on an unresolved symbol is a symbol-not-found error" {
     );
     defer res.deinit();
     try testing.expectEqual(@as(i64, -32001), try errorCodeOf(res));
+}
+
+// B2 regression: `budget` must actually bound the response. Pre-fix,
+// `callers` was the one section the drop ladder never touched and nothing
+// capped its length, so budgets 1 through 2000 produced byte-identical
+// output on a heavily-called symbol (verified on `build@src/index.zig`,
+// 242 callers, in the merge-gate review). 250 direct callers here.
+test "navgraph/context enforces its budget: budgets 1 and 2000 return different, budget-respecting responses on a heavily-called symbol" {
+    const gpa = testing.allocator;
+    const caller_count = 250;
+    var src = try manyCallersFixture(gpa, caller_count);
+    defer src.deinit();
+    const files = [_][2][]const u8{.{ "app.zig", src.written() }};
+
+    const ts = try TestServer.init(gpa, testing.io, &files);
+    defer ts.deinit();
+    try ts.start();
+
+    var tight = try ts.request(330,
+        \\{"jsonrpc":"2.0","id":330,"method":"navgraph/context","params":{"symbol":"target","budget":1}}
+    );
+    defer tight.deinit();
+    const tight_r = (try resultOf(tight)).object;
+
+    var loose = try ts.request(331,
+        \\{"jsonrpc":"2.0","id":331,"method":"navgraph/context","params":{"symbol":"target","budget":2000}}
+    );
+    defer loose.deinit();
+    const loose_r = (try resultOf(loose)).object;
+
+    const tight_shown = tight_r.get("callers").?.array.items.len;
+    const loose_shown = loose_r.get("callers").?.array.items.len;
+    try testing.expectEqual(@as(i64, caller_count), tight_r.get("callersTotal").?.integer);
+    try testing.expectEqual(@as(i64, caller_count), loose_r.get("callersTotal").?.integer);
+    // The core regression: budget 1 and budget 2000 must not be identical.
+    try testing.expect(tight_shown < loose_shown);
+    try testing.expect(loose_shown < caller_count);
+    try testing.expect(tight_shown >= 1); // never capped to nothing while callers exist.
+    try testing.expect(tight_r.get("truncated").?.bool);
+    try testing.expect(loose_r.get("truncated").?.bool);
+    try testing.expect(tight_r.get("next").? != .null);
+    try testing.expect(loose_r.get("next").? != .null);
+
+    // A budget generous enough to cover everything shows all of it, untruncated.
+    var full = try ts.request(332,
+        \\{"jsonrpc":"2.0","id":332,"method":"navgraph/context","params":{"symbol":"target","budget":1000000}}
+    );
+    defer full.deinit();
+    const full_r = (try resultOf(full)).object;
+    try testing.expectEqual(@as(usize, caller_count), full_r.get("callers").?.array.items.len);
+    try testing.expect(!full_r.get("truncated").?.bool);
+    try testing.expect(full_r.get("next").? == .null);
+
+    // `next` is a working continuation (B1 applied to context): paging from
+    // it picks up a *different* caller than the tight response showed.
+    const tight_next = tight_r.get("next").?.integer;
+    var page2_buf: [160]u8 = undefined;
+    const page2_body = try std.fmt.bufPrint(
+        &page2_buf,
+        "{{\"jsonrpc\":\"2.0\",\"id\":333,\"method\":\"navgraph/context\",\"params\":{{\"symbol\":\"target\",\"budget\":1,\"offset\":{d}}}}}",
+        .{tight_next},
+    );
+    var page2 = try ts.request(333, page2_body);
+    defer page2.deinit();
+    const page2_r = (try resultOf(page2)).object;
+    try testing.expectEqual(@as(usize, 1), page2_r.get("callers").?.array.items.len);
+    const first_id = tight_r.get("callers").?.array.items[0].object.get("id").?.integer;
+    const second_id = page2_r.get("callers").?.array.items[0].object.get("id").?.integer;
+    try testing.expect(first_id != second_id);
 }
 
 test "navgraph/where resolves the enclosing symbol and its breadcrumb chain" {
