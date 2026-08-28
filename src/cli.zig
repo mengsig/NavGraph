@@ -235,7 +235,7 @@ pub fn usage(w: *std.Io.Writer) !void {
 pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
     const command = registry.parseCommand(name) orelse return false;
     const desc = registry.descriptor(command);
-    try w.print("NavGraph command: {s}\n\nUSAGE: navgraph {s}", .{ desc.name, desc.name });
+    try w.print("NavGraph command: {s}\n{s}\n\nUSAGE: navgraph {s}", .{ desc.name, desc.summary, desc.name });
     for (desc.arguments) |argument| {
         if (argument.required) {
             try w.print(" <{s}>", .{argument.name});
@@ -244,7 +244,7 @@ pub fn usageCommand(w: *std.Io.Writer, name: []const u8) !bool {
         }
     }
     if (desc.options.len != 0) try w.writeAll(" [options]");
-    try w.writeByte('\n');
+    try w.print("\nEXAMPLE: {s}\n", .{desc.example});
 
     if (desc.aliases.len != 0) {
         try w.writeAll("ALIASES: ");
