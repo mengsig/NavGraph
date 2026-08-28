@@ -921,7 +921,9 @@ pub fn writeCodeLens(w: *Writer, ctx: Ctx, file: model.SourceFile) !void {
             idx.callersOf(sym.id).len, query.fanOut(sym),
         });
         try payload.writeQualifiedAtFileBody(w, ctx, sym);
-        try w.writeAll("\"}]}");
+        // Closes: the symbol string+object, the arguments array, the command
+        // object, then the lens item itself (`{"range":...,"command":{...}}`).
+        try w.writeAll("\"}]}}");
     }
     try w.writeByte(']');
 }

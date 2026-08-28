@@ -1822,6 +1822,150 @@ test "textDocument/implementation covers structural and nominal conformance" {
     try testing.expectEqual(@as(usize, 2), method_locs.len);
 }
 
+const widget_project = [_][2][]const u8{
+    .{
+        "widget.zig",
+        \\pub const Widget = struct {
+        \\    id: u32 = 0,
+        \\};
+        \\
+        \\pub fn run(w: Widget) void {
+        \\    _ = w;
+        \\}
+        \\
+    },
+};
+
+test "textDocument/typeDefinition resolves a typed param to its declaration" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &widget_project);
+    defer ts.deinit();
+    try ts.start();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "widget.zig");
+
+    // Param `w: Widget` sits on line 5 (1-based) -> 0-based 4, "pub fn run(" = 11 cols in.
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":65,"method":"textDocument/typeDefinition","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":4,"character":11}}}}}}
+    , .{uri});
+    var res = try ts.request(65, body);
+    defer res.deinit();
+    const locs = (try resultOf(res)).array.items;
+    try testing.expectEqual(@as(usize, 1), locs.len);
+    try testing.expect(std.mem.endsWith(u8, locs[0].object.get("uri").?.string, "widget.zig"));
+    try testing.expectEqual(@as(i64, 0), locs[0].object.get("range").?.object.get("start").?.object.get("line").?.integer);
+}
+
+test "textDocument/typeDefinition off an untyped identifier returns an empty array" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &widget_project);
+    defer ts.deinit();
+    try ts.start();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "widget.zig");
+
+    // `run` itself (line 5, 1-based -> 0-based 4, "pub fn " = 7 cols in) has
+    // no binding named "run" in its own body/param list.
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":66,"method":"textDocument/typeDefinition","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":4,"character":7}}}}}}
+    , .{uri});
+    var res = try ts.request(66, body);
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(res)).array.items.len);
+}
+
+test "textDocument/documentHighlight reports the definition and each call site" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+
+    // The `mid()` call inside `run` (line 5, 1-based -> 0-based 4).
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":67,"method":"textDocument/documentHighlight","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":4,"character":5}}}}}}
+    , .{uri});
+    var res = try ts.request(67, body);
+    defer res.deinit();
+    const items = (try resultOf(res)).array.items;
+    try testing.expectEqual(@as(usize, 2), items.len);
+
+    var saw_def = false;
+    var saw_call = false;
+    for (items) |item| {
+        const line = item.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+        const kind = item.object.get("kind").?.integer;
+        if (line == 7) { // `fn mid` definition line (0-based).
+            try testing.expectEqual(@as(i64, 1), kind);
+            saw_def = true;
+        } else if (line == 4) { // `mid();` call site (0-based).
+            try testing.expectEqual(@as(i64, 2), kind);
+            saw_call = true;
+        }
+    }
+    try testing.expect(saw_def and saw_call);
+}
+
+test "textDocument/documentHighlight off whitespace returns an empty array" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":68,"method":"textDocument/documentHighlight","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":1,"character":0}}}}}}
+    , .{uri});
+    var res = try ts.request(68, body);
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 0), (try resultOf(res)).array.items.len);
+}
+
+test "textDocument/codeLens reports callers/callees per definition, and resolve is a no-op" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":69,"method":"textDocument/codeLens","params":{{"textDocument":{{"uri":"{s}"}}}}}}
+    , .{uri});
+    var res = try ts.request(69, body);
+    defer res.deinit();
+    const items = (try resultOf(res)).array.items;
+    try testing.expectEqual(@as(usize, 2), items.len);
+
+    var by_symbol = std.StringHashMap(std.json.Value).init(testing.allocator);
+    defer by_symbol.deinit();
+    for (items) |item| {
+        const args = item.object.get("command").?.object.get("arguments").?.array.items;
+        try by_symbol.put(args[0].object.get("symbol").?.string, item);
+    }
+
+    const run_lens = by_symbol.get("run@app.zig").?.object;
+    try testing.expectEqualStrings("0 callers \xc2\xb7 1 callees", run_lens.get("command").?.object.get("title").?.string);
+    try testing.expectEqualStrings("navgraph.blast", run_lens.get("command").?.object.get("command").?.string);
+
+    const mid_lens = by_symbol.get("mid@app.zig").?.object;
+    try testing.expectEqualStrings("1 callers \xc2\xb7 1 callees", mid_lens.get("command").?.object.get("title").?.string);
+
+    // `codeLens/resolve` is the identity function: it echoes its params.
+    var resolve_res = try ts.request(70,
+        \\{"jsonrpc":"2.0","id":70,"method":"codeLens/resolve","params":{"range":{"start":{"line":3,"character":0},"end":{"line":3,"character":1}},"command":{"title":"0 callers \u00b7 1 callees","command":"navgraph.blast","arguments":[{"symbol":"run@app.zig"}]}}}
+    );
+    defer resolve_res.deinit();
+    const resolved = (try resultOf(resolve_res)).object;
+    try testing.expectEqual(@as(i64, 3), resolved.get("range").?.object.get("start").?.object.get("line").?.integer);
+    try testing.expectEqualStrings("navgraph.blast", resolved.get("command").?.object.get("command").?.string);
+    try testing.expectEqualStrings("run@app.zig", resolved.get("command").?.object.get("arguments").?.array.items[0].object.get("symbol").?.string);
+
+    // Missing params is a hostile-input rejection, not a crash.
+    var bad = try ts.request(71,
+        \\{"jsonrpc":"2.0","id":71,"method":"codeLens/resolve"}
+    );
+    defer bad.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(bad));
+}
+
 test "navgraph/blast reports depth, via, byFile and the file target form" {
     const ts = try started(testing.allocator);
     defer ts.deinit();
@@ -3091,3 +3235,4 @@ test "golden parity: routes/events/imports/importers agree with the CLI's -j out
         try expectSameOrder(cli_flat.items, lsp_flat.items);
     }
 }
+
