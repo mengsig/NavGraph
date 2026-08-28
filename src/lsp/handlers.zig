@@ -3130,6 +3130,105 @@ test "navgraph/impact narrows to the named uri when several documents changed" {
     try testing.expect(std.mem.endsWith(u8, hunks[0].object.get("uri").?.string, "util.zig"));
 }
 
+test "navgraph/context reports the definition, callers, callees and a token estimate" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(82,
+        \\{"jsonrpc":"2.0","id":82,"method":"navgraph/context","params":{"symbol":"mid"}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("mid", r.get("symbol").?.object.get("name").?.string);
+    try testing.expect(std.mem.indexOf(u8, r.get("definition").?.object.get("text").?.string, "util.helper()") != null);
+    try testing.expect(std.mem.indexOf(u8, r.get("signature").?.string, "fn mid") != null);
+
+    const callers = r.get("callers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqualStrings("run", callers[0].object.get("name").?.string);
+
+    const callees = r.get("callees").?.array.items;
+    try testing.expectEqual(@as(usize, 1), callees.len);
+    try testing.expectEqualStrings("helper", callees[0].object.get("name").?.string);
+
+    try testing.expectEqual(@as(usize, 0), r.get("tests").?.array.items.len);
+    try testing.expect(!r.get("truncated").?.bool);
+    try testing.expect(r.get("tokensEstimate").?.integer > 0);
+}
+
+test "navgraph/context drops sections in order under a tight budget, but never callers" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(83,
+        \\{"jsonrpc":"2.0","id":83,"method":"navgraph/context","params":{"symbol":"mid","budget":1}}
+    );
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    // The body drops first: `definition.text` falls back to the bare signature.
+    try testing.expect(std.mem.indexOf(u8, r.get("definition").?.object.get("text").?.string, "util.helper()") == null);
+    try testing.expectEqual(@as(usize, 0), r.get("callees").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("types").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), r.get("tests").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), r.get("callers").?.array.items.len);
+    try testing.expect(r.get("truncated").?.bool);
+}
+
+test "navgraph/context on an unresolved symbol is a symbol-not-found error" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var res = try ts.request(84,
+        \\{"jsonrpc":"2.0","id":84,"method":"navgraph/context","params":{"symbol":"nope_xyz"}}
+    );
+    defer res.deinit();
+    try testing.expectEqual(@as(i64, -32001), try errorCodeOf(res));
+}
+
+test "navgraph/where resolves the enclosing symbol and its breadcrumb chain" {
+    const ts = try startedPy(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "ports.py");
+
+    // Line 6 (1-based) is `MemoryStore.get`'s body ("return key").
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":85,"method":"navgraph/where","params":{{"uri":"{s}","line":6}}}}
+    , .{uri});
+    var res = try ts.request(85, body);
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expectEqualStrings("get", r.get("enclosing").?.object.get("name").?.string);
+    try testing.expectEqualStrings("ports.py", r.get("file").?.string);
+    const breadcrumbs = r.get("breadcrumbs").?.array.items;
+    try testing.expectEqual(@as(usize, 2), breadcrumbs.len);
+    try testing.expectEqualStrings("MemoryStore", breadcrumbs[0].object.get("name").?.string);
+    try testing.expectEqualStrings("get", breadcrumbs[1].object.get("name").?.string);
+}
+
+test "navgraph/where off any definition answers null, and a missing line is rejected" {
+    const ts = try started(testing.allocator);
+    defer ts.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+
+    // Line 2 (1-based) is blank, outside every definition's span.
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":86,"method":"navgraph/where","params":{{"uri":"{s}","line":2}}}}
+    , .{uri});
+    var res = try ts.request(86, body);
+    defer res.deinit();
+    const r = (try resultOf(res)).object;
+    try testing.expect(r.get("enclosing").? == .null);
+    try testing.expectEqual(@as(usize, 0), r.get("breadcrumbs").?.array.items.len);
+
+    const missing_line = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":87,"method":"navgraph/where","params":{{"uri":"{s}"}}}}
+    , .{uri});
+    var bad = try ts.request(87, missing_line);
+    defer bad.deinit();
+    try testing.expectEqual(@as(i64, -32602), try errorCodeOf(bad));
+}
+
 test "navgraph/routes maps an HTTP route to its handler and its client caller" {
     const ts = try TestServer.initAt(testing.allocator, testing.io, "testenv/fullstack");
     defer ts.deinit();
