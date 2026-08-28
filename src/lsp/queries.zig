@@ -1322,11 +1322,14 @@ pub fn writeTypeDefinition(w: *Writer, ctx: Ctx, path: []const u8, offset: usize
 /// `textDocument/documentHighlight`: every reference site of the symbol under
 /// `offset`, restricted to `path`'s own file — the declaration (kind `Text`)
 /// plus every resolved read/write use (kind `Read`/`Write`).
-pub fn writeDocumentHighlight(w: *Writer, ctx: Ctx, path: []const u8, offset: usize) !void {
+pub fn writeDocumentHighlight(w: *Writer, gpa: std.mem.Allocator, ctx: Ctx, path: []const u8, offset: usize) !void {
     const idx = ctx.index();
     const file_id = fileIdOf(idx, path) orelse return w.writeAll("[]");
     const file = idx.graph.files[file_id];
-    const located = (try locate(ctx.session.gpa, ctx, path, offset)) orelse return w.writeAll("[]");
+    // `locate`'s candidates must come from the per-request arena, not the
+    // long-lived session allocator — every other call site does this; this
+    // one leaked `Located.candidates` on every request (coldstart F2).
+    const located = (try locate(gpa, ctx, path, offset)) orelse return w.writeAll("[]");
     if (located.symbol == invalid) return w.writeAll("[]");
     const target = idx.graph.symbols[located.symbol];
 

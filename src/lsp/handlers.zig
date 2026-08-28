@@ -809,7 +809,7 @@ fn documentHighlight(self: *Server, arena: std.mem.Allocator, params: ?std.json.
     try self.flushPending(arena, .change);
     const c = try self.ctx();
     const at = (try offsetOf(self, arena, Params.from(params))) orelse return w.writeAll("[]");
-    try queries.writeDocumentHighlight(w, c, at.path, at.offset);
+    try queries.writeDocumentHighlight(w, arena, c, at.path, at.offset);
 }
 
 fn codeLens(self: *Server, arena: std.mem.Allocator, params: ?std.json.Value, w: *Writer) Error!void {
@@ -2071,6 +2071,41 @@ test "textDocument/documentHighlight off whitespace returns an empty array" {
     var res = try ts.request(68, body);
     defer res.deinit();
     try testing.expectEqual(@as(usize, 0), (try resultOf(res)).array.items.len);
+}
+
+const highlight_leak_project = [_][2][]const u8{
+    .{ "app.zig", "pub fn run() void {}\n" },
+    .{ "other.zig", "pub fn run() void {}\n" },
+    .{ "third.zig", "pub fn run() void {}\n" },
+};
+
+// coldstart F2: `writeDocumentHighlight` passed `locate`'s `candidates`
+// allocation to the long-lived session allocator instead of the per-request
+// arena, leaking on every request whose cursor sits on a name with any
+// same-named definition elsewhere in the index. `run` here has two such
+// candidates (`other.zig`, `third.zig`); `testing.allocator` panics on any
+// leaked byte at teardown, so 1000 requests reaching `ts.deinit()` below is
+// itself the RSS-flat proof — no leaked memory survives a single iteration.
+test "textDocument/documentHighlight does not leak into the session allocator across many requests on a multi-candidate name" {
+    const ts = try TestServer.init(testing.allocator, testing.io, &highlight_leak_project);
+    defer ts.deinit();
+    try ts.start();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const uri = try ts.uri(arena.allocator(), "app.zig");
+    // Cursor on `run`'s own definition (0-based col 7 -> the 'r').
+    const body = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"jsonrpc":"2.0","id":900,"method":"textDocument/documentHighlight","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":0,"character":7}}}}}}
+    , .{uri});
+
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        var res = try ts.request(900, body);
+        defer res.deinit();
+        const items = (try resultOf(res)).array.items;
+        try testing.expectEqual(@as(usize, 1), items.len); // just the definition; no cross-file refs.
+    }
 }
 
 test "textDocument/codeLens reports callers/callees per definition, and resolve is a no-op" {
