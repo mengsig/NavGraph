@@ -80,6 +80,8 @@
         // `zig build test` is broken in a package archive.
         "tests",
         "testenv",
+        // `test` also runs the LSP smoke driver in `tools/`.
+        "tools",
         "README.md",
         "prompt.md",
     },
