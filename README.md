@@ -1,6 +1,6 @@
 # NavGraph
 
-**Steroids for a coding agent's understanding of a repository.**
+**A code graph for your repository.**
 
 <p align="center">
   <img src="assets/navgraph-graph.gif" alt="NavGraph rendering its own source as an interactive, dependency-layered graph — callers on top, callees below, click any symbol to trace its callers and callees" width="840">
@@ -9,64 +9,128 @@
   <sub><b><code>navgraph graph src &gt; graph.html</code></b> — the whole codebase as one interactive, dependency-layered page (callers → callees, top-down). Click a symbol to trace it. <a href="#visualize-the-graph">Details ↓</a></sub>
 </p>
 
-NavGraph builds a dependency graph of your codebase — definitions, calls,
-references, imports — and exposes it through a fast CLI that emits
-*hyper-compressed*, token-frugal views. It is designed so an agent can navigate
-and understand a repo almost entirely through NavGraph instead of `grep` + `read`.
+NavGraph indexes your codebase and answers precise structural questions —
+who calls this, what does this touch, what breaks if I change it — instead of
+grep-and-hope. It tracks definitions, call edges, and blast radius across 13
+languages (Zig, C/C++, C#, Java, Python, JavaScript, TypeScript, TSX, Lua, Go,
+Rust, Ruby), and ships as one dependency-free static binary. Use it from a
+terminal, from Neovim, or from an AI agent — same commands, same answers.
+<!-- navgraph-supported-languages: zig,c,cpp,csharp,python,javascript,typescript,tsx,lua,go,rust,ruby,java -->
 
-Ask precise questions ("what does `foo()` call, 2 levels deep?", "which classes
-implement this port?", "which clients hit this route?", "outline this file at
-signature detail") and get exactly the information needed — nothing more.
+## 60-second quickstart
 
-- **Language-agnostic core.** Ships with Zig, C/C++, C#, Java, Python, JavaScript,
-  TypeScript, TSX, Lua, Go, Rust and Ruby.
-  <!-- navgraph-supported-languages: zig,c,cpp,csharp,python,javascript,typescript,tsx,lua,go,rust,ruby,java -->
-- **Depth control.** Walk the call graph outward (callees) or inward (callers)
-  to a bounded depth.
-- **Verbosity levels.** `names` → `sig` → `doc` → `full`, so you spend tokens
-  only where you need detail.
-- **Ports and adapters.** Follow Protocol/interface dispatch to nominal and
-  structural implementations, or audit sibling signature divergence in one query.
-- **Program-depth views.** Inspect nominal MROs and overrides, propagate raised
-  exceptions to handlers, and trace value-level security sources to sinks.
-- **Git provenance.** View symbol history and blame, or rank current symbols by
-  historical commit/line churn without shell pipelines.
-- **Cross-language APIs.** Link HTTP routes to client calls, including mounted
-  FastAPI router prefixes, and expose unhit routes and orphan calls.
-- **Trust signals.** Type-scoped member resolution avoids global same-name guesses;
-  `status` reports snapshot freshness, skipped paths, parse health, and unresolved
-  or external graph references; structured references and relation edges carry
-  `exact|inferred|heuristic|ambiguous|unresolved` status plus resolution reason.
-- **Agent workflow.** Select affected tests, page stable JSONL, compact deep walks
-  to a node/byte budget, inspect exact edit sites, and preview or apply safe renames.
-- **Fast.** A ~550-file project indexes and answers a query in ~0.2s. The default
-  is a dependency-free one-shot static binary; optional `serve` mode keeps one
-  index alive and exposes the same commands over JSON-RPC/MCP.
+Download the latest release (swap `x86_64-linux` for `aarch64-linux`,
+`x86_64-macos`, or `aarch64-macos` to match your machine):
 
-## Build & install
+```sh
+curl -LO https://github.com/mengsig/NavGraph/releases/latest/download/navgraph-x86_64-linux.tar.gz
+tar xzf navgraph-x86_64-linux.tar.gz
+install navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
+```
 
-Requires Zig `0.16.0`.
+Now point it at a repo. There's no separate "build the index" step — the
+first command does it and caches the result:
+
+```
+$ navgraph status
+index root: .
+snapshot: 50 files, 3911 symbols
+cache: loaded=true, entries=50, hits=50/50, rewrite=current
+freshness: current
+...
+```
+
+Find a symbol:
+
+```
+$ navgraph search usageCommand
+fn usageCommand (w: *std.Io.Writer, name: []const u8) !bool  src/cli.zig:235-329
+test usageCommand renders concise registry-derived argument and option help  src/cli.zig:1323-1343
+```
+
+See who calls it:
+
+```
+$ navgraph callers usageCommand
+fn usageCommand (w: *std.Io.Writer, name: []const u8) !bool  src/cli.zig:235-329
+  test usageCommand renders concise registry-derived argument and option help  src/cli.zig:1323-1343  ↳:1329,1337
+  fn main (init: std.process.Init) !void  src/main.zig:21-156  ↳:72
+```
+
+Ask what a change would break — every test that transitively reaches
+anything changed since a git ref (`affected`, alias `impact`):
+
+```
+$ navgraph affected --since HEAD~1
+test typed agent decoder constructs canonical read-only requests  src/agent_api.zig:1122-1130
+test typed list envelope applies cursor before byte truncation and emits runnable next call  src/agent_api.zig:1152-1188
+test edit site review gaps lower envelope exactness and remain visible as a warning  src/agent_api.zig:1190-1222
+...
+… 477 nodes elided (limit; 300 shown)
+```
+
+That's the loop: index once (automatic), then `search` / `def` / `calls` /
+`callers` / `affected` and the rest of the ~35 commands in [Usage](#usage)
+below — `navgraph help <command>` prints one-line usage plus an example for
+any of them.
+
+## Use it from Neovim
+
+[epicenter.nvim](https://github.com/mengsig/epicenter.nvim) is the reference
+Neovim client — install it and it wires up `navgraph lsp` plus pickers for
+search, callers, and blast radius. Any editor with an LSP client works the
+same way; see [Editor integration](#editor-integration) below for the raw
+`vim.lsp.start` setup and what the resident server gives you.
+
+## Use it from an AI agent
+
+`navgraph mcp` (alias for `navgraph serve`) runs a long-lived MCP server over
+stdio: an agent gets one compact, typed `navgraph.query` tool instead of
+shelling out per command, with a `max_bytes` budget on every result so an
+answer never blows a context window. `navgraph lsp` gives an editor the same
+resident graph over LSP. Both re-index incrementally as files change instead
+of rebuilding from scratch.
+
+## Doc map
+
+- [docs/lsp.md](docs/lsp.md) — the full editor/LSP protocol: every method,
+  its exact payload shape, and the concurrency model.
+- [docs/accuracy.md](docs/accuracy.md) — how resolution accuracy is measured
+  per language, and where it currently stands.
+- [docs/backends.md](docs/backends.md) — the heuristic vs. tree-sitter parser
+  backends: what each trades off and how to build with tree-sitter enabled.
+
+## Visualize the graph
+
+Turn the whole graph into a **standalone, offline HTML page** — the animation at
+the top is NavGraph rendering *its own* source. It's a **layered dependency view**
+(callers on top, callees below, edges flowing downward), with a force-directed
+mode one click away. Zoom, pan, search, and **click any symbol to trace its
+callers/callees**; nodes are sized by fan-in and colored by file. No server, no
+CDN, no dependencies — the data *and* the renderer are inlined into one
+self-contained file you can open (or email) anywhere.
+
+```sh
+navgraph graph src --no-tests > graph.html   # then open graph.html in a browser
+navgraph graph                                # whole repo (tests hidden in the initial view)
+navgraph graph -C src/lexer.zig > lexer.html  # scope to a single file
+navgraph graph -j > graph.json                # raw {nodes, edges} model for other tools
+navgraph graph -j -l 200                      # capped: `nodes_total` + `truncated` say what was withheld
+```
+
+> Tip: GitHub won't run the page's JavaScript inline, so a repo shows a
+> screenshot/GIF like the one above — but the file itself is fully interactive the
+> moment you open it locally.
+
+## Build from source & tests
+
+Prefer a release binary for normal use (see [Quickstart](#60-second-quickstart)
+above). To build from source, you need Zig `0.16.0`:
 
 ```sh
 zig build -Doptimize=ReleaseFast          # -> zig-out/bin/navgraph
 zig build -Doptimize=ReleaseFast --prefix ~/.local   # installs to ~/.local/bin/navgraph
 ```
-
-### Install from a release
-
-Prebuilt `ReleaseFast` binaries (x86_64/aarch64, Linux/macOS) are attached to
-every [release](https://github.com/mengsig/NavGraph/releases):
-
-```sh
-gh release download -R mengsig/NavGraph --pattern 'navgraph-x86_64-linux.tar.gz'
-tar xzf navgraph-x86_64-linux.tar.gz
-install navgraph-x86_64-linux/navgraph ~/.local/bin/navgraph   # any dir on your PATH
-navgraph --version
-```
-
-Swap `x86_64-linux` for `aarch64-linux`, `x86_64-macos` or `aarch64-macos` to
-match your machine. The release also attaches a `SHA256SUMS` file (one entry
-per archive) if you want to verify the download.
 
 Run the tests:
 
@@ -103,28 +167,6 @@ line-coverage tool for this codebase; this is a dependency-free substitute):
 navgraph coverage src            # per-file % + overall, computed natively
 navgraph coverage src -j         # same, as JSON
 ```
-
-## Visualize the graph
-
-Turn the whole graph into a **standalone, offline HTML page** — the animation at
-the top is NavGraph rendering *its own* source. It's a **layered dependency view**
-(callers on top, callees below, edges flowing downward), with a force-directed
-mode one click away. Zoom, pan, search, and **click any symbol to trace its
-callers/callees**; nodes are sized by fan-in and colored by file. No server, no
-CDN, no dependencies — the data *and* the renderer are inlined into one
-self-contained file you can open (or email) anywhere.
-
-```sh
-navgraph graph src --no-tests > graph.html   # then open graph.html in a browser
-navgraph graph                                # whole repo (tests hidden in the initial view)
-navgraph graph -C src/lexer.zig > lexer.html  # scope to a single file
-navgraph graph -j > graph.json                # raw {nodes, edges} model for other tools
-navgraph graph -j -l 200                      # capped: `nodes_total` + `truncated` say what was withheld
-```
-
-> Tip: GitHub won't run the page's JavaScript inline, so a repo shows a
-> screenshot/GIF like the one above — but the file itself is fully interactive the
-> moment you open it locally.
 
 ## Usage
 
