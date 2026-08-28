@@ -27,11 +27,28 @@ pub const SymbolKind = enum {
     module,
     import,
     route,
+    /// A router-mount directive (FastAPI `include_router(mod.router, prefix=…)`):
+    /// records the URL prefix under which another module's routes are mounted, so
+    /// `index` can prefix those routes cross-file. Never shown to users.
+    route_mount,
     /// A test unit with its own body/call-graph: a Zig `test "…" {}` block (and,
     /// in future, other native test constructs). Kept as a first-class symbol so
     /// `callers`/`coverage` can see which tests exercise a function.
     test_case,
     unknown,
+
+    /// Whether `t` names a known kind: a tag (`fn`, `struct`, …) or a CLI alias
+    /// (`function`/`func`, `constant`, `variable`). Lets the CLI reject a typo'd
+    /// `-k` filter instead of silently matching nothing.
+    pub fn validName(t: []const u8) bool {
+        inline for (@typeInfo(SymbolKind).@"enum".fields) |f| {
+            if (std.mem.eql(u8, t, @field(SymbolKind, f.name).tag())) return true;
+        }
+        inline for (.{ "function", "func", "constant", "variable", "interface", "module" }) |a| {
+            if (std.mem.eql(u8, t, a)) return true;
+        }
+        return false;
+    }
 
     pub fn tag(self: SymbolKind) []const u8 {
         return switch (self) {
@@ -49,6 +66,7 @@ pub const SymbolKind = enum {
             .module => "mod",
             .import => "import",
             .route => "route",
+            .route_mount => "mount",
             .test_case => "test",
             .unknown => "sym",
         };
@@ -57,7 +75,7 @@ pub const SymbolKind = enum {
     /// Symbols an agent typically wants as top-level outline entries.
     pub fn isTopLevelInteresting(self: SymbolKind) bool {
         return switch (self) {
-            .import, .field, .unknown => false,
+            .import, .field, .unknown, .route_mount => false,
             else => true,
         };
     }
@@ -69,6 +87,35 @@ pub const RefKind = enum {
     read,
     import,
     route_call,
+};
+
+/// Confidence assigned to a reference after project-wide resolution. `exact`
+/// remains the compatibility/strict-traversal bit; this enum explains every
+/// non-exact edge without forcing consumers to reverse-engineer that boolean.
+pub const ResolutionStatus = enum {
+    unresolved,
+    exact,
+    inferred,
+    heuristic,
+    ambiguous,
+};
+
+/// Bounded provenance for the resolver branch that produced (or attempted to
+/// produce) a reference edge. This deliberately describes evidence, not every
+/// language-specific parser detail, so the JSON contract stays small/stable.
+pub const ResolutionReason = enum {
+    none,
+    lexical_member,
+    self_member,
+    typed_receiver,
+    type_qualifier,
+    local_import,
+    static_import,
+    inheritance,
+    same_file_fallback,
+    global_fallback,
+    route,
+    go_package,
 };
 
 /// Definition modifiers that refine a symbol without changing its `kind`:
@@ -101,9 +148,17 @@ pub const Reference = struct {
     /// Receiver identifier for a member access `recv.name`, else "" for a bare
     /// reference. Used to type-scope resolution (kills same-name false edges).
     qualifier: []const u8 = "",
+    /// Identifier heading the receiver chain when `qualifier` is itself a member
+    /// (`o.store.Get()` -> "o"); empty when `qualifier` heads the chain. Tells a
+    /// field access apart from a bare module/package qualifier, so the enclosing
+    /// type's field table can never answer for another object's field.
+    receiver_root: []const u8 = "",
     /// First line (1-based) where this name is referenced in the body.
     line: u32,
     kind: RefKind,
+    /// Access direction at this site. Calls and ordinary uses read; assignment
+    /// targets and constructor keyword labels write.
+    write: bool = false,
     /// Number of times this name is referenced within the owning symbol's body.
     count: u32 = 1,
     /// The distinct 1-based lines this name is referenced on, in source order
@@ -112,10 +167,18 @@ pub const Reference = struct {
     /// `line`. Lets `callers`/`calls` show *every* call site, not just the first,
     /// when a caller invokes the target on several lines.
     lines: []const u32 = &.{},
+    /// Exact byte offsets of every occurrence in the owning source file. Kept in
+    /// source order and aligned with `count`; rename uses these as edit sites.
+    offsets: []const u32 = &.{},
     target: SymbolId = invalid_symbol,
-    /// True when resolution bound `target` via a known receiver type or self,
-    /// rather than a heuristic global name match. `--strict` follows only these.
+    /// Compatibility trust bit for strict traversal. New consumers should also
+    /// inspect `resolution_status`/`resolution_reason`; `--strict` follows only
+    /// references whose `exact` bit is true.
     exact: bool = false,
+    /// Machine-readable confidence/provenance. Resolution fills these alongside
+    /// `target`; parser/cache construction can rely on the unresolved defaults.
+    resolution_status: ResolutionStatus = .unresolved,
+    resolution_reason: ResolutionReason = .none,
 };
 
 /// A local variable binding discovered inside a symbol body: `name` was declared
@@ -151,6 +214,16 @@ pub const Symbol = struct {
     refs: []Reference,
     /// Local variable -> type-name bindings discovered in the body.
     bindings: []const Binding = &.{},
+    /// Declaring/receiver type recorded when a language puts a method outside
+    /// its type body (`impl Type` in Rust, `func (r Type)` in Go).  The parser
+    /// may not be able to assign `parent` until every project file is indexed;
+    /// the index consumes this hint in a cross-file parenting pass.  Kept on
+    /// the symbol so warm-cache and clean builds make the same decision.
+    receiver: []const u8 = "",
+    /// Nominal protocol named by an out-of-line implementation declaration
+    /// (`impl Trait for Type`). Empty for inherent methods and languages that
+    /// do not spell a protocol at the implementation site.
+    impl_protocol: []const u8 = "",
     /// For an `import` symbol: the raw module string (`"util.zig"`, `"./api"`,
     /// `os.path`). Empty for every other kind. `name` holds the binding it is
     /// imported as, so `import_path` + `name` gives `alias -> module`.
@@ -197,6 +270,17 @@ pub const Symbol = struct {
     }
 };
 
+/// File-level parser reliability. A desync means an unterminated literal may
+/// have swallowed the reported line range, so missing symbols/edges are suspect.
+pub const ParseHealth = struct {
+    desync_from: ?u32 = null,
+    desync_to: u32 = 0,
+
+    pub fn reliable(self: ParseHealth) bool {
+        return self.desync_from == null;
+    }
+};
+
 pub const SourceFile = struct {
     id: FileId,
     /// Path relative to the project root.
@@ -204,6 +288,8 @@ pub const SourceFile = struct {
     language: language.Language,
     /// Owned source text (kept alive for the graph's lifetime).
     text: []const u8,
+    /// Parser reliability captured on both fresh parses and cache restores.
+    parse_health: ParseHealth = .{},
     /// Half-open range into `Graph.symbols` for this file's symbols.
     sym_start: u32,
     sym_end: u32,
@@ -255,13 +341,21 @@ test "symbol signature and body slice within bounds" {
 test "endLine equals line for a single-line definition" {
     const src = "const x = 1;\n";
     const sym = Symbol{
-        .id = 0, .file = 0, .name = "x", .kind = .constant, .line = 1,
-        .span_start = 0, .span_end = 12, .sig_end = 12, .doc = "",
-        .parent = invalid_symbol, .exported = false, .refs = &.{},
+        .id = 0,
+        .file = 0,
+        .name = "x",
+        .kind = .constant,
+        .line = 1,
+        .span_start = 0,
+        .span_end = 12,
+        .sig_end = 12,
+        .doc = "",
+        .parent = invalid_symbol,
+        .exported = false,
+        .refs = &.{},
     };
     try std.testing.expectEqual(@as(u32, 1), sym.endLine(src));
 }
-
 
 // ---------------------------------------------------------------------------
 // Appended tests for src/model.zig
@@ -291,6 +385,19 @@ fn mkSymForTest(
         .exported = false,
         .refs = &.{},
     };
+}
+
+test "SymbolKind.validName accepts every tag and alias, rejects typos" {
+    inline for (@typeInfo(SymbolKind).@"enum".fields) |f| {
+        try std.testing.expect(SymbolKind.validName(@field(SymbolKind, f.name).tag()));
+    }
+    try std.testing.expect(SymbolKind.validName("function"));
+    try std.testing.expect(SymbolKind.validName("func"));
+    try std.testing.expect(SymbolKind.validName("variable"));
+    try std.testing.expect(SymbolKind.validName("interface"));
+    try std.testing.expect(SymbolKind.validName("module"));
+    try std.testing.expect(!SymbolKind.validName("xyz123"));
+    try std.testing.expect(!SymbolKind.validName("fns"));
 }
 
 test "SymbolKind.tag returns the exact short tag for every kind" {
@@ -327,7 +434,7 @@ test "SymbolKind.tag is unique across every kind" {
         }
         seen += 1;
     }
-    try std.testing.expectEqual(@as(usize, 16), seen);
+    try std.testing.expectEqual(@as(usize, 17), seen);
 }
 
 test "isTopLevelInteresting is false only for import, field and unknown" {
@@ -335,6 +442,7 @@ test "isTopLevelInteresting is false only for import, field and unknown" {
     try std.testing.expect(!SymbolKind.import.isTopLevelInteresting());
     try std.testing.expect(!SymbolKind.field.isTopLevelInteresting());
     try std.testing.expect(!SymbolKind.unknown.isTopLevelInteresting());
+    try std.testing.expect(!SymbolKind.route_mount.isTopLevelInteresting());
     // Everything else is interesting.
     try std.testing.expect(SymbolKind.function.isTopLevelInteresting());
     try std.testing.expect(SymbolKind.method.isTopLevelInteresting());
@@ -361,7 +469,7 @@ test "isTopLevelInteresting count matches expectation across all kinds" {
             boring += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 3), boring);
+    try std.testing.expectEqual(@as(usize, 4), boring);
     try std.testing.expectEqual(@as(usize, 13), interesting);
 }
 

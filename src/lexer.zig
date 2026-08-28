@@ -89,6 +89,10 @@ pub fn tokenize(
 ) !void {
     std.debug.assert(source.len <= std.math.maxInt(u32));
     var lx = Lexer{ .gpa = gpa, .source = source, .cfg = cfg };
+    // Skip a leading UTF-8 BOM (EF BB BF) so it does not desync the tokenizer and
+    // drop the file's first symbol. Offsets stay absolute (the 3 BOM bytes are
+    // simply covered by no token), keeping `read`/`edits` byte ranges aligned.
+    if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) lx.pos = 3;
     while (lx.pos < lx.source.len) {
         const c = lx.peek();
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
@@ -152,6 +156,16 @@ fn lexToken(lx: *Lexer, out: *std.ArrayList(Token)) std.mem.Allocator.Error!void
     // that swallows to the next quote.
     if (cfg.language == .rust and c == '\'' and !isRustCharLiteral(lx)) {
         try appendSingle(lx, out, .punct);
+        return;
+    }
+    // JS/TS/JSX regex literals (`/foo\/bar/gi`). A `/` here is not a comment
+    // (lexComment ran first) so it is either division or a regex. In expression
+    // position (after `=`, `(`, `,`, an operator, or a keyword like `return`) it
+    // starts a regex; the quotes, brackets and escapes inside must be consumed as
+    // one opaque literal — left unhandled they desync the tokenizer and silently
+    // drop every symbol after the regex (the app.js 224-line drop).
+    if (cfg.language.family() == .js and c == '/' and regexAllowedHere(out.items, lx.source)) {
+        try lexRegex(lx, out);
         return;
     }
     if (isStringDelim(cfg, c) or (cfg.template_strings and c == '`')) {
@@ -375,6 +389,7 @@ fn lexLineString(lx: *Lexer, out: *std.ArrayList(Token)) !void {
 }
 
 fn lexString(lx: *Lexer, out: *std.ArrayList(Token), quote: u8) !void {
+    if (quote == '`') return lexTemplateString(lx, out);
     const start = lx.pos;
     const line = lx.line;
     const col = lx.col;
@@ -391,17 +406,122 @@ fn lexString(lx: *Lexer, out: *std.ArrayList(Token), quote: u8) !void {
             lx.advance();
         }
     } else {
-        while (lx.pos < lx.source.len and lx.peek() != quote) {
-            if (lx.peek() == '\\') lx.advance();
-            if (lx.pos < lx.source.len) lx.advance();
-        }
+        skipQuotedBody(lx, quote);
+    }
+    try out.append(lx.gpa, .{ .kind = .string, .start = start, .end = lx.pos, .line = line, .col = col });
+}
+
+fn skipQuotedBody(lx: *Lexer, quote: u8) void {
+    std.debug.assert(quote == '"' or quote == '\'');
+    std.debug.assert(lx.pos > 0 and lx.source[lx.pos - 1] == quote);
+    while (lx.pos < lx.source.len and lx.peek() != quote) {
+        if (lx.peek() == '\\') lx.advance();
         if (lx.pos < lx.source.len) lx.advance();
     }
+    if (lx.pos < lx.source.len) lx.advance();
+}
+
+/// Consume a complete JS template literal as one string token. Interpolation
+/// code is tokenized into scratch storage so nested strings/comments stay opaque.
+fn lexTemplateString(lx: *Lexer, out: *std.ArrayList(Token)) !void {
+    std.debug.assert(lx.peek() == '`');
+    const start = lx.pos;
+    const line = lx.line;
+    const col = lx.col;
+    var inner: std.ArrayList(Token) = .empty;
+    defer inner.deinit(lx.gpa);
+    lx.advance();
+    while (lx.pos < lx.source.len) {
+        const c = lx.peek();
+        if (c == '\\') {
+            lx.advance();
+            if (lx.pos < lx.source.len) lx.advance();
+        } else if (c == '`') {
+            lx.advance();
+            break;
+        } else if (c == '$' and lx.at(1) == '{') {
+            lx.advance();
+            lx.advance();
+            inner.clearRetainingCapacity();
+            try lexInterpHole(lx, &inner);
+        } else {
+            lx.advance();
+        }
+    }
+    std.debug.assert(lx.pos >= start + 1);
     try out.append(lx.gpa, .{ .kind = .string, .start = start, .end = lx.pos, .line = line, .col = col });
 }
 
 fn isTripleClose(lx: *const Lexer, quote: u8) bool {
     return lx.peek() == quote and lx.at(1) == quote and lx.at(2) == quote;
+}
+
+/// Whether a `/` at the cursor begins a regex literal, decided by the previous
+/// significant (non-comment) token. A regex can only appear in expression
+/// position; after a value (identifier, number, string, or a closing
+/// `)`/`]`/`}`) the `/` is division. `<`/`>` are excluded so a JSX close tag
+/// (`</div>`) is never mistaken for a regex.
+fn regexAllowedHere(toks: []const Token, source: []const u8) bool {
+    var i = toks.len;
+    while (i > 0) {
+        i -= 1;
+        const t = toks[i];
+        if (t.kind == .comment) continue;
+        return switch (t.kind) {
+            .number, .string => false,
+            .identifier => regexKeyword(t.text(source)),
+            .punct => std.mem.indexOfScalar(u8, "(,=:[!&|?{;+-*%^~", source[t.start]) != null,
+            else => true,
+        };
+    }
+    return true; // start of file: `/` can only be a regex
+}
+
+/// Keywords after which a `/` starts a regex rather than a division
+/// (`return /x/`, `typeof /x/`). Any other identifier is a value, so `x / y` is
+/// division.
+fn regexKeyword(name: []const u8) bool {
+    const kws = [_][]const u8{
+        "return", "typeof", "instanceof", "in",    "of",   "new",   "delete",
+        "void",   "do",     "else",       "yield", "case", "throw", "await",
+    };
+    for (kws) |k| if (std.mem.eql(u8, name, k)) return true;
+    return false;
+}
+
+/// Lex a JS/TS regex literal `/pattern/flags` as one opaque `.string` token so
+/// its contents are never tokenized as code. Character classes (`[...]`) keep a
+/// `/` from closing the regex; a backslash escapes the next byte. A regex cannot
+/// span a newline, so an unterminated one stops at end-of-line, bounding the
+/// damage of a misclassified division to a single line.
+fn lexRegex(lx: *Lexer, out: *std.ArrayList(Token)) !void {
+    const start = lx.pos;
+    const line = lx.line;
+    const col = lx.col;
+    lx.advance(); // consume the opening '/'
+    var in_class = false;
+    while (lx.pos < lx.source.len) {
+        const ch = lx.peek();
+        if (ch == '\n') break;
+        if (ch == '\\') {
+            lx.advance();
+            if (lx.pos < lx.source.len) lx.advance();
+            continue;
+        }
+        if (ch == '[') {
+            in_class = true;
+        } else if (ch == ']') {
+            in_class = false;
+        } else if (ch == '/' and !in_class) {
+            lx.advance(); // consume the closing '/'
+            break;
+        }
+        lx.advance();
+    }
+    // Trailing flags (`g`, `i`, `m`, …) are part of the literal.
+    while (lx.pos < lx.source.len and isIdentCont(lx.peek())) lx.advance();
+    std.debug.assert(lx.pos > start);
+    try out.append(lx.gpa, .{ .kind = .string, .start = start, .end = lx.pos, .line = line, .col = col });
 }
 
 fn lexIdentifier(lx: *Lexer, out: *std.ArrayList(Token)) !void {
@@ -620,6 +740,97 @@ test "C++ char prefix (L'a') stays a char literal; code after it survives" {
     try std.testing.expect(saw_fn);
 }
 
+test "JS regex literal with quotes/brackets does not desync the tokenizer" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.javascript);
+    // A regex packed with quotes, escaped slashes and a char class — the exact
+    // shape (app.js:997) that used to swallow every symbol after it.
+    const src =
+        \\const re = /("(?:[^"\\]|\\.)*")(\s*:)?|\/x\//g;
+        \\function afterRegex() { return 1; }
+        \\function lastOne() { return 2; }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    var saw_after = false;
+    var saw_last = false;
+    for (toks.items) |t| {
+        if (t.kind != .identifier) continue;
+        if (std.mem.eql(u8, t.text(src), "afterRegex")) saw_after = true;
+        if (std.mem.eql(u8, t.text(src), "lastOne")) saw_last = true;
+    }
+    try std.testing.expect(saw_after);
+    try std.testing.expect(saw_last);
+}
+
+test "a `/` after a value is division, not a regex" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.javascript);
+    // `total / count` is division; `count` and the code after must survive as
+    // real identifiers (a regex would have swallowed to the next `/`).
+    const src =
+        \\const avg = total / count / 2;
+        \\function tail() { return avg; }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    var saw_count = false;
+    var saw_tail = false;
+    for (toks.items) |t| {
+        if (t.kind != .identifier) continue;
+        if (std.mem.eql(u8, t.text(src), "count")) saw_count = true;
+        if (std.mem.eql(u8, t.text(src), "tail")) saw_tail = true;
+    }
+    try std.testing.expect(saw_count);
+    try std.testing.expect(saw_tail);
+}
+
+test "nested JS template interpolation stays in one string token" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const path = `/aoi-library${query ? `?${query}` : ""}`;
+        \\function tail() { return path; }
+    ;
+    var toks = try lexAll(gpa, src, .typescript);
+    defer toks.deinit(gpa);
+    const string = firstOfKind(toks.items, .string).?;
+    try std.testing.expectEqualStrings("`/aoi-library${query ? `?${query}` : \"\"}`", string.text(src));
+    try std.testing.expect(hasIdent(toks.items, src, "tail"));
+}
+
+test "JS template interpolation keeps regex and comment delimiters opaque" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const regexValue = `${/`}/.test(input)}`;
+        \\const commentValue = `${input /* ` } */ + 1}`;
+        \\function afterTemplates() { return regexValue + commentValue; }
+    ;
+    var toks = try lexAll(gpa, src, .typescript);
+    defer toks.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), countKind(toks.items, .string));
+    try std.testing.expect(hasIdent(toks.items, src, "afterTemplates"));
+}
+
+test "JSX closing tag is not mistaken for a regex" {
+    const gpa = std.testing.allocator;
+    const cfg = language.configFor(.tsx);
+    // `</div>` opens with `<` then `/`; treating the `/` as a regex would eat the
+    // rest of the line and hide the component defined afterwards.
+    const src =
+        \\function View() { return <div>hi</div>; }
+        \\function Sibling() { return null; }
+    ;
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    try tokenize(gpa, src, cfg, &toks);
+    var saw_sibling = false;
+    for (toks.items) |t| {
+        if (t.kind == .identifier and std.mem.eql(u8, t.text(src), "Sibling")) saw_sibling = true;
+    }
+    try std.testing.expect(saw_sibling);
+}
 
 // ===================================================================
 // Appended hardening tests for lexer.zig

@@ -16,6 +16,7 @@ const build_options = @import("build_options");
 const language = @import("language.zig");
 const model = @import("model.zig");
 const parser = @import("parser.zig");
+const workspace_path = @import("workspace_path.zig");
 
 const Language = language.Language;
 const ParsedSymbol = parser.ParsedSymbol;
@@ -26,7 +27,7 @@ const invalid_local: u32 = std.math.maxInt(u32);
 /// Bump the trailing digit whenever the on-disk *layout* changes. Logic changes
 /// (parser/indexer) are guarded separately by `build_key` below, so you only
 /// touch this when the byte format itself moves.
-const magic = "NGCACHE5";
+const magic = "NGCACHE11";
 
 /// A fingerprint of NavGraph's own source, injected by `build.zig`. It is
 /// written into every cache header and checked on load: a cache produced by a
@@ -51,6 +52,7 @@ pub const FileStat = struct { mtime_ns: i128, ctime_ns: i128, size: u64 };
 pub const Restored = struct {
     text: []const u8,
     symbols: []ParsedSymbol,
+    parse_health: model.ParseHealth,
 };
 
 /// One file's entry located within a loaded cache buffer, not yet materialized.
@@ -88,7 +90,7 @@ pub const Store = struct {
 /// absent, unreadable, wrong-version, or corrupt — every such case is a safe
 /// full rebuild rather than an error.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, root_dir: std.Io.Dir) ?Store {
-    const bytes = root_dir.readFileAlloc(io, cache_path, gpa, .limited(max_cache_bytes)) catch return null;
+    const bytes = workspace_path.readFileAlloc(root_dir, io, cache_path, gpa, .limited(max_cache_bytes)) catch return null;
     var store = Store{ .gpa = gpa, .bytes = bytes, .entries = .empty };
     indexEntries(&store) catch {
         store.deinit();
@@ -115,11 +117,13 @@ fn indexEntries(store: *Store) !void {
         const blob = try readBlob(&cur);
         try store.entries.put(store.gpa, path, .{ .stat = stat, .lang = lang, .blob = blob });
     }
+    if (cur.pos != store.bytes.len) return error.TrailingData;
 }
 
 /// Read (and skip past) one file's text+symbols region, returning it as a slice.
 fn readBlob(cur: *Cursor) ![]const u8 {
     const start = cur.pos;
+    _ = try readHealth(cur);
     _ = try cur.getStr(); // text
     const sym_count = try cur.getU32();
     var s: u32 = 0;
@@ -136,17 +140,24 @@ fn skipSymbol(cur: *Cursor) !void {
     _ = try cur.getU8(); // modifiers
     _ = try cur.getStr(); // doc
     _ = try cur.getStr(); // import_path
+    _ = try cur.getStr(); // receiver
+    _ = try cur.getStr(); // impl_protocol
     const ref_count = try cur.getU32();
     var r: u32 = 0;
     while (r < ref_count) : (r += 1) {
         _ = try cur.getStr(); // name
         _ = try cur.getStr(); // qualifier
+        _ = try cur.getStr(); // receiver_root
         _ = try cur.getU32(); // line
         _ = try cur.getU8(); // kind
+        _ = try cur.getU8(); // write
         _ = try cur.getU32(); // count
         const nlines = try cur.getU32(); // distinct call-site lines
         var l: u32 = 0;
         while (l < nlines) : (l += 1) _ = try cur.getU32();
+        const noffsets = try cur.getU32(); // exact occurrence byte offsets
+        var o: u32 = 0;
+        while (o < noffsets) : (o += 1) _ = try cur.getU32();
     }
     const bind_count = try cur.getU32();
     var b: u32 = 0;
@@ -162,12 +173,24 @@ fn skipSymbol(cur: *Cursor) !void {
 
 fn materialize(arena: std.mem.Allocator, blob: []const u8) !Restored {
     var cur = Cursor{ .bytes = blob };
+    const parse_health = try readHealth(&cur);
     const text = try arena.dupe(u8, try cur.getStr());
     const sym_count = try cur.getU32();
     const symbols = try arena.alloc(ParsedSymbol, sym_count);
     for (symbols) |*sym| sym.* = try readSymbol(arena, &cur);
-    std.debug.assert(cur.pos == blob.len);
-    return .{ .text = text, .symbols = symbols };
+    if (cur.pos != blob.len) return error.TrailingData;
+    return .{ .text = text, .symbols = symbols, .parse_health = parse_health };
+}
+
+fn readHealth(cur: *Cursor) !model.ParseHealth {
+    const from_raw = try cur.getU32();
+    const to = try cur.getU32();
+    if (from_raw == 0) {
+        if (to != 0) return error.BadParseHealth;
+        return .{};
+    }
+    if (to < from_raw) return error.BadParseHealth;
+    return .{ .desync_from = from_raw, .desync_to = to };
 }
 
 fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
@@ -182,6 +205,8 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
     const modifiers: model.Mods = @bitCast(try cur.getU8());
     const doc = try arena.dupe(u8, try cur.getStr());
     const import_path = try arena.dupe(u8, try cur.getStr());
+    const receiver = try arena.dupe(u8, try cur.getStr());
+    const impl_protocol = try arena.dupe(u8, try cur.getStr());
     std.debug.assert(span_start <= sig_end and sig_end <= span_end);
     return .{
         .name = name,
@@ -196,6 +221,8 @@ fn readSymbol(arena: std.mem.Allocator, cur: *Cursor) !ParsedSymbol {
         .parent_local = if (parent_raw == invalid_local) null else parent_raw,
         .refs = try readRefs(arena, cur),
         .bindings = try readBindings(arena, cur),
+        .receiver = receiver,
+        .impl_protocol = impl_protocol,
         .import_path = import_path,
     };
 }
@@ -206,19 +233,27 @@ fn readRefs(arena: std.mem.Allocator, cur: *Cursor) ![]Reference {
     for (refs) |*ref| {
         const name = try arena.dupe(u8, try cur.getStr());
         const qualifier = try arena.dupe(u8, try cur.getStr());
+        const receiver_root = try arena.dupe(u8, try cur.getStr());
         const line = try cur.getU32();
         const kind = try cur.getRefKind();
+        const is_write = try cur.getU8() != 0;
         const count = try cur.getU32();
         const nlines = try cur.getU32();
         const lines = try arena.alloc(u32, nlines);
         for (lines) |*ln| ln.* = try cur.getU32();
+        const noffsets = try cur.getU32();
+        const offsets = try arena.alloc(u32, noffsets);
+        for (offsets) |*offset| offset.* = try cur.getU32();
         ref.* = .{
             .name = name,
             .qualifier = qualifier,
+            .receiver_root = receiver_root,
             .line = line,
             .kind = kind,
+            .write = is_write,
             .count = count,
             .lines = lines,
+            .offsets = offsets,
         };
     }
     return refs;
@@ -258,8 +293,19 @@ pub fn write(
     try putU32(gpa, &buf, @intCast(files.len));
     for (files, stats) |file, stat| try writeFile(gpa, &buf, file, stat, symbols);
 
-    try root_dir.createDirPath(io, cache_dir);
-    try root_dir.writeFile(io, .{ .sub_path = cache_path, .data = buf.items });
+    root_dir.createDir(io, cache_dir, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => |e| return e,
+    };
+    // Do not follow a repository-controlled `.navgraph` symlink/junction.
+    // Write through an unnamed/random temporary and atomically replace the
+    // basename, so an existing `cache` symlink is replaced rather than opened.
+    var dir = try root_dir.openDir(io, cache_dir, .{ .follow_symlinks = false });
+    defer dir.close(io);
+    var atomic = try dir.createFileAtomic(io, "cache", .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, buf.items);
+    try atomic.replace(io);
 }
 
 fn writeFile(
@@ -277,33 +323,48 @@ fn writeFile(
     try putU64(gpa, buf, stat.size);
     try putStr(gpa, buf, file.path);
     try buf.append(gpa, @intFromEnum(file.language));
+    try putHealth(gpa, buf, file.parse_health);
     try putStr(gpa, buf, file.text);
     try putU32(gpa, buf, file.sym_end - file.sym_start);
     var i = file.sym_start;
-    while (i < file.sym_end) : (i += 1) try writeSymbol(gpa, buf, symbols[i], file.sym_start);
+    while (i < file.sym_end) : (i += 1) {
+        try writeSymbol(gpa, buf, symbols[i], file.sym_start, file.sym_end);
+    }
 }
 
-fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbol, base: u32) !void {
+fn writeSymbol(
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    sym: model.Symbol,
+    base: u32,
+    end: u32,
+) !void {
     try putStr(gpa, buf, sym.name);
     try buf.append(gpa, @intFromEnum(sym.kind));
     try putU32(gpa, buf, sym.line);
     try putU32(gpa, buf, sym.span_start);
     try putU32(gpa, buf, sym.span_end);
     try putU32(gpa, buf, sym.sig_end);
-    try putU32(gpa, buf, localParent(sym, base));
+    try putU32(gpa, buf, localParent(sym, base, end));
     try buf.append(gpa, @intFromBool(sym.exported));
     try buf.append(gpa, @as(u8, @bitCast(sym.modifiers)));
     try putStr(gpa, buf, sym.doc);
     try putStr(gpa, buf, sym.import_path);
+    try putStr(gpa, buf, sym.receiver);
+    try putStr(gpa, buf, sym.impl_protocol);
     try putU32(gpa, buf, @intCast(sym.refs.len));
     for (sym.refs) |ref| {
         try putStr(gpa, buf, ref.name);
         try putStr(gpa, buf, ref.qualifier);
+        try putStr(gpa, buf, ref.receiver_root);
         try putU32(gpa, buf, ref.line);
         try buf.append(gpa, @intFromEnum(ref.kind));
+        try buf.append(gpa, @intFromBool(ref.write));
         try putU32(gpa, buf, ref.count);
         try putU32(gpa, buf, @intCast(ref.lines.len));
         for (ref.lines) |ln| try putU32(gpa, buf, ln);
+        try putU32(gpa, buf, @intCast(ref.offsets.len));
+        for (ref.offsets) |offset| try putU32(gpa, buf, offset);
     }
     try putU32(gpa, buf, @intCast(sym.bindings.len));
     for (sym.bindings) |b| {
@@ -312,17 +373,27 @@ fn writeSymbol(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), sym: model.Symbo
     }
 }
 
-/// A parent symbol id is always within the same file range; store it relative
-/// to the file base so it survives global-id renumbering. `invalid` → sentinel.
-fn localParent(sym: model.Symbol, base: u32) u32 {
+/// Store same-file parents relative to the file base so they survive global-id
+/// renumbering. Cross-file parents are reconstructed from receiver metadata;
+/// `invalid` and cross-file ids both serialize as the sentinel.
+fn localParent(sym: model.Symbol, base: u32, end: u32) u32 {
     if (sym.parent == model.invalid_symbol) return invalid_local;
-    std.debug.assert(sym.parent >= base);
+    // Cross-file owners are reconstructed from `receiver` after all cached
+    // files are restored; the per-file cache can only encode local parent ids.
+    if (sym.parent < base or sym.parent >= end) return invalid_local;
     return sym.parent - base;
 }
 
 // ---------------------------------------------------------------------------
 // Low-level encode helpers
 // ---------------------------------------------------------------------------
+
+fn putHealth(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), health: model.ParseHealth) !void {
+    const from = health.desync_from orelse 0;
+    std.debug.assert((from == 0) == (health.desync_to == 0));
+    try putU32(gpa, buf, from);
+    try putU32(gpa, buf, health.desync_to);
+}
 
 fn putU8(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: u8) !void {
     try buf.append(gpa, v);
@@ -411,7 +482,7 @@ test "cache round-trips a file's parsed symbols" {
     ;
     var parsed: std.ArrayList(ParsedSymbol) = .empty;
     defer parsed.deinit(testing.allocator);
-    try parser.parse(testing.allocator, arena, source, .zig, &parsed);
+    _ = try parser.parse(testing.allocator, arena, source, .zig, &parsed);
     try testing.expect(parsed.items.len >= 2);
 
     // Promote parsed symbols into graph Symbols (mirrors index.zig).
@@ -423,6 +494,7 @@ test "cache round-trips a file's parsed symbols" {
         .path = "m.zig",
         .language = .zig,
         .text = source,
+        .parse_health = .{ .desync_from = 3, .desync_to = 5 },
         .sym_start = 0,
         .sym_end = @intCast(syms.items.len),
     }};
@@ -436,6 +508,8 @@ test "cache round-trips a file's parsed symbols" {
     defer store.deinit();
     const hit = store.restore(arena, "m.zig", stats[0]).?;
     try testing.expectEqualStrings(source, hit.text);
+    try testing.expectEqual(@as(?u32, 3), hit.parse_health.desync_from);
+    try testing.expectEqual(@as(u32, 5), hit.parse_health.desync_to);
     try testing.expectEqual(parsed.items.len, hit.symbols.len);
     try testing.expectEqualStrings(parsed.items[0].name, hit.symbols[0].name);
     // A changed mtime misses; a changed ctime misses; an absent path misses.
@@ -483,9 +557,10 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
         .modifiers = p.modifiers,
         .refs = p.refs,
         .bindings = p.bindings,
+        .receiver = p.receiver,
+        .impl_protocol = p.impl_protocol,
     };
 }
-
 
 // ---------------------------------------------------------------------------
 // Appended tests: exhaustive coverage of cache serialization round-trips,
@@ -497,10 +572,13 @@ fn promote(p: ParsedSymbol, id: u32) model.Symbol {
 const TestRef = struct {
     name: []const u8 = "",
     qualifier: []const u8 = "",
+    receiver_root: []const u8 = "",
     line: u32 = 1,
     kind: u8 = 0,
+    write: bool = false,
     count: u32 = 1,
     lines: []const u32 = &[_]u32{},
+    offsets: []const u32 = &[_]u32{},
 };
 
 /// Hand-encode one symbol record in exactly the byte layout `readSymbol`
@@ -529,15 +607,21 @@ fn encSym(
     try putU8(a, buf, mods_byte);
     try putStr(a, buf, doc);
     try putStr(a, buf, import_path);
+    try putStr(a, buf, ""); // receiver
+    try putStr(a, buf, ""); // impl_protocol
     try putU32(a, buf, @intCast(refs.len));
     for (refs) |r| {
         try putStr(a, buf, r.name);
         try putStr(a, buf, r.qualifier);
+        try putStr(a, buf, r.receiver_root);
         try putU32(a, buf, r.line);
         try putU8(a, buf, r.kind);
+        try putU8(a, buf, @intFromBool(r.write));
         try putU32(a, buf, r.count);
         try putU32(a, buf, @intCast(r.lines.len));
         for (r.lines) |ln| try putU32(a, buf, ln);
+        try putU32(a, buf, @intCast(r.offsets.len));
+        for (r.offsets) |offset| try putU32(a, buf, offset);
     }
     try putU32(a, buf, @intCast(binds.len));
     for (binds) |b| {
@@ -566,6 +650,7 @@ fn buildOneEntryCache(
     try putU64(a, &buf, @intCast(text.len)); // size
     try putStr(a, &buf, path);
     try putU8(a, &buf, lang_byte);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, text); // blob: text
     try putU32(a, &buf, 0); // blob: sym_count
     return buf;
@@ -592,6 +677,8 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
     try t.expectEqual(@as(u8, @bitCast(expected.modifiers)), @as(u8, @bitCast(got.modifiers)));
     try t.expectEqualStrings(expected.doc, got.doc);
     try t.expectEqualStrings(expected.import_path, got.import_path);
+    try t.expectEqualStrings(expected.receiver, got.receiver);
+    try t.expectEqualStrings(expected.impl_protocol, got.impl_protocol);
     if (expected.parent == model.invalid_symbol) {
         try t.expectEqual(@as(?u32, null), got.parent_local);
     } else {
@@ -601,10 +688,13 @@ fn expectSymEq(base: u32, expected: model.Symbol, got: ParsedSymbol) !void {
     for (expected.refs, got.refs) |er, gr| {
         try t.expectEqualStrings(er.name, gr.name);
         try t.expectEqualStrings(er.qualifier, gr.qualifier);
+        try t.expectEqualStrings(er.receiver_root, gr.receiver_root);
         try t.expectEqual(er.line, gr.line);
         try t.expectEqual(er.kind, gr.kind);
+        try t.expectEqual(er.write, gr.write);
         try t.expectEqual(er.count, gr.count);
         try t.expectEqualSlices(u32, er.lines, gr.lines);
+        try t.expectEqualSlices(u32, er.offsets, gr.offsets);
     }
     try t.expectEqual(expected.bindings.len, got.bindings.len);
     for (expected.bindings, got.bindings) |eb, gb| {
@@ -626,20 +716,20 @@ test "full round-trip preserves every field across two files with distinct langu
 
     var no_refs = [_]Reference{};
     var refs1 = [_]Reference{
-        .{ .name = "helper", .qualifier = "", .line = 30, .kind = .call, .count = 3, .lines = &[_]u32{ 30, 33, 40 } },
-        .{ .name = "Widget", .qualifier = "w", .line = 31, .kind = .type_use, .count = 1, .lines = &[_]u32{} },
+        .{ .name = "helper", .qualifier = "", .line = 30, .kind = .call, .count = 3, .lines = &[_]u32{ 30, 33, 40 }, .offsets = &[_]u32{ 2, 7, 12 } },
+        .{ .name = "Widget", .qualifier = "w", .line = 31, .kind = .type_use, .count = 1, .lines = &[_]u32{}, .offsets = &[_]u32{8} },
     };
     const binds1 = [_]Binding{
         .{ .name = "tmp", .type_name = "i32" },
         .{ .name = "w", .type_name = "Widget" },
     };
     var refs3 = [_]Reference{
-        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .count = 2, .lines = &[_]u32{ 5, 6 } },
+        .{ .name = "total", .qualifier = "self", .line = 5, .kind = .read, .write = true, .count = 2, .lines = &[_]u32{ 5, 6 }, .offsets = &[_]u32{ 1, 5 } },
     };
 
     var syms = [_]model.Symbol{
         .{ .id = 0, .file = 0, .name = "Container", .kind = .@"struct", .line = 1, .span_start = 0, .span_end = 20, .sig_end = 10, .doc = "/// A container", .parent = model.invalid_symbol, .exported = true, .refs = &no_refs },
-        .{ .id = 1, .file = 0, .name = "run", .kind = .method, .line = 3, .span_start = 20, .span_end = 30, .sig_end = 25, .doc = "", .parent = 0, .exported = false, .modifiers = .{ .is_async = true, .getter = true }, .refs = &refs1, .bindings = &binds1 },
+        .{ .id = 1, .file = 0, .name = "run", .kind = .method, .line = 3, .span_start = 20, .span_end = 30, .sig_end = 25, .doc = "", .parent = 0, .exported = false, .modifiers = .{ .is_async = true, .getter = true }, .refs = &refs1, .bindings = &binds1, .receiver = "Container", .impl_protocol = "Runnable" },
         // File B (python): an import (carries import_path) + a variable whose
         // parent points base-relative into file B to exercise the base offset.
         .{ .id = 2, .file = 1, .name = "np", .kind = .import, .line = 1, .span_start = 0, .span_end = 10, .sig_end = 8, .doc = "", .parent = model.invalid_symbol, .exported = false, .import_path = "numpy", .refs = &no_refs },
@@ -648,7 +738,7 @@ test "full round-trip preserves every field across two files with distinct langu
 
     const files = [_]model.SourceFile{
         .{ .id = 0, .path = "a.zig", .language = .zig, .text = textA, .sym_start = 0, .sym_end = 2 },
-        .{ .id = 1, .path = "b.py", .language = .python, .text = textB, .sym_start = 2, .sym_end = 4 },
+        .{ .id = 1, .path = "b.py", .language = .python, .text = textB, .parse_health = .{ .desync_from = 2, .desync_to = 4 }, .sym_start = 2, .sym_end = 4 },
     };
     const stats = [_]FileStat{
         .{ .mtime_ns = 1000, .ctime_ns = 2000, .size = textA.len },
@@ -673,6 +763,8 @@ test "full round-trip preserves every field across two files with distinct langu
 
     const hitB = store.restore(arena, "b.py", stats[1]).?;
     try testing.expectEqualStrings(textB, hitB.text);
+    try testing.expectEqual(@as(?u32, 2), hitB.parse_health.desync_from);
+    try testing.expectEqual(@as(u32, 4), hitB.parse_health.desync_to);
     try testing.expectEqual(@as(usize, 2), hitB.symbols.len);
     try expectSymEq(2, syms[2], hitB.symbols[0]);
     try expectSymEq(2, syms[3], hitB.symbols[1]);
@@ -847,6 +939,7 @@ test "materialize reconstructs all scalar, string, ref and binding fields" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{ .desync_from = 7, .desync_to = 9 });
     try putStr(a, &buf, "the text"); // blob text
     try putU32(a, &buf, 2); // sym_count
 
@@ -867,6 +960,8 @@ test "materialize reconstructs all scalar, string, ref and binding fields" {
 
     const r = try materialize(arena, buf.items);
     try testing.expectEqualStrings("the text", r.text);
+    try testing.expectEqual(@as(?u32, 7), r.parse_health.desync_from);
+    try testing.expectEqual(@as(u32, 9), r.parse_health.desync_to);
     try testing.expectEqual(@as(usize, 2), r.symbols.len);
 
     const s0 = r.symbols[0];
@@ -907,6 +1002,7 @@ test "materialize decodes every SymbolKind value" {
     inline for (@typeInfo(model.SymbolKind).@"enum".fields) |f| {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
+        try putHealth(a, &buf, .{});
         try putStr(a, &buf, "t");
         try putU32(a, &buf, 1);
         try encSym(a, &buf, "s", @intCast(f.value), invalid_local, 0, 0, "", "", &.{}, &.{});
@@ -924,6 +1020,7 @@ test "materialize decodes every RefKind value" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "t");
     try putU32(a, &buf, 1);
     var refs: [@typeInfo(model.RefKind).@"enum".fields.len]TestRef = undefined;
@@ -945,6 +1042,7 @@ test "materialize rejects an out-of-range symbol kind" {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "t");
     try putU32(a, &buf, 1);
     try encSym(a, &buf, "s", 250, invalid_local, 0, 0, "", "", &.{}, &.{});
@@ -959,6 +1057,7 @@ test "materialize rejects an out-of-range ref kind" {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "t");
     try putU32(a, &buf, 1);
     const refs = [_]TestRef{.{ .name = "r", .kind = 250, .line = 1 }};
@@ -974,11 +1073,30 @@ test "materialize rejects a truncated blob" {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
+    try putHealth(a, &buf, .{});
     try putStr(a, &buf, "text");
     try putU32(a, &buf, 1);
     try encSym(a, &buf, "s", @intFromEnum(model.SymbolKind.function), invalid_local, 0, 0, "", "", &.{}, &.{});
-    // Chop it down so the very first getStr (blob text) truncates.
+    // Chop it down before the parse-health header is complete.
     try testing.expectError(error.Truncated, materialize(arena, buf.items[0..3]));
+}
+
+test "materialize rejects inconsistent parse health" {
+    const testing = std.testing;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    try putU32(testing.allocator, &buf, 0);
+    try putU32(testing.allocator, &buf, 3);
+    try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
+
+    buf.clearRetainingCapacity();
+    try putU32(testing.allocator, &buf, 7);
+    try putU32(testing.allocator, &buf, 6);
+    try testing.expectError(error.BadParseHealth, materialize(arena, buf.items));
 }
 
 test "write emits the versioned magic and build key header" {
@@ -1079,7 +1197,7 @@ test "load rejects empty and sub-magic cache files" {
     try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
 }
 
-test "load ignores a cache truncated by a single trailing byte" {
+test "load ignores cache data with trailing junk or truncation" {
     const testing = std.testing;
     var no_refs = [_]Reference{};
     const binds = [_]Binding{.{ .name = "v", .type_name = "X" }};
@@ -1098,11 +1216,17 @@ test "load ignores a cache truncated by a single trailing byte" {
     const raw = try tmp.dir.readFileAlloc(testing.io, cache_path, testing.allocator, .unlimited);
     defer testing.allocator.free(raw);
     try testing.expect(raw.len > 1);
-    // A valid cache loads; dropping one trailing byte busts the whole thing.
+    // A valid cache loads; trailing or missing bytes bust the whole thing.
     {
         var ok = load(testing.allocator, testing.io, tmp.dir).?;
         ok.deinit();
     }
+    const with_junk = try testing.allocator.alloc(u8, raw.len + 1);
+    defer testing.allocator.free(with_junk);
+    @memcpy(with_junk[0..raw.len], raw);
+    with_junk[raw.len] = 0xff;
+    try writeRawCache(&tmp, with_junk);
+    try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
     try writeRawCache(&tmp, raw[0 .. raw.len - 1]);
     try testing.expect(load(testing.allocator, testing.io, tmp.dir) == null);
 }

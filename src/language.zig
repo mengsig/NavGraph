@@ -20,6 +20,7 @@ pub const Language = enum {
     go,
     rust,
     ruby,
+    java,
     unknown,
 
     /// Human-readable short tag used in compressed output.
@@ -37,7 +38,33 @@ pub const Language = enum {
             .go => "go",
             .rust => "rs",
             .ruby => "rb",
+            .java => "java",
             .unknown => "?",
+        };
+    }
+
+    /// True when the indexer actually resolves this language's import bindings.
+    /// Only then is a non-`resolved_local` outcome *evidence* that a name is
+    /// external; elsewhere it just means the import form was never parsed.
+    /// Mirrors the manifest split in `capabilities.zig`: Rust `use` and Java
+    /// wildcards are declared partial, C/C++/C#/Go unsupported.
+    pub fn resolvesImportBindings(self: Language) bool {
+        return switch (self) {
+            .zig, .python, .javascript, .typescript, .tsx, .lua, .ruby => true,
+            .c, .cpp, .csharp, .go, .rust, .java, .unknown => false,
+        };
+    }
+
+    /// True where `T(...)` legitimately invokes the type itself — a Python/Ruby
+    /// class call, a C++/Java/C#/Rust constructor, a JS factory. Elsewhere a
+    /// *call* bound to a type is always a mis-binding. Go is excluded even
+    /// though it spells conversion as a call: `goPackageTarget` records
+    /// `models.WidgetID(n)` as a `.type_use`, so nothing is lost and a Go local
+    /// shadowing a package can no longer produce an exact call to a type.
+    pub fn callMayTargetType(self: Language) bool {
+        return switch (self) {
+            .python, .ruby, .javascript, .typescript, .tsx, .cpp, .csharp, .java, .rust => true,
+            .zig, .c, .go, .lua, .unknown => false,
         };
     }
 
@@ -53,12 +80,38 @@ pub const Language = enum {
             .go => .go,
             .rust => .rust,
             .ruby => .ruby,
+            .java => .java,
             .unknown => .other,
         };
     }
 };
 
-pub const Family = enum { zig, c, csharp, python, js, lua, go, rust, ruby, other };
+pub const Family = enum { zig, c, csharp, python, js, lua, go, rust, ruby, java, other };
+
+/// Canonical public language inventory. Detection and the capability manifest
+/// consume the same table so adding a parser family cannot silently leave agent
+/// clients advertising an older set.
+pub const Descriptor = struct {
+    language: Language,
+    name: []const u8,
+    extensions: []const []const u8,
+};
+
+pub const supported = [_]Descriptor{
+    .{ .language = .zig, .name = "zig", .extensions = &.{".zig"} },
+    .{ .language = .c, .name = "c", .extensions = &.{ ".c", ".h" } },
+    .{ .language = .cpp, .name = "cpp", .extensions = &.{ ".cc", ".cpp", ".cxx", ".hpp", ".hh" } },
+    .{ .language = .csharp, .name = "csharp", .extensions = &.{".cs"} },
+    .{ .language = .python, .name = "python", .extensions = &.{ ".py", ".pyi" } },
+    .{ .language = .javascript, .name = "javascript", .extensions = &.{ ".js", ".mjs", ".cjs", ".jsx" } },
+    .{ .language = .typescript, .name = "typescript", .extensions = &.{ ".ts", ".mts" } },
+    .{ .language = .tsx, .name = "tsx", .extensions = &.{".tsx"} },
+    .{ .language = .lua, .name = "lua", .extensions = &.{".lua"} },
+    .{ .language = .go, .name = "go", .extensions = &.{".go"} },
+    .{ .language = .rust, .name = "rust", .extensions = &.{".rs"} },
+    .{ .language = .ruby, .name = "ruby", .extensions = &.{".rb"} },
+    .{ .language = .java, .name = "java", .extensions = &.{".java"} },
+};
 
 /// Doc-comment extraction style differs enough between languages to name it.
 pub const DocStyle = enum {
@@ -103,7 +156,7 @@ pub fn configFor(language: Language) Config {
             .doc_style = .zig_slashes,
             .brace_scoped = true,
         },
-        .c, .cpp, .csharp => .{
+        .c, .cpp, .csharp, .java => .{
             .language = language,
             .line_comment = "//",
             .block_open = "/*",
@@ -193,32 +246,10 @@ pub fn configFor(language: Language) Config {
 /// extension is not recognised so callers can skip non-source files.
 pub fn detect(path: []const u8) Language {
     const ext = extension(path);
-    const map = .{
-        .{ ".zig", Language.zig },
-        .{ ".c", Language.c },
-        .{ ".h", Language.c },
-        .{ ".cc", Language.cpp },
-        .{ ".cpp", Language.cpp },
-        .{ ".cxx", Language.cpp },
-        .{ ".hpp", Language.cpp },
-        .{ ".hh", Language.cpp },
-        .{ ".cs", Language.csharp },
-        .{ ".py", Language.python },
-        .{ ".pyi", Language.python },
-        .{ ".js", Language.javascript },
-        .{ ".mjs", Language.javascript },
-        .{ ".cjs", Language.javascript },
-        .{ ".jsx", Language.javascript },
-        .{ ".ts", Language.typescript },
-        .{ ".mts", Language.typescript },
-        .{ ".tsx", Language.tsx },
-        .{ ".lua", Language.lua },
-        .{ ".go", Language.go },
-        .{ ".rs", Language.rust },
-        .{ ".rb", Language.ruby },
-    };
-    inline for (map) |entry| {
-        if (std.mem.eql(u8, ext, entry[0])) return entry[1];
+    inline for (supported) |descriptor| {
+        inline for (descriptor.extensions) |candidate| {
+            if (std.mem.eql(u8, ext, candidate)) return descriptor.language;
+        }
     }
     return .unknown;
 }
@@ -243,10 +274,28 @@ test "detect language from extension" {
     try std.testing.expectEqual(Language.go, detect("cmd/server/main.go"));
     try std.testing.expectEqual(Language.rust, detect("src/lib.rs"));
     try std.testing.expectEqual(Language.ruby, detect("app/models/user.rb"));
+    try std.testing.expectEqual(Language.java, detect("src/main/java/com/foo/Bar.java"));
     try std.testing.expectEqual(Language.unknown, detect("README.md"));
     try std.testing.expectEqual(Language.unknown, detect(".gitignore"));
 }
 
+test "supported language descriptors cover every indexed enum exactly once" {
+    try std.testing.expectEqual(std.meta.fields(Language).len - 1, supported.len);
+    var seen = std.EnumSet(Language).initEmpty();
+    for (supported) |descriptor| {
+        try std.testing.expect(descriptor.language != .unknown);
+        try std.testing.expectEqualStrings(@tagName(descriptor.language), descriptor.name);
+        try std.testing.expect(!seen.contains(descriptor.language));
+        seen.insert(descriptor.language);
+        try std.testing.expect(descriptor.extensions.len > 0);
+        for (descriptor.extensions) |ext| {
+            try std.testing.expect(ext.len > 1 and ext[0] == '.');
+            var path_buf: [32]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "fixture{s}", .{ext});
+            try std.testing.expectEqual(descriptor.language, detect(path));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Appended hardening tests for language.zig
@@ -531,6 +580,18 @@ test "configFor: ruby specifics" {
     try std.testing.expectEqual(false, cfg.template_strings);
 }
 
+test "configFor: java specifics" {
+    const cfg = configFor(.java);
+    try std.testing.expectEqual(Language.java, cfg.language);
+    try std.testing.expectEqualStrings("//", cfg.line_comment);
+    try std.testing.expectEqualStrings("/*", cfg.block_open);
+    try std.testing.expectEqualStrings("*/", cfg.block_close);
+    try std.testing.expectEqualStrings("\"'", cfg.string_delims);
+    try std.testing.expectEqual(false, cfg.template_strings);
+    try std.testing.expectEqual(DocStyle.block_star, cfg.doc_style);
+    try std.testing.expectEqual(true, cfg.brace_scoped);
+}
+
 test "configFor: unknown is fully inert" {
     const cfg = configFor(.unknown);
     try std.testing.expectEqualStrings("", cfg.line_comment);
@@ -559,6 +620,7 @@ test "tag: every language yields its documented short tag" {
     try std.testing.expectEqualStrings("go", Language.go.tag());
     try std.testing.expectEqualStrings("rs", Language.rust.tag());
     try std.testing.expectEqualStrings("rb", Language.ruby.tag());
+    try std.testing.expectEqualStrings("java", Language.java.tag());
     try std.testing.expectEqualStrings("?", Language.unknown.tag());
 }
 
@@ -584,6 +646,7 @@ test "family: each language maps to its resolution family" {
     try std.testing.expectEqual(Family.go, Language.go.family());
     try std.testing.expectEqual(Family.rust, Language.rust.family());
     try std.testing.expectEqual(Family.ruby, Language.ruby.family());
+    try std.testing.expectEqual(Family.java, Language.java.family());
     try std.testing.expectEqual(Family.other, Language.unknown.family());
 }
 

@@ -34,21 +34,21 @@ pub const RouteDef = struct {
 // HTTP client. Kept small and explicit to avoid false positives; the decorator
 // form (`@x.get(...)`) is accepted regardless of receiver name.
 const router_receivers = std.StaticStringMap(void).initComptime(.{
-    .{"app"},        .{"router"}, .{"server"}, .{"blueprint"},
-    .{"bp"},         .{"application"},
+    .{"app"}, .{"router"},      .{"server"}, .{"blueprint"},
+    .{"bp"},  .{"application"},
 });
 const client_receivers = std.StaticStringMap(void).initComptime(.{
-    .{"axios"},  .{"http"},   .{"https"},    .{"client"}, .{"api"},
-    .{"request"},.{"requests"},.{"session"}, .{"httpx"},  .{"ky"},
-    .{"got"},    .{"superagent"},
+    .{"axios"},   .{"http"},       .{"https"},   .{"client"}, .{"api"},
+    .{"request"}, .{"requests"},   .{"session"}, .{"httpx"},  .{"ky"},
+    .{"got"},     .{"superagent"},
 });
 
 /// Map a route/client verb to an HTTP method string, or null if not a verb.
 fn verbMethod(verb: []const u8) ?[]const u8 {
     const map = .{
-        .{ "get", "GET" },     .{ "post", "POST" }, .{ "put", "PUT" },
-        .{ "patch", "PATCH" }, .{ "delete", "DELETE" },
-        .{ "route", "ANY" },   .{ "use", "ANY" },   .{ "all", "ANY" },
+        .{ "get", "GET" },     .{ "post", "POST" },     .{ "put", "PUT" },
+        .{ "patch", "PATCH" }, .{ "delete", "DELETE" }, .{ "route", "ANY" },
+        .{ "use", "ANY" },     .{ "all", "ANY" },
     };
     inline for (map) |e| if (std.mem.eql(u8, verb, e[0])) return e[1];
     return null;
@@ -58,8 +58,8 @@ fn verbMethod(verb: []const u8) ?[]const u8 {
 /// (`"post"`, `"POST"`), or null when it is not a recognized method.
 fn canonMethod(verb: []const u8) ?[]const u8 {
     const map = .{
-        .{ "get", "GET" },     .{ "post", "POST" },    .{ "put", "PUT" },
-        .{ "patch", "PATCH" }, .{ "delete", "DELETE" }, .{ "head", "HEAD" },
+        .{ "get", "GET" },         .{ "post", "POST" },     .{ "put", "PUT" },
+        .{ "patch", "PATCH" },     .{ "delete", "DELETE" }, .{ "head", "HEAD" },
         .{ "options", "OPTIONS" },
     };
     inline for (map) |e| if (std.ascii.eqlIgnoreCase(verb, e[0])) return e[1];
@@ -73,15 +73,17 @@ fn canonMethod(verb: []const u8) ?[]const u8 {
 fn clientMethodOverride(toks: []const Token, source: []const u8, open_i: u32, default_method: []const u8) []const u8 {
     if (!isPunct(toks, source, open_i, '(')) return default_method;
     var depth: i32 = 0;
+    var argument: u32 = 0;
     var j = open_i;
-    const limit = @min(@as(u32, @intCast(toks.len)), open_i + 64);
-    while (j < limit) : (j += 1) {
+    while (j < toks.len) : (j += 1) {
         if (isPunct(toks, source, j, '(') or isPunct(toks, source, j, '{') or isPunct(toks, source, j, '[')) {
             depth += 1;
         } else if (isPunct(toks, source, j, ')') or isPunct(toks, source, j, '}') or isPunct(toks, source, j, ']')) {
             depth -= 1;
             if (depth <= 0) break;
-        } else if (identEql(toks, source, j, "method") and isPunct(toks, source, j + 1, ':') and
+        } else if (depth == 1 and isPunct(toks, source, j, ',')) {
+            argument += 1;
+        } else if (argument == 1 and depth == 2 and identEql(toks, source, j, "method") and isPunct(toks, source, j + 1, ':') and
             j + 2 < toks.len and toks[j + 2].kind == .string)
         {
             if (canonMethod(stripQuotes(toks[j + 2].text(source)))) |m| return m;
@@ -134,8 +136,8 @@ fn pathOf(raw: []const u8) ?[]const u8 {
     // the URL is fully dynamic (no literal path to match on).
     var skipped_interp = false;
     while (s.len >= 2 and s[0] == '$' and s[1] == '{') {
-        const close = std.mem.indexOfScalar(u8, s, '}') orelse return null;
-        s = s[close + 1 ..];
+        const end = interpolationEnd(s, 0) orelse return null;
+        s = s[end..];
         skipped_interp = true;
     }
     // An empty path is valid ONLY when the literal was genuinely empty (a
@@ -143,8 +145,114 @@ fn pathOf(raw: []const u8) ?[]const u8 {
     // it emptied out after dropping a `${…}` prefix.
     if (s.len == 0) return if (skipped_interp) null else s;
     if (s[0] != '/') return null;
-    if (std.mem.indexOfAny(u8, s, "?#")) |cut| s = s[0..cut];
+    s = trimTrailingQueryInterpolation(s);
+    if (staticQueryCut(s)) |cut| s = s[0..cut];
     return s;
+}
+
+/// Drop a final `${...}` only when its top-level ternary selects between a
+/// query/fragment literal and an empty literal. Path-valued expressions remain.
+fn trimTrailingQueryInterpolation(path: []const u8) []const u8 {
+    std.debug.assert(path.len != 0);
+    std.debug.assert(path[0] == '/');
+    var i: usize = 0;
+    while (i + 1 < path.len) : (i += 1) {
+        if (path[i] != '$' or path[i + 1] != '{') continue;
+        const end = interpolationEnd(path, i) orelse continue;
+        if (end != path.len) continue;
+        if (isConditionalQuerySuffix(path[i + 2 .. end - 1])) return path[0..i];
+    }
+    return path;
+}
+
+fn interpolationEnd(text: []const u8, start: usize) ?usize {
+    std.debug.assert(start + 1 < text.len);
+    std.debug.assert(text[start] == '$' and text[start + 1] == '{');
+    var depth: u32 = 1;
+    var i = start + 2;
+    while (i < text.len) {
+        if (text[i] == '"' or text[i] == '\'') {
+            i = quotedEnd(text, i);
+            continue;
+        }
+        if (text[i] == '{') depth += 1;
+        if (text[i] == '}') {
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn quotedEnd(text: []const u8, start: usize) usize {
+    std.debug.assert(start < text.len);
+    const quote = text[start];
+    std.debug.assert(quote == '"' or quote == '\'' or quote == '`');
+    var i = start + 1;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (text[i] == quote) return i + 1;
+    }
+    return text.len;
+}
+
+const Ternary = struct { question: usize, colon: usize };
+
+fn topLevelTernary(expr: []const u8) ?Ternary {
+    var depth: u32 = 0;
+    var question: ?usize = null;
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+        if (c == '"' or c == '\'' or c == '`') {
+            i = quotedEnd(expr, i);
+            continue;
+        }
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if (c == ')' or c == ']' or c == '}') depth -|= 1;
+        if (depth == 0 and question == null and c == '?' and (i + 1 >= expr.len or (expr[i + 1] != '?' and expr[i + 1] != '.'))) question = i;
+        if (depth == 0 and c == ':' and question != null) return .{ .question = question.?, .colon = i };
+        i += 1;
+    }
+    return null;
+}
+
+fn isConditionalQuerySuffix(expr: []const u8) bool {
+    const ternary = topLevelTernary(expr) orelse return false;
+    const yes = std.mem.trim(u8, expr[ternary.question + 1 .. ternary.colon], " \t\r\n");
+    const no = std.mem.trim(u8, expr[ternary.colon + 1 ..], " \t\r\n");
+    return (isQueryLiteral(yes) and isEmptyLiteral(no)) or (isEmptyLiteral(yes) and isQueryLiteral(no));
+}
+
+fn isQueryLiteral(value: []const u8) bool {
+    if (value.len < 3) return false;
+    const quote = value[0];
+    if (quote != '"' and quote != '\'' and quote != '`') return false;
+    return value[value.len - 1] == quote and (value[1] == '?' or value[1] == '#');
+}
+
+fn isEmptyLiteral(value: []const u8) bool {
+    if (value.len != 2) return false;
+    return (value[0] == '"' or value[0] == '\'' or value[0] == '`') and value[1] == value[0];
+}
+
+fn staticQueryCut(path: []const u8) ?usize {
+    std.debug.assert(path.len != 0);
+    std.debug.assert(path[0] == '/');
+    var i: usize = 0;
+    while (i < path.len) {
+        if (i + 1 < path.len and path[i] == '$' and path[i + 1] == '{') {
+            i = interpolationEnd(path, i) orelse return null;
+            continue;
+        }
+        if (path[i] == '?' or path[i] == '#') return i;
+        i += 1;
+    }
+    return null;
 }
 
 /// A router variable declaration that carries a URL prefix, e.g.
@@ -170,15 +278,63 @@ pub fn matchRouterDecl(toks: []const Token, source: []const u8, i: u32) ?RouterD
     if (!isPunct(toks, source, i + 1, '=') or !isIdent(toks, i + 2)) return null;
     const kw = prefixKeyword(toks[i + 2].text(source)) orelse return null;
     if (!isPunct(toks, source, i + 3, '(')) return null;
-    // Scan a bounded window of the argument list for `<kw> = "/path"`.
+    // Scan the constructor's direct arguments for `<kw> = "/path"`.
     var j = i + 4;
-    const limit = @min(@as(u32, @intCast(toks.len)), i + 4 + 48);
+    const limit: u32 = @intCast(toks.len);
+    var depth: i32 = 1;
     while (j + 2 < limit) : (j += 1) {
-        if (isPunct(toks, source, j, ')')) break;
-        if (!identEql(toks, source, j, kw)) continue;
-        if (!isPunct(toks, source, j + 1, '=')) continue;
-        const prefix = stringPath(toks, source, j + 2) orelse return null;
-        return .{ .name = toks[i].text(source), .prefix = prefix };
+        if (isPunct(toks, source, j, '(') or isPunct(toks, source, j, '[') or isPunct(toks, source, j, '{')) {
+            depth += 1;
+        } else if (isPunct(toks, source, j, ')') or isPunct(toks, source, j, ']') or isPunct(toks, source, j, '}')) {
+            depth -= 1;
+            if (depth <= 0) break;
+        } else if (depth == 1 and identEql(toks, source, j, kw) and isPunct(toks, source, j + 1, '=')) {
+            const prefix = stringPath(toks, source, j + 2) orelse return null;
+            return .{ .name = toks[i].text(source), .prefix = prefix };
+        }
+    }
+    return null;
+}
+
+/// A recognized router-mount call: `<recv>.include_router(<router>, prefix="/x")`.
+/// `module` is the receiver-module of a dotted router argument (`orders.router` →
+/// "orders"), or "" for a bare argument (`router`, `orders_router`). `router` is
+/// the bare last identifier. `prefix` is the mount prefix path.
+pub const RouterMount = struct {
+    module: []const u8,
+    router: []const u8,
+    prefix: []const u8,
+};
+
+/// At token `i`, recognize a FastAPI-style mount `recv.include_router(arg, ...,
+/// prefix="/x", ...)`. Returns null unless a `prefix="/path"` argument is present
+/// (a mount with no prefix changes no route path, so there is nothing to record).
+pub fn matchIncludeRouter(toks: []const Token, source: []const u8, i: u32) ?RouterMount {
+    if (!isIdent(toks, i) or i + 4 >= toks.len) return null;
+    if (!isPunct(toks, source, i + 1, '.') or !identEql(toks, source, i + 2, "include_router")) return null;
+    if (!isPunct(toks, source, i + 3, '(')) return null;
+    if (!isIdent(toks, i + 4)) return null;
+    var module: []const u8 = "";
+    var router = toks[i + 4].text(source);
+    if (isPunct(toks, source, i + 5, '.') and isIdent(toks, i + 6)) {
+        module = toks[i + 4].text(source);
+        router = toks[i + 6].text(source);
+    }
+    // Scan direct arguments for `prefix = "/path"`.
+    var j = i + 5;
+    const limit: u32 = @intCast(toks.len);
+    var depth: i32 = 1; // the include_router '(' is already open
+    while (j < limit) : (j += 1) {
+        if (isPunct(toks, source, j, '(') or isPunct(toks, source, j, '[') or isPunct(toks, source, j, '{')) {
+            depth += 1;
+        } else if (isPunct(toks, source, j, ')') or isPunct(toks, source, j, ']') or isPunct(toks, source, j, '}')) {
+            depth -= 1;
+            if (depth <= 0) break;
+        } else if (depth == 1 and identEql(toks, source, j, "prefix") and isPunct(toks, source, j + 1, '=')) {
+            const prefix = stringPath(toks, source, j + 2) orelse return null;
+            if (prefix.len == 0) return null;
+            return .{ .module = module, .router = router, .prefix = prefix };
+        }
     }
     return null;
 }
@@ -378,6 +534,40 @@ test "router prefix declaration recognized" {
     try t.expectEqualStrings("/api/admin", found.?.prefix);
 }
 
+test "include_router mount recognized (dotted and bare arg)" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const lang = @import("language.zig");
+    const cases = .{
+        .{ "app.include_router(orders.router, prefix=\"/v1\")\n", "orders", "router", "/v1" },
+        .{ "app.include_router(router, prefix=\"/api\")\n", "", "router", "/api" },
+        .{ "app.include_router(orders_router, tags=[\"o\"], prefix=\"/v2\")\n", "", "orders_router", "/v2" },
+    };
+    inline for (cases) |c| {
+        var toks: std.ArrayList(Token) = .empty;
+        defer toks.deinit(gpa);
+        try lexer.tokenize(gpa, c[0], lang.configFor(.python), &toks);
+        var found: ?RouterMount = null;
+        var i: u32 = 0;
+        while (i < toks.items.len) : (i += 1) {
+            if (matchIncludeRouter(toks.items, c[0], i)) |m| found = m;
+        }
+        try t.expect(found != null);
+        try t.expectEqualStrings(c[1], found.?.module);
+        try t.expectEqualStrings(c[2], found.?.router);
+        try t.expectEqualStrings(c[3], found.?.prefix);
+    }
+    // A mount with no prefix is not recorded (nothing to apply).
+    var toks: std.ArrayList(Token) = .empty;
+    defer toks.deinit(gpa);
+    const src = "app.include_router(orders.router)\n";
+    try lexer.tokenize(gpa, src, lang.configFor(.python), &toks);
+    var i: u32 = 0;
+    while (i < toks.items.len) : (i += 1) {
+        try t.expect(matchIncludeRouter(toks.items, src, i) == null);
+    }
+}
+
 test "empty route path is accepted; non-slash relative still rejected" {
     const t = std.testing;
     try t.expectEqualStrings("", pathOf("").?);
@@ -405,11 +595,21 @@ test "fetch options object overrides the default GET method" {
     const del = firstClientCall("fetch(`/users/${id}`, { method: 'DELETE' });\n").?;
     try t.expectEqualStrings("DELETE", del.method);
 
-    // No options → still GET.
+    // No options → still GET, and nested object fields cannot override it.
     const get = firstClientCall("fetch('/orders');\n").?;
     try t.expectEqualStrings("GET", get.method);
-}
+    const nested = firstClientCall("fetch('/orders', { headers: { method: 'POST' } });\n").?;
+    try t.expectEqualStrings("GET", nested.method);
+    const third = firstClientCall("fetch('/orders', {}, { method: 'POST' });\n").?;
+    try t.expectEqualStrings("GET", third.method);
 
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(t.allocator);
+    try long.appendSlice(t.allocator, "fetch('/orders', {");
+    for (0..40) |_| try long.appendSlice(t.allocator, "header: 'x',");
+    try long.appendSlice(t.allocator, "method: 'PATCH'});\n");
+    try t.expectEqualStrings("PATCH", firstClientCall(long.items).?.method);
+}
 
 // ---------------------------------------------------------------------------
 // Appended tests for src/api.zig — pure matchers over token slices.
@@ -507,6 +707,16 @@ test "pathOf strips scheme/host, query and fragment" {
     try t.expectEqualStrings("/", pathOf("http://host").?);
     try t.expectEqualStrings("/", pathOf("https://host/").?);
     try t.expectEqualStrings("/v1/x", pathOf("http://h:8080/v1/x").?);
+}
+
+test "pathOf strips a trailing conditional template query without losing the literal route" {
+    const t = std.testing;
+    try t.expectEqualStrings("/aoi-library", pathOf("/aoi-library${query ? `?${query}` : \"\"}").?);
+    try t.expectEqualStrings("/aoi-library", pathOf("/aoi-library${query ? \"?}\" : \"\"}").?);
+    try t.expectEqualStrings("/runs/${id}/aoi-analysis", pathOf("/runs/${id}/aoi-analysis").?);
+    try t.expectEqualStrings("/users/${id}", pathOf("/users/${id}").?);
+    try t.expectEqualStrings("/files/${encodeURIComponent(\"?\")}", pathOf("/files/${encodeURIComponent(\"?\")}").?);
+    try t.expectEqualStrings("/files/${name.replace(\"?\", \"\")}", pathOf("/files/${name.replace(\"?\", \"\")}").?);
 }
 
 test "pathOf skips one or more leading interpolation prefixes" {
@@ -729,6 +939,18 @@ test "matchRouterDecl recognizes APIRouter/Router/Blueprint prefixes" {
     const bp = firstRouterDecl("bp = Blueprint(\"admin\", __name__, url_prefix=\"/admin\")\n", .python).?;
     try t.expectEqualStrings("bp", bp.name);
     try t.expectEqualStrings("/admin", bp.prefix);
+
+    const nested = firstRouterDecl("r = APIRouter(dependencies=[Depends(auth)], prefix=\"/api\")\n", .python).?;
+    try t.expectEqualStrings("/api", nested.prefix);
+    const direct = firstRouterDecl("r = APIRouter(dependencies=[Depends(prefix=\"/wrong\")], prefix=\"/right\")\n", .python).?;
+    try t.expectEqualStrings("/right", direct.prefix);
+
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(t.allocator);
+    try long.appendSlice(t.allocator, "r = APIRouter(");
+    for (0..40) |_| try long.appendSlice(t.allocator, "dependency=value,");
+    try long.appendSlice(t.allocator, "prefix=\"/late\")\n");
+    try t.expectEqualStrings("/late", firstRouterDecl(long.items, .python).?.prefix);
 }
 
 test "matchRouterDecl rejects wrong ctor, missing/mismatched kw, and variable prefix" {

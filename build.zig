@@ -66,6 +66,10 @@ pub fn build(b: *std.Build) void {
     // branch's matching cache instead of thrashing it.
     const build_opts = b.addOptions();
     build_opts.addOption(u64, "cache_key", srcFingerprint(b));
+    // Release/packaging systems may supply a VCS revision without making the
+    // build graph invoke git (which would be non-hermetic and fail in source
+    // archives). The source fingerprint remains authoritative when omitted.
+    build_opts.addOption([]const u8, "revision", b.option([]const u8, "revision", "source revision embedded in capability metadata") orelse "");
     const build_opts_mod = build_opts.createModule();
     mod.addImport("build_options", build_opts_mod);
 
@@ -137,6 +141,7 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    run_mod_tests.setCwd(b.path("."));
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -147,6 +152,7 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    run_exe_tests.setCwd(b.path("."));
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
@@ -154,6 +160,45 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Real executable/corpus contracts live outside the white-box test roots.
+    // Named steps remain independently runnable, and the main `test` gate also
+    // depends on both so CI cannot accidentally exercise only white-box roots.
+    const contract_cmd = b.addSystemCommand(&.{"sh"});
+    contract_cmd.addFileArg(b.path("tests/agent-contract.sh"));
+    contract_cmd.addArtifactArg(exe);
+    contract_cmd.addDirectoryArg(b.path("."));
+    contract_cmd.setCwd(b.path("."));
+    const contract_step = b.step("contract", "Run black-box agent and polyglot corpus contracts");
+    contract_step.dependOn(&contract_cmd.step);
+
+    // The shell contract covers real corpus behavior. This generated companion
+    // consumes the executable's own capability JSON and synthesizes invalid and
+    // valid argv, catching descriptor/parser drift without duplicating flags.
+    const manifest_contract_exe = b.addExecutable(.{
+        .name = "manifest-contract",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/manifest-contract.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const manifest_contract_cmd = b.addRunArtifact(manifest_contract_exe);
+    manifest_contract_cmd.addArtifactArg(exe);
+    manifest_contract_cmd.addDirectoryArg(b.path("."));
+    manifest_contract_cmd.setCwd(b.path("."));
+    contract_step.dependOn(&manifest_contract_cmd.step);
+
+    const efficiency_cmd = b.addSystemCommand(&.{"sh"});
+    efficiency_cmd.addFileArg(b.path("tests/efficiency-contract.sh"));
+    efficiency_cmd.addArtifactArg(exe);
+    efficiency_cmd.addDirectoryArg(b.path("."));
+    efficiency_cmd.setCwd(b.path("."));
+    const efficiency_step = b.step("efficiency", "Check deterministic agent-context compression budgets");
+    efficiency_step.dependOn(&efficiency_cmd.step);
+    test_step.dependOn(&contract_cmd.step);
+    test_step.dependOn(&manifest_contract_cmd.step);
+    test_step.dependOn(&efficiency_cmd.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

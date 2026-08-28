@@ -43,7 +43,7 @@ const none = std.math.maxInt(u32);
 fn isNodeKind(kind: model.SymbolKind) bool {
     return switch (kind) {
         .function, .method, .class, .@"struct", .@"enum", .interface, .type, .macro, .route, .test_case => true,
-        .variable, .constant, .field, .module, .import, .unknown => false,
+        .variable, .constant, .field, .module, .import, .route_mount, .unknown => false,
     };
 }
 
@@ -57,10 +57,24 @@ fn inScope(scope: query.TestScope, is_test: bool) bool {
     };
 }
 
+/// How much of the node set `-l` withheld. `total` counts every node the
+/// filters selected, whether or not the cap let it through.
+pub const Truncation = struct {
+    shown: usize,
+    total: usize,
+
+    pub fn any(self: Truncation) bool {
+        std.debug.assert(self.shown <= self.total);
+        return self.shown < self.total;
+    }
+};
+
 /// Build the node/edge model and render it as an interactive HTML page (or, with
 /// `--json`, as the raw graph JSON). `path_filter` scopes to a subtree; the
-/// `--tests` scope selects whether test symbols are included.
-pub fn graph(w: *Writer, idx: *const Index, path_filter: []const u8, opts: query.Options) !void {
+/// `--tests` scope selects whether test symbols are included. Returns what `-l`
+/// withheld so the caller can say so — a silently smaller graph reads as the
+/// whole graph.
+pub fn graph(w: *Writer, idx: *const Index, path_filter: []const u8, opts: query.Options) !Truncation {
     const gpa = idx.gpa;
     const syms = idx.graph.symbols;
 
@@ -72,11 +86,17 @@ pub fn graph(w: *Writer, idx: *const Index, path_filter: []const u8, opts: query
     // Pass 1 — select nodes (kind + path filter + test scope).
     var node_ids: std.ArrayList(SymbolId) = .empty;
     defer node_ids.deinit(gpa);
+    var in_scope: usize = 0;
     for (syms) |sym| {
         if (!isNodeKind(sym.kind)) continue;
         const file = idx.graph.files[sym.file];
         if (!query.matchesFilter(file.path, path_filter)) continue;
         if (!inScope(opts.tests, query.isTestSymbol(idx, sym))) continue;
+        in_scope += 1;
+        // `-l` caps the node set (edges then span only surviving nodes). Only
+        // when the user asked: an unset limit still renders the whole graph.
+        // Keep counting past the cap so the total can be reported.
+        if (query.listCap(opts)) |cap| if (node_ids.items.len >= cap) continue;
         node_of[sym.id] = @intCast(node_ids.items.len);
         try node_ids.append(gpa, sym.id);
     }
@@ -112,14 +132,19 @@ pub fn graph(w: *Writer, idx: *const Index, path_filter: []const u8, opts: query
         }
     }
 
+    const truncation: Truncation = .{ .shown = n, .total = in_scope };
     if (opts.format != .json) try w.writeAll(head);
-    try emitJson(w, idx, node_ids.items, edges.items, fan_in, fan_out);
+    try emitJson(w, idx, node_ids.items, edges.items, fan_in, fan_out, truncation);
     if (opts.format != .json) try w.writeAll(tail);
+    return truncation;
 }
 
-/// Emit the graph model as compact JSON: `{root, files[], nodes[], edges[]}`.
+/// Emit the graph model as compact JSON:
+/// `{root, files[], nodes[], edges[], nodes_total, truncated}`.
 /// Node fields are short keys to keep the payload small: `n`ame, `k`ind, `f`ile,
-/// `l`ine, `e`xported, `t`est, fan-`in`, fan-`out`.
+/// `l`ine, `e`xported, `t`est, fan-`in`, fan-`out`. `nodes_total`/`truncated`
+/// tell a client that `-l` withheld nodes, so a capped subgraph is never read
+/// as the whole graph.
 fn emitJson(
     w: *Writer,
     idx: *const Index,
@@ -127,6 +152,7 @@ fn emitJson(
     edges: []const Edge,
     fan_in: []const u32,
     fan_out: []const u32,
+    truncation: Truncation,
 ) !void {
     const syms = idx.graph.symbols;
 
@@ -164,7 +190,7 @@ fn emitJson(
         try w.print("{{\"s\":{d},\"t\":{d},\"x\":{d}}}", .{ e.s, e.t, @as(u8, if (e.exact) 1 else 0) });
     }
 
-    try w.writeAll("]}");
+    try w.print("],\"nodes_total\":{d},\"truncated\":{}}}", .{ truncation.total, truncation.any() });
 }
 
 /// Write `s` as a JSON string literal. Besides the standard escapes, `<` is
@@ -202,7 +228,7 @@ fn vzRender(idx: *Index, filter: []const u8, opts: query.Options) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     var aw: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
     defer aw.deinit();
-    try graph(&aw.writer, idx, filter, opts);
+    _ = try graph(&aw.writer, idx, filter, opts);
     // Return an exact-sized owned copy so the caller can free it directly (the
     // Allocating writer's buffer capacity may exceed its written length).
     return testing.allocator.dupe(u8, aw.written());
@@ -294,6 +320,36 @@ test "graph --no-tests drops test nodes; --tests-only keeps only them" {
     defer testing.allocator.free(only);
     try testing.expect(std.mem.indexOf(u8, only, "\"n\":\"add\"") == null);
     try testing.expect(std.mem.indexOf(u8, only, "\"k\":\"test\"") != null);
+}
+
+test "graph -l caps the node set but reports the total and the truncation" {
+    // Regression (F3): `-l N` silently returned a smaller subgraph with no
+    // marker and no warning, so a client's standard `-l 200` read as the graph.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "u.zig", .data =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+    });
+
+    var idx = try vzBuild(&tmp);
+    defer idx.deinit();
+
+    const full = try vzRender(&idx, "", .{ .format = .json });
+    defer testing.allocator.free(full);
+    try testing.expect(std.mem.indexOf(u8, full, "\"nodes_total\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "\"truncated\":false") != null);
+
+    const capped = try vzRender(&idx, "", .{ .format = .json, .limit = 2, .limit_set = true });
+    defer testing.allocator.free(capped);
+    // Two of four nodes emitted, and the payload says so.
+    try testing.expect(std.mem.indexOf(u8, capped, "\"n\":\"a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, capped, "\"n\":\"d\"") == null);
+    try testing.expect(std.mem.indexOf(u8, capped, "\"nodes_total\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, capped, "\"truncated\":true") != null);
 }
 
 test "graph escapes a name that could break out of the script tag" {

@@ -82,7 +82,7 @@ pub fn symbolSite(
     const source = idx.graph.files[sym.file].text;
     switch (v) {
         .names => {},
-        .sig, .doc => try writeSigSuffix(w, sym, source),
+        .sig, .doc => try writeSigSuffix(w, idx, sym, source),
         .full => {},
     }
     try writeLocation(w, idx, sym, source, show_path);
@@ -155,10 +155,14 @@ fn writeQualifiedName(w: *Writer, idx: *const Index, sym: Symbol) !void {
 }
 
 /// Append the collapsed signature after the name, minus the redundant name/kind.
-fn writeSigSuffix(w: *Writer, sym: Symbol, source: []const u8) !void {
+fn writeSigSuffix(w: *Writer, idx: *const Index, sym: Symbol, source: []const u8) !void {
     const is_value = switch (sym.kind) {
         .function, .method => false,
-        .class, .@"struct", .@"enum", .interface, .import, .macro, .module, .test_case => return,
+        // Containers show their inheritance clause (`class Group(Command)`,
+        // `class Foo extends Bar`, `struct X : Y`) — the one hierarchy fact an
+        // "explain these classes" task otherwise needs a read per class for.
+        .class, .@"struct", .interface => return writeBaseClause(w, sym, source),
+        .@"enum", .import, .macro, .module, .test_case => return,
         else => true,
     };
     const suffix = if (is_value)
@@ -173,12 +177,105 @@ fn writeSigSuffix(w: *Writer, sym: Symbol, source: []const u8) !void {
     // whole literal. `outline -v full` still shows the complete definition.
     const cap: usize = if (is_value) max_value_len else max_sig_len;
     try writeCollapsed(w, suffix, cap);
+    // Java declares the return type before the method name. Keeping only the
+    // parameter suffix silently erased it from the compact view — exactly the
+    // view an agent uses to compare APIs without opening every definition.
+    if (!is_value and idx.graph.files[sym.file].language == .java) {
+        const return_type = javaReturnType(sym.signature(source), sym.name);
+        if (return_type.len != 0) {
+            try w.writeAll(" -> ");
+            try writeCollapsed(w, return_type, max_sig_len);
+        }
+    }
+}
+
+/// Print a container's inheritance clause: the signature text after the name,
+/// minus declaration punctuation (`{`, `:` line-end) and bodyless noise. Yields
+/// `(Command)` for Python, `extends Bar implements Baz` for JS/TS, `: IBar`
+/// for C++/C#, `< Base` for Ruby — and nothing for a bare `struct {`.
+fn writeBaseClause(w: *Writer, sym: Symbol, source: []const u8) !void {
+    const sig = sym.signature(source);
+    const n = std.mem.indexOf(u8, sig, sym.name) orelse return;
+    var rest = sig[n + sym.name.len ..];
+    // Generic params belong to the name, not the base clause: `class Foo<T> …`.
+    if (rest.len != 0 and (rest[0] == '<' or rest[0] == '[')) {
+        const closer: u8 = if (rest[0] == '<') '>' else ']';
+        if (std.mem.indexOfScalar(u8, rest, closer)) |c| rest = rest[c + 1 ..];
+    }
+    rest = std.mem.trim(u8, rest, " \t\r\n");
+    while (rest.len != 0 and (rest[rest.len - 1] == '{' or rest[rest.len - 1] == ':')) {
+        rest = std.mem.trimEnd(u8, rest[0 .. rest.len - 1], " \t\r\n");
+    }
+    // Nothing left, or only the declaration keyword (`= struct`, `interface`):
+    // no base clause to show.
+    inline for (.{ "", "=", "= struct", "= enum", "= union", "= opaque", "struct", "interface", "class", "object" }) |noise| {
+        if (std.mem.eql(u8, rest, noise)) return;
+    }
+    try w.writeByte(' ');
+    try writeCollapsed(w, rest, 80);
 }
 
 /// The parameter/return portion of a function signature (from the first `(`).
 fn paramSlice(sig: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, sig, '(')) |p| return sig[p..];
     return "";
+}
+
+/// Extract Java's leading return type from a method declaration. Constructors
+/// naturally return empty because stripping their modifiers leaves no text
+/// before the declaration name. Generic method parameters are declaration
+/// metadata rather than part of the return type and are skipped as a balanced
+/// `<...>` prefix.
+fn javaReturnType(sig: []const u8, name: []const u8) []const u8 {
+    var search_from: usize = 0;
+    var name_at: ?usize = null;
+    while (std.mem.indexOfPos(u8, sig, search_from, name)) |at| {
+        const after = std.mem.trimStart(u8, sig[at + name.len ..], " \t\r\n");
+        if (after.len != 0 and after[0] == '(') name_at = at;
+        search_from = at + name.len;
+    }
+    var prefix = std.mem.trim(u8, sig[0 .. name_at orelse return ""], " \t\r\n");
+
+    // Declaration annotations may be included in a symbol's source span. Drop
+    // complete leading annotation lines; type-use annotations after modifiers
+    // remain visible as part of the return type.
+    while (prefix.len != 0 and prefix[0] == '@') {
+        const newline = std.mem.indexOfScalar(u8, prefix, '\n') orelse break;
+        prefix = std.mem.trimStart(u8, prefix[newline + 1 ..], " \t\r\n");
+    }
+
+    const modifiers = [_][]const u8{
+        "public",       "protected", "private",  "static",  "final",     "abstract",
+        "synchronized", "native",    "strictfp", "default", "transient",
+    };
+    while (prefix.len != 0) {
+        const word_end = std.mem.indexOfAny(u8, prefix, " \t\r\n") orelse prefix.len;
+        const word = prefix[0..word_end];
+        var is_modifier = false;
+        for (modifiers) |modifier| {
+            if (std.mem.eql(u8, word, modifier)) {
+                is_modifier = true;
+                break;
+            }
+        }
+        if (!is_modifier) break;
+        prefix = std.mem.trimStart(u8, prefix[word_end..], " \t\r\n");
+    }
+
+    if (prefix.len != 0 and prefix[0] == '<') {
+        var depth: usize = 0;
+        for (prefix, 0..) |c, i| {
+            if (c == '<') depth += 1;
+            if (c == '>') {
+                depth -= 1;
+                if (depth == 0) {
+                    prefix = std.mem.trimStart(u8, prefix[i + 1 ..], " \t\r\n");
+                    break;
+                }
+            }
+        }
+    }
+    return prefix;
 }
 
 /// For a const/var/type, the value/type portion after the name.
@@ -205,6 +302,20 @@ fn writeLocation(w: *Writer, idx: *const Index, sym: Symbol, source: []const u8,
 }
 
 /// Collapse runs of whitespace to single spaces, capping length with an ellipsis.
+/// The (1-based) `line_no`-th line of `text`, or "" when out of range. Linear
+/// scan — callers print at most a few hundred rows per query.
+pub fn sourceLine(text: []const u8, line_no: u32) []const u8 {
+    if (line_no == 0) return "";
+    var rest = text;
+    var n: u32 = 1;
+    while (n < line_no) : (n += 1) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+        rest = rest[nl + 1 ..];
+    }
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.mem.trim(u8, rest[0..end], " \t\r");
+}
+
 pub fn writeCollapsed(w: *Writer, text: []const u8, cap: usize) !void {
     var written: usize = 0;
     var prev_space = false;
@@ -285,7 +396,6 @@ fn firstLine(s: []const u8) []const u8 {
     line = std.mem.trimStart(u8, line, "/#* \t");
     return std.mem.trim(u8, line, " \t\r");
 }
-
 
 // ---------------------------------------------------------------------------
 // Appended tests for render.zig
@@ -527,6 +637,19 @@ test "paramSlice returns from the first paren, else empty" {
     try t.expectEqualStrings("", paramSlice(""));
     // Only the first paren matters.
     try t.expectEqualStrings("(a)(b)", paramSlice("g(a)(b)"));
+}
+
+test "javaReturnType preserves declared and generic return types but not constructors" {
+    const t = std.testing;
+    try t.expectEqualStrings("String", javaReturnType("public static String format(int cents)", "format"));
+    try t.expectEqualStrings(
+        "Map<String, T>",
+        javaReturnType("protected final <T extends Number> Map<String, T> collect(T item)", "collect"),
+    );
+    try t.expectEqualStrings("void", javaReturnType("synchronized void flush()", "flush"));
+    try t.expectEqualStrings("", javaReturnType("private Money(int cents)", "Money"));
+    try t.expectEqualStrings("String", javaReturnType("@Override\npublic String label()", "label"));
+    try t.expectEqualStrings("", javaReturnType("public String label()", "missing"));
 }
 
 test "valueSlice extracts the value after the name, trimming separators" {
@@ -794,6 +917,31 @@ test "writeSigSuffix shows params for functions and values for consts, nothing f
     }
 }
 
+test "writeSigSuffix renders Java's leading method return type" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "Money.java", .data =
+        \\public final class Money {
+        \\    public Money(int cents) {}
+        \\    public static String format(int cents) { return ""; }
+        \\}
+    });
+    var path_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var idx = try index_mod.build(testing.allocator, io, root, false);
+    defer idx.deinit();
+
+    const method = try renderByName(&idx, "format", .sig, false);
+    defer testing.allocator.free(method);
+    try testing.expect(std.mem.indexOf(u8, method, "Money.format (int cents) -> String") != null);
+
+    const constructor = try renderByName(&idx, "Money", .sig, false);
+    defer testing.allocator.free(constructor);
+    try testing.expect(std.mem.indexOf(u8, constructor, "->") == null);
+}
+
 test "writeSigSuffix caps a long const value with an ellipsis" {
     const testing = std.testing;
     const io = testing.io;
@@ -1005,4 +1153,13 @@ test "symbol honors indent depth for the leading field" {
     const out = aw.written();
     // Two levels of indent (four spaces) then the kind field.
     try testing.expect(std.mem.startsWith(u8, out, "    fn foo"));
+}
+
+test "sourceLine returns the trimmed 1-based line, and empty out of range" {
+    const src = "first\n  second line  \nthird";
+    try std.testing.expectEqualStrings("first", sourceLine(src, 1));
+    try std.testing.expectEqualStrings("second line", sourceLine(src, 2));
+    try std.testing.expectEqualStrings("third", sourceLine(src, 3));
+    try std.testing.expectEqualStrings("", sourceLine(src, 4));
+    try std.testing.expectEqualStrings("", sourceLine(src, 0));
 }

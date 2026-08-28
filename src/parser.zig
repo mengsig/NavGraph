@@ -38,12 +38,21 @@ pub const ParsedSymbol = struct {
     bindings: []const Binding = &.{},
     /// For an `import` symbol: the raw module string (see `model.Symbol`).
     import_path: []const u8 = "",
+    /// An out-of-line method's receiver/implemented type name. Go records the
+    /// receiver from `func (m *Metrics) Provision`, and Rust records `Expr`
+    /// from `impl Trait for Expr`. A same-file post-pass may assign
+    /// `parent_local`; the index retains this hint to parent cross-file impls.
+    receiver: []const u8 = "",
+    /// Trait named by Rust's `impl Trait for Type`; empty for inherent impls.
+    impl_protocol: []const u8 = "",
 };
 
 /// References plus local bindings collected from one symbol body.
 const BodyInfo = struct {
     refs: []Reference,
-    bindings: []const Binding,
+    /// Mutable so a language that discovers an extra binding after the body scan
+    /// (the Go method receiver) can grow the slice instead of abandoning it.
+    bindings: []Binding,
 };
 
 const sentinel: u32 = std.math.maxInt(u32);
@@ -81,7 +90,14 @@ const Ctx = struct {
     }
 };
 
-/// Parse `source` for `lang`, appending discovered symbols to `out`.
+/// Parse-health signal for one file. `desync_from` is set when the tokenizer
+/// likely lost sync — an unterminated string/char literal ran to end-of-file,
+/// swallowing the code after it — with the 1-based line range that was lost.
+pub const ParseHealth = model.ParseHealth;
+
+/// Parse `source` for `lang`, appending discovered symbols to `out`. Returns a
+/// `ParseHealth` so callers can warn about a tokenizer desync (a confidently
+/// wrong, silently-truncated parse is the worst failure mode for an agent).
 /// `arena` owns the reference slices and lives as long as the graph.
 pub fn parse(
     gpa: std.mem.Allocator,
@@ -89,13 +105,14 @@ pub fn parse(
     source: []const u8,
     lang: language.Language,
     out: *std.ArrayList(ParsedSymbol),
-) !void {
+) !ParseHealth {
     std.debug.assert(source.len <= std.math.maxInt(u32));
     const cfg = language.configFor(lang);
     var toks: std.ArrayList(Token) = .empty;
     defer toks.deinit(gpa);
     try lexer.tokenize(gpa, source, cfg, &toks);
     std.debug.assert(toks.items.len >= 1); // always an eof token
+    const health = scanHealth(source, toks.items);
 
     const close = try buildMatches(gpa, source, toks.items);
     defer gpa.free(close);
@@ -113,6 +130,7 @@ pub fn parse(
             .go => go_keywords,
             .rust => rust_keywords,
             .ruby => ruby_keywords,
+            .java => java_keywords,
             else => c_keywords,
         },
     };
@@ -123,12 +141,42 @@ pub fn parse(
         .js => try parseJsScope(&ctx, 0, n, null),
         .python => try parsePython(&ctx),
         .lua => try parseLuaScope(&ctx, 0, n, null),
-        .go => try parseGoScope(&ctx, 0, n, null),
+        .go => {
+            try parseGoScope(&ctx, 0, n, null);
+            attachGoReceivers(&ctx);
+        },
         .rust => try parseRustScope(&ctx, 0, n, null, false),
         .ruby => try parseRubyScope(&ctx, 0, n, null),
+        .java => try parseCScope(&ctx, 0, n, null),
         .other => {},
     }
     try detectApi(&ctx, n);
+    try removeNestedReferenceOwnership(&ctx);
+    return health;
+}
+
+/// Detect a tokenizer desync: an unterminated single-line string/char literal
+/// (opened by `"` or `'`) that ran to end-of-file. Its closing delimiter is
+/// missing, so every symbol after the opener was swallowed. Triple-quoted and
+/// template literals legitimately reach EOF, so only plain-quote openers whose
+/// final byte is not their own (unescaped) closing quote count.
+fn scanHealth(source: []const u8, toks: []const Token) ParseHealth {
+    if (source.len == 0) return .{};
+    for (toks) |t| {
+        if (t.kind != .string or t.end != source.len) continue;
+        std.debug.assert(t.start < source.len);
+        const open = source[t.start];
+        if (open != '"' and open != '\'') continue; // not a plain-quote literal
+        if (t.end - t.start >= 3 and source[t.start + 1] == open and source[t.start + 2] == open) continue; // triple-quoted
+        if (t.end - t.start >= 2 and source[t.end - 1] == open) continue; // properly closed
+        var last_line = t.line;
+        var i = t.start;
+        while (i < source.len) : (i += 1) {
+            if (source[i] == '\n') last_line += 1;
+        }
+        return .{ .desync_from = t.line, .desync_to = last_line };
+    }
+    return .{};
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +200,13 @@ fn detectApi(ctx: *Ctx, n: u32) !void {
     i = 0;
     while (i < n) : (i += 1) {
         if (api.matchRouteDef(ctx.toks, ctx.source, i)) |rd| try emitRoute(ctx, rd, n, &prefixes);
+    }
+    // Router mounts (`app.include_router(mod.router, prefix="/v1")`): recorded as
+    // `.route_mount` symbols so `index` can prefix the mounted module's routes
+    // across files (the routes live in a different file than the mount).
+    i = 0;
+    while (i < n) : (i += 1) {
+        if (api.matchIncludeRouter(ctx.toks, ctx.source, i)) |m| try emitMount(ctx, m, i);
     }
     var wrappers = try detectWrappers(ctx, route_start, n);
     defer wrappers.deinit();
@@ -221,6 +276,69 @@ fn emitRoute(ctx: *Ctx, rd: api.RouteDef, n: u32, prefixes: *const std.StringHas
         .parent_local = null,
         .refs = refs,
     });
+}
+
+/// Emit a `.route_mount` symbol for a router mount. `name` carries the mount
+/// prefix and `import_path` the module qualifier of the mounted router
+/// (`orders.router` → "orders", bare → ""); `index` resolves the mounted module
+/// to a file and prefixes its routes.
+fn emitMount(ctx: *Ctx, m: api.RouterMount, recv_i: u32) !void {
+    const span_start = lineStartOffset(ctx, recv_i);
+    const span_end = ctx.toks[recv_i].end;
+    const inferred = if (m.module.len == 0 and ctx.cfg.language == .python)
+        pythonMountModule(ctx, m.router)
+    else
+        null;
+    const module = inferred orelse m.module;
+    std.debug.assert(span_start <= span_end);
+    std.debug.assert(module.len != 0 or m.router.len != 0);
+    _ = try emit(ctx, .{
+        .name = try ctx.arena.dupe(u8, m.prefix),
+        .kind = .route_mount,
+        .line = ctx.toks[recv_i].line,
+        .span_start = span_start,
+        .span_end = span_end,
+        .sig_end = span_end,
+        .doc = "",
+        .exported = false,
+        .parent_local = null,
+        .refs = &.{},
+        .import_path = try ctx.arena.dupe(u8, module),
+    });
+}
+
+/// Resolve `from pkg.routes.health import router as health_router` for a bare
+/// `include_router(health_router, ...)` argument.
+fn pythonMountModule(ctx: *const Ctx, alias: []const u8) ?[]const u8 {
+    std.debug.assert(alias.len != 0);
+    std.debug.assert(ctx.toks.len != 0);
+    var i: u32 = 0;
+    while (i + 2 < ctx.toks.len) : (i += 1) {
+        if (!ctx.identEql(i, "from")) continue;
+        const line = ctx.toks[i].line;
+        var import_i = i + 1;
+        while (import_i < ctx.toks.len and ctx.toks[import_i].line == line and !ctx.identEql(import_i, "import")) : (import_i += 1) {}
+        if (import_i >= ctx.toks.len or ctx.toks[import_i].line != line or import_i == i + 1) continue;
+        const module = ctx.source[ctx.toks[i + 1].start..ctx.toks[import_i - 1].end];
+        var end = import_i + 1;
+        if (end < ctx.toks.len and ctx.isPunct(end, '(')) {
+            const close = ctx.close[end];
+            end = if (close == sentinel) end else close + 1;
+        } else {
+            while (end < ctx.toks.len and ctx.toks[end].line == line) : (end += 1) {}
+        }
+        var j = import_i + 1;
+        while (j < end) : (j += 1) {
+            if (ctx.toks[j].kind != .identifier or ctx.identEql(j, "as")) continue;
+            var bound = ctx.textOf(j);
+            if (j + 2 < end and ctx.identEql(j + 1, "as") and ctx.toks[j + 2].kind == .identifier) {
+                bound = ctx.textOf(j + 2);
+                j += 2;
+            }
+            if (std.mem.eql(u8, bound, alias)) return module;
+        }
+    }
+    return null;
 }
 
 /// The handler name a route dispatches to: an Express identifier argument after
@@ -389,6 +507,16 @@ fn collectDoc(ctx: *const Ctx, def_i: u32) []const u8 {
     return ctx.source[ctx.toks[first].start..ctx.toks[def_i - 1].end];
 }
 
+fn collectPyDoc(ctx: *const Ctx, def_i: u32, body_lo: u32, body_hi: u32) []const u8 {
+    std.debug.assert(body_lo <= body_hi);
+    const leading = collectDoc(ctx, def_i);
+    if (leading.len != 0) return leading;
+    var i = body_lo;
+    while (i < body_hi and isComment(ctx, i)) : (i += 1) {}
+    if (i < body_hi and ctx.toks[i].kind == .string) return ctx.toks[i].text(ctx.source);
+    return "";
+}
+
 /// Line-start offset of the token at index `i` (column 0 of its line).
 fn lineStartOffset(ctx: *const Ctx, i: u32) u32 {
     const t = ctx.toks[i];
@@ -429,6 +557,11 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         for (line_lists.items) |*ll| ll.deinit(ctx.gpa);
         line_lists.deinit(ctx.gpa);
     }
+    var offset_lists: std.ArrayList(std.ArrayList(u32)) = .empty;
+    defer {
+        for (offset_lists.items) |*ol| ol.deinit(ctx.gpa);
+        offset_lists.deinit(ctx.gpa);
+    }
 
     var i = lo;
     while (i < hi) : (i += 1) {
@@ -436,20 +569,44 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
         if (t.kind != .identifier) continue;
         const name = t.text(ctx.source);
         if (name.len < 2 or kw.has(name)) continue;
-        const qualifier = memberQualifier(ctx, i, lo);
+        const receiver = memberQualifier(ctx, i, lo);
+        // Zig's inferred enum/union tags and struct-literal fields (`.ready`,
+        // `.{ .value = x }`) are labels, not references to a same-named symbol.
+        // Keeping them as bare refs lets a unique unrelated definition become
+        // an "exact" call/read edge later, which is especially dangerous in
+        // strict agent queries. Preserve real receivers such as `value.field`
+        // and `make().field`.
+        if (isZigReceiverlessMember(ctx, i, lo, receiver.name)) continue;
+        const assignment = assignmentAccess(ctx, i, hi);
+        const qualifier = if (assignment.write and receiver.name.len == 0)
+            enclosingCallQualifier(ctx, i, lo)
+        else
+            receiver.name;
+        // Only a real member access has a chain to walk: a constructor-keyword
+        // qualifier is synthesised, not read off the token stream.
+        const root = if (receiver.name.len != 0) receiverChainRoot(ctx, receiver.tok, lo) else "";
         // Skip only a *bare* self-reference (recursion noise). A qualified call
         // like `other.foo()` from inside `foo` is a real edge to keep.
         if (qualifier.len == 0 and std.mem.eql(u8, name, self_name)) continue;
-        // A JS/TS object-literal property key (`{ count: ... }`) names a field,
-        // not a reference to a same-named binding — don't emit an edge for it.
-        if (qualifier.len == 0 and isJsObjectKey(ctx, i, lo, hi)) continue;
-        const is_call = i + 1 < hi and ctx.isPunct(i + 1, '(');
-        try recordRef(ctx, &refs, &line_lists, &seen, name, qualifier, t.line, is_call);
+        // A JS/TS object-literal property key (`{ count: ... }`) and a Go
+        // composite-literal field key (`API{store: s}`) name a field, not a
+        // reference to a same-named binding — don't emit an edge for either.
+        if (receiver.name.len == 0 and
+            (isJsObjectKey(ctx, i, lo, hi) or isGoLiteralFieldKey(ctx, i, lo, hi))) continue;
+        const is_call = referenceCallOpen(ctx, i, hi) != null;
+        if (assignment.read) {
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, is_call, false);
+        }
+        if (assignment.write) {
+            try recordRef(ctx, &refs, &line_lists, &offset_lists, &seen, name, qualifier, root, t.line, t.start, false, true);
+        }
     }
     // Keep the distinct-line list only when a ref spans more than one line; a
     // single-site ref falls back to `line` and needs no allocation.
-    for (refs.items, line_lists.items) |*r, ll| {
+    for (refs.items, line_lists.items, offset_lists.items) |*r, ll, ol| {
         if (ll.items.len > 1) r.lines = try ctx.arena.dupe(u32, ll.items);
+        std.debug.assert(ol.items.len == r.count);
+        r.offsets = try ctx.arena.dupe(u32, ol.items);
     }
     return .{
         .refs = try ctx.arena.dupe(Reference, refs.items),
@@ -457,25 +614,180 @@ fn collectRefs(ctx: *Ctx, params_open: u32, lo: u32, hi: u32, self_name: []const
     };
 }
 
+fn isZigReceiverlessMember(ctx: *const Ctx, i: u32, lo: u32, qualifier: []const u8) bool {
+    if (ctx.cfg.language != .zig or i <= lo or !ctx.isPunct(i - 1, '.')) return false;
+    if (qualifier.len != 0) return false;
+    if (i < lo + 2) return true;
+    const recv = ctx.toks[i - 2];
+    if (recv.kind == .identifier and !zig_keywords.has(ctx.textOf(i - 2))) return false;
+    if (recv.kind == .punct) {
+        const c = ctx.ch(i - 2);
+        // Zig postfix unwrap/deref chains are `value.?.field` / `ptr.*.field`.
+        if ((c == '?' or c == '*') and i >= lo + 4 and ctx.isPunct(i - 3, '.')) return false;
+        // A closed expression is a receiver only when the member dot is
+        // adjacent. In `if (cond) .ready`, the gap starts an inferred enum tag.
+        if (c == ')' or c == ']' or c == '}') return recv.end != ctx.toks[i - 1].start;
+    }
+    return true;
+}
+
+/// Classify a direct assignment target. Augmented assignment is both a read and
+/// a write; comparisons remain reads.
+fn assignmentAccess(ctx: *const Ctx, i: u32, hi: u32) struct { read: bool, write: bool } {
+    std.debug.assert(i < hi);
+    std.debug.assert(hi <= ctx.toks.len);
+    if (i + 1 >= hi) return .{ .read = true, .write = false };
+    if (ctx.isPunct(i + 1, '=') and (i + 2 >= hi or !ctx.isPunct(i + 2, '=')))
+        return .{ .read = false, .write = true };
+    if (i + 2 < hi and ctx.cfg.language.family() == .go and ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, '='))
+        return .{ .read = false, .write = true };
+    if (i + 2 < hi and ((ctx.isPunct(i + 1, '+') and ctx.isPunct(i + 2, '+')) or
+        (ctx.isPunct(i + 1, '-') and ctx.isPunct(i + 2, '-'))))
+    {
+        return .{ .read = true, .write = true };
+    }
+    const compound = ctx.isPunct(i + 1, '+') or ctx.isPunct(i + 1, '-') or
+        ctx.isPunct(i + 1, '*') or ctx.isPunct(i + 1, '/') or ctx.isPunct(i + 1, '%') or
+        ctx.isPunct(i + 1, '&') or ctx.isPunct(i + 1, '|') or ctx.isPunct(i + 1, '^');
+    if (i + 2 < hi and compound and ctx.isPunct(i + 2, '=')) return .{ .read = true, .write = true };
+    if (i + 3 < hi and compound and ctx.ch(i + 1) == ctx.ch(i + 2) and ctx.isPunct(i + 3, '='))
+        return .{ .read = true, .write = true };
+    return .{ .read = true, .write = false };
+}
+
+fn referenceCallOpen(ctx: *const Ctx, i: u32, hi: u32) ?u32 {
+    std.debug.assert(i < hi);
+    std.debug.assert(hi <= ctx.toks.len);
+    var cursor = i + 1;
+    if (cursor < hi and ctx.isPunct(cursor, '(')) return cursor;
+    const lang = ctx.cfg.language;
+    if (lang != .cpp and lang != .csharp and lang != .typescript and lang != .tsx and lang != .rust) return null;
+    if (cursor + 2 < hi and ctx.isPunct(cursor, ':') and ctx.isPunct(cursor + 1, ':') and ctx.isPunct(cursor + 2, '<')) cursor += 2;
+    if (cursor >= hi or !ctx.isPunct(cursor, '<')) return null;
+    var depth: u32 = 0;
+    while (cursor < hi) : (cursor += 1) {
+        if (ctx.isPunct(cursor, '<')) depth += 1;
+        if (!ctx.isPunct(cursor, '>')) continue;
+        if (depth == 0) return null;
+        depth -= 1;
+        if (depth == 0) return if (cursor + 1 < hi and ctx.isPunct(cursor + 1, '(')) cursor + 1 else null;
+    }
+    return null;
+}
+
+fn enclosingCallQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+    std.debug.assert(lo <= i);
+    std.debug.assert(i < ctx.toks.len);
+    var depth: u32 = 0;
+    var j = i;
+    while (j > lo) {
+        j -= 1;
+        if (ctx.isPunct(j, ')') or ctx.isPunct(j, ']') or ctx.isPunct(j, '}')) {
+            depth += 1;
+            continue;
+        }
+        const opening = ctx.isPunct(j, '(') or ctx.isPunct(j, '[') or ctx.isPunct(j, '{');
+        if (!opening) continue;
+        if (depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        if (!ctx.isPunct(j, '(')) return "";
+        if (j > lo and ctx.toks[j - 1].kind == .identifier) return ctx.textOf(j - 1);
+        return "";
+    }
+    return "";
+}
+
+/// The receiver of a member access: its identifier text plus the token index it
+/// sits at, so the chain can be walked one link further back. `name` is "" when
+/// token `i` is not a member access.
+const Receiver = struct {
+    name: []const u8 = "",
+    tok: u32 = 0,
+};
+
 /// If token `i` is the trailing member of a member access, return the receiver
-/// identifier; otherwise "". Recognizes `recv.name` (all languages) and the
-/// C/C++ two-punct operators `recv->name` and `Scope::name`, so instance and
-/// static dispatch there is visible to resolution. `lo` bounds the body start.
-fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) []const u8 {
+/// identifier; otherwise an empty `Receiver`.
+fn memberQualifier(ctx: *const Ctx, i: u32, lo: u32) Receiver {
+    std.debug.assert(lo <= i);
+    std.debug.assert(i < ctx.toks.len);
     // `recv.name`
-    if (i >= lo + 2 and ctx.isPunct(i - 1, '.') and ctx.toks[i - 2].kind == .identifier)
-        return ctx.textOf(i - 2);
+    if (i >= lo + 2 and ctx.isPunct(i - 1, '.')) {
+        if (ctx.toks[i - 2].kind == .identifier) {
+            if (ctx.cfg.language != .zig or !zig_keywords.has(ctx.textOf(i - 2))) return ident(ctx, i - 2);
+        }
+        if (ctx.isPunct(i - 2, '>')) return genericReceiver(ctx, i - 2, lo);
+    }
+    // Lua method call `recv:name(...)`: the colon is sugar for passing `recv`
+    // as self, so the receiver scopes the member exactly as `recv.name` does.
+    if (ctx.cfg.language == .lua and i >= lo + 2 and ctx.isPunct(i - 1, ':') and
+        ctx.toks[i - 2].kind == .identifier)
+    {
+        return ident(ctx, i - 2);
+    }
+    // Zig postfix unwrap/deref: `opt.?.name` / `ptr.*.name`.
+    if (ctx.cfg.language == .zig and i >= lo + 4 and ctx.isPunct(i - 1, '.') and
+        (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '*')) and ctx.isPunct(i - 3, '.') and
+        ctx.toks[i - 4].kind == .identifier)
+    {
+        return ident(ctx, i - 4);
+    }
     // Two-punct member operators, receiver two tokens back:
     //   `recv?.name` / `recv!.name` — JS/TS optional-chaining & non-null assertion
     //   `recv->name`                — C/C++ pointer member
     //   `Scope::name`               — C++ scope resolution
-    if (i >= lo + 3 and ctx.toks[i - 3].kind == .identifier) {
-        if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
-            return ctx.textOf(i - 3);
-        if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ctx.textOf(i - 3);
-        if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ctx.textOf(i - 3);
+    if (i >= lo + 3) {
+        if (ctx.toks[i - 3].kind == .identifier) {
+            if (ctx.isPunct(i - 1, '.') and (ctx.isPunct(i - 2, '?') or ctx.isPunct(i - 2, '!')))
+                return ident(ctx, i - 3);
+            if (ctx.isPunct(i - 1, '>') and ctx.isPunct(i - 2, '-')) return ident(ctx, i - 3);
+            if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':')) return ident(ctx, i - 3);
+        }
+        if (ctx.isPunct(i - 1, ':') and ctx.isPunct(i - 2, ':') and ctx.isPunct(i - 3, '>'))
+            return genericReceiver(ctx, i - 3, lo);
     }
-    return "";
+    return .{};
+}
+
+fn ident(ctx: *const Ctx, i: u32) Receiver {
+    return .{ .name = ctx.textOf(i), .tok = i };
+}
+
+/// The identifier heading the receiver chain that ends at token `tok`
+/// (`a.store` at `store` -> "a"), or "" when `tok` already heads the chain.
+/// Walks the same member-access shapes `memberQualifier` recognises, one link
+/// at a time; each step moves strictly left, so the walk terminates.
+fn receiverChainRoot(ctx: *const Ctx, tok: u32, lo: u32) []const u8 {
+    var cursor = tok;
+    var root: []const u8 = "";
+    while (cursor > lo) {
+        const prev = memberQualifier(ctx, cursor, lo);
+        if (prev.name.len == 0) break;
+        std.debug.assert(prev.tok < cursor);
+        root = prev.name;
+        cursor = prev.tok;
+    }
+    return root;
+}
+
+fn genericReceiver(ctx: *const Ctx, close: u32, lo: u32) Receiver {
+    std.debug.assert(lo <= close);
+    std.debug.assert(ctx.isPunct(close, '>'));
+    var depth: u32 = 1;
+    var cursor = close;
+    while (cursor > lo) {
+        cursor -= 1;
+        if (ctx.isPunct(cursor, '>')) depth += 1;
+        if (!ctx.isPunct(cursor, '<')) continue;
+        depth -= 1;
+        if (depth != 0) continue;
+        if (cursor > lo and ctx.toks[cursor - 1].kind == .identifier) return ident(ctx, cursor - 1);
+        if (cursor >= lo + 3 and ctx.isPunct(cursor - 1, ':') and ctx.isPunct(cursor - 2, ':') and ctx.toks[cursor - 3].kind == .identifier)
+            return ident(ctx, cursor - 3);
+        return .{};
+    }
+    return .{};
 }
 
 /// Whether token `i` is a JS/TS object-literal property key: an identifier
@@ -490,19 +802,73 @@ fn isJsObjectKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
     return ctx.isPunct(i - 1, '{') or ctx.isPunct(i - 1, ',');
 }
 
+/// Whether token `i` is a Go composite-literal field key (`&API{store: s}`): an
+/// identifier after `{` or `,` and before `:`. Such a key names a field, not a
+/// reference to a same-named package or variable. Map/slice/array literals
+/// (`map[K]V{…}`, `[]T{…}`) keep their keys — there the key is an expression.
+fn isGoLiteralFieldKey(ctx: *const Ctx, i: u32, lo: u32, hi: u32) bool {
+    if (ctx.cfg.language != .go) return false;
+    if (i <= lo or i + 1 >= hi) return false;
+    if (!ctx.isPunct(i + 1, ':') or ctx.isPunct(i + 2, '=')) return false;
+    if (!ctx.isPunct(i - 1, '{') and !ctx.isPunct(i - 1, ',')) return false;
+    const open = enclosingBraceOpen(ctx, i, lo) orelse return false;
+    return goLiteralTypeIsNamed(ctx, open, lo);
+}
+
+/// The `{` opening the block token `i` sits directly inside, or null when the
+/// nearest enclosing bracket is a `(`/`[` or there is none in range.
+fn enclosingBraceOpen(ctx: *const Ctx, i: u32, lo: u32) ?u32 {
+    var depth: u32 = 0;
+    var j = i;
+    while (j > lo) {
+        j -= 1;
+        if (ctx.isPunct(j, '}') or ctx.isPunct(j, ')') or ctx.isPunct(j, ']')) {
+            depth += 1;
+            continue;
+        }
+        if (!ctx.isPunct(j, '{') and !ctx.isPunct(j, '(') and !ctx.isPunct(j, '[')) continue;
+        if (depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        return if (ctx.isPunct(j, '{')) j else null;
+    }
+    return null;
+}
+
+/// Whether the composite literal opened at `open` names a plain type (`API{`,
+/// `models.Widget{`) rather than a map/slice/array whose `]` precedes the type.
+fn goLiteralTypeIsNamed(ctx: *const Ctx, open: u32, lo: u32) bool {
+    if (open == lo) return false;
+    var j = open - 1;
+    if (ctx.toks[j].kind != .identifier) return false;
+    while (j >= lo + 2 and ctx.isPunct(j - 1, '.') and ctx.toks[j - 2].kind == .identifier) j -= 2;
+    return j == lo or !ctx.isPunct(j - 1, ']');
+}
+
 fn recordRef(
     ctx: *Ctx,
     refs: *std.ArrayList(Reference),
     line_lists: *std.ArrayList(std.ArrayList(u32)),
+    offset_lists: *std.ArrayList(std.ArrayList(u32)),
     seen: *std.StringHashMap(u32),
     name: []const u8,
     qualifier: []const u8,
+    receiver_root: []const u8,
     line: u32,
+    offset: u32,
     is_call: bool,
+    write: bool,
 ) !void {
-    // Dedup on (qualifier, name) so `a.foo()` and `b.foo()` stay distinct.
-    var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ qualifier, name }) catch name;
+    std.debug.assert(name.len > 0);
+    std.debug.assert(offset < ctx.source.len);
+    std.debug.assert(!is_call or !write);
+    // Direction participates in deduplication so a read and write of the same
+    // member retain separate source lines and access modes. So does the chain
+    // root: `a.store.Get()` and `o.store.Get()` reach different objects and must
+    // resolve independently.
+    var key_buf: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}\x00{s}\x00{c}", .{ receiver_root, qualifier, name, if (write) @as(u8, 'w') else 'r' }) catch name;
     if (seen.get(key)) |idx| {
         var r = &refs.items[idx];
         r.count += 1;
@@ -511,19 +877,184 @@ fn recordRef(
         // order, so lines are non-decreasing — compare against the last kept.
         const ll = &line_lists.items[idx];
         if (ll.items.len == 0 or ll.items[ll.items.len - 1] != line) try ll.append(ctx.gpa, line);
+        try offset_lists.items[idx].append(ctx.gpa, offset);
         return;
     }
     try seen.put(try ctx.gpa.dupe(u8, key), @intCast(refs.items.len));
     try refs.append(ctx.gpa, .{
         .name = name,
         .qualifier = qualifier,
+        .receiver_root = receiver_root,
         .line = line,
         .kind = if (is_call) .call else .read,
+        .write = write,
         .count = 1,
     });
     var ll: std.ArrayList(u32) = .empty;
     try ll.append(ctx.gpa, line);
     try line_lists.append(ctx.gpa, ll);
+    var ol: std.ArrayList(u32) = .empty;
+    try ol.append(ctx.gpa, offset);
+    try offset_lists.append(ctx.gpa, ol);
+}
+
+/// A broad body scan sees through nested function declarations. Once every
+/// symbol in the file is known, assign each occurrence to the innermost
+/// callable span so the outer owner does not inherit the nested function's
+/// calls. Rebuild partially-overlapping refs occurrence-by-occurrence: an outer
+/// function may legitimately use the same name outside its nested function.
+fn removeNestedReferenceOwnership(ctx: *Ctx) !void {
+    for (ctx.out.items, 0..) |*owner, owner_idx| {
+        if (!isCallable(owner.kind) or owner.refs.len == 0) continue;
+        if (!hasNestedCallable(ctx, owner_idx)) continue;
+        var changed = false;
+        for (owner.refs) |ref| {
+            for (ref.offsets) |offset| {
+                if (nestedCallableOwnsOffset(ctx, owner_idx, offset)) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) break;
+        }
+        if (!changed) continue;
+
+        var refs: std.ArrayList(Reference) = .empty;
+        var transferred = false;
+        defer {
+            if (!transferred) for (refs.items) |ref| freeReferenceSites(ctx, ref);
+            refs.deinit(ctx.gpa);
+        }
+        for (owner.refs) |ref| {
+            if (ref.offsets.len == 0) {
+                const kept = try cloneReferenceSites(ctx, ref, ref.offsets, ref.lines);
+                refs.append(ctx.gpa, kept) catch |err| {
+                    freeReferenceSites(ctx, kept);
+                    return err;
+                };
+                continue;
+            }
+            var offsets: std.ArrayList(u32) = .empty;
+            defer offsets.deinit(ctx.gpa);
+            var lines: std.ArrayList(u32) = .empty;
+            defer lines.deinit(ctx.gpa);
+            var has_call = false;
+            for (ref.offsets) |offset| {
+                if (nestedCallableOwnsOffset(ctx, owner_idx, offset)) {
+                    continue;
+                }
+                try offsets.append(ctx.gpa, offset);
+                const tok_i = tokenAtOffset(ctx, offset) orelse continue;
+                const line = ctx.toks[tok_i].line;
+                if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line)
+                    try lines.append(ctx.gpa, line);
+                if (!ref.write and referenceCallOpen(ctx, tok_i, @intCast(ctx.toks.len - 1)) != null)
+                    has_call = true;
+            }
+            if (offsets.items.len == 0) continue;
+            var kept = try cloneReferenceSites(
+                ctx,
+                ref,
+                offsets.items,
+                if (lines.items.len > 1) lines.items else &.{},
+            );
+            kept.count = @intCast(offsets.items.len);
+            if (lines.items.len != 0) kept.line = lines.items[0];
+            if (ref.kind == .call or ref.kind == .read) kept.kind = if (has_call) .call else .read;
+            refs.append(ctx.gpa, kept) catch |err| {
+                freeReferenceSites(ctx, kept);
+                return err;
+            };
+        }
+        const old_refs = owner.refs;
+        const replacement = try ctx.arena.dupe(Reference, refs.items);
+        owner.refs = replacement;
+        for (old_refs) |old| {
+            freeReferenceSites(ctx, old);
+        }
+        ctx.arena.free(old_refs);
+        transferred = true;
+    }
+}
+
+fn cloneReferenceSites(
+    ctx: *Ctx,
+    ref: Reference,
+    offsets: []const u32,
+    lines: []const u32,
+) !Reference {
+    var kept = ref;
+    kept.lines = &.{};
+    kept.offsets = &.{};
+    if (lines.len != 0) {
+        kept.lines = try ctx.arena.dupe(u32, lines);
+        errdefer ctx.arena.free(kept.lines);
+    }
+    if (offsets.len != 0) {
+        kept.offsets = try ctx.arena.dupe(u32, offsets);
+        errdefer ctx.arena.free(kept.offsets);
+    }
+    return kept;
+}
+
+fn freeReferenceSites(ctx: *Ctx, ref: Reference) void {
+    if (ref.lines.len != 0) ctx.arena.free(ref.lines);
+    if (ref.offsets.len != 0) ctx.arena.free(ref.offsets);
+}
+
+fn isCallable(kind: SymbolKind) bool {
+    return kind == .function or kind == .method or kind == .test_case;
+}
+
+fn hasNestedCallable(ctx: *const Ctx, owner_idx: usize) bool {
+    const owner = ctx.out.items[owner_idx];
+    for (ctx.out.items, 0..) |nested, nested_idx| {
+        if (nested_idx == owner_idx or !isCallable(nested.kind)) continue;
+        if (nested.span_start > owner.span_start and nested.span_end <= owner.span_end) return true;
+    }
+    return false;
+}
+
+fn nestedCallableOwnsOffset(ctx: *const Ctx, owner_idx: usize, offset: u32) bool {
+    const owner = ctx.out.items[owner_idx];
+    for (ctx.out.items, 0..) |nested, nested_idx| {
+        if (nested_idx == owner_idx or !isCallable(nested.kind)) continue;
+        if (nested.span_start <= owner.span_start or nested.span_end > owner.span_end) continue;
+        if (offset < nested.span_start or offset >= nested.span_end) continue;
+        if (ctx.cfg.language != .python) return true;
+        // Python evaluates nested defaults/annotations while defining the inner
+        // function, in the outer scope. Preserve those signature expressions,
+        // but remove the declaration name and everything in the nested body.
+        if (offset >= nested.sig_end) return true;
+        if (nestedNameOffset(ctx, nested)) |name_offset| {
+            if (offset == name_offset) return true;
+        }
+    }
+    return false;
+}
+
+fn nestedNameOffset(ctx: *const Ctx, nested: ParsedSymbol) ?u32 {
+    for (ctx.toks) |tok| {
+        if (tok.start < nested.span_start) continue;
+        if (tok.start >= nested.sig_end) break;
+        if (tok.line != nested.line or tok.kind != .identifier) continue;
+        if (std.mem.eql(u8, tok.text(ctx.source), nested.name)) return tok.start;
+    }
+    return null;
+}
+
+fn tokenAtOffset(ctx: *const Ctx, offset: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = ctx.toks.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ctx.toks[mid].start < offset)
+            lo = mid + 1
+        else
+            hi = mid;
+    }
+    if (lo < ctx.toks.len and ctx.toks[lo].start == offset) return @intCast(lo);
+    return null;
 }
 
 /// Factory-method names whose receiver is the constructed type: `T.init(...)`.
@@ -533,10 +1064,15 @@ const factory_names = std.StaticStringMap(void).initComptime(.{
 
 /// Scan a body for `const/var/let NAME [: T] = ...` and `NAME = T(...)` and
 /// record inferred `NAME -> T` bindings used for receiver resolution.
-fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]const Binding {
+fn collectBindings(ctx: *Ctx, params_open: u32, lo: u32, hi: u32) ![]Binding {
     var list: std.ArrayList(Binding) = .empty;
     defer list.deinit(ctx.gpa);
-    if (params_open != sentinel) try collectParamBindings(ctx, params_open, &list);
+    if (params_open != sentinel) {
+        if (ctx.cfg.language.family() == .c)
+            try collectCParamBindings(ctx, params_open, &list)
+        else
+            try collectParamBindings(ctx, params_open, &list);
+    }
     var i = lo;
     while (i < hi) : (i += 1) {
         const b = detectBinding(ctx, i, hi, lo) orelse continue;
@@ -550,6 +1086,8 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
     const close = ctx.close[open];
     if (close == sentinel) return;
     var expect_name = true;
+    // First name of the Go parameter group still waiting for its shared type.
+    var group_start = list.items.len;
     var i = open + 1;
     while (i < close) {
         if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '{')) {
@@ -571,17 +1109,162 @@ fn collectParamBindings(ctx: *Ctx, open: u32, list: *std.ArrayList(Binding)) !vo
             var ty: []const u8 = "";
             if (ctx.isPunct(i + 1, ':')) {
                 if (typeFromChain(ctx, i + 2, close)) |t| ty = t;
+            } else if (ctx.cfg.language == .go and i + 1 < close and !ctx.isPunct(i + 1, ',')) {
+                // Go writes `name T` with no separator (`o *Other`, `w http.ResponseWriter`).
+                if (typeFromChain(ctx, i + 1, close)) |t| ty = t;
             }
             try list.append(ctx.gpa, .{ .name = ctx.textOf(i), .type_name = ty });
+            // A Go group shares one type written after the last name
+            // (`store, other *Local`): back-fill the names that parsed untyped.
+            if (ctx.cfg.language == .go and ty.len != 0) {
+                for (list.items[group_start..]) |*b| b.type_name = ty;
+                group_start = list.items.len;
+            }
         }
         expect_name = false;
         i += 1;
     }
 }
 
+/// Leading words a C/C++ declarator may carry before its type.
+const c_decl_modifiers = KeywordSet.initComptime(.{
+    .{"const"},  .{"static"},   .{"volatile"}, .{"mutable"}, .{"register"},
+    .{"extern"}, .{"constexpr"}, .{"inline"},  .{"unsigned"}, .{"signed"},
+    .{"long"},   .{"short"},    .{"struct"},   .{"enum"},     .{"union"},
+    .{"class"},  .{"auto"},     .{"typename"},
+});
+
+/// Words that open a statement rather than a declaration, so a run starting
+/// with one is never `Type name`.
+const c_statement_keywords = KeywordSet.initComptime(.{
+    .{"if"},     .{"for"},       .{"while"},     .{"switch"}, .{"return"},
+    .{"else"},   .{"do"},        .{"case"},      .{"goto"},   .{"break"},
+    .{"continue"}, .{"sizeof"},  .{"new"},       .{"delete"}, .{"throw"},
+    .{"try"},    .{"catch"},     .{"using"},     .{"namespace"}, .{"typedef"},
+    .{"template"}, .{"public"},  .{"private"},   .{"protected"}, .{"friend"},
+    .{"virtual"}, .{"operator"}, .{"default"},
+});
+
+/// Modifiers that are a complete type on their own, so the declarator may carry
+/// no type identifier at all (`long alpha = 0;`, `const auto x = f();`).
+const c_scalar_modifiers = KeywordSet.initComptime(.{
+    .{"unsigned"}, .{"signed"}, .{"long"}, .{"short"}, .{"auto"},
+});
+
+/// Whether token `i` closes a declarator (`; = , ) : [ {`). A `(` means a call
+/// or a function declaration, never a variable we can type.
+fn endsCDeclarator(ctx: *const Ctx, i: u32, limit: u32) bool {
+    if (i >= limit or ctx.toks[i].kind != .punct) return false;
+    const c = ctx.ch(i);
+    return c == ';' or c == '=' or c == ',' or c == ')' or c == ':' or c == '[' or c == '{';
+}
+
+/// Parse a C/C++ declarator `[modifiers] [Type[::Q][<...>]] [*&]* name` ending
+/// at `; = , ) : [ {`, returning `name -> Type`. A scalar modifier can be the
+/// whole type (`long alpha`), in which case the binding is untyped: it names no
+/// project type, and its job is to shadow a same-named global. Anything without
+/// a name yields nothing, so an expression statement is not a declaration.
+fn cDeclarator(ctx: *const Ctx, start: u32, limit: u32) ?Binding {
+    if (c_statement_keywords.has(ctx.textOf(start))) return null;
+    var i = start;
+    var scalar = false;
+    while (i < limit and ctx.toks[i].kind == .identifier and
+        c_decl_modifiers.has(ctx.textOf(i))) : (i += 1)
+    {
+        if (c_scalar_modifiers.has(ctx.textOf(i))) scalar = true;
+    }
+
+    // Type chain: `A`, `a::B`, each optionally followed by `<...>`.
+    var type_name: ?[]const u8 = null;
+    while (i < limit and ctx.toks[i].kind == .identifier) {
+        type_name = ctx.textOf(i);
+        i += 1;
+        if (i < limit and ctx.isPunct(i, '<')) {
+            const close = ctx.close[i];
+            if (close == sentinel or close >= limit) return null;
+            i = close + 1;
+        }
+        if (i + 1 < limit and ctx.isPunct(i, ':') and ctx.isPunct(i + 1, ':')) {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+
+    const after_type = i;
+    while (i < limit and (ctx.isPunct(i, '*') or ctx.isPunct(i, '&'))) : (i += 1) {}
+
+    if (i < limit and ctx.toks[i].kind == .identifier and
+        !c_decl_modifiers.has(ctx.textOf(i)) and !c_statement_keywords.has(ctx.textOf(i)))
+    {
+        if (!endsCDeclarator(ctx, i + 1, limit)) return null;
+        const name = ctx.textOf(i);
+        if (type_name) |t| return .{ .name = name, .type_name = t };
+        // `long *p;` — the modifier is the type.
+        return if (scalar) .{ .name = name, .type_name = "" } else null;
+    }
+
+    // `long alpha = 0;` — no name followed the type chain, so what it consumed
+    // *is* the name and the scalar modifier was the type.
+    if (!scalar or i != after_type) return null;
+    const name = type_name orelse return null;
+    return if (endsCDeclarator(ctx, i, limit)) .{ .name = name, .type_name = "" } else null;
+}
+
+/// Record `name -> Type` for each C/C++ parameter in `(...)`.
+fn collectCParamBindings(ctx: *const Ctx, open: u32, list: *std.ArrayList(Binding)) !void {
+    const close = ctx.close[open];
+    if (close == sentinel) return;
+    var start = open + 1;
+    var i = start;
+    while (i < close) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '<')) {
+            const inner = ctx.close[i];
+            i = if (inner == sentinel or inner >= close) i + 1 else inner + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, ',')) {
+            if (cDeclarator(ctx, start, i + 1)) |b| try list.append(ctx.gpa, b);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < close) {
+        if (cDeclarator(ctx, start, close + 1)) |b| try list.append(ctx.gpa, b);
+    }
+}
+
+/// Statement keywords a Go short declaration may follow directly, so the
+/// declared name is not the first token on its line.
+const go_short_decl_openers = KeywordSet.initComptime(.{
+    .{"for"}, .{"if"}, .{"switch"}, .{"case"},
+});
+
+/// Whether identifier `i` is a declared name on the left of a Go short
+/// declaration. The name list runs `ident (, ident)*` up to `:=`, and `i` must
+/// itself start a list item — statement start, a preceding statement keyword,
+/// or the list's own comma — so a call argument never looks like a declaration.
+fn goShortDeclName(ctx: *const Ctx, i: u32, hi: u32, lo: u32) bool {
+    const starts_item = i == lo or ctx.toks[i - 1].line != ctx.toks[i].line or
+        ctx.isPunct(i - 1, ',') or ctx.isPunct(i - 1, ';') or
+        (ctx.toks[i - 1].kind == .identifier and go_short_decl_openers.has(ctx.textOf(i - 1)));
+    if (!starts_item) return false;
+    var j = i + 1;
+    while (j + 1 < hi and ctx.isPunct(j, ',') and ctx.toks[j + 1].kind == .identifier) j += 2;
+    return j + 1 < hi and ctx.isPunct(j, ':') and ctx.isPunct(j + 1, '=');
+}
+
 fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
     const t = ctx.toks[i];
     if (t.kind != .identifier) return null;
+    // C/C++ put the type before the name (`const Shape* s`), so the
+    // `const`-introduces-a-name rule below would read the *type* as the name.
+    if (ctx.cfg.language.family() == .c) {
+        if (i != lo and !ctx.isPunct(i - 1, ';') and !ctx.isPunct(i - 1, '{') and
+            !ctx.isPunct(i - 1, '}') and !ctx.isPunct(i - 1, '(') and
+            ctx.toks[i - 1].line == t.line) return null;
+        return cDeclarator(ctx, i, hi);
+    }
     const is_decl = ctx.identEql(i, "const") or ctx.identEql(i, "var") or ctx.identEql(i, "let");
     if (is_decl) {
         if (i + 1 >= hi or ctx.toks[i + 1].kind != .identifier) return null;
@@ -591,10 +1274,43 @@ fn detectBinding(ctx: *const Ctx, i: u32, hi: u32, lo: u32) ?Binding {
         const ty = inferDeclType(ctx, i + 1, hi) orelse "";
         return .{ .name = ctx.textOf(i + 1), .type_name = ty };
     }
-    // Bare assignment at line start: `name = Type(...)` (python/js).
+    // Python `for NAME in …`, `with … as NAME`, `except … as NAME`: loop and
+    // context variables are locals; an unrecorded one used to leak as a bare
+    // ref and bind cross-file to any same-named global (a trial's
+    // `for envvar in self.envvar:` pointed at an unrelated example script's
+    // `envvar`). Python-gated: `as` is an expression operator in C# and an
+    // import alias elsewhere.
+    if (ctx.cfg.language.family() == .python and
+        (ctx.identEql(i, "for") or ctx.identEql(i, "as")))
+    {
+        if (i + 1 < hi and ctx.toks[i + 1].kind == .identifier) {
+            return .{ .name = ctx.textOf(i + 1), .type_name = "" };
+        }
+        return null;
+    }
+    // Go short declarations bind *every* name on the left, and start after a
+    // statement keyword as often as at line start: `x, err := f()`,
+    // `for _, x := range xs`, `if x, ok := m[k]; ok`. A missing binding here let
+    // a local shadowing an imported package resolve to the package instead.
+    if (ctx.cfg.language == .go and goShortDeclName(ctx, i, hi, lo)) {
+        if (ctx.identEql(i, "_")) return null; // blank identifier declares nothing
+        // Only the single-name form has a typeable RHS; a tuple RHS stays
+        // untyped, which still shadows a same-named package or global.
+        const single = ctx.isPunct(i + 1, ':');
+        const ty = if (single) typeFromRhs(ctx, i + 3, hi) orelse "" else "";
+        return .{ .name = ctx.textOf(i), .type_name = ty };
+    }
     const first_on_line = i == lo or ctx.toks[i - 1].line != t.line;
-    if (!first_on_line or !ctx.isPunct(i + 1, '=') or ctx.isPunct(i + 2, '=')) return null;
-    const ty = typeFromRhs(ctx, i + 2, hi) orelse return null;
+    if (!first_on_line) return null;
+    // Short declaration `name := …` (tokens `:` `=`) outside Go.
+    if (ctx.isPunct(i + 1, ':') and ctx.isPunct(i + 2, '=')) {
+        return .{ .name = ctx.textOf(i), .type_name = typeFromRhs(ctx, i + 3, hi) orelse "" };
+    }
+    // Bare assignment at line start: `name = RHS` (python/js). Typed when the
+    // RHS constructs a known type; still recorded untyped otherwise so the
+    // local shadows same-named globals.
+    if (!ctx.isPunct(i + 1, '=') or ctx.isPunct(i + 2, '=')) return null;
+    const ty = typeFromRhs(ctx, i + 2, hi) orelse "";
     return .{ .name = ctx.textOf(i), .type_name = ty };
 }
 
@@ -603,6 +1319,8 @@ fn inferDeclType(ctx: *const Ctx, name_i: u32, hi: u32) ?[]const u8 {
     const j = name_i + 1;
     if (ctx.isPunct(j, ':')) return typeFromChain(ctx, j + 1, hi);
     if (ctx.isPunct(j, '=')) return typeFromRhs(ctx, j + 1, hi);
+    // Go `var x T` / `var x *T`: the type follows the name with no separator.
+    if (ctx.cfg.language == .go) return typeFromChain(ctx, j, hi);
     return null;
 }
 
@@ -643,8 +1361,10 @@ fn typeFromRhs(ctx: *const Ctx, start: u32, hi: u32) ?[]const u8 {
 }
 
 fn isRhsSkip(ctx: *const Ctx, i: u32) bool {
+    // `&` leads Go/Rust address-of construction (`store := &Cache{}`), which
+    // names the same type as the plain literal.
     return ctx.identEql(i, "new") or ctx.identEql(i, "try") or
-        ctx.identEql(i, "await") or ctx.identEql(i, "comptime");
+        ctx.identEql(i, "await") or ctx.identEql(i, "comptime") or ctx.isPunct(i, '&');
 }
 
 fn emit(ctx: *Ctx, sym: ParsedSymbol) !u32 {
@@ -660,12 +1380,12 @@ fn emit(ctx: *Ctx, sym: ParsedSymbol) !u32 {
 // ---------------------------------------------------------------------------
 
 const zig_keywords = KeywordSet.initComptime(.{
-    .{"const"}, .{"var"},   .{"fn"},     .{"pub"},    .{"return"}, .{"if"},
-    .{"else"},  .{"while"}, .{"for"},    .{"switch"}, .{"struct"}, .{"enum"},
-    .{"union"}, .{"try"},   .{"catch"},  .{"defer"},  .{"errdefer"}, .{"comptime"},
-    .{"inline"},.{"and"},   .{"or"},     .{"orelse"}, .{"test"},   .{"error"},
-    .{"break"}, .{"continue"}, .{"opaque"}, .{"extern"}, .{"export"}, .{"usingnamespace"},
-    .{"anytype"}, .{"void"}, .{"unreachable"},
+    .{"const"},   .{"var"},      .{"fn"},          .{"pub"},    .{"return"},   .{"if"},
+    .{"else"},    .{"while"},    .{"for"},         .{"switch"}, .{"struct"},   .{"enum"},
+    .{"union"},   .{"try"},      .{"catch"},       .{"defer"},  .{"errdefer"}, .{"comptime"},
+    .{"inline"},  .{"and"},      .{"or"},          .{"orelse"}, .{"test"},     .{"error"},
+    .{"break"},   .{"continue"}, .{"opaque"},      .{"extern"}, .{"export"},   .{"usingnamespace"},
+    .{"anytype"}, .{"void"},     .{"unreachable"},
 });
 
 fn parseZigScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
@@ -795,7 +1515,7 @@ fn parseZigFn(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exporte
         span_end = sig_end;
     }
     const body = try collectRefs(ctx, fn_i + 2, body_lo, body_hi, ctx.textOf(name_i), zig_keywords);
-    _ = try emit(ctx, .{
+    const fn_idx = try emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = kind,
         .line = ctx.toks[name_i].line,
@@ -808,7 +1528,40 @@ fn parseZigFn(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, exporte
         .refs = body.refs,
         .bindings = body.bindings,
     });
+    if (body_lo < body_hi) try parseZigReturnedContainerMembers(ctx, body_lo, body_hi, fn_idx);
     return if (span_end > ctx.toks[start_i].start) tokenAfterOffset(ctx, span_end, hi) else start_i + 1;
+}
+
+/// A Zig generic type factory commonly has the shape
+/// `fn Box(comptime T: type) type { return struct { ... }; }`. The function is
+/// still the public symbol, but its returned anonymous container owns useful
+/// methods that agents need to discover and edit. Parent those methods to the
+/// factory so selectors such as `Box.init` remain stable and intuitive.
+fn parseZigReturnedContainerMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
+    var i = lo;
+    while (i < hi) {
+        if (ctx.identEql(i, "return")) {
+            var kind_i = i + 1;
+            while (kind_i < hi and (ctx.identEql(kind_i, "packed") or ctx.identEql(kind_i, "extern")))
+                kind_i += 1;
+            if (kind_i < hi and (ctx.identEql(kind_i, "struct") or ctx.identEql(kind_i, "union") or
+                ctx.identEql(kind_i, "enum") or ctx.identEql(kind_i, "opaque")))
+            {
+                const open = findNext(ctx, kind_i + 1, hi, '{');
+                if (open != sentinel and ctx.close[open] != sentinel and ctx.close[open] <= hi) {
+                    try parseZigScope(ctx, open + 1, ctx.close[open], parent);
+                    i = ctx.close[open] + 1;
+                    continue;
+                }
+            }
+        }
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '{') or ctx.isPunct(i, '[')) {
+            const next = skipBracket(ctx, i);
+            i = if (next > i) next else i + 1;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn parseZigConst(ctx: *Ctx, start_i: u32, kw_i: u32, hi: u32, parent: ?u32, exported: bool) !u32 {
@@ -977,30 +1730,107 @@ fn tokenAfterOffset(ctx: *const Ctx, offset: u32, hi: u32) u32 {
 // ---------------------------------------------------------------------------
 
 const c_keywords = KeywordSet.initComptime(.{
-    .{"if"},     .{"else"},   .{"for"},    .{"while"},  .{"return"}, .{"switch"},
-    .{"case"},   .{"break"},  .{"continue"}, .{"struct"}, .{"enum"}, .{"union"},
-    .{"typedef"}, .{"static"}, .{"const"},  .{"void"},   .{"int"},   .{"char"},
-    .{"float"},  .{"double"}, .{"unsigned"}, .{"signed"}, .{"long"}, .{"short"},
-    .{"sizeof"}, .{"goto"},   .{"do"},     .{"extern"}, .{"inline"}, .{"register"},
-    .{"volatile"}, .{"class"}, .{"public"}, .{"private"}, .{"namespace"}, .{"template"},
+    .{"if"},       .{"else"},   .{"for"},      .{"while"},   .{"return"},    .{"switch"},
+    .{"case"},     .{"break"},  .{"continue"}, .{"struct"},  .{"enum"},      .{"union"},
+    .{"typedef"},  .{"static"}, .{"const"},    .{"void"},    .{"int"},       .{"char"},
+    .{"float"},    .{"double"}, .{"unsigned"}, .{"signed"},  .{"long"},      .{"short"},
+    .{"sizeof"},   .{"goto"},   .{"do"},       .{"extern"},  .{"inline"},    .{"register"},
+    .{"volatile"}, .{"class"},  .{"public"},   .{"private"}, .{"namespace"}, .{"template"},
 });
 
 /// C# control/type/modifier keywords — kept apart from `c_keywords` so the shared
 /// C-family scanners skip C#-specific keywords when reading a body's references
 /// and detecting member functions.
 const cs_keywords = KeywordSet.initComptime(.{
-    .{"if"},      .{"else"},    .{"for"},      .{"foreach"}, .{"while"},   .{"do"},
-    .{"return"},  .{"switch"},  .{"case"},     .{"break"},   .{"continue"}, .{"goto"},
-    .{"using"},   .{"namespace"}, .{"class"},  .{"struct"},  .{"interface"}, .{"enum"},
-    .{"record"},  .{"public"},  .{"private"},  .{"protected"}, .{"internal"}, .{"static"},
-    .{"readonly"}, .{"const"},  .{"virtual"},  .{"override"}, .{"abstract"}, .{"sealed"},
-    .{"async"},   .{"await"},   .{"new"},      .{"this"},    .{"base"},    .{"var"},
-    .{"void"},    .{"int"},     .{"string"},   .{"bool"},    .{"double"},  .{"float"},
-    .{"long"},    .{"short"},   .{"byte"},     .{"char"},    .{"object"},  .{"decimal"},
-    .{"true"},    .{"false"},   .{"null"},     .{"is"},      .{"as"},      .{"typeof"},
-    .{"try"},     .{"catch"},   .{"finally"},  .{"throw"},   .{"yield"},   .{"ref"},
-    .{"out"},     .{"in"},      .{"where"},    .{"get"},     .{"set"},     .{"partial"},
+    .{"if"},       .{"else"},      .{"for"},     .{"foreach"},   .{"while"},     .{"do"},
+    .{"return"},   .{"switch"},    .{"case"},    .{"break"},     .{"continue"},  .{"goto"},
+    .{"using"},    .{"namespace"}, .{"class"},   .{"struct"},    .{"interface"}, .{"enum"},
+    .{"record"},   .{"public"},    .{"private"}, .{"protected"}, .{"internal"},  .{"static"},
+    .{"readonly"}, .{"const"},     .{"virtual"}, .{"override"},  .{"abstract"},  .{"sealed"},
+    .{"async"},    .{"await"},     .{"new"},     .{"this"},      .{"base"},      .{"var"},
+    .{"void"},     .{"int"},       .{"string"},  .{"bool"},      .{"double"},    .{"float"},
+    .{"long"},     .{"short"},     .{"byte"},    .{"char"},      .{"object"},    .{"decimal"},
+    .{"true"},     .{"false"},     .{"null"},    .{"is"},        .{"as"},        .{"typeof"},
+    .{"try"},      .{"catch"},     .{"finally"}, .{"throw"},     .{"yield"},     .{"ref"},
+    .{"out"},      .{"in"},        .{"where"},   .{"get"},       .{"set"},       .{"partial"},
 });
+
+/// Java control/type/modifier keywords — kept apart from `c_keywords` so the
+/// shared C-family scanners skip Java-specific keywords when reading a body's
+/// references and detecting member methods.
+const java_keywords = KeywordSet.initComptime(.{
+    .{"if"},       .{"else"},       .{"for"},          .{"while"},     .{"do"},
+    .{"return"},   .{"switch"},     .{"case"},         .{"break"},     .{"continue"},
+    .{"default"},  .{"class"},      .{"interface"},    .{"enum"},      .{"record"},
+    .{"extends"},  .{"implements"}, .{"throws"},       .{"import"},    .{"package"},
+    .{"public"},   .{"private"},    .{"protected"},    .{"static"},    .{"final"},
+    .{"abstract"}, .{"native"},     .{"synchronized"}, .{"transient"}, .{"volatile"},
+    .{"strictfp"}, .{"void"},       .{"int"},          .{"long"},      .{"short"},
+    .{"byte"},     .{"char"},       .{"float"},        .{"double"},    .{"boolean"},
+    .{"true"},     .{"false"},      .{"null"},         .{"this"},      .{"super"},
+    .{"new"},      .{"instanceof"}, .{"try"},          .{"catch"},     .{"finally"},
+    .{"throw"},    .{"var"},        .{"yield"},        .{"assert"},    .{"sealed"},
+    .{"permits"},  .{"const"},      .{"goto"},
+});
+
+/// A Java `package a.b.c;` declaration — emit a module symbol for outline
+/// visibility. `kw_i` is the `package` token; returns the index just past `;`.
+fn parseJavaPackage(ctx: *Ctx, kw_i: u32, hi: u32) AllocError!u32 {
+    const line = ctx.toks[kw_i].line;
+    var semi = kw_i + 1;
+    var name_i: ?u32 = null;
+    while (semi < hi and !ctx.isPunct(semi, ';') and ctx.toks[semi].line == line) : (semi += 1) {
+        if (ctx.toks[semi].kind == .identifier) name_i = semi;
+    }
+    const end = if (semi < hi) ctx.toks[semi].end else ctx.toks[semi - 1].end;
+    if (name_i) |ni| {
+        _ = try emit(ctx, .{
+            .name = ctx.textOf(ni),
+            .kind = .module,
+            .line = ctx.toks[ni].line,
+            .span_start = lineStartOffset(ctx, kw_i),
+            .span_end = end,
+            .sig_end = ctx.toks[ni].end,
+            .doc = collectDoc(ctx, kw_i),
+            .exported = true,
+            .parent_local = null,
+            .refs = &.{},
+        });
+    }
+    return if (semi < hi) semi + 1 else semi;
+}
+
+/// A Java `import a.b.C;`, `import static a.b.C.member;`, or `import a.b.*;`
+/// directive. Emits an import symbol whose `import_path` is the full dotted path
+/// (as written) and whose name is the last simple identifier — the name the
+/// importing file uses to refer to the type. `kw_i` is the `import` token.
+fn parseJavaImport(ctx: *Ctx, kw_i: u32, hi: u32) AllocError!u32 {
+    const line = ctx.toks[kw_i].line;
+    var start = kw_i + 1;
+    if (ctx.identEql(start, "static")) start += 1;
+    var semi = start;
+    while (semi < hi and !ctx.isPunct(semi, ';') and ctx.toks[semi].line == line) semi += 1;
+    if (semi <= start) return if (semi < hi) semi + 1 else semi;
+    var name_i: ?u32 = null;
+    var j = start;
+    while (j < semi) : (j += 1) {
+        if (ctx.toks[j].kind == .identifier) name_i = j;
+    }
+    const path = ctx.source[ctx.toks[start].start..ctx.toks[semi - 1].end];
+    const simple = if (name_i) |ni| ctx.textOf(ni) else "";
+    _ = try emit(ctx, importSymbol(simple, path, line, lineStartOffset(ctx, kw_i), ctx.toks[semi - 1].end));
+    return if (semi < hi) semi + 1 else semi;
+}
+
+/// Whether token `i` begins a C-family record/type declaration. `record` is a
+/// contextual keyword, so it only counts in C# and Java where it is reserved.
+fn startsCRecord(ctx: *const Ctx, i: u32) bool {
+    if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
+        ctx.identEql(i, "union") or ctx.identEql(i, "class") or
+        ctx.identEql(i, "interface")) return true;
+    return ctx.identEql(i, "record") and
+        (ctx.cfg.language == .csharp or ctx.cfg.language == .java);
+}
 
 fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
     var stmt_start = lo;
@@ -1026,6 +1856,20 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
                 continue;
             }
         }
+        if (ctx.cfg.language == .java) {
+            // `package a.b.c;` names the compilation unit's module; `import
+            // a.b.C;` / `import static a.b.C.m;` are Java's imports.
+            if (ctx.identEql(i, "package")) {
+                i = try parseJavaPackage(ctx, i, hi);
+                stmt_start = i;
+                continue;
+            }
+            if (ctx.identEql(i, "import")) {
+                i = try parseJavaImport(ctx, i, hi);
+                stmt_start = i;
+                continue;
+            }
+        }
         if (ctx.identEql(i, "namespace")) {
             const adv = try parseCppNamespace(ctx, i, hi, parent);
             if (adv > i) {
@@ -1034,10 +1878,7 @@ fn parseCScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
                 continue;
             }
         }
-        if (ctx.identEql(i, "struct") or ctx.identEql(i, "enum") or
-            ctx.identEql(i, "union") or ctx.identEql(i, "class") or
-            ctx.identEql(i, "interface"))
-        {
+        if (startsCRecord(ctx, i)) {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
                 i = adv;
@@ -1182,16 +2023,20 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
     // The body `{` must come before any `;` (forward decl / typed variable) and
     // before any `(` (a function returning the type). Inheritance is allowed:
     // `class C : public B { ... }`.
+    const is_record = ctx.identEql(kw_i, "record");
     const open = findNext(ctx, name_i + 1, hi, '{');
     if (open == sentinel or ctx.close[open] == sentinel) return kw_i;
     const semi = findNext(ctx, name_i + 1, hi, ';');
     if (semi != sentinel and semi < open) return kw_i;
     const paren = findNext(ctx, name_i + 1, hi, '(');
-    if (paren != sentinel and paren < open) return kw_i;
+    // A record's positional parameter list (`record Point(int x, int y) {}`)
+    // legitimately precedes its body; for other records a `(` before `{` marks a
+    // function returning the type, so the declaration is not a record body.
+    if (!is_record and paren != sentinel and paren < open) return kw_i;
     const close = ctx.close[open];
     const kind: SymbolKind = if (ctx.identEql(kw_i, "enum"))
         .@"enum"
-    else if (ctx.identEql(kw_i, "class"))
+    else if (ctx.identEql(kw_i, "class") or is_record)
         .class
     else if (ctx.identEql(kw_i, "interface"))
         .interface
@@ -1211,7 +2056,8 @@ fn parseCRecord(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) Al
     });
     // C++ class/struct bodies hold methods; C# class/struct/interface bodies do
     // too. Parse them as members (enums do not hold methods).
-    const parses_members = ctx.cfg.language == .cpp or ctx.cfg.language == .csharp;
+    const parses_members = ctx.cfg.language == .cpp or ctx.cfg.language == .csharp or
+        ctx.cfg.language == .java;
     if (parses_members and kind != .@"enum") {
         try parseCppMembers(ctx, open + 1, close, my_idx);
     }
@@ -1229,10 +2075,7 @@ fn parseCppMembers(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
             stmt_start = i;
             continue;
         }
-        if (ctx.identEql(i, "struct") or ctx.identEql(i, "class") or
-            ctx.identEql(i, "enum") or ctx.identEql(i, "union") or
-            ctx.identEql(i, "interface"))
-        {
+        if (startsCRecord(ctx, i)) {
             const adv = try parseCRecord(ctx, stmt_start, i, hi, parent);
             if (adv > i) {
                 i = adv;
@@ -1345,7 +2188,7 @@ fn tryCppMethod(ctx: *Ctx, stmt_start: u32, name_i: u32, hi: u32, parent: u32) A
 /// such keyword here and stay exported (`true`); a bare C# member (no modifier)
 /// also stays `true` to avoid over-hiding (its default depends on the container).
 fn memberExported(ctx: *const Ctx, stmt_start: u32, name_i: u32) bool {
-    if (ctx.cfg.language != .csharp) return true;
+    if (ctx.cfg.language != .csharp and ctx.cfg.language != .java) return true;
     return !(hasKeywordBetween(ctx, stmt_start, name_i, "private") or
         hasKeywordBetween(ctx, stmt_start, name_i, "protected") or
         hasKeywordBetween(ctx, stmt_start, name_i, "internal"));
@@ -1371,6 +2214,17 @@ fn cBodyOpen(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
         {
             return findNext(ctx, j + 1, hi, '{');
         }
+        // Java `M(...) throws A, b.C.D { ... }`: the checked-exception list (dotted,
+        // comma-separated type names) precedes the body's `{`.
+        if (ctx.cfg.language == .java and ctx.identEql(j, "throws")) {
+            var k = j + 1;
+            while (k < hi) : (k += 1) {
+                if (ctx.isPunct(k, '{')) return k;
+                if (ctx.toks[k].kind == .identifier or ctx.isPunct(k, '.') or ctx.isPunct(k, ',')) continue;
+                return sentinel; // e.g. the `;` of an abstract/interface declaration
+            }
+            return sentinel;
+        }
         if (ctx.toks[j].kind == .identifier) continue; // const / noexcept / override / final
         return sentinel;
     }
@@ -1388,6 +2242,9 @@ fn declEnd(ctx: *const Ctx, params_close: u32, hi: u32) u32 {
         guard += 1;
     }) {
         if (ctx.isPunct(j, ';')) return j;
+        // Java interface/abstract method declaration `m(...) throws A.B;`.
+        if (ctx.cfg.language == .java and ctx.identEql(j, "throws"))
+            return findNext(ctx, j + 1, hi, ';');
         const ok = ctx.toks[j].kind == .identifier or ctx.toks[j].kind == .number or
             ctx.isPunct(j, '=');
         if (!ok) return sentinel;
@@ -1463,14 +2320,14 @@ fn lineEndOffset(ctx: *const Ctx, from: u32) u32 {
 // ---------------------------------------------------------------------------
 
 const js_keywords = KeywordSet.initComptime(.{
-    .{"const"},  .{"let"},    .{"var"},    .{"function"}, .{"return"}, .{"if"},
-    .{"else"},   .{"for"},    .{"while"},  .{"switch"},   .{"case"},   .{"break"},
-    .{"continue"}, .{"class"}, .{"extends"}, .{"new"},    .{"async"},  .{"await"},
-    .{"import"}, .{"export"}, .{"from"},   .{"default"},  .{"typeof"}, .{"instanceof"},
-    .{"this"},   .{"super"},  .{"try"},    .{"catch"},    .{"finally"}, .{"throw"},
-    .{"yield"},  .{"static"}, .{"get"},    .{"set"},      .{"of"},     .{"in"},
-    .{"true"},   .{"false"},  .{"null"},   .{"undefined"}, .{"void"},  .{"delete"},
-    .{"interface"}, .{"type"}, .{"enum"},  .{"public"},   .{"private"}, .{"readonly"},
+    .{"const"},     .{"let"},    .{"var"},     .{"function"},  .{"return"},  .{"if"},
+    .{"else"},      .{"for"},    .{"while"},   .{"switch"},    .{"case"},    .{"break"},
+    .{"continue"},  .{"class"},  .{"extends"}, .{"new"},       .{"async"},   .{"await"},
+    .{"import"},    .{"export"}, .{"from"},    .{"default"},   .{"typeof"},  .{"instanceof"},
+    .{"this"},      .{"super"},  .{"try"},     .{"catch"},     .{"finally"}, .{"throw"},
+    .{"yield"},     .{"static"}, .{"get"},     .{"set"},       .{"of"},      .{"in"},
+    .{"true"},      .{"false"},  .{"null"},    .{"undefined"}, .{"void"},    .{"delete"},
+    .{"interface"}, .{"type"},   .{"enum"},    .{"public"},    .{"private"}, .{"readonly"},
 });
 
 fn parseJsScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
@@ -1977,12 +2834,12 @@ fn stripQuotes(s: []const u8) []const u8 {
 // ---------------------------------------------------------------------------
 
 const py_keywords = KeywordSet.initComptime(.{
-    .{"def"},    .{"class"},  .{"return"}, .{"if"},     .{"elif"},   .{"else"},
-    .{"for"},    .{"while"},  .{"import"}, .{"from"},   .{"as"},     .{"with"},
-    .{"try"},    .{"except"}, .{"finally"}, .{"raise"}, .{"pass"},   .{"break"},
-    .{"continue"}, .{"and"},  .{"or"},     .{"not"},    .{"in"},     .{"is"},
-    .{"lambda"}, .{"yield"},  .{"await"},  .{"async"},  .{"global"}, .{"nonlocal"},
-    .{"True"},   .{"False"},  .{"None"},   .{"self"},   .{"del"},    .{"assert"},
+    .{"def"},      .{"class"},  .{"return"},  .{"if"},    .{"elif"},   .{"else"},
+    .{"for"},      .{"while"},  .{"import"},  .{"from"},  .{"as"},     .{"with"},
+    .{"try"},      .{"except"}, .{"finally"}, .{"raise"}, .{"pass"},   .{"break"},
+    .{"continue"}, .{"and"},    .{"or"},      .{"not"},   .{"in"},     .{"is"},
+    .{"lambda"},   .{"yield"},  .{"await"},   .{"async"}, .{"global"}, .{"nonlocal"},
+    .{"True"},     .{"False"},  .{"None"},    .{"self"},  .{"del"},    .{"assert"},
 });
 
 const PyScope = struct { indent: u32, local_idx: u32, is_class: bool };
@@ -2173,7 +3030,7 @@ fn parsePyDef(ctx: *Ctx, start_i: u32, def_i: u32, hi: u32, parent: ?u32, is_met
         .span_start = lineStartOffset(ctx, start_i),
         .span_end = span_end,
         .sig_end = sig_end,
-        .doc = collectDoc(ctx, start_i),
+        .doc = collectPyDoc(ctx, start_i, body_lo, term),
         .exported = ctx.source[ctx.toks[name_i].start] != '_',
         .modifiers = mods,
         .parent_local = parent,
@@ -2191,6 +3048,7 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
     const term = pyBlockEnd(ctx, block_from, indent, hi);
     const span_end = if (term < hi) lineStartTrimEnd(ctx, term) else @as(u32, @intCast(ctx.source.len));
     const sig_end = if (colon != sentinel) ctx.toks[colon].end else ctx.toks[name_i].end;
+    const body_lo = if (colon != sentinel) colon + 1 else name_i + 1;
     return emit(ctx, .{
         .name = ctx.textOf(name_i),
         .kind = .class,
@@ -2198,7 +3056,7 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
         .span_start = lineStartOffset(ctx, start_i),
         .span_end = span_end,
         .sig_end = sig_end,
-        .doc = collectDoc(ctx, start_i),
+        .doc = collectPyDoc(ctx, start_i, body_lo, term),
         .exported = ctx.source[ctx.toks[name_i].start] != '_',
         .parent_local = parent,
         .refs = &.{},
@@ -2206,14 +3064,21 @@ fn parsePyClass(ctx: *Ctx, start_i: u32, hi: u32, parent: ?u32) !u32 {
 }
 
 fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
-    // `NAME = ...` or `NAME: TYPE = ...` at line start → module/class variable.
-    if (i + 1 >= hi) return;
-    var j = i + 1;
-    if (ctx.isPunct(j, ':')) { // annotation
-        while (j < hi and !ctx.isPunct(j, '=') and ctx.toks[j].line == ctx.toks[i].line) j += 1;
-    }
-    if (j >= hi or !ctx.isPunct(j, '=')) return;
-    if (j + 1 < hi and ctx.isPunct(j + 1, '=')) return; // comparison ==
+    // `NAME = ...`, `NAME: TYPE = ...`, or annotation-only `NAME: TYPE` at line
+    // start → module/class variable. Dataclasses and ordinary classes both use
+    // annotation-only fields, and omitting them makes outline/flow blind to a
+    // large part of the data model.
+    if (i + 1 >= hi or pyInsideBracket(ctx, i)) return;
+    const annotated = ctx.isPunct(i + 1, ':');
+    const eq_i = if (annotated)
+        pyAnnotationInitializer(ctx, i + 2, hi, ctx.toks[i].line)
+    else if (ctx.isPunct(i + 1, '='))
+        i + 1
+    else
+        sentinel;
+    const has_initializer = eq_i != sentinel;
+    if (!has_initializer and !annotated) return;
+    if (has_initializer and eq_i + 1 < hi and ctx.isPunct(eq_i + 1, '=')) return; // comparison ==
     const first_line_end = lineEndOffset(ctx, ctx.toks[i].start);
     // A bracketed multi-line initializer (`NAME = [ … ]` / `{ … }` / `( … )`)
     // spans past line 1: capture the whole literal so `def NAME -v full` shows
@@ -2221,8 +3086,8 @@ fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
     // signature stays the first line, so the `sig` view still collapses to the
     // head. Only a *direct* bracket literal extends — `NAME = f([…])` does not.
     var span_end = first_line_end;
-    if (j + 1 < hi and (ctx.isPunct(j + 1, '[') or ctx.isPunct(j + 1, '{') or ctx.isPunct(j + 1, '('))) {
-        const close = ctx.close[j + 1];
+    if (has_initializer and eq_i + 1 < hi and (ctx.isPunct(eq_i + 1, '[') or ctx.isPunct(eq_i + 1, '{') or ctx.isPunct(eq_i + 1, '('))) {
+        const close = ctx.close[eq_i + 1];
         if (close != sentinel and close < hi) span_end = @max(span_end, ctx.toks[close].end);
     }
     _ = try emit(ctx, .{
@@ -2239,6 +3104,51 @@ fn tryPyAssign(ctx: *Ctx, i: u32, hi: u32, parent: ?u32) !void {
     });
 }
 
+fn pyAnnotationInitializer(ctx: *const Ctx, from: u32, hi: u32, line: u32) u32 {
+    var i = from;
+    while (i < hi and ctx.toks[i].line == line) {
+        if (ctx.isPunct(i, '(') or ctx.isPunct(i, '[') or ctx.isPunct(i, '{')) {
+            const close = ctx.close[i];
+            if (close == sentinel) return sentinel;
+            i = close + 1;
+            continue;
+        }
+        if (ctx.isPunct(i, '=')) return i;
+        i += 1;
+    }
+    return sentinel;
+}
+
+fn pyInsideBracket(ctx: *const Ctx, i: u32) bool {
+    var parens: u32 = 0;
+    var brackets: u32 = 0;
+    var braces: u32 = 0;
+    var j = i;
+    while (j != 0) {
+        j -= 1;
+        if (ctx.toks[j].kind != .punct) continue;
+        switch (ctx.ch(j)) {
+            ')' => parens += 1,
+            ']' => brackets += 1,
+            '}' => braces += 1,
+            '(' => {
+                if (parens == 0) return true;
+                parens -= 1;
+            },
+            '[' => {
+                if (brackets == 0) return true;
+                brackets -= 1;
+            },
+            '{' => {
+                if (braces == 0) return true;
+                braces -= 1;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn lineStartTrimEnd(ctx: *const Ctx, term: u32) u32 {
     // span end is the byte just before the terminating token's line begins.
     const ls = lineStartOffset(ctx, term);
@@ -2250,16 +3160,17 @@ fn lineStartTrimEnd(ctx: *const Ctx, term: u32) u32 {
 // ---------------------------------------------------------------------------
 
 const lua_keywords = KeywordSet.initComptime(.{
-    .{"and"},   .{"break"}, .{"do"},    .{"else"},   .{"elseif"}, .{"end"},
-    .{"false"}, .{"for"},   .{"function"}, .{"goto"}, .{"if"},    .{"in"},
-    .{"local"}, .{"nil"},   .{"not"},   .{"or"},     .{"repeat"}, .{"return"},
-    .{"then"},  .{"true"},  .{"until"}, .{"while"},  .{"self"},
+    .{"and"},   .{"break"}, .{"do"},       .{"else"},  .{"elseif"}, .{"end"},
+    .{"false"}, .{"for"},   .{"function"}, .{"goto"},  .{"if"},     .{"in"},
+    .{"local"}, .{"nil"},   .{"not"},      .{"or"},    .{"repeat"}, .{"return"},
+    .{"then"},  .{"true"},  .{"until"},    .{"while"}, .{"self"},
 });
 
 /// The name a Lua function definition binds: `function a.b:c(...)` yields the
-/// last segment `c`, whether the final separator was a `:` (implicit `self`),
-/// whether any receiver preceded it, and the params `(` index.
-const LuaName = struct { name_i: u32, is_member: bool, is_method: bool, open_i: u32 };
+/// last segment `c`, the first receiver segment `a`, whether the final separator
+/// was a `:` (implicit `self`), whether any receiver preceded it, and the params
+/// `(` index.
+const LuaName = struct { name_i: u32, receiver_i: u32, is_member: bool, is_method: bool, open_i: u32 };
 
 fn luaFuncName(ctx: *const Ctx, start: u32, hi: u32) ?LuaName {
     if (start >= hi or ctx.toks[start].kind != .identifier) return null;
@@ -2274,7 +3185,7 @@ fn luaFuncName(ctx: *const Ctx, start: u32, hi: u32) ?LuaName {
         if (is_method) break; // `:` is only valid as the final separator
     }
     const open = if (ctx.isPunct(last + 1, '(')) last + 1 else sentinel;
-    return .{ .name_i = last, .is_member = is_member, .is_method = is_method, .open_i = open };
+    return .{ .name_i = last, .receiver_i = start, .is_member = is_member, .is_method = is_method, .open_i = open };
 }
 
 /// Keywords that open an `end`/`until`-terminated Lua block. `for`/`while`
@@ -2346,6 +3257,10 @@ fn parseLuaFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, i
     const params_close = ctx.close[nm.open_i];
     const end_i = luaBlockEnd(ctx, params_close + 1, hi);
     const name = ctx.textOf(nm.name_i);
+    const member_parent = if (nm.is_member)
+        findLuaReceiver(ctx, ctx.textOf(nm.receiver_i)) orelse parent
+    else
+        parent;
     const span_end = if (end_i < hi) ctx.toks[end_i].end else @as(u32, @intCast(ctx.source.len));
     const body = try collectRefs(ctx, nm.open_i, params_close + 1, end_i, name, lua_keywords);
     _ = try emit(ctx, .{
@@ -2357,11 +3272,28 @@ fn parseLuaFunction(ctx: *Ctx, start_i: u32, fn_i: u32, hi: u32, parent: ?u32, i
         .sig_end = ctx.toks[params_close].end,
         .doc = collectDoc(ctx, start_i),
         .exported = !is_local,
-        .parent_local = parent,
+        .parent_local = member_parent,
         .refs = body.refs,
         .bindings = body.bindings,
     });
     return if (end_i < hi) end_i + 1 else hi;
+}
+
+fn findLuaReceiver(ctx: *const Ctx, name: []const u8) ?u32 {
+    var i = ctx.out.items.len;
+    while (i != 0) {
+        i -= 1;
+        const sym = ctx.out.items[i];
+        if (!std.mem.eql(u8, sym.name, name)) continue;
+        switch (sym.kind) {
+            // Lua receiver roots emitted by this parser are table/value
+            // variables or require() imports. A same-named nested field is not
+            // evidence for a later bare `T.method` declaration.
+            .variable, .import => return @intCast(i),
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Parse `[local] NAME[.field|:method]* = RHS`. `ns` is the first target token
@@ -2384,9 +3316,13 @@ fn parseLuaAssign(ctx: *Ctx, start_i: u32, ns: u32, hi: u32, parent: ?u32, is_lo
     if (!is_member) {
         if (luaRequirePath(ctx, rhs, hi)) |path| return emitLuaImport(ctx, start_i, name_i, path, hi);
     }
+    const binding_parent = if (is_member)
+        findLuaReceiver(ctx, ctx.textOf(ns)) orelse parent
+    else
+        parent;
     if (rhs < hi and ctx.identEql(rhs, "function"))
-        return parseLuaFuncExpr(ctx, start_i, name_i, rhs, hi, parent, is_local, is_member);
-    return parseLuaVar(ctx, start_i, name_i, rhs, hi, parent, is_local, is_member);
+        return parseLuaFuncExpr(ctx, start_i, name_i, rhs, hi, binding_parent, is_local, is_member);
+    return parseLuaVar(ctx, start_i, name_i, rhs, hi, binding_parent, is_local, is_member);
 }
 
 fn emitLuaImport(ctx: *Ctx, start_i: u32, name_i: u32, path: []const u8, hi: u32) !u32 {
@@ -2490,11 +3426,11 @@ fn parseLuaTableFields(ctx: *Ctx, open: u32, close: u32, parent: u32) !void {
 // ---------------------------------------------------------------------------
 
 const go_keywords = KeywordSet.initComptime(.{
-    .{"break"},  .{"case"},    .{"chan"},   .{"const"},  .{"continue"}, .{"default"},
-    .{"defer"},  .{"else"},    .{"fallthrough"}, .{"for"}, .{"func"},   .{"go"},
-    .{"goto"},   .{"if"},      .{"import"}, .{"interface"}, .{"map"},    .{"package"},
-    .{"range"},  .{"return"},  .{"select"}, .{"struct"}, .{"switch"},   .{"type"},
-    .{"var"},    .{"nil"},     .{"true"},   .{"false"},
+    .{"break"}, .{"case"},   .{"chan"},        .{"const"},     .{"continue"}, .{"default"},
+    .{"defer"}, .{"else"},   .{"fallthrough"}, .{"for"},       .{"func"},     .{"go"},
+    .{"goto"},  .{"if"},     .{"import"},      .{"interface"}, .{"map"},      .{"package"},
+    .{"range"}, .{"return"}, .{"select"},      .{"struct"},    .{"switch"},   .{"type"},
+    .{"var"},   .{"nil"},    .{"true"},        .{"false"},
 });
 
 /// A Go identifier is exported when its first letter is upper-case.
@@ -2511,6 +3447,26 @@ fn lastPathSegment(path: []const u8) []const u8 {
 fn parseGoScope(ctx: *Ctx, lo: u32, hi: u32, parent: ?u32) AllocError!void {
     var i = lo;
     while (i < hi) {
+        // `package caddy` — emitted as a `.module` symbol so package-qualified
+        // calls (`caddy.Load(...)`) can resolve to this file's top-level defs.
+        if (parent == null and ctx.identEql(i, "package") and isLineStart(ctx, i) and
+            i + 1 < hi and ctx.toks[i + 1].kind == .identifier)
+        {
+            _ = try emit(ctx, .{
+                .name = ctx.textOf(i + 1),
+                .kind = .module,
+                .line = ctx.toks[i].line,
+                .span_start = lineStartOffset(ctx, i),
+                .span_end = ctx.toks[i + 1].end,
+                .sig_end = ctx.toks[i + 1].end,
+                .doc = "",
+                .exported = true,
+                .parent_local = null,
+                .refs = &.{},
+            });
+            i += 2;
+            continue;
+        }
         if (ctx.identEql(i, "func")) {
             const adv = try parseGoFunc(ctx, i, hi, parent);
             if (adv > i) {
@@ -2614,10 +3570,15 @@ fn emitGoValue(ctx: *Ctx, name_i: u32, kind: SymbolKind, parent: ?u32) AllocErro
 fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     var j = func_i + 1;
     var is_method = false;
+    var receiver: []const u8 = "";
+    var receiver_name: []const u8 = "";
     // Optional receiver: `func (r T) Name(...)`.
     if (j < hi and ctx.isPunct(j, '(')) {
         const rc = ctx.close[j];
         if (rc == sentinel) return func_i;
+        receiver = goReceiverType(ctx, j, rc);
+        if (rc > j + 1 and ctx.toks[j + 1].kind == .identifier and !std.mem.eql(u8, ctx.textOf(j + 1), receiver))
+            receiver_name = ctx.textOf(j + 1);
         j = rc + 1;
         is_method = true;
     }
@@ -2640,6 +3601,7 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     const body = try collectRefs(ctx, params_open, body_open + 1, body_close, name, go_keywords);
     _ = try emit(ctx, .{
         .name = name,
+        .bindings = try withGoReceiverBinding(ctx, body.bindings, receiver_name, receiver),
         .kind = if (is_method) .method else .function,
         .line = ctx.toks[name_i].line,
         .span_start = lineStartOffset(ctx, func_i),
@@ -2649,9 +3611,67 @@ fn parseGoFunc(ctx: *Ctx, func_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
         .exported = goExported(name),
         .parent_local = parent,
         .refs = body.refs,
-        .bindings = body.bindings,
+        .receiver = receiver,
     });
     return body_close + 1;
+}
+
+/// `bindings` plus the Go method receiver as a typed local (`func (a *API)` ->
+/// `a -> API`). Appended last so a body local of the same name shadows it, and
+/// it is what lets `a.store.Get()` reach the receiver type's field table.
+fn withGoReceiverBinding(ctx: *Ctx, bindings: []Binding, name: []const u8, type_name: []const u8) ![]Binding {
+    if (name.len == 0 or type_name.len == 0) return bindings;
+    const grown = try ctx.arena.realloc(bindings, bindings.len + 1);
+    grown[grown.len - 1] = .{ .name = name, .type_name = type_name };
+    return grown;
+}
+
+/// A Go-modules major-version import segment: `v2`, `v10`, ….
+fn isGoVersionSegment(s: []const u8) bool {
+    if (s.len < 2 or s[0] != 'v') return false;
+    for (s[1..]) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// The receiver *type* name of a Go method: in `(m *Metrics)` the second
+/// identifier ("Metrics"); in the nameless form `(Metrics)` the only one.
+/// Generic receivers `(m *Metrics[T])` still yield "Metrics" (the type
+/// parameter comes after and is ignored).
+fn goReceiverType(ctx: *const Ctx, open: u32, close: u32) []const u8 {
+    var first: []const u8 = "";
+    var k = open + 1;
+    while (k < close) : (k += 1) {
+        if (ctx.isPunct(k, '[')) break; // type params — done
+        if (ctx.toks[k].kind != .identifier) continue;
+        if (first.len == 0) {
+            first = ctx.textOf(k);
+        } else {
+            return ctx.textOf(k); // `name *Type` — the second identifier
+        }
+    }
+    return first;
+}
+
+/// Go post-pass: attach each method to its receiver type when that type is
+/// declared in the same file (`func (m *Metrics) Provision` → parent = the
+/// `Metrics` symbol), regardless of declaration order. Makes the
+/// `Metrics.Provision` pin, qualified rendering, and type-scoped queries work
+/// for Go the way they do for class languages.
+fn attachGoReceivers(ctx: *Ctx) void {
+    for (ctx.out.items, 0..) |*sym, i| {
+        if (sym.kind != .method or sym.receiver.len == 0 or sym.parent_local != null) continue;
+        for (ctx.out.items, 0..) |cand, ci| {
+            if (ci == i) continue;
+            switch (cand.kind) {
+                .@"struct", .class, .interface, .type, .@"enum" => {},
+                else => continue,
+            }
+            if (std.mem.eql(u8, cand.name, sym.receiver)) {
+                sym.parent_local = @intCast(ci);
+                break;
+            }
+        }
+    }
 }
 
 /// The `{` opening a Go function body after its parameter list closes at
@@ -2704,6 +3724,7 @@ fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
             .exported = goExported(name),
             .parent_local = parent,
             .refs = &.{},
+            .bindings = if (is_iface) &.{} else try collectGoFieldBindings(ctx, open, close),
         });
         if (is_iface) try parseGoInterfaceMethods(ctx, open + 1, close, my);
         return close + 1;
@@ -2725,6 +3746,42 @@ fn parseGoType(ctx: *Ctx, type_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     return tokenAfterOffset(ctx, end, hi);
 }
 
+/// Field `name Type` pairs from a Go struct body. A method of the struct can
+/// then resolve a member access through one of its fields by the field's
+/// declared type — `a.store.Get()` where `store store.Store` — instead of
+/// guessing by method name. The compact reference model keeps only `store` as
+/// the qualifier, so the field table is the only surviving type evidence.
+fn collectGoFieldBindings(ctx: *Ctx, open: u32, close: u32) ![]const Binding {
+    var list: std.ArrayList(Binding) = .empty;
+    defer list.deinit(ctx.gpa);
+    var i = open + 1;
+    while (i < close) : (i += 1) {
+        if (ctx.toks[i].kind != .identifier or !isLineStart(ctx, i)) continue;
+        if (go_keywords.has(ctx.textOf(i))) continue;
+        const field_line = ctx.toks[i].line;
+        const name = ctx.textOf(i);
+        var j = i + 1;
+        // `*T`, `[]T`, `map[K]V` all put the element type after the decoration.
+        while (j < close and (ctx.isPunct(j, '*') or ctx.isPunct(j, '['))) {
+            if (ctx.isPunct(j, '[')) {
+                const c = ctx.close[j];
+                j = if (c == sentinel or c >= close) close else c + 1;
+                continue;
+            }
+            j += 1;
+        }
+        if (j >= close or ctx.toks[j].kind != .identifier) continue;
+        if (ctx.toks[j].line != field_line) continue;
+        var type_name = ctx.textOf(j);
+        while (j + 2 < close and ctx.isPunct(j + 1, '.') and ctx.toks[j + 2].kind == .identifier) {
+            j += 2;
+            type_name = ctx.textOf(j);
+        }
+        try list.append(ctx.gpa, .{ .name = name, .type_name = type_name });
+    }
+    return ctx.arena.dupe(Binding, list.items);
+}
+
 /// Emit a `method` for each `Name(params) ret` signature line in a Go interface
 /// body [lo, hi). Embedded interfaces (a bare type name, no `(`) are skipped.
 fn parseGoInterfaceMethods(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!void {
@@ -2735,19 +3792,29 @@ fn parseGoInterfaceMethods(ctx: *Ctx, lo: u32, hi: u32, parent: u32) AllocError!
         const pc = ctx.close[i + 1];
         if (pc == sentinel) continue;
         const name = ctx.textOf(i);
+        // Extend past the return type, which runs to the end of the method's
+        // line (a Go interface method is declared on one line). Including it in
+        // the signature lets conformance comparison see the same shape as the
+        // implementing method (`Get(id) (Widget, error)`), not just the params.
+        const method_line = ctx.toks[i].line;
+        var end_i = pc;
+        var j = pc + 1;
+        while (j < hi and ctx.toks[j].line == method_line and ctx.toks[j].kind != .comment) : (j += 1) {
+            end_i = j;
+        }
         _ = try emit(ctx, .{
             .name = name,
             .kind = .method,
             .line = ctx.toks[i].line,
             .span_start = lineStartOffset(ctx, i),
-            .span_end = ctx.toks[pc].end,
-            .sig_end = ctx.toks[pc].end,
+            .span_end = ctx.toks[end_i].end,
+            .sig_end = ctx.toks[end_i].end,
             .doc = collectDoc(ctx, i),
             .exported = goExported(name),
             .parent_local = parent,
             .refs = &.{},
         });
-        i = pc;
+        i = end_i;
     }
 }
 
@@ -2772,11 +3839,16 @@ fn parseGoImport(ctx: *Ctx, import_i: u32, hi: u32) AllocError!u32 {
 }
 
 /// Emit an import for the path string at `str_i`, binding it to the preceding
-/// alias identifier when one sits on the same line, else the path's last segment.
+/// alias identifier when one sits on the same line, else the path's last
+/// segment — skipping a Go-modules major-version suffix (`…/caddy/v2` binds as
+/// `caddy`, the real package name, not `v2`).
 fn emitGoImport(ctx: *Ctx, str_i: u32) AllocError!void {
     const path = stripQuotes(ctx.textOf(str_i));
     if (path.len == 0) return;
     var binding = lastPathSegment(path);
+    if (isGoVersionSegment(binding) and path.len > binding.len + 1) {
+        binding = lastPathSegment(path[0 .. path.len - binding.len - 1]);
+    }
     var span_start_tok = str_i;
     // A preceding same-line identifier is an import alias (`alias "path"`) — but
     // NOT the `import` keyword itself of a single, ungrouped `import "fmt"`, which
@@ -2796,13 +3868,13 @@ fn emitGoImport(ctx: *Ctx, str_i: u32) AllocError!void {
 // ---------------------------------------------------------------------------
 
 const rust_keywords = KeywordSet.initComptime(.{
-    .{"as"},     .{"break"},  .{"const"},  .{"continue"}, .{"crate"},  .{"dyn"},
-    .{"else"},   .{"enum"},   .{"extern"}, .{"false"},    .{"fn"},     .{"for"},
-    .{"if"},     .{"impl"},   .{"in"},     .{"let"},      .{"loop"},   .{"match"},
-    .{"mod"},    .{"move"},   .{"mut"},    .{"pub"},      .{"ref"},    .{"return"},
-    .{"self"},   .{"Self"},   .{"static"}, .{"struct"},   .{"super"},  .{"trait"},
-    .{"true"},   .{"type"},   .{"union"},  .{"unsafe"},   .{"use"},    .{"where"},
-    .{"while"},  .{"async"},  .{"await"},
+    .{"as"},    .{"break"}, .{"const"},  .{"continue"}, .{"crate"}, .{"dyn"},
+    .{"else"},  .{"enum"},  .{"extern"}, .{"false"},    .{"fn"},    .{"for"},
+    .{"if"},    .{"impl"},  .{"in"},     .{"let"},      .{"loop"},  .{"match"},
+    .{"mod"},   .{"move"},  .{"mut"},    .{"pub"},      .{"ref"},   .{"return"},
+    .{"self"},  .{"Self"},  .{"static"}, .{"struct"},   .{"super"}, .{"trait"},
+    .{"true"},  .{"type"},  .{"union"},  .{"unsafe"},   .{"use"},   .{"where"},
+    .{"while"}, .{"async"}, .{"await"},
 });
 
 /// Whether `pub` appears as a modifier in [lo, kw_i) — the export marker.
@@ -3025,9 +4097,42 @@ fn parseRustImpl(ctx: *Ctx, impl_i: u32, hi: u32) AllocError!u32 {
     // Nest methods under the implemented type when it is a known container, so
     // outline groups them; otherwise leave them parentless but still methods.
     const type_name = rustImplTypeName(ctx, impl_i + 1, open);
+    const protocol_name = rustImplProtocolName(ctx, impl_i + 1, open);
     const parent = if (type_name.len != 0) findEmittedContainer(ctx, type_name) else null;
+    const first_method = ctx.out.items.len;
     try parseRustScope(ctx, open + 1, close, parent, true);
+    // `impl` blocks commonly live in a different module from the type. Keep
+    // enough nominal evidence for the whole-project index to attach those
+    // otherwise-parentless methods after every file has been parsed.
+    for (ctx.out.items[first_method..]) |*sym| {
+        if (sym.kind != .method) continue;
+        sym.receiver = type_name;
+        sym.impl_protocol = protocol_name;
+    }
     return close + 1;
+}
+
+/// Trait name from `impl Trait for Type`, or empty for an inherent `impl Type`.
+/// Like `rustImplTypeName`, this keeps the last path segment (`traits::Draw` ->
+/// `Draw`); resolution later requires a unique project container before it
+/// treats the nominal relation as exact.
+fn rustImplProtocolName(ctx: *const Ctx, from: u32, open: u32) []const u8 {
+    var j = skipRustGenerics(ctx, from, open);
+    var protocol: []const u8 = "";
+    while (j < open) : (j += 1) {
+        if (ctx.identEql(j, "for")) return protocol;
+        if (ctx.isPunct(j, '<')) {
+            const next = skipRustGenerics(ctx, j, open);
+            if (next > j) {
+                j = next - 1;
+                continue;
+            }
+        }
+        if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) {
+            protocol = ctx.textOf(j);
+        }
+    }
+    return "";
 }
 
 /// The `{` that opens an `impl ... { }` body, skipping generics, the `for` type,
@@ -3074,12 +4179,13 @@ fn rustImplTypeName(ctx: *const Ctx, from: u32, open: u32) []const u8 {
             after_for = true;
             continue;
         }
+        if (ctx.identEql(j, "where")) break;
         if (ctx.toks[j].kind == .identifier and !rust_keywords.has(ctx.textOf(j))) {
-            // The impl'd type is the first identifier; `impl Trait for Type` names
-            // the type after `for` instead.
+            // Keep the final path segment; `impl crate::Trait for model::Type`
+            // must attach to `Type`, not the leading module identifier.
             if (after_for) {
-                if (for_ident.len == 0) for_ident = ctx.textOf(j);
-            } else if (type_ident.len == 0) {
+                for_ident = ctx.textOf(j);
+            } else {
                 type_ident = ctx.textOf(j);
             }
         }
@@ -3236,12 +4342,12 @@ fn parseRustMacro(ctx: *Ctx, stmt_start: u32, kw_i: u32, hi: u32, parent: ?u32) 
 // ---------------------------------------------------------------------------
 
 const ruby_keywords = KeywordSet.initComptime(.{
-    .{"def"},     .{"end"},    .{"if"},     .{"elsif"},  .{"else"},   .{"unless"},
-    .{"while"},   .{"until"},  .{"for"},    .{"in"},     .{"do"},     .{"begin"},
-    .{"rescue"},  .{"ensure"}, .{"retry"},  .{"return"}, .{"yield"},  .{"then"},
-    .{"case"},    .{"when"},   .{"class"},  .{"module"}, .{"self"},   .{"nil"},
-    .{"true"},    .{"false"},  .{"and"},    .{"or"},     .{"not"},    .{"super"},
-    .{"break"},   .{"next"},   .{"redo"},   .{"require"}, .{"require_relative"},
+    .{"def"},    .{"end"},    .{"if"},    .{"elsif"},   .{"else"},             .{"unless"},
+    .{"while"},  .{"until"},  .{"for"},   .{"in"},      .{"do"},               .{"begin"},
+    .{"rescue"}, .{"ensure"}, .{"retry"}, .{"return"},  .{"yield"},            .{"then"},
+    .{"case"},   .{"when"},   .{"class"}, .{"module"},  .{"self"},             .{"nil"},
+    .{"true"},   .{"false"},  .{"and"},   .{"or"},      .{"not"},              .{"super"},
+    .{"break"},  .{"next"},   .{"redo"},  .{"require"}, .{"require_relative"},
 });
 
 /// Whether the `do` at `i` merely re-marks a block already opened by a
@@ -3313,8 +4419,17 @@ fn parseRubyDef(ctx: *Ctx, def_i: u32, hi: u32, parent: ?u32) AllocError!u32 {
     }
     if (j >= hi or ctx.toks[j].kind != .identifier) return def_i;
     const name_i = j;
-    const name = ctx.textOf(name_i);
+    var name = ctx.textOf(name_i);
     var after = name_i + 1;
+    // Ruby predicate/bang methods (`available?`, `save!`) end in a sigil that is
+    // a separate adjacent token but part of the method's identifier — include it
+    // so the symbol name matches the source (and its call sites).
+    if (after < hi and ctx.toks[after].start == ctx.toks[name_i].end and
+        (ctx.isPunct(after, '?') or ctx.isPunct(after, '!')))
+    {
+        name = ctx.source[ctx.toks[name_i].start..ctx.toks[after].end];
+        after += 1;
+    }
     if (ctx.isPunct(after, '(')) {
         const pc = ctx.close[after];
         if (pc == sentinel) return def_i;
@@ -3411,8 +4526,34 @@ fn parseForTest(src: []const u8, lang: language.Language) !std.ArrayList(ParsedS
     var out: std.ArrayList(ParsedSymbol) = .empty;
     // arena leaks into the test allocator's checking; use testing allocator via arena.
     const arena = testing.allocator;
-    try parse(testing.allocator, arena, src, lang, &out);
+    _ = try parse(testing.allocator, arena, src, lang, &out);
     return out;
+}
+
+test "parse-health: an unterminated string that runs to EOF is reported" {
+    var out: std.ArrayList(ParsedSymbol) = .empty;
+    defer out.deinit(testing.allocator);
+    // The opening quote is never closed, so the tokenizer swallows to EOF.
+    const src =
+        \\function ok() { return 1; }
+        \\const bad = "never closed
+        \\function hidden() { return 2; }
+    ;
+    const health = try parse(testing.allocator, testing.allocator, src, .javascript, &out);
+    try testing.expect(health.desync_from != null);
+    try testing.expectEqual(@as(u32, 2), health.desync_from.?);
+    try testing.expect(health.desync_to >= 3);
+}
+
+test "parse-health: a well-formed file reports no desync" {
+    var out: std.ArrayList(ParsedSymbol) = .empty;
+    defer out.deinit(testing.allocator);
+    const src =
+        \\const re = /("(?:[^"\\]|\\.)*")/g;
+        \\function fine() { return "closed string"; }
+    ;
+    const health = try parse(testing.allocator, testing.allocator, src, .javascript, &out);
+    try testing.expect(health.desync_from == null);
 }
 
 fn findSym(list: []const ParsedSymbol, name: []const u8) ?ParsedSymbol {
@@ -3457,6 +4598,69 @@ test "zig: functions, struct, methods, refs" {
     try testing.expect(found_add_ref);
 }
 
+test "zig: a generic type factory indexes returned anonymous-container methods" {
+    const src =
+        \\pub fn Box(comptime T: type) type {
+        \\    return struct {
+        \\        value: T,
+        \\        pub fn init(value: T) @This() {
+        \\            return .{ .value = value };
+        \\        }
+        \\        pub fn get(self: @This()) T {
+        \\            return self.value;
+        \\        }
+        \\    };
+        \\}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    var box_idx: ?u32 = null;
+    for (out.items, 0..) |sym, i| {
+        if (std.mem.eql(u8, sym.name, "Box")) box_idx = @intCast(i);
+    }
+    try testing.expect(box_idx != null);
+    const init = findSym(out.items, "init").?;
+    const get = findSym(out.items, "get").?;
+    try testing.expectEqual(SymbolKind.method, init.kind);
+    try testing.expectEqual(SymbolKind.method, get.kind);
+    try testing.expectEqual(box_idx, init.parent_local);
+    try testing.expectEqual(box_idx, get.parent_local);
+}
+
+test "zig: receiverless enum tags and struct fields never become symbol references" {
+    const src =
+        \\const Operation = enum { symbol, relations };
+        \\const Node = struct { field: usize };
+        \\fn symbol() void {}
+        \\fn ready() void {}
+        \\fn decode(operation: Operation, opt: ?Node, ptr: *Node, cond: bool) void {
+        \\    switch (operation) {
+        \\        .symbol => {},
+        \\        .relations => {},
+        \\    }
+        \\    _ = opt.?.field;
+        \\    _ = ptr.*.field;
+        \\    const selected: Operation = if (cond) .ready else .relations;
+        \\    _ = selected;
+        \\}
+    ;
+    var out = try parseForTest(src, .zig);
+    defer freeRefs(&out);
+    const decode = findSym(out.items, "decode").?;
+    try testing.expect(!hasRef(decode, "symbol"));
+    try testing.expect(!hasRef(decode, "relations"));
+    try testing.expect(!hasRef(decode, "ready"));
+    var saw_opt_field = false;
+    var saw_ptr_field = false;
+    for (decode.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "field")) continue;
+        if (std.mem.eql(u8, ref.qualifier, "opt")) saw_opt_field = true;
+        if (std.mem.eql(u8, ref.qualifier, "ptr")) saw_ptr_field = true;
+    }
+    try testing.expect(saw_opt_field);
+    try testing.expect(saw_ptr_field);
+}
+
 test "python: def, class, method, refs" {
     const src =
         \\import os
@@ -3481,6 +4685,38 @@ test "python: def, class, method, refs" {
         if (std.mem.eql(u8, r.name, "helper")) found = true;
     }
     try testing.expect(found);
+}
+
+test "python: annotation-only class and dataclass fields are indexed" {
+    const src =
+        \\from dataclasses import dataclass
+        \\from typing import Literal
+        \\@dataclass
+        \\class User:
+        \\    name: str
+        \\    age: int = 0
+        \\    rule: Literal[1 == 1] = "same"
+        \\    mapping = {
+        \\        key: value,
+        \\    }
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    var user_idx: ?u32 = null;
+    for (out.items, 0..) |sym, i| {
+        if (std.mem.eql(u8, sym.name, "User")) user_idx = @intCast(i);
+    }
+    try testing.expect(user_idx != null);
+    const name = findSym(out.items, "name").?;
+    const age = findSym(out.items, "age").?;
+    const rule = findSym(out.items, "rule").?;
+    try testing.expectEqual(SymbolKind.field, name.kind);
+    try testing.expectEqual(SymbolKind.field, age.kind);
+    try testing.expectEqual(SymbolKind.field, rule.kind);
+    try testing.expectEqual(user_idx, name.parent_local);
+    try testing.expectEqual(user_idx, age.parent_local);
+    try testing.expectEqual(user_idx, rule.parent_local);
+    try testing.expect(findSym(out.items, "key") == null);
 }
 
 test "python: multi-line signature with dedented close paren does not crash" {
@@ -4023,6 +5259,10 @@ test "lua: local/global functions, table methods, refs and export flags" {
         \\function M:method(x)
         \\  return self.value + x
         \\end
+        \\
+        \\M.assigned = function(x)
+        \\  return x
+        \\end
     ;
     var out = try parseForTest(src, .lua);
     defer freeRefs(&out);
@@ -4033,7 +5273,16 @@ test "lua: local/global functions, table methods, refs and export flags" {
     const pub_add = findSym(out.items, "publicAdd").?;
     try testing.expectEqual(SymbolKind.method, pub_add.kind);
     try testing.expect(pub_add.exported); // table function → public
-    try testing.expectEqual(SymbolKind.method, findSym(out.items, "method").?.kind);
+    const method = findSym(out.items, "method").?;
+    try testing.expectEqual(SymbolKind.method, method.kind);
+    var module_idx: ?u32 = null;
+    for (out.items, 0..) |sym, i| {
+        if (std.mem.eql(u8, sym.name, "M")) module_idx = @intCast(i);
+    }
+    try testing.expect(module_idx != null);
+    try testing.expectEqual(module_idx, pub_add.parent_local);
+    try testing.expectEqual(module_idx, method.parent_local);
+    try testing.expectEqual(module_idx, findSym(out.items, "assigned").?.parent_local);
     var found = false;
     for (pub_add.refs) |r| {
         if (std.mem.eql(u8, r.name, "addPrivate")) {
@@ -4042,6 +5291,20 @@ test "lua: local/global functions, table methods, refs and export flags" {
         }
     }
     try testing.expect(found);
+}
+
+test "lua: an unrelated nested field is not a receiver root for a bare method" {
+    const src =
+        \\local Other = {}
+        \\Other.T = {}
+        \\function T.open()
+        \\  return 1
+        \\end
+    ;
+    var out = try parseForTest(src, .lua);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "T").?.parent_local != null);
+    try testing.expect(findSym(out.items, "open").?.parent_local == null);
 }
 
 test "lua: require() emits an import; a block comment hides code inside it" {
@@ -4350,7 +5613,7 @@ test "rust: multiple impl blocks and a trait impl all contribute methods to the 
         \\    pub fn new() -> Widget { Widget }
         \\    fn helper(&self) -> u32 { 1 }
         \\}
-        \\impl Draw for Widget {
+        \\impl crate::Draw for crate::Widget {
         \\    fn draw(&self) { self.helper(); }
         \\}
     ;
@@ -4366,6 +5629,15 @@ test "rust: multiple impl blocks and a trait impl all contribute methods to the 
     try testing.expect(new.parent_local != null);
     try testing.expect(findSym(out.items, "helper").?.parent_local != null);
     try testing.expect(countKind(out.items, .method) >= 3);
+    var saw_nominal_impl = false;
+    for (out.items) |sym| {
+        if (!std.mem.eql(u8, sym.name, "draw") or sym.receiver.len == 0) continue;
+        try testing.expectEqualStrings("Widget", sym.receiver);
+        try testing.expectEqualStrings("Draw", sym.impl_protocol);
+        try testing.expect(sym.parent_local != null);
+        saw_nominal_impl = true;
+    }
+    try testing.expect(saw_nominal_impl);
 }
 
 test "rust: where-clause and Fn() bounds do not break the fn body" {
@@ -4457,10 +5729,11 @@ test "ruby: endless methods and bang/question method names" {
     ;
     var out = try parseForTest(src, .ruby);
     defer freeRefs(&out);
-    // `?`/`!` lex as punct, so the method name is the identifier stem.
-    try testing.expectEqual(SymbolKind.method, findSym(out.items, "valid").?.kind);
-    try testing.expect(hasRef(findSym(out.items, "valid").?, "check"));
-    try testing.expectEqual(SymbolKind.method, findSym(out.items, "save").?.kind);
+    // A trailing `?`/`!` is part of the Ruby method identifier and is kept on the
+    // symbol name so it matches the source and its call sites.
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "valid?").?.kind);
+    try testing.expect(hasRef(findSym(out.items, "valid?").?, "check"));
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "save!").?.kind);
     // An endless method is a single-line method.
     const double = findSym(out.items, "double").?;
     try testing.expectEqual(SymbolKind.method, double.kind);
@@ -4489,13 +5762,13 @@ test "zig: enum and tagged union are indexed; a test block is a test_case symbol
     try testing.expect(findSym(out.items, "add") == null);
 }
 
-test "python: subclass async method captures nested fn and call refs" {
+test "python: nested body calls belong to the inner owner while defaults stay outer" {
     const src =
         \\class Base:
         \\    pass
         \\class Derived(Base):
         \\    async def load(self):
-        \\        def inner():
+        \\        def inner(value=make_default()):
         \\            return fetch()
         \\        return inner()
     ;
@@ -4506,13 +5779,16 @@ test "python: subclass async method captures nested fn and call refs" {
     const load = findSym(out.items, "load").?;
     try testing.expectEqual(SymbolKind.method, load.kind);
     try testing.expect(load.parent_local != null);
-    // The async method sees both its nested-fn call and the inner fetch.
+    // The async method owns its call to the nested function, but not calls made
+    // inside that nested function.
     try testing.expect(hasCallRef(load, "inner"));
-    try testing.expect(hasCallRef(load, "fetch"));
+    try testing.expect(hasCallRef(load, "make_default"));
+    try testing.expect(!hasRef(load, "fetch"));
     // The nested function is itself indexed and calls fetch.
     const inner = findSym(out.items, "inner").?;
     try testing.expectEqual(SymbolKind.function, inner.kind);
     try testing.expect(hasCallRef(inner, "fetch"));
+    try testing.expect(!hasRef(inner, "make_default"));
 }
 
 test "ts: an exported arrow-const is a function that captures its call" {
@@ -4549,13 +5825,15 @@ fn bindingType(bindings: []const Binding, name: []const u8) ?[]const u8 {
 
 fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
     for (out.items) |s| {
-        for (s.refs) |ref| if (ref.lines.len != 0) testing.allocator.free(ref.lines);
+        for (s.refs) |ref| {
+            if (ref.lines.len != 0) testing.allocator.free(ref.lines);
+            if (ref.offsets.len != 0) testing.allocator.free(ref.offsets);
+        }
         if (s.refs.len != 0) testing.allocator.free(s.refs);
         if (s.bindings.len != 0) testing.allocator.free(s.bindings);
     }
     out.deinit(testing.allocator);
 }
-
 
 // ===========================================================================
 // APPENDED TESTS — parser.zig hardening
@@ -4565,12 +5843,13 @@ fn freeRefs(out: *std.ArrayList(ParsedSymbol)) void {
 
 test "edge: empty source yields no symbols across languages" {
     inline for (.{
-        language.Language.zig,      language.Language.c,
-        language.Language.cpp,      language.Language.csharp,
-        language.Language.python,   language.Language.javascript,
+        language.Language.zig,        language.Language.c,
+        language.Language.cpp,        language.Language.csharp,
+        language.Language.python,     language.Language.javascript,
         language.Language.typescript, language.Language.tsx,
-        language.Language.lua,      language.Language.go,
-        language.Language.rust,     language.Language.ruby,
+        language.Language.lua,        language.Language.go,
+        language.Language.rust,       language.Language.ruby,
+        language.Language.java,
     }) |lang| {
         var out = try parseForTest("", lang);
         defer freeRefs(&out);
@@ -5406,4 +6685,199 @@ test "go: grouped const/var skips multi-line initializers (no phantom symbols)" 
     try testing.expect(findSym(out.items, "config") == null);
     try testing.expect(findSym(out.items, "timeout") == null);
     try testing.expect(findSym(out.items, "suffix") == null);
+}
+
+test "go: package decl is a module symbol; methods parent to their same-file receiver type" {
+    const src =
+        \\package metrics
+        \\
+        \\func (m *Metrics) Provision(x int) error {
+        \\    return nil
+        \\}
+        \\
+        \\type Metrics struct {
+        \\    n int
+        \\}
+        \\
+        \\func (Metrics) Nameless() {}
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+
+    const pkg = findSym(out.items, "metrics").?;
+    try testing.expectEqual(SymbolKind.module, pkg.kind);
+
+    // Method declared BEFORE its type still gets parented (post-pass).
+    const typ_idx: u32 = blk: {
+        for (out.items, 0..) |s, i| {
+            if (s.kind == .@"struct" and std.mem.eql(u8, s.name, "Metrics")) break :blk @intCast(i);
+        }
+        unreachable;
+    };
+    const prov = findSym(out.items, "Provision").?;
+    try testing.expectEqual(typ_idx, prov.parent_local.?);
+    // Nameless-receiver form `func (Metrics) X()` parents too.
+    const nameless = findSym(out.items, "Nameless").?;
+    try testing.expectEqual(typ_idx, nameless.parent_local.?);
+}
+
+test "go: a /vN module import binds the real package name, not the version segment" {
+    const src =
+        \\package main
+        \\
+        \\import (
+        \\    "github.com/caddyserver/caddy/v2"
+        \\    "example.com/single/v10"
+        \\)
+    ;
+    var out = try parseForTest(src, .go);
+    defer freeRefs(&out);
+    try testing.expect(findSym(out.items, "caddy") != null);
+    try testing.expect(findSym(out.items, "single") != null);
+    try testing.expect(findSym(out.items, "v2") == null);
+}
+
+test "write classification covers direct, augmented, increment, and Go declaration assignment" {
+    var js = try parseForTest("function run(obj) { obj.value = 1; obj.value += 2; obj.value++; }", .javascript);
+    defer freeRefs(&js);
+    const run = findSym(js.items, "run").?;
+    var reads: u32 = 0;
+    var writes: u32 = 0;
+    for (run.refs) |ref| {
+        if (!std.mem.eql(u8, ref.name, "value")) continue;
+        if (ref.write) writes += ref.count else reads += ref.count;
+    }
+    try testing.expectEqual(@as(u32, 3), writes);
+    try testing.expectEqual(@as(u32, 2), reads);
+
+    var go = try parseForTest("package p\nfunc run() { value := 1; _ = value }\n", .go);
+    defer freeRefs(&go);
+    const go_run = findSym(go.items, "run").?;
+    var saw_declaration_write = false;
+    for (go_run.refs) |ref| if (std.mem.eql(u8, ref.name, "value") and ref.write) {
+        saw_declaration_write = true;
+    };
+    try testing.expect(saw_declaration_write);
+}
+
+test "python: kwarg labels are typed writes and loop/context variables stay local" {
+    const src =
+        \\def use(envvar, done):
+        \\    configure(envvar="PATH")
+        \\    for envvar in items:
+        \\        touch(envvar)
+        \\    with open("f") as handle:
+        \\        handle.close()
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    const use = findSym(out.items, "use").?;
+    var saw_kwarg_write = false;
+    for (use.refs) |r| {
+        if (std.mem.eql(u8, r.name, "envvar") and r.line == 2) {
+            try testing.expect(r.write);
+            try testing.expectEqualStrings("configure", r.qualifier);
+            saw_kwarg_write = true;
+        }
+    }
+    try testing.expect(saw_kwarg_write);
+    var saw_envvar = false;
+    var saw_handle = false;
+    for (use.bindings) |b| {
+        if (std.mem.eql(u8, b.name, "envvar")) saw_envvar = true;
+        if (std.mem.eql(u8, b.name, "handle")) saw_handle = true;
+    }
+    try testing.expect(saw_envvar); // `for envvar in …`
+    try testing.expect(saw_handle); // `with … as handle`
+}
+
+test "references retain every exact source offset for rename planning" {
+    const src = "function run() { helper(); helper(); }";
+    var out = try parseForTest(src, .javascript);
+    defer freeRefs(&out);
+    const run = findSym(out.items, "run").?;
+    const helper = for (run.refs) |ref| {
+        if (std.mem.eql(u8, ref.name, "helper")) break ref;
+    } else unreachable;
+    try testing.expectEqual(helper.count, helper.offsets.len);
+    try testing.expectEqual(@as(usize, 2), helper.offsets.len);
+    for (helper.offsets) |offset| {
+        try testing.expect(offset + helper.name.len <= src.len);
+        try testing.expectEqualStrings("helper", src[offset .. offset + helper.name.len]);
+    }
+}
+
+test "python docstrings attach to function and class symbols" {
+    const src =
+        \\class Service:
+        \\    """Service contract."""
+        \\    def run(self):
+        \\        """Run one request."""
+        \\        return work()
+    ;
+    var out = try parseForTest(src, .python);
+    defer freeRefs(&out);
+    try testing.expectEqualStrings("\"\"\"Service contract.\"\"\"", findSym(out.items, "Service").?.doc);
+    try testing.expectEqualStrings("\"\"\"Run one request.\"\"\"", findSym(out.items, "run").?.doc);
+}
+
+// --- Java -----------------------------------------------------------------
+
+test "java: package, imports, class, methods, and body refs" {
+    const src =
+        \\package com.foo.app;
+        \\import java.util.List;
+        \\import static java.lang.Math.max;
+        \\
+        \\public class Calc {
+        \\    private int total;
+        \\    public int tally() {
+        \\        return add(total, 1);
+        \\    }
+        \\    int add(int a, int b) { return a + b; }
+        \\}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    // `package` is a module symbol.
+    try testing.expectEqual(SymbolKind.module, findSym(out.items, "app").?.kind);
+    // Imports bind under their simple name with the full dotted path.
+    try testing.expectEqualStrings("java.util.List", findSym(out.items, "List").?.import_path);
+    try testing.expectEqualStrings("java.lang.Math.max", findSym(out.items, "max").?.import_path);
+    // The class and its members are indexed.
+    try testing.expectEqual(SymbolKind.class, findSym(out.items, "Calc").?.kind);
+    const tally = findSym(out.items, "tally").?;
+    try testing.expectEqual(SymbolKind.method, tally.kind);
+    try testing.expect(tally.parent_local != null);
+    try testing.expect(hasCallRef(tally, "add"));
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "add").?.kind);
+}
+
+test "java: interface, enum, and record are their own kinds" {
+    const src =
+        \\public interface Store {
+        \\    String get(String key);
+        \\}
+        \\enum Color { RED, GREEN, BLUE }
+        \\public record Point(int x, int y) {}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    try testing.expectEqual(SymbolKind.interface, findSym(out.items, "Store").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSym(out.items, "get").?.kind);
+    try testing.expectEqual(SymbolKind.@"enum", findSym(out.items, "Color").?.kind);
+    try testing.expectEqual(SymbolKind.class, findSym(out.items, "Point").?.kind);
+}
+
+test "java: private member is not exported; public member is" {
+    const src =
+        \\public class Svc {
+        \\    private void secret() {}
+        \\    public void open() {}
+        \\}
+    ;
+    var out = try parseForTest(src, .java);
+    defer freeRefs(&out);
+    try testing.expect(!findSym(out.items, "secret").?.exported);
+    try testing.expect(findSym(out.items, "open").?.exported);
 }

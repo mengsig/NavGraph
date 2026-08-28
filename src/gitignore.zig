@@ -60,6 +60,20 @@ pub const Matcher = struct {
         }
         return ignored;
     }
+
+    /// Whether the last rule matching `path` is a negation (`!pattern`) — an
+    /// explicit re-include. Used to let a `.navgraphignore` `!name` override
+    /// the built-in directory skip set (e.g. force-index `vendor/`).
+    pub fn isReincluded(self: *const Matcher, path: []const u8, is_dir: bool) bool {
+        std.debug.assert(path.len != 0);
+        var reincluded = false;
+        for (self.rules.items) |r| {
+            if (r.dir_only and !is_dir) continue;
+            const rel = relativeTo(r.base, path) orelse continue;
+            if (matchRule(r, rel)) reincluded = r.negated;
+        }
+        return reincluded;
+    }
 };
 
 /// Parse a single `.gitignore` line into a `Rule`, or null for a blank/comment
@@ -115,7 +129,8 @@ fn matchRule(r: Rule, rel: []const u8) bool {
 
 /// Glob match with gitignore semantics: `?` and `*` match runs of non-`/`
 /// characters, `**` matches across `/` (and `**/` may match zero directories).
-fn glob(pattern: []const u8, text: []const u8) bool {
+/// Pub: `query.zig` reuses it for glob patterns in symbol/path arguments.
+pub fn glob(pattern: []const u8, text: []const u8) bool {
     if (pattern.len == 0) return text.len == 0;
 
     if (pattern[0] == '*') {
@@ -190,7 +205,6 @@ test "nested gitignore scoped to its subtree, deeper wins" {
     try std.testing.expect(!m.isIgnored("sub/a.log", false)); // deeper negation wins
     try std.testing.expect(m.isIgnored("other/a.log", false)); // sub rule doesn't reach
 }
-
 
 // ---------------------------------------------------------------------------
 // Appended tests: parseLine, relativeTo, matchRule, glob, and Matcher.isIgnored
@@ -432,6 +446,20 @@ test "isIgnored: bracket pattern is matched literally, not as a class" {
     try std.testing.expect(m.isIgnored("[abc].txt", false));
     try std.testing.expect(!m.isIgnored("a.txt", false));
     try std.testing.expect(!m.isIgnored("b.txt", false));
+}
+
+test "isReincluded: negated rule re-includes, plain or absent rule does not" {
+    var m = Matcher.init(std.testing.allocator);
+    defer m.deinit();
+    try m.addFile("", "junk/\n!node_modules/\n");
+    // `!node_modules/` → explicit re-include (overrides a built-in skip).
+    try std.testing.expect(m.isReincluded("node_modules", true));
+    // Plain ignore rule and unmatched paths are not re-includes.
+    try std.testing.expect(!m.isReincluded("junk", true));
+    try std.testing.expect(!m.isReincluded("src", true));
+    // A later plain rule wins over an earlier negation.
+    try m.addFile("", "node_modules/\n");
+    try std.testing.expect(!m.isReincluded("node_modules", true));
 }
 
 test "isIgnored: anchored root rule does not match nested dirs" {
