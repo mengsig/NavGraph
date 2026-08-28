@@ -281,22 +281,38 @@ nearly quadrupling what it finds.
 
 **Golden corrections (fix round 2).** The wave's own golden additions had been
 written to the indexer's answer, and two raised cpp floors rested on that. The
-entries now say what the source says, and the three floors that could not hold
-were lowered with the reason recorded in `floors.json`'s history:
+entries now say what the source says: four corrections below, of which three
+lower a floor (the fourth, ruby `site_recall`, raises one — `floors.json`
+72.72 → 73.52 — because the new `[204]` call site grows the denominator this
+metric is graded against):
 
 - cpp `exact_agreement` 75.00 → 55.00 — the four `Car` edges (`tricky_run ->
   Car.goUnique`/`goShared`, `Car.goUnique`/`goShared -> Engine.start`) were the
   only inexact entries among 92, and C++ binds each to exactly one definition.
+  Pure golden strictness: re-running the pre-wave resolver against this golden
+  scores the identical 55.00 — the indexer did not move.
 - cpp `def_recall` 57.55 → 56.89 — `Car.engine_` and `Car.shared_` are listed
-  like the 22 comparable fields in the same golden.
+  like the 22 comparable fields in the same golden. Also pure golden
+  strictness, confirmed the same way.
 - ruby `site_recall` 74.62 → 73.52 — `LoudLedger.new` [204] dispatches to
-  `Ledger#initialize`, which `LoudLedger` does not define.
-- ruby `exact_agreement` 82.60 → 81.25 — the new `LoudLedger.size ->
-  Ledger.size` [134] edge is exact in Ruby (MRO `LoudLedger -> Loud ->
-  Ledger`, and `Loud` has no `size`); the resolver reports it inferred.
+  `Ledger#initialize`, which `LoudLedger` does not define. A golden addition,
+  not an indexer change; grades against the same unchanged resolver output.
+- ruby `exact_agreement` 82.60 → 81.25 — **this one is caused by the indexer,
+  not the golden.** Making a bare `super` a call (this wave) newly *produces*
+  `LoudLedger.size -> Ledger.size` [134], which is provably exact in Ruby (MRO
+  `LoudLedger -> Loud -> Ledger`, and `Loud` has no `size`) but the resolver
+  can only report it inferred, so agreements go 38 → 39 while the denominator
+  goes 46 → 48 and the ratio falls. Re-running the pre-wave resolver against
+  this golden scores 82.60, not 81.25 — the drop tracks the indexer, not a
+  regrade.
 
-Nothing about the indexer changed for any of these: seven gaps that were
-hidden in the grading are now findings the next wave can see.
+Nothing is masked either way — ruby `edge_recall` and `site_recall` both rose
+this round, and no metric fell in any language against the like-for-like base
+below — but the mechanism differs per bullet: the three cpp/ruby-`site_recall`
+corrections are pure golden strictness against an unchanged indexer; the ruby
+`exact_agreement` drop is the indexer producing a new, honestly-inferred edge.
+Eight gaps that were hidden in the grading, or newly produced and correctly
+graded as inferred, are now findings the next wave can see.
 
 **What each change bought.** Ordered by what moved:
 
